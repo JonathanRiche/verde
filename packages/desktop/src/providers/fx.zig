@@ -1,9 +1,15 @@
 //! FX provider harness backed by the fx CLI ACP server (`fx acp`).
 //! Generic ACP transport/protocol machinery lives in `acp.zig`; this module
-//! owns fx binary discovery, argv construction, and fx's handshake-based
-//! auth/model discovery. Model discovery stays on ACP `configOptions` rather
-//! than `fx models --json`: the CLI command prints the whole gateway catalog
-//! with exit 0 when signed out, so it cannot double as an auth signal.
+//! owns fx binary discovery, argv construction, fx's handshake-based
+//! auth/model discovery, and fx's ACP extensions (0.0.16):
+//! - `configOptions` carry per-model `effort` (reasoning) and `fast` selects,
+//!   set per session with `session/set_config_option`. Model discovery reads
+//!   them from ACP rather than `fx models --json`, which prints the whole
+//!   gateway catalog with exit 0 when signed out and omits Codex/Grok tiers.
+//! - `_meta.fx.steering` in initialize: a `session/prompt` with
+//!   `_meta.fx.steer` joins the running turn at its next safe boundary.
+//! Permission modes are deliberately left alone: fx persists `session/set_mode`
+//! into its global settings, so switching them would change the user's CLI.
 
 const std = @import("std");
 const acp = @import("acp.zig");
@@ -22,6 +28,16 @@ const INSTALL_FALLBACK_RELATIVE = ".local/bin/fx";
 /// the next readiness poll instead of piling up.
 const AUTH_PROBE_DEADLINE_MS: u64 = 10_000;
 
+/// Request ids outside the shared 1/2/3 sequence (initialize, session setup,
+/// prompt), so fx-only replies never reach the shared turn handler.
+const SET_EFFORT_REQUEST_ID: i64 = 10;
+const SET_FAST_REQUEST_ID: i64 = 11;
+/// Model discovery switches its throwaway session through each catalog model.
+const MODEL_PROBE_REQUEST_ID_BASE: i64 = 100;
+const MAX_PROBED_MODELS: usize = 512;
+/// Steering prompts count up from here; fx answers each when its turn ends.
+const STEER_REQUEST_ID_BASE: i64 = 1_000_000;
+
 const ACP_HARNESS: acp.Harness = .{
     .diagnostics_category = .fx_acp,
     .assistant_author = "FX",
@@ -33,6 +49,21 @@ const ACP_HARNESS: acp.Harness = .{
 };
 
 var active_process_state: acp.ActiveProcessState = .{};
+
+/// Steering bookkeeping for the registered turn, guarded by
+/// `active_process_state`'s mutex. `child` scopes it to one fx process so a
+/// newer turn's steers never hold an older turn open.
+const SteerState = struct {
+    child: ?*platform_process.OwnedChild = null,
+    supported: bool = false,
+    next_id: i64 = STEER_REQUEST_ID_BASE,
+    /// Steering prompts written but not yet answered. fx answers each when
+    /// the turn that absorbed it ends, or runs it as the next turn when it
+    /// arrived after the turn stopped taking input, so the reader stays
+    /// attached until all of them settle.
+    pending: u32 = 0,
+};
+var steer_state: SteerState = .{};
 
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
@@ -155,10 +186,29 @@ pub const Client = struct {
         }
     }
 
+    /// Writes a `_meta.fx.steer` prompt into the running turn. fx defers its
+    /// reply until that turn ends, so delivery is confirmed by the write
+    /// alone. `SteerNotDelivered` (no steerable turn, images) lets callers
+    /// queue the message as the next turn instead.
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
         _ = self;
-        _ = request;
-        return error.UnsupportedOperation;
+        // fx steering takes text blocks only; images wait for the next turn.
+        if (request.images.len > 0) return error.SteerNotDelivered;
+        if (std.mem.trim(u8, request.prompt, &std.ascii.whitespace).len == 0) return error.SteerNotDelivered;
+
+        active_process_state.lock();
+        defer active_process_state.unlock();
+        const child = active_process_state.child orelse return error.SteerNotDelivered;
+        const session_id = active_process_state.session_id orelse return error.SteerNotDelivered;
+        const stdin = active_process_state.stdin orelse return error.SteerNotDelivered;
+        if (!std.mem.eql(u8, session_id, request.thread_id)) return error.SteerNotDelivered;
+        if (steer_state.child != child or !steer_state.supported) return error.SteerNotDelivered;
+
+        const line = try makeSteerPromptRequestAlloc(std.heap.page_allocator, steer_state.next_id, session_id, request.prompt);
+        defer std.heap.page_allocator.free(line);
+        try acp.writeJsonLineToFile(std.heap.page_allocator, stdin, line);
+        steer_state.next_id += 1;
+        steer_state.pending += 1;
     }
 
     fn listThreadsAcp(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
@@ -188,9 +238,10 @@ pub const Client = struct {
     }
 
     // fx publishes its model catalog only in the `configOptions` of a
-    // session/new or session/load response. Loading the newest existing
-    // session avoids minting an empty throwaway session on every refresh;
-    // session/new is the first-run fallback.
+    // session response, and each model's reasoning tiers and Fast lane only
+    // once that model is selected. A fresh session is free to probe: fx does
+    // not save a session until its first prompt, so switching the throwaway
+    // session through every model touches no saved session or setting.
     fn listModelsAcp(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
         var proc = try self.spawnAcp(allocator, null);
         defer proc.deinit();
@@ -199,7 +250,12 @@ pub const Client = struct {
         defer allocator.free(cwd);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        try proc.writeLine(try acp.makeSessionListRequestAlloc(allocator, 2, try allocator.dupe(u8, cwd)));
+        try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 2, cwd, null));
+
+        var models: []provider_types.ModelInfo = &.{};
+        errdefer provider_types.freeModelInfos(allocator, models);
+        var probe_count: usize = 0;
+        var probed: usize = 0;
 
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
@@ -209,25 +265,38 @@ pub const Client = struct {
             if (line.len == 0) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
             defer parsed.deinit();
-            try acp.failIfJsonRpcError(ACP_HARNESS, parsed.value);
             const id = acp.responseId(parsed.value) orelse continue;
-            if (id == 2) {
-                if (try newestSessionIdAlloc(allocator, parsed.value)) |session_id| {
-                    defer allocator.free(session_id);
-                    try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 3, session_id, cwd, null));
-                } else {
-                    try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 3, cwd, null));
-                }
-                try proc.closeStdin();
+            if (id == 1) {
+                try acp.failIfJsonRpcError(ACP_HARNESS, parsed.value);
                 continue;
             }
-            if (id == 3) {
-                const models = try parseModelConfigOptionsAlloc(allocator, parsed.value);
-                proc.stop();
-                return models;
+            if (id == 2) {
+                try acp.failIfJsonRpcError(ACP_HARNESS, parsed.value);
+                models = try parseModelConfigOptionsAlloc(allocator, parsed.value);
+                const session_id = acp.parseSessionId(parsed.value) orelse break;
+                probe_count = @min(models.len, MAX_PROBED_MODELS);
+                for (models[0..probe_count], 0..) |model, index| {
+                    const probe_id = MODEL_PROBE_REQUEST_ID_BASE + @as(i64, @intCast(index));
+                    try proc.writeLine(try acp.makeSetConfigOptionRequestAlloc(allocator, probe_id, session_id, "model", model.model_id));
+                }
+                try proc.closeStdin();
+                if (probe_count == 0) break;
+                continue;
             }
+            if (id < MODEL_PROBE_REQUEST_ID_BASE) continue;
+            const index: usize = @intCast(id - MODEL_PROBE_REQUEST_ID_BASE);
+            if (index >= probe_count) continue;
+            // A model fx refuses to select (missing provider login) keeps the
+            // defaults: no reasoning tiers, no Fast toggle.
+            if (acp.getObjectField(parsed.value, "error") == null) {
+                try applySessionOptions(allocator, &models[index], parseSessionOptions(parsed.value));
+            }
+            probed += 1;
+            if (probed == probe_count) break;
         }
-        return error.AcpFailed;
+        proc.stop();
+        if (models.len == 0) return error.AcpFailed;
+        return models;
     }
 
     fn readThreadAcp(
@@ -285,8 +354,9 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
         // `fx acp --model <id>` overrides the session's stored model for this
-        // process; fx has no fast/effort suffix algebra. "default" is Verde's
-        // sentinel for deferring to fx's own persisted model selection.
+        // process; effort and Fast are session config options applied once
+        // the session is ready. "default" is Verde's sentinel for deferring
+        // to fx's own persisted model selection.
         const requested_model = request.model orelse self.config.model;
         const model_arg = if (requested_model) |model|
             (if (std.mem.eql(u8, model, "default")) null else model)
@@ -311,6 +381,8 @@ pub const Client = struct {
 
         var state: acp.SendPromptState = .{};
         errdefer state.deinit(allocator);
+        var session_options: SessionOptions = .{};
+        var awaiting_steers = false;
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
 
@@ -320,6 +392,11 @@ pub const Client = struct {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
+            switch (try interceptFxResponse(allocator, line, request, &session_options, &proc.process, awaiting_steers)) {
+                .forward => {},
+                .consumed => continue,
+                .turn_finished => break,
+            }
             const action = try acp.handleSendPromptLine(allocator, ACP_HARNESS, line, request, &state, proc.process.child.stdin);
             switch (action) {
                 .continue_reading => {},
@@ -331,14 +408,26 @@ pub const Client = struct {
                 })),
                 .session_ready => {
                     if (state.session_id) |session_id| {
+                        active_process_state.lock();
+                        steer_state = .{ .child = &proc.process, .supported = session_options.steering };
+                        active_process_state.unlock();
                         active_process_state.register(&proc.process, proc.process.child.stdin, session_id);
                         if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
                         if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
+                        // fx handles requests in order, so these settle
+                        // before the prompt starts.
+                        try writeTurnSettings(allocator, &proc, session_id, request, session_options);
                         try proc.writeLine(try acp.makePromptRequestAlloc(allocator, 3, session_id, request, state.capabilities.image));
                         state.prompt_submitted = true;
                     }
                 },
-                .prompt_done => break,
+                .prompt_done => {
+                    if (finishTurnUnlessSteering(&proc.process)) break;
+                    // fx answers absorbed steers just after the prompt reply,
+                    // and runs one that missed this turn's input as the next
+                    // turn; keep streaming into this reply until all settle.
+                    awaiting_steers = true;
+                },
             }
             if (request.on_should_stop) |should_stop| {
                 if (should_stop(request.stream_context)) {
@@ -414,6 +503,189 @@ fn writeSessionMeta(stringify: *std.json.Stringify) std.json.Stringify.Error!voi
     try stringify.write(.{ .fx = .{ .profileMcpServers = true } });
 }
 
+/// The fx `configOptions` that shape a turn, read from a session response
+/// or a `session/set_config_option` reply (both carry the full list).
+const SessionOptions = struct {
+    /// `_meta.fx.steering` from initialize, not a config option.
+    steering: bool = false,
+    /// Verde-named tiers the active model offers; fx's `auto` (model default)
+    /// and `ultra` have no Verde equivalent and are skipped.
+    efforts: std.EnumSet(provider_types.ReasoningEffort) = .initEmpty(),
+    current_effort: ?provider_types.ReasoningEffort = null,
+    fast_available: bool = false,
+    fast_on: bool = false,
+};
+
+fn parseSessionOptions(value: std.json.Value) SessionOptions {
+    var options: SessionOptions = .{};
+    const result = acp.getObjectField(value, "result") orelse return options;
+    const config_options = acp.getObjectField(result, "configOptions") orelse return options;
+    if (config_options != .array) return options;
+    for (config_options.array.items) |option| {
+        if (option != .object) continue;
+        const option_id = acp.getOptionalObjectString(option, "id") orelse continue;
+        const current = acp.getOptionalObjectString(option, "currentValue");
+        if (std.mem.eql(u8, option_id, "effort")) {
+            const entries = acp.getObjectField(option, "options") orelse continue;
+            if (entries != .array) continue;
+            for (entries.array.items) |entry| {
+                const tier = acp.getOptionalObjectString(entry, "value") orelse continue;
+                if (std.meta.stringToEnum(provider_types.ReasoningEffort, tier)) |effort| options.efforts.insert(effort);
+            }
+            if (current) |tier| options.current_effort = std.meta.stringToEnum(provider_types.ReasoningEffort, tier);
+        } else if (std.mem.eql(u8, option_id, "fast")) {
+            options.fast_available = true;
+            options.fast_on = if (current) |flag| std.mem.eql(u8, flag, "true") else false;
+        }
+    }
+    return options;
+}
+
+/// Records a probed model's tiers in the shared per-model effort field and
+/// its Fast lane in the shared fast flag.
+fn applySessionOptions(allocator: std.mem.Allocator, model: *provider_types.ModelInfo, options: SessionOptions) !void {
+    model.cursor_fast_supported = options.fast_available;
+    model.reasoning_supported = options.efforts.count() > 0;
+    if (!model.reasoning_supported) return;
+    var values: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (values.items) |value| allocator.free(value);
+        values.deinit(allocator);
+    }
+    var iterator = options.efforts.iterator();
+    while (iterator.next()) |effort| try values.append(allocator, try allocator.dupeZ(u8, @tagName(effort)));
+    model.grok_effort_values = try values.toOwnedSlice(allocator);
+}
+
+/// Applies Verde's effort and Fast choices to the session before the prompt.
+/// fx keeps both per session, so Fast is written whenever it differs (Verde's
+/// toggle is authoritative) while a "Default" effort leaves fx's tier alone.
+/// Tiers the model does not offer are skipped rather than failing the turn.
+fn writeTurnSettings(
+    allocator: std.mem.Allocator,
+    proc: *acp.Process,
+    session_id: []const u8,
+    request: provider_types.SendPromptRequest,
+    options: SessionOptions,
+) !void {
+    if (request.reasoning_effort) |effort| {
+        const already_set = if (options.current_effort) |current| current == effort else false;
+        if (options.efforts.contains(effort) and !already_set) {
+            try proc.writeLine(try acp.makeSetConfigOptionRequestAlloc(allocator, SET_EFFORT_REQUEST_ID, session_id, "effort", @tagName(effort)));
+        }
+    }
+    if (options.fast_available) {
+        const want_fast = if (request.service_tier) |tier| tier == .fast else false;
+        if (want_fast != options.fast_on) {
+            try proc.writeLine(try acp.makeSetConfigOptionRequestAlloc(allocator, SET_FAST_REQUEST_ID, session_id, "fast", if (want_fast) "true" else "false"));
+        }
+    }
+}
+
+const Intercept = enum { forward, consumed, turn_finished };
+
+/// Reads fx-specific response details before the shared handler sees the
+/// line, and keeps replies to fx-only requests (settings, steering) away from
+/// it: the shared handler fails the turn on any JSON-RPC error.
+fn interceptFxResponse(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    request: provider_types.SendPromptRequest,
+    options: *SessionOptions,
+    child: *platform_process.OwnedChild,
+    awaiting_steers: bool,
+) !Intercept {
+    // Requests and notifications carry an unescaped "method" key; responses
+    // never do, so streaming updates skip the extra parse.
+    if (std.mem.indexOf(u8, line, "\"method\"") != null) return .forward;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return .forward;
+    defer parsed.deinit();
+    const id = acp.responseId(parsed.value) orelse return .forward;
+    const failed = acp.getObjectField(parsed.value, "error") != null;
+    switch (id) {
+        1 => {
+            if (!failed) options.steering = initializeAdvertisesSteering(parsed.value);
+            return .forward;
+        },
+        2 => {
+            if (!failed) {
+                const steering = options.steering;
+                options.* = parseSessionOptions(parsed.value);
+                options.steering = steering;
+            }
+            return .forward;
+        },
+        SET_EFFORT_REQUEST_ID, SET_FAST_REQUEST_ID => {
+            if (failed) emitRejection(request, if (id == SET_EFFORT_REQUEST_ID) "FX reasoning effort not applied" else "FX Fast mode not applied", parsed.value);
+            return .consumed;
+        },
+        else => {},
+    }
+    if (id < STEER_REQUEST_ID_BASE) return .forward;
+    if (failed) emitRejection(request, "FX steering failed", parsed.value);
+    active_process_state.lock();
+    defer active_process_state.unlock();
+    if (steer_state.child != child) return if (awaiting_steers) .turn_finished else .consumed;
+    steer_state.pending -|= 1;
+    if (!awaiting_steers or steer_state.pending > 0) return .consumed;
+    clearRegistrationLocked(child);
+    return .turn_finished;
+}
+
+/// True (and the turn is no longer steerable) when no steering reply is
+/// outstanding. Deciding and unregistering under one lock keeps a steer from
+/// landing between the last reply and the process shutting down.
+fn finishTurnUnlessSteering(child: *platform_process.OwnedChild) bool {
+    active_process_state.lock();
+    defer active_process_state.unlock();
+    if (steer_state.child == child and steer_state.pending > 0) return false;
+    clearRegistrationLocked(child);
+    return true;
+}
+
+fn clearRegistrationLocked(child: *platform_process.OwnedChild) void {
+    if (steer_state.child == child) steer_state = .{};
+    if (active_process_state.child == child) {
+        active_process_state.child = null;
+        active_process_state.stdin = null;
+        active_process_state.session_id = null;
+    }
+}
+
+fn initializeAdvertisesSteering(value: std.json.Value) bool {
+    const result = acp.getObjectField(value, "result") orelse return false;
+    const agent = acp.getObjectField(result, "agentCapabilities") orelse return false;
+    const meta = acp.getObjectField(agent, "_meta") orelse return false;
+    const fx_meta = acp.getObjectField(meta, "fx") orelse return false;
+    return acp.getOptionalObjectBool(fx_meta, "steering") orelse false;
+}
+
+fn emitRejection(request: provider_types.SendPromptRequest, title: []const u8, value: std.json.Value) void {
+    const on_stream_event = request.on_stream_event orelse return;
+    const error_value = acp.getObjectField(value, "error") orelse return;
+    const message = acp.getOptionalObjectString(error_value, "message") orelse "fx rejected the request.";
+    on_stream_event(request.stream_context, .{ .message = .{ .title = title, .body = message } });
+}
+
+/// fx's steering extension: a `session/prompt` flagged `_meta.fx.steer`
+/// joins the running turn instead of failing with "Prompt already in progress".
+fn makeSteerPromptRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, text: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.write(.{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "session/prompt",
+        .params = .{
+            .sessionId = session_id,
+            .prompt = .{.{ .type = "text", .text = text }},
+            ._meta = .{ .fx = .{ .steer = true } },
+        },
+    });
+    return writer.toOwnedSlice();
+}
+
 pub fn shutdownOwnedServer() void {
     active_process_state.lock();
     defer active_process_state.unlock();
@@ -431,28 +703,6 @@ fn mapAcpError(err: anyerror) anyerror {
         error.AcpAttachmentsUnsupported => error.FxAttachmentsUnsupported,
         else => err,
     };
-}
-
-// fx session/list entries carry sessionId/cwd/updatedAt (ISO-8601, so
-// lexicographic comparison orders chronologically) and no title.
-fn newestSessionIdAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
-    const result = acp.getObjectField(value, "result") orelse return null;
-    const sessions = acp.getObjectField(result, "sessions") orelse return null;
-    if (sessions != .array) return null;
-
-    var newest_id: ?[]const u8 = null;
-    var newest_stamp: []const u8 = "";
-    for (sessions.array.items) |session| {
-        if (session != .object) continue;
-        const id = acp.getOptionalObjectString(session, "sessionId") orelse continue;
-        const stamp = acp.getOptionalObjectString(session, "updatedAt") orelse "";
-        if (newest_id == null or std.mem.order(u8, stamp, newest_stamp) != .lt) {
-            newest_id = id;
-            newest_stamp = stamp;
-        }
-    }
-    const id = newest_id orelse return null;
-    return try allocator.dupe(u8, id);
 }
 
 // Parses the `configOptions` model select from a session/new or session/load
@@ -554,4 +804,112 @@ test "parseModelConfigOptionsAlloc reads fx configOptions model select" {
     , .{});
     defer missing.deinit();
     try std.testing.expectError(error.AcpFailed, parseModelConfigOptionsAlloc(std.testing.allocator, missing.value));
+}
+
+test "parseSessionOptions maps fx effort tiers and the fast select" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1","configOptions":[
+        \\{"id":"model","type":"select","currentValue":"gpt-6.1-sol","options":[{"value":"gpt-6.1-sol","name":"gpt-6.1-sol"}]},
+        \\{"id":"effort","category":"thought_level","type":"select","currentValue":"high","options":[
+        \\{"value":"auto","name":"default"},{"value":"low","name":"low"},{"value":"high","name":"high"},
+        \\{"value":"max","name":"max"},{"value":"ultra","name":"ultra"}]},
+        \\{"id":"fast","category":"model","type":"select","currentValue":"true","options":[{"value":"false","name":"off"},{"value":"true","name":"on"}]}
+        \\]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const options = parseSessionOptions(parsed.value);
+    try std.testing.expect(options.efforts.contains(.low));
+    try std.testing.expect(options.efforts.contains(.high));
+    try std.testing.expect(options.efforts.contains(.max));
+    try std.testing.expect(!options.efforts.contains(.medium));
+    try std.testing.expectEqual(@as(usize, 3), options.efforts.count());
+    try std.testing.expectEqual(@as(?provider_types.ReasoningEffort, .high), options.current_effort);
+    try std.testing.expect(options.fast_available);
+    try std.testing.expect(options.fast_on);
+
+    var model: provider_types.ModelInfo = .{
+        .provider_id = try std.testing.allocator.dupe(u8, "fx"),
+        .provider_name = try std.testing.allocator.dupe(u8, "FX"),
+        .model_id = try std.testing.allocator.dupe(u8, "gpt-6.1-sol"),
+        .model_name = try std.testing.allocator.dupe(u8, "gpt-6.1-sol"),
+    };
+    defer model.deinit(std.testing.allocator);
+    try applySessionOptions(std.testing.allocator, &model, options);
+    try std.testing.expect(model.reasoning_supported);
+    try std.testing.expect(model.cursor_fast_supported);
+    const tiers = model.grok_effort_values.?;
+    try std.testing.expectEqual(@as(usize, 3), tiers.len);
+    try std.testing.expectEqualStrings("low", tiers[0]);
+    try std.testing.expectEqualStrings("high", tiers[1]);
+    try std.testing.expectEqualStrings("max", tiers[2]);
+
+    // A model without an effort select reports no reasoning control.
+    var bare = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":101,"result":{"configOptions":[{"id":"model","type":"select","currentValue":"m","options":[]}]}}
+    , .{});
+    defer bare.deinit();
+    const bare_options = parseSessionOptions(bare.value);
+    try std.testing.expectEqual(@as(usize, 0), bare_options.efforts.count());
+    try std.testing.expect(!bare_options.fast_available);
+}
+
+test "steering prompts carry the fx steer flag and text only" {
+    const line = try makeSteerPromptRequestAlloc(std.testing.allocator, STEER_REQUEST_ID_BASE, "s-1", "use tabs");
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1000000,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"s-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"use tabs\"}],\"_meta\":{\"fx\":{\"steer\":true}}}}",
+        line,
+    );
+
+    var init = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,"_meta":{"fx":{"steering":true}}}}}
+    , .{});
+    defer init.deinit();
+    try std.testing.expect(initializeAdvertisesSteering(init.value));
+    var old = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}
+    , .{});
+    defer old.deinit();
+    try std.testing.expect(!initializeAdvertisesSteering(old.value));
+}
+
+test "fx-only replies stay away from the shared handler and steering holds the turn open" {
+    var child: platform_process.OwnedChild = undefined;
+    const request: provider_types.SendPromptRequest = .{ .prompt = "hi" };
+    var options: SessionOptions = .{};
+    defer {
+        active_process_state.lock();
+        clearRegistrationLocked(&child);
+        active_process_state.unlock();
+    }
+
+    // initialize records steering support and still reaches the shared handler.
+    try std.testing.expectEqual(Intercept.forward, try interceptFxResponse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"_meta":{"fx":{"steering":true}}}}}
+    , request, &options, &child, false));
+    try std.testing.expect(options.steering);
+    // A rejected setting is consumed, so it cannot fail the turn.
+    try std.testing.expectEqual(Intercept.consumed, try interceptFxResponse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":10,"error":{"code":-32602,"message":"Reasoning effort is not available for the active model"}}
+    , request, &options, &child, false));
+    // Notifications skip the pre-parse.
+    try std.testing.expectEqual(Intercept.forward, try interceptFxResponse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk"}}}
+    , request, &options, &child, false));
+
+    active_process_state.lock();
+    steer_state = .{ .child = &child, .supported = true, .pending = 2 };
+    active_process_state.unlock();
+    try std.testing.expect(!finishTurnUnlessSteering(&child));
+    // First steer reply while the prompt is still running: consumed.
+    try std.testing.expectEqual(Intercept.consumed, try interceptFxResponse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1000000,"result":{"stopReason":"end_turn"}}
+    , request, &options, &child, false));
+    // Last steer reply after the prompt finished ends the turn.
+    try std.testing.expectEqual(Intercept.turn_finished, try interceptFxResponse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1000001,"result":{"stopReason":"end_turn"}}
+    , request, &options, &child, true));
+    try std.testing.expectEqual(@as(?*platform_process.OwnedChild, null), steer_state.child);
+    try std.testing.expect(finishTurnUnlessSteering(&child));
 }

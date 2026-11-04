@@ -840,6 +840,27 @@ pub fn makeSetModelRequestAlloc(allocator: std.mem.Allocator, id: i64, session_i
     return writer.toOwnedSlice();
 }
 
+/// Standard ACP `session/set_config_option` for one select option
+/// (`model`, `effort`, `fast`, ...) advertised in the session's `configOptions`.
+pub fn makeSetConfigOptionRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    session_id: []const u8,
+    config_id: []const u8,
+    value: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.write(.{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "session/set_config_option",
+        .params = .{ .sessionId = session_id, .configId = config_id, .value = value },
+    });
+    return writer.toOwnedSlice();
+}
+
 /// JSON-RPC -32601 reply for an agent request Verde does not implement.
 pub fn makeMethodNotFoundResponseAlloc(allocator: std.mem.Allocator, id: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
