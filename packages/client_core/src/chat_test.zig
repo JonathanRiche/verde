@@ -174,6 +174,22 @@ test "chat recorded paging and tail match durable transcript and retain access-c
     for (f.host.state.rpc.calls) |call| try expect(!h.eq(call.method, "workspaces") and !h.eq(call.method, "panes") and !h.eq(call.method, "chat.status"));
 }
 
+test "chat model discovery failure leaves the loaded chat readable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage(null, false);
+    try f.recorded("chat.message.list", @embedFile("fixtures/chat/page-0.json"));
+    // Reopen as a provider with model discovery (the fixture thread is codex).
+    f.host.state.chat.threads[0].metadata.provider = "claude";
+    f.host.state.chat.threads[0].saved.selection.provider = "claude";
+    _ = try f.intent("thread_open", .{});
+    _ = try f.response("provider.models.list", .null, .{ .code = "provider_unavailable", .message = "ProviderBridgeNotFound" });
+    const t = &f.host.state.chat.threads[0];
+    try expect(t.@"error" == null);
+    try expect(t.rows.len > 0);
+}
+
 test "chat send freezes draft, stages ordered chunks, and preserves newer typing" {
     var f = try Fixture.init();
     defer f.deinit();

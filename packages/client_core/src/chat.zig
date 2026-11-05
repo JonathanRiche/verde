@@ -895,6 +895,10 @@ fn failed(tx: *h.Transaction, request: Request, failure: h.LocalError, fallback:
         @constCast(&tx.state.chat.requests[tx.state.chat.requests.len - 1]).reconcile = request.reconcile;
         return;
     }
+    // Model discovery is a best-effort catalog refresh: a host without that
+    // provider's CLI or bridge still has a readable chat, and the composer
+    // keeps its static model list. Never surface it as a failed chat.
+    if (request.kind == .model_list) return;
     t.@"error" = failure;
     operation(tx, request.intent, if (eq(failure.delivery orelse "", "uncertain")) "uncertain" else "failed", failure);
     if (request.kind == .page or request.kind == .legacy) {
