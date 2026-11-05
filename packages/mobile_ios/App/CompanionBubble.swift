@@ -272,13 +272,33 @@ struct CompanionBubbleLayer: View {
     private func bubble(_ active: RosterEntry, layout: BubbleLayout) -> some View {
         let presence = model.presence
         let badge = model.badgeCount
-        let running = model.crew.contains { $0.attention == .running } || presence.pose == .working
         let d = layout.diameter
         let liveOn = live.active
+        return bubbleFace(active, diameter: d)
+            .overlay(alignment: .topTrailing) { bubbleBadge(badge) }
+            .overlay(alignment: .bottom) { bubbleLiveTag(liveOn) }
+            .overlay(alignment: edge == .leading ? .leading : .trailing) { bubbleSideCallout(diameter: d) }
+        .contentShape(Circle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
+        .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
+        .accessibilityHint(liveOn ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { if liveOn { live.end() } else { open() } }
+        .accessibilityAction(named: liveOn ? "End live conversation" : "Talk live") { live.toggle() }
+        .accessibilityAction(named: "Settings") { settings() }
+        .accessibilityAction(named: "Hide bubble") { hidden = true }
+        .accessibilityIdentifier("companion-bubble")
+    }
+
+    /// The avatar disc with its Live level ring and working outline.
+    private func bubbleFace(_ active: RosterEntry, diameter d: CGFloat) -> some View {
+        let presence = model.presence
+        let running = model.crew.contains { $0.attention == .running } || presence.pose == .working
         let liveLevel = max(live.inputLevel, live.outputLevel)
         let still = reduceMotion || AppearanceSettings.shared.reducedMotion
         return ZStack {
-            if liveOn {
+            if live.active {
                 // Level ring while Live.
                 Circle().stroke(VerdeTheme.accent.opacity(0.35 + 0.5 * liveLevel), lineWidth: 4)
                     .scaleEffect(still ? 1.12 : 1.08 + 0.25 * liveLevel)
@@ -291,66 +311,64 @@ struct CompanionBubbleLayer: View {
             CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.6)
         }
         .frame(width: d, height: d)
-        .overlay(alignment: .topTrailing) {
-            if badge > 0 {
-                Text(badge > 99 ? "99+" : "\(badge)")
-                    .font(VerdeTheme.ui(11, bold: true)).foregroundStyle(Color.white)
-                    .padding(.horizontal, 5).frame(minWidth: 20, minHeight: 20)
-                    .background(VerdeTheme.danger, in: Capsule())
-                    .overlay(Capsule().stroke(VerdeTheme.background, lineWidth: 1.5))
-                    .offset(x: 4, y: -4)
-            }
+    }
+
+    @ViewBuilder
+    private func bubbleBadge(_ badge: Int) -> some View {
+        if badge > 0 {
+            Text(badge > 99 ? "99+" : "\(badge)")
+                .font(VerdeTheme.ui(11, bold: true)).foregroundStyle(Color.white)
+                .padding(.horizontal, 5).frame(minWidth: 20, minHeight: 20)
+                .background(VerdeTheme.danger, in: Capsule())
+                .overlay(Capsule().stroke(VerdeTheme.background, lineWidth: 1.5))
+                .offset(x: 4, y: -4)
         }
-        .overlay(alignment: .bottom) {
-            if liveOn {
-                Text(live.phase == .connecting ? "…" : "Live")
-                    .font(VerdeTheme.ui(10, bold: true)).foregroundStyle(VerdeTheme.background)
-                    .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(VerdeTheme.accent, in: Capsule())
-                    .offset(y: 8)
-                    .allowsHitTesting(false)
-            }
-        }
-        .overlay(alignment: edge == .leading ? .leading : .trailing) {
-            if press == .talk {
-                // Live transcript while holding.
-                HStack(spacing: 8) {
-                    LevelMeter(level: voice.level, color: cancelArmed ? VerdeTheme.danger : VerdeTheme.accent)
-                    Text(cancelArmed ? "Release to cancel" : voice.notice ?? (voice.partial.isEmpty ? "Listening…" : voice.partial))
-                        .font(VerdeTheme.ui(13)).lineLimit(3).multilineTextAlignment(.leading)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(cancelArmed ? VerdeTheme.danger : VerdeTheme.accent))
-                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-                .frame(width: 240, alignment: edge == .leading ? .leading : .trailing)
-                .offset(x: edge == .leading ? d + 8 : -(d + 8))
+    }
+
+    @ViewBuilder
+    private func bubbleLiveTag(_ liveOn: Bool) -> some View {
+        if liveOn {
+            Text(live.phase == .connecting ? "…" : "Live")
+                .font(VerdeTheme.ui(10, bold: true)).foregroundStyle(VerdeTheme.background)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(VerdeTheme.accent, in: Capsule())
+                .offset(y: 8)
                 .allowsHitTesting(false)
-            } else if let chip {
-                Button(action: open) {
-                    Text(chip).font(VerdeTheme.ui(13)).lineLimit(2).multilineTextAlignment(.leading)
-                        .padding(.horizontal, 12).padding(.vertical, 8)
-                        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
-                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.border))
-                        .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-                }
-                .buttonStyle(.plain)
-                .frame(width: 220, alignment: edge == .leading ? .leading : .trailing)
-                .offset(x: edge == .leading ? d + 8 : -(d + 8))
-                .transition(.opacity)
-                .accessibilityLabel(chip)
-            }
         }
-        .contentShape(Circle())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
-        .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
-        .accessibilityHint(liveOn ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { if liveOn { live.end() } else { open() } }
-        .accessibilityAction(named: liveOn ? "End live conversation" : "Talk live") { live.toggle() }
-        .accessibilityAction(named: "Settings") { settings() }
-        .accessibilityAction(named: "Hide bubble") { hidden = true }
-        .accessibilityIdentifier("companion-bubble")
+    }
+
+    /// Hold-to-talk transcript, or the last status chip, beside the bubble.
+    @ViewBuilder
+    private func bubbleSideCallout(diameter d: CGFloat) -> some View {
+        let leading = edge == .leading
+        if press == .talk {
+            let tint = cancelArmed ? VerdeTheme.danger : VerdeTheme.accent
+            let caption: String = cancelArmed ? "Release to cancel" : voice.notice ?? (voice.partial.isEmpty ? "Listening…" : voice.partial)
+            HStack(spacing: 8) {
+                LevelMeter(level: voice.level, color: tint)
+                Text(caption)
+                    .font(VerdeTheme.ui(13)).lineLimit(3).multilineTextAlignment(.leading)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(tint))
+            .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            .frame(width: 240, alignment: leading ? .leading : .trailing)
+            .offset(x: leading ? d + 8 : -(d + 8))
+            .allowsHitTesting(false)
+        } else if let chip {
+            Button(action: open) {
+                Text(chip).font(VerdeTheme.ui(13)).lineLimit(2).multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.border))
+                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 220, alignment: leading ? .leading : .trailing)
+            .offset(x: leading ? d + 8 : -(d + 8))
+            .transition(.opacity)
+            .accessibilityLabel(chip)
+        }
     }
 }
