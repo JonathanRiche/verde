@@ -1796,14 +1796,15 @@ fn truncatedLabel(buffer: []u8, label: []const u8, max_w: f32, font_size: f32) [
 
 fn truncatedLabelRole(buffer: []u8, label: []const u8, max_w: f32, font_size: f32, role: palette.FontRole) []const u8 {
     const ellipsis = "\u{2026}";
-    const bounded = label[0..@min(label.len, buffer.len - ellipsis.len)];
+    const bounded = utf8SafePrefix(label, buffer.len - ellipsis.len);
     if (bounded.len == label.len and text_measure.textWidth(role, font_size, bounded) <= max_w) return label;
     const ellipsis_w = text_measure.textWidth(role, font_size, ellipsis);
     var end: usize = 0;
     var fit_end: usize = 0;
     while (end < bounded.len) {
         const cp_len = std.unicode.utf8ByteSequenceLength(bounded[end]) catch 1;
-        const next = @min(end + cp_len, bounded.len);
+        if (end + cp_len > bounded.len) break;
+        const next = end + cp_len;
         if (text_measure.textPrefixWidth(role, bounded, font_size, next) + ellipsis_w > max_w) break;
         fit_end = next;
         end = next;
@@ -1891,4 +1892,22 @@ test "wrap keeps hard newlines and empty lines" {
     try std.testing.expectEqual(Line{ .start = 8, .end = 8 }, out[1]);
     try std.testing.expectEqual(Line{ .start = 9, .end = 13 }, out[2]);
     try std.testing.expectEqual(@as(usize, 1), wrapLines("", 13.0, 100.0, &out));
+}
+
+/// Longest prefix of `text` within `max_bytes` that ends on a UTF-8 codepoint
+/// boundary, so truncated labels never end in half a multi-byte character.
+fn utf8SafePrefix(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+test "truncated labels never end inside a multi-byte codepoint" {
+    const label = "UI fix R3 Stream A \u{2014} sidebar and tab strip";
+    const dash = comptime std.mem.indexOf(u8, label, "\u{2014}").?;
+    var cut: usize = dash;
+    while (cut <= dash + 3) : (cut += 1) {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(utf8SafePrefix(label, cut)));
+    }
 }

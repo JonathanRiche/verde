@@ -1,10 +1,13 @@
 //! Workspace rail rendering for the native shell.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const palette = @import("palette");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
+const tooltip = @import("tooltip.zig");
+const workspace_strip = @import("workspace_strip.zig");
 const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const workspace_identity = @import("workspace_identity.zig");
@@ -18,6 +21,7 @@ const platform_runtime = @import("platform_runtime");
 const native_state = @import("../state.zig");
 const chat_panel = @import("chat_panel.zig");
 const lease_run_status = @import("../state/lease_run_status.zig");
+const TerminalLaunchKind = @import("../terminal/terminal.zig").TerminalLaunchKind;
 const Provider = native_state.Provider;
 const SurfaceProvider = native_state.SurfaceProvider;
 
@@ -44,6 +48,8 @@ const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 42.0;
 // tab group does not dominate the OPEN list.
 const SIDEBAR_TILE_ROW_HEIGHT_CSS: f32 = 30.0;
 const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 10.0;
+/// Leading inset of a row's workspace chip; clears the 3px selected bar.
+const SIDEBAR_ROW_CHIP_X_CSS: f32 = 8.0;
 /// Horizontal gap between the icon slot and the title.
 const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 /// Width reserved for the live status column ("Working · 59:59"); titles only
@@ -66,6 +72,8 @@ const SIDEBAR_FOOTER_RESERVE_CSS: f32 = 56.0;
 const SIDEBAR_ACTIVE_MAX_ROWS: usize = 10;
 /// Caption band above ACTIVE rows, including the gap under the label.
 const SIDEBAR_ACTIVE_LABEL_H_CSS: f32 = 20.0;
+/// Section captions ("Active", "Open"): sentence case, one size for both.
+const SIDEBAR_SECTION_LABEL_FONT_CSS: f32 = 12.0;
 /// Hairline divider plus trailing gap that separates ACTIVE from the tree.
 const SIDEBAR_ACTIVE_TRAILING_H_CSS: f32 = 12.0;
 /// Keep at least this much of the workspace tree visible under a tall ACTIVE
@@ -246,6 +254,18 @@ var sidebar_menu_row_actions: [16]SidebarContextMenuAction = undefined;
 var sidebar_menu_row_enabled: [16]bool = undefined;
 var sidebar_menu_row_labels: [16][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
+/// Row (or control) the context menu was opened from. The menu opens below
+/// it so the right-clicked row stays visible, or above it near the bottom.
+var sidebar_menu_anchor_row: ?palette.Rect = null;
+/// Hover bands of this frame's list scrollbars (OPEN tree, ACTIVE cluster)
+/// and whether the pointer is over one, so motion repaints the thumb.
+var scrollbar_bands: [2]palette.Rect = undefined;
+var scrollbar_band_count: usize = 0;
+var scrollbar_hovered: bool = false;
+/// Keyboard highlight in the open context menu; null until an arrow/Tab key.
+var sidebar_menu_key_index: ?usize = null;
+/// The highlight is drawn only after keyboard input, not on pointer open.
+var sidebar_menu_key_visible: bool = false;
 
 var settings_hovered: bool = false;
 var add_workspace_hovered: bool = false;
@@ -255,8 +275,35 @@ var switcher_trigger_hovered: bool = false;
 /// Per-frame: OPEN rows are interleaved newest-activity first (All
 /// Workspaces), so in-workspace drag reorder is off.
 var open_rows_recency_sorted: bool = false;
-/// Per-frame: OPEN rows carry a workspace identity chip (All Workspaces).
-var open_rows_show_chip: bool = false;
+/// Per-frame: every row carries its workspace identity chip (All
+/// Workspaces). Otherwise only rows from another workspace than the
+/// selected one do; see `rowShowsWorkspaceChip`.
+var open_rows_chip_every_row: bool = false;
+
+/// A row's workspace chip is attribution, not decoration: shown under All
+/// Workspaces, or when the row belongs to a workspace other than the
+/// selected one. Rows of the selected workspace give the width to titles.
+fn rowShowsWorkspaceChip(state: *const runtime.AppState, project_index: usize) bool {
+    return open_rows_chip_every_row or project_index != state.project_controller.selected_index;
+}
+
+/// Icon-button tooltips offered while rendering the rail and the workspace
+/// tab strip. They are queued from `renderContextMenuOverlay`, which runs
+/// after the panes, so the floating label is never clipped by a pane's local
+/// command range.
+/// Rects a tooltip must stay clear of (e.g. the strip row and the pane
+/// title band under it); empty for ordinary placement.
+const MAX_TOOLTIP_AVOID: usize = 2;
+const TooltipOffer = struct {
+    target: palette.Rect,
+    label: []const u8,
+    avoid: [MAX_TOOLTIP_AVOID]palette.Rect = undefined,
+    avoid_count: usize = 0,
+    /// Left edge for `tooltip.queueBeside` (e.g. just past the rail).
+    beside_x: ?f32 = null,
+};
+var tooltip_offers: [64]TooltipOffer = undefined;
+var tooltip_offer_count: usize = 0;
 
 const PaneRowDragState = struct {
     pending: bool = false,
@@ -283,6 +330,8 @@ var pane_drop_target_rect: palette.Rect = .{};
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
     palette_hit_count = 0;
+    focus_stop_count = 0;
+    scrollbar_band_count = 0;
     attention_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     attention_max_scroll_y = 0.0;
     // Re-armed below by any ACTIVE row or viewport still easing; cleared here
@@ -298,11 +347,487 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     }, paletteColor(theme.borderMuted()));
 
     renderPaletteExpandedSidebar(state, rect);
+    renderKeyboardFocusRing(state);
 }
 
-/// Renders the context menu after workspace-local clipping has completed.
+/// Renders the context menu and the rail/tab-strip tooltips after
+/// workspace-local clipping has completed.
 pub fn renderContextMenuOverlay(state: *runtime.AppState) void {
     if (state.sidebar_context_menu_open) renderSidebarContextMenu(state, palette_sidebar_rect);
+    flushTooltips(state);
+}
+
+/// Selected-row tint: the accent over the panel, opaque. Light themes get
+/// a share large enough to read as a tint on its own (not only via the
+/// bar), still clearly apart from the neutral hover.
+pub fn selectedRowFill() [4]f32 {
+    return selectedRowFillFor(theme.COLOR_PANEL, theme.COLOR_GREEN, theme.isLightPalette());
+}
+
+/// Accent share of the selected tint: dark themes keep the established
+/// wash; light themes need more because a pale tint vanishes on white.
+const SELECTED_TINT_DARK: f32 = 72.0 / 255.0;
+const SELECTED_TINT_LIGHT: f32 = 0.16;
+
+fn selectedRowFillFor(panel: [4]f32, accent: [4]f32, light: bool) [4]f32 {
+    const fill = theme.mix(panel, accent, if (light) SELECTED_TINT_LIGHT else SELECTED_TINT_DARK);
+    return .{ fill[0], fill[1], fill[2], 1.0 };
+}
+
+/// WCAG non-text contrast for the selected row's 3px bar.
+const SELECTED_BAR_MIN_CONTRAST: f32 = 3.0;
+
+/// The selected row's leading bar: the accent, pushed toward the text
+/// colour only as far as needed to reach 3:1 against both the panel and
+/// the selected tint it sits on.
+fn selectedBarColor() [4]f32 {
+    return selectedBarColorFor(theme.accent(), theme.COLOR_PANEL, selectedRowFill(), theme.COLOR_WHITE);
+}
+
+fn selectedBarColorFor(accent: [4]f32, panel: [4]f32, tint: [4]f32, text: [4]f32) [4]f32 {
+    var color: [4]f32 = .{ accent[0], accent[1], accent[2], 1.0 };
+    var amount: f32 = 0.0;
+    while (@min(theme.contrastRatio(color, panel), theme.contrastRatio(color, tint)) < SELECTED_BAR_MIN_CONTRAST and amount < 1.0) {
+        amount = @min(amount + 0.1, 1.0);
+        color = theme.mix(.{ accent[0], accent[1], accent[2], 1.0 }, text, amount);
+    }
+    return color;
+}
+
+test "selected row: visible tint in light themes and a 3:1 bar" {
+    const white: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+    const ink: [4]f32 = .{ 0.06, 0.09, 0.08, 1.0 };
+    const verde_light_accent: [4]f32 = .{ 0x15.0 / 255.0, 0x80.0 / 255.0, 0x3D.0 / 255.0, 1.0 };
+    const pale_accent: [4]f32 = .{ 0x4F.0 / 255.0, 0xD1.0 / 255.0, 0x8B.0 / 255.0, 1.0 };
+    for ([_][4]f32{ verde_light_accent, pale_accent }) |accent| {
+        const tint = selectedRowFillFor(white, accent, true);
+        // At least ~8% accent: each channel moves noticeably off white.
+        const shift = @max(@max(white[0] - tint[0], white[1] - tint[1]), white[2] - tint[2]);
+        try std.testing.expect(shift >= 0.08);
+        const bar = selectedBarColorFor(accent, white, tint, ink);
+        try std.testing.expect(theme.contrastRatio(bar, white) >= SELECTED_BAR_MIN_CONTRAST);
+        try std.testing.expect(theme.contrastRatio(bar, tint) >= SELECTED_BAR_MIN_CONTRAST);
+    }
+}
+
+/// Hover fill shared by rail rows and buttons (and the tab strip): ~6% of
+/// the text colour over the panel, opaque so it is one clean layer. Accent
+/// fills stay reserved for the selected row.
+pub fn hoverFill() [4]f32 {
+    const fill = theme.mix(theme.COLOR_PANEL, theme.COLOR_WHITE, 0.06);
+    return .{ fill[0], fill[1], fill[2], 1.0 };
+}
+
+// Keyboard focus. Shift+F6 moves focus into the rail; Tab/Shift+Tab and
+// Up/Down walk its controls in visual order (pinned header controls, ACTIVE
+// rows, OPEN rows, settings); Home/End jump; Enter/Space runs the same action
+// as a click; Shift+F10 or the Menu key opens the row's context menu;
+// Escape or F6 returns focus to the pane. Stops are recorded by the same
+// pass that registers hits (with unclipped row rects, so scrolled-out rows
+// stay reachable) and focus is tracked by identity, not list position. The
+// accent ring is drawn only while focus came from the keyboard.
+
+/// One Tab stop from the last rendered frame.
+const FocusStop = struct {
+    rect: palette.Rect,
+    /// Viewport the stop scrolls in (the rail itself for pinned controls).
+    clip: palette.Rect,
+    key: FocusKey,
+};
+
+/// Identity of a focusable rail control: its action plus the workspace and
+/// pane (or thread) it targets.
+const FocusKey = struct {
+    kind: SidebarHitKind,
+    project_index: usize,
+    thread_index: usize,
+
+    fn eql(a: FocusKey, b: FocusKey) bool {
+        return a.kind == b.kind and a.project_index == b.project_index and a.thread_index == b.thread_index;
+    }
+};
+
+var focus_stops: [palette_hits.len]FocusStop = undefined;
+var focus_stop_count: usize = 0;
+/// Focused rail control while the rail owns the keyboard; null otherwise.
+var keyboard_focus: ?FocusKey = null;
+/// Pane input that owned the keyboard when Shift+F6 moved it into the rail;
+/// every keyboard exit hands it back so a passed-through key lands there.
+const PaneInput = enum { none, composer, terminal };
+var keyboard_focus_return: PaneInput = .none;
+
+/// True while the rail owns keyboard input (its focus ring is showing).
+pub fn hasKeyboardFocus() bool {
+    return keyboard_focus != null;
+}
+
+/// Drops rail keyboard focus without moving focus elsewhere (e.g. a click).
+pub fn clearKeyboardFocus(state: *runtime.AppState) void {
+    keyboard_focus_return = .none;
+    if (keyboard_focus == null) return;
+    keyboard_focus = null;
+    state.markDirty();
+}
+
+fn addFocusStop(rect: palette.Rect, clip: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
+    if (focus_stop_count >= focus_stops.len or rect.w <= 0.0 or rect.h <= 0.0) return;
+    focus_stops[focus_stop_count] = .{ .rect = rect, .clip = clip, .key = .{ .kind = kind, .project_index = project_index, .thread_index = thread_index } };
+    focus_stop_count += 1;
+}
+
+/// Visual band of a stop: pinned chrome renders last but sits on top, so
+/// registration order alone is not the visual order.
+fn focusBand(kind: SidebarHitKind) u8 {
+    return switch (kind) {
+        .collapse, .workspace_switcher, .add_workspace, .command_palette, .new_thread, .new_terminal => 0,
+        .open_pane => 1, // ACTIVE cluster rows
+        .open_pane_reorder => 2, // OPEN rows
+        .settings => 3,
+    };
+}
+
+/// Stop indices in Tab order: by band, then registration order (which is
+/// top-to-bottom, left-to-right within a band). Returns the filled prefix.
+fn focusOrder(stops: []const FocusStop, out: []usize) []usize {
+    var count: usize = 0;
+    var band: u8 = 0;
+    while (band <= 3) : (band += 1) {
+        for (stops, 0..) |stop, index| {
+            if (focusBand(stop.key.kind) != band or count >= out.len) continue;
+            out[count] = index;
+            count += 1;
+        }
+    }
+    return out[0..count];
+}
+
+/// Position of `key` in `order`, if it is still on screen.
+fn focusPosition(stops: []const FocusStop, order: []const usize, key: FocusKey) ?usize {
+    for (order, 0..) |stop_index, position| {
+        if (stops[stop_index].key.eql(key)) return position;
+    }
+    return null;
+}
+
+/// Next position from `current` by `delta`, wrapping; with no current stop
+/// forward starts at the first and backward at the last.
+fn nextFocusPosition(count: usize, current: ?usize, delta: i32) ?usize {
+    if (count == 0) return null;
+    const pos = current orelse return if (delta > 0) 0 else count - 1;
+    return if (delta > 0) (pos + 1) % count else (pos + count - 1) % count;
+}
+
+test "sidebar keyboard focus follows visual bands and wraps" {
+    const r: palette.Rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    const stops = [_]FocusStop{
+        .{ .rect = r, .clip = r, .key = .{ .kind = .open_pane_reorder, .project_index = 0, .thread_index = 7 } },
+        .{ .rect = r, .clip = r, .key = .{ .kind = .settings, .project_index = 0, .thread_index = 0 } },
+        .{ .rect = r, .clip = r, .key = .{ .kind = .open_pane, .project_index = 0, .thread_index = 3 } },
+        .{ .rect = r, .clip = r, .key = .{ .kind = .collapse, .project_index = 0, .thread_index = 0 } },
+    };
+    var buf: [8]usize = undefined;
+    const order = focusOrder(&stops, &buf);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 2, 0, 1 }, order);
+    const row = focusPosition(&stops, order, .{ .kind = .open_pane_reorder, .project_index = 0, .thread_index = 7 });
+    try std.testing.expectEqual(@as(?usize, 2), row);
+    try std.testing.expectEqual(@as(?usize, 3), nextFocusPosition(order.len, row, 1));
+    try std.testing.expectEqual(@as(?usize, 0), nextFocusPosition(order.len, 3, 1));
+    try std.testing.expectEqual(@as(?usize, 3), nextFocusPosition(order.len, 0, -1));
+    try std.testing.expectEqual(@as(?usize, 0), nextFocusPosition(order.len, null, 1));
+}
+
+test "sidebar keyboard focus hands a typed key back to the pane input" {
+    const storage_mod = @import("../state/storage.zig");
+    const app_config = @import("../app/config.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    const previous_stop_count = focus_stop_count;
+    defer {
+        focus_stop_count = previous_stop_count;
+        clearKeyboardFocus(&state);
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    // One rendered Tab stop is enough for Shift+F6 to enter the rail.
+    const r: palette.Rect = .{ .x = 0, .y = 0, .w = 30, .h = 30 };
+    focus_stop_count = 0;
+    addFocusStop(r, r, .settings, 0, 0);
+
+    const enter: palette.event.KeyEvent = .{ .key = .f6, .mod = .{ .shift = true } };
+    const typed: palette.event.KeyEvent = .{ .key = .character, .codepoint = 'x', .base_codepoint = 'x' };
+
+    // Terminal had the keyboard: Shift+F6 takes it, "x" falls through and
+    // lands back in the terminal.
+    state.terminal_controller.focused = true;
+    try std.testing.expect(handleKeyboardFocusKeyDown(&state, &enter));
+    try std.testing.expect(hasKeyboardFocus());
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(!handleKeyboardFocusKeyDown(&state, &typed));
+    try std.testing.expect(!hasKeyboardFocus());
+    try std.testing.expect(state.terminal_controller.focused);
+
+    // Same for the chat composer.
+    state.terminal_controller.focused = false;
+    state.restoreComposerFocus();
+    try std.testing.expect(handleKeyboardFocusKeyDown(&state, &enter));
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!handleKeyboardFocusKeyDown(&state, &typed));
+    try std.testing.expect(!hasKeyboardFocus());
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
+}
+
+/// Rail keyboard focus. Returns true when the key was consumed. While the
+/// rail owns focus, unhandled keys drop it and fall through, so typing
+/// never gets stuck in the rail.
+pub fn handleKeyboardFocusKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    // An open context menu owns the keys (its own routing runs first).
+    if (!event.down or state.sidebar_context_menu_open) return false;
+    // A click into the composer or a terminal took the keyboard back.
+    if (keyboard_focus != null and keyboardFocusTaken(state)) {
+        keyboard_focus = null;
+        keyboard_focus_return = .none;
+    }
+    const enter_key = event.key == .f6 and event.mod.shift and !event.mod.primary() and !event.mod.alt;
+    if (keyboard_focus == null) {
+        if (!enter_key or event.repeat or state.isSidebarHidden() or focus_stop_count == 0) return false;
+        enterKeyboardFocus(state);
+        return true;
+    }
+    if (state.isSidebarHidden() or focus_stop_count == 0) {
+        leaveKeyboardFocus(state);
+        return false;
+    }
+    // Modifiers arrive as their own key-downs before chords like Shift+Tab.
+    switch (event.key) {
+        .lshift, .rshift, .lctrl, .rctrl, .lalt, .ralt, .lgui, .rgui => return true,
+        else => {},
+    }
+    if (event.mod.primary() or event.mod.alt) {
+        leaveKeyboardFocus(state);
+        return false;
+    }
+    var order_buf: [focus_stops.len]usize = undefined;
+    const stops = focus_stops[0..focus_stop_count];
+    const order = focusOrder(stops, &order_buf);
+    const current = focusPosition(stops, order, keyboard_focus.?);
+    switch (event.key) {
+        .f6, .escape => leaveKeyboardFocus(state),
+        .tab => moveKeyboardFocus(state, stops, order, current, if (event.mod.shift) -1 else 1),
+        .down => moveKeyboardFocus(state, stops, order, current, 1),
+        .up => moveKeyboardFocus(state, stops, order, current, -1),
+        .home => moveKeyboardFocus(state, stops, order, null, 1),
+        .end => moveKeyboardFocus(state, stops, order, null, -1),
+        .@"return", .kp_enter, .space => {
+            if (event.repeat) return true;
+            const pos = current orelse return true;
+            const stop = stops[order[pos]];
+            keyboard_focus = null;
+            keyboard_focus_return = .none;
+            activatePaletteHit(state, .{ .rect = stop.rect, .kind = stop.key.kind, .project_index = stop.key.project_index, .thread_index = stop.key.thread_index });
+            state.markDirty();
+        },
+        .menu, .f10 => {
+            if (event.key == .f10 and !event.mod.shift) {
+                leaveKeyboardFocus(state);
+                return false;
+            }
+            const pos = current orelse return true;
+            openKeyboardContextMenu(state, stops[order[pos]]);
+        },
+        else => {
+            // Not a rail key: give the pane its input back first so this key
+            // (and its text input) reaches the composer or terminal.
+            leaveKeyboardFocus(state);
+            return false;
+        },
+    }
+    return true;
+}
+
+/// Focus lands on the selected pane's row when it is listed, else on the
+/// first control; pane input (composer, terminal) lets go of the keyboard.
+fn enterKeyboardFocus(state: *runtime.AppState) void {
+    const stops = focus_stops[0..focus_stop_count];
+    var target: ?FocusKey = null;
+    if (state.project_controller.projects.items.len > 0) {
+        const selected = state.project_controller.selected_index;
+        if (state.project_controller.projects.items[selected].workspace_layout.focused_pane_id) |pane_id| {
+            for (stops) |stop| {
+                const row = stop.key.kind == .open_pane or stop.key.kind == .open_pane_reorder;
+                if (row and stop.key.project_index == selected and stop.key.thread_index == pane_id) {
+                    target = stop.key;
+                    break;
+                }
+            }
+        }
+    }
+    if (target == null) {
+        var order_buf: [focus_stops.len]usize = undefined;
+        const order = focusOrder(stops, &order_buf);
+        if (order.len > 0) target = stops[order[0]].key;
+    }
+    keyboard_focus = target;
+    keyboard_focus_return = if (state.terminal_controller.focused) .terminal else if (state.composer_controller.focused) .composer else .none;
+    state.blurPaletteComposer();
+    state.terminal_controller.focused = false;
+    if (target) |key| for (stops) |stop| if (stop.key.eql(key)) revealFocusStop(stop);
+    state.markDirty();
+}
+
+fn keyboardFocusTaken(state: *const runtime.AppState) bool {
+    return state.composer_controller.focused or state.terminal_controller.focused;
+}
+
+/// Every keyboard exit (Escape/F6, or a key the rail passes through): hand
+/// the keyboard back to the input that had it, else to the focused pane.
+fn leaveKeyboardFocus(state: *runtime.AppState) void {
+    keyboard_focus = null;
+    const previous = keyboard_focus_return;
+    keyboard_focus_return = .none;
+    state.markDirty();
+    switch (previous) {
+        .terminal => {
+            state.terminal_controller.focused = true;
+            return;
+        },
+        .composer => {
+            state.restoreComposerFocus();
+            return;
+        },
+        .none => {},
+    }
+    if (state.project_controller.projects.items.len > 0) {
+        const selected = state.project_controller.selected_index;
+        if (state.project_controller.projects.items[selected].workspace_layout.focused_pane_id) |pane_id| {
+            state.focusWorkspaceOpenPaneFromSidebar(selected, pane_id);
+        }
+    }
+    state.markDirty();
+}
+
+fn moveKeyboardFocus(state: *runtime.AppState, stops: []const FocusStop, order: []const usize, current: ?usize, delta: i32) void {
+    const pos = nextFocusPosition(order.len, current, delta) orelse return;
+    const stop = stops[order[pos]];
+    keyboard_focus = stop.key;
+    revealFocusStop(stop);
+    state.markDirty();
+}
+
+/// Scrolls the list holding `stop` so the whole row is visible.
+fn revealFocusStop(stop: FocusStop) void {
+    switch (focusBand(stop.key.kind)) {
+        1 => attention_scroll_y = revealSidebarRow(attention_scroll_y, stop.rect.y + attention_scroll_y, stop.rect.h, stop.clip, attention_max_scroll_y),
+        2 => sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, stop.rect.y + sidebar_scroll_y, stop.rect.h, stop.clip, sidebar_max_scroll_y),
+        else => {},
+    }
+}
+
+/// Shift+F10 / Menu: the right-click menu of the focused control, with its
+/// first item highlighted. Controls without a menu ignore the key.
+fn openKeyboardContextMenu(state: *runtime.AppState, stop: FocusStop) void {
+    const visible = intersectRects(stop.rect, stop.clip) orelse return;
+    const cx = visible.x + @min(visible.w * 0.5, theme.scaledUi(24.0));
+    const cy = visible.y + visible.h * 0.5;
+    if (!handlePaletteSecondaryMouseButton(state, cx, cy, true)) return;
+    if (state.sidebar_context_menu_open) moveSidebarContextMenuKeyIndex(state, 1);
+}
+
+/// Crisp accent ring around the keyboard-focused control, clipped to its
+/// list so a half-scrolled row never draws over pinned chrome.
+fn renderKeyboardFocusRing(state: *runtime.AppState) void {
+    const key = keyboard_focus orelse return;
+    if (state.sidebar_context_menu_open or keyboardFocusTaken(state)) return;
+    for (focus_stops[0..focus_stop_count]) |stop| {
+        if (!stop.key.eql(key)) continue;
+        const ring = snapRect(stop.rect);
+        // Same corner radius as each control's hover fill.
+        const radius = theme.scaledUi(switch (stop.key.kind) {
+            .command_palette => 6.0,
+            .workspace_switcher, .open_pane, .open_pane_reorder => 7.0,
+            else => 8.0,
+        });
+        state.palette_overlay_batch.rectBorderClipped(state.allocator, ring, paletteColor(theme.accent()), radius, @max(@round(theme.scaledUi(1.5)), 1.0), stop.clip) catch {};
+        return;
+    }
+}
+
+/// Registers a hover tooltip for an icon-only control (or a truncated tab)
+/// drawn this frame. `label` is copied, so stack-formatted text is fine.
+pub fn offerTooltip(state: *runtime.AppState, target: palette.Rect, label: []const u8) void {
+    offerTooltipAvoiding(state, target, label, &.{});
+}
+
+/// Like `offerTooltip`, but the tooltip is placed clear of `avoid` (up to
+/// two rects) via `tooltip.queueAvoiding`.
+pub fn offerTooltipAvoiding(state: *runtime.AppState, target: palette.Rect, label: []const u8, avoid: []const palette.Rect) void {
+    offerTooltipPlaced(state, target, label, avoid, null);
+}
+
+/// Like `offerTooltipAvoiding`, preferring the slot whose left edge is
+/// `beside_x` (`tooltip.queueBeside`).
+fn offerTooltipBeside(state: *runtime.AppState, target: palette.Rect, label: []const u8, avoid: []const palette.Rect, beside_x: f32) void {
+    offerTooltipPlaced(state, target, label, avoid, beside_x);
+}
+
+fn offerTooltipPlaced(state: *runtime.AppState, target: palette.Rect, label: []const u8, avoid: []const palette.Rect, beside_x: ?f32) void {
+    if (label.len == 0 or target.w <= 0.0 or target.h <= 0.0) return;
+    if (tooltip_offer_count >= tooltip_offers.len) return;
+    const stable = stablePaletteText(state, label) catch return;
+    var offer: TooltipOffer = .{ .target = target, .label = stable, .beside_x = beside_x };
+    for (avoid[0..@min(avoid.len, MAX_TOOLTIP_AVOID)]) |rect| {
+        offer.avoid[offer.avoid_count] = rect;
+        offer.avoid_count += 1;
+    }
+    tooltip_offers[tooltip_offer_count] = offer;
+    tooltip_offer_count += 1;
+}
+
+/// Hands every offered target to the shared tooltip helper, which owns the
+/// ~500ms hover delay. Menus and modals above the rail suppress tooltips.
+fn flushTooltips(state: *runtime.AppState) void {
+    defer tooltip_offer_count = 0;
+    const suppressed = state.sidebar_context_menu_open or
+        state.palette_modal_hits.items.len > 0 or
+        pane_row_drag.active or
+        !state.transcript_controller.palette_mouse_in_workspace;
+    if (suppressed) return;
+    for (tooltip_offers[0..tooltip_offer_count]) |*offer| {
+        if (offer.beside_x) |x| {
+            tooltip.queueBeside(state, offer.target, offer.label, offer.avoid[0..offer.avoid_count], x);
+        } else if (offer.avoid_count > 0) {
+            tooltip.queueAvoiding(state, offer.target, offer.label, offer.avoid[0..offer.avoid_count]);
+        } else {
+            tooltip.queue(state, offer.target, offer.label);
+        }
+    }
+}
+
+/// Tooltip text for a control with an optional keyboard shortcut: "Label"
+/// or "Label · Ctrl+B". Written into the frame arena.
+fn tooltipWithShortcut(state: *runtime.AppState, label: []const u8, bindings: ?[]const keybinds.Keybind) []const u8 {
+    const list = bindings orelse return label;
+    if (list.len == 0) return label;
+    var key_buf: [48]u8 = undefined;
+    const key = keybinds.formatKeybind(&key_buf, list[0]);
+    if (key.len == 0) return label;
+    return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s} · {s}", .{ label, key }) catch label;
+}
+
+/// "Label · <first binding of `field`>" for tooltips outside the rail.
+pub fn shortcutTooltip(state: *runtime.AppState, label: []const u8, comptime field: []const u8) []const u8 {
+    return tooltipWithShortcut(state, label, keyboardBindings(state, field));
+}
+
+fn keyboardBindings(state: *const runtime.AppState, comptime field: []const u8) ?[]const keybinds.Keybind {
+    const config = state.command_controller.keyboard_config orelse return null;
+    return @field(config, field);
 }
 
 pub fn pointerOverSidebar(x: f32, y: f32) bool {
@@ -385,18 +910,29 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const switcher_changed = switcher_trigger_hovered != new_switcher_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     const add_workspace_changed = add_workspace_hovered != new_add_workspace_hover;
+    var new_scrollbar_hover = false;
+    for (scrollbar_bands[0..scrollbar_band_count]) |band| {
+        if (rectContainsPoint(band, x, y)) new_scrollbar_hover = true;
+    }
+    const scrollbar_changed = scrollbar_hovered != new_scrollbar_hover;
+    scrollbar_hovered = new_scrollbar_hover;
     add_workspace_hovered = new_add_workspace_hover;
     terminal_action_hovered = new_terminal_hover;
     search_trigger_hovered = new_search_hover;
     switcher_trigger_hovered = new_switcher_hover;
     settings_hovered = new_settings_hover;
-    if (!new_thread_changed and !terminal_changed and !search_changed and !switcher_changed and !settings_changed and !add_workspace_changed) return;
+    if (!new_thread_changed and !terminal_changed and !search_changed and !switcher_changed and !settings_changed and !add_workspace_changed and !scrollbar_changed) return;
 
     state.sidebar_new_thread_hover = new_new_thread_hover;
     state.markDirty();
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
+    // Pointer use hides the keyboard ring (focus rings are keyboard-only).
+    if (down) {
+        keyboard_focus = null;
+        keyboard_focus_return = .none;
+    }
     if (!down) {
         if (pane_row_drag.pending or pane_row_drag.active) return finishPaneRowDrag(state, x, y);
         return rectContainsPoint(palette_sidebar_rect, x, y) or (state.sidebar_context_menu_open and rectContainsPoint(sidebar_menu_panel_rect, x, y));
@@ -414,43 +950,57 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         const hit = palette_hits[index];
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
-        // Opening a chat, terminal or new thread from the rail would land
-        // behind an open Companion (fully hidden when it is expanded), so the
-        // Companion steps aside first.
-        switch (hit.kind) {
-            .open_pane, .new_thread, .new_terminal => if (state.isCompanionEnabled() and state.companion_controller.visibility == .sidecar_open) state.closeCompanion(),
-            else => {},
-        }
-        switch (hit.kind) {
-            // A hover-revealed rail is hidden: the toggle pins it open.
-            .collapse => state.toggleSidebarHidden(),
-            .workspace_switcher => state.openWorkspaceSwitcher(),
-            .add_workspace => state.openAddWorkspace(true),
-            .new_thread => {
-                if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
-            },
-            .new_terminal => {
-                if (hit.project_index < state.project_controller.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
-            },
-            .open_pane => {
-                state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, @intCast(hit.thread_index));
-            },
-            .open_pane_reorder => {
-                startPaneRowDrag(state, hit.project_index, @intCast(hit.thread_index), x, y);
-            },
-            .command_palette => {
-                state.openCommandPalette(null);
-            },
-            .settings => {
-                state.openSettingsModal();
-            },
+        if (hit.kind == .open_pane_reorder) {
+            // Click focuses on release; a drag reorders instead.
+            startPaneRowDrag(state, hit.project_index, @intCast(hit.thread_index), x, y);
+        } else {
+            activatePaletteHit(state, hit);
         }
         return true;
     }
     return true;
 }
 
+/// Opening a chat, terminal or new thread from the rail would land behind
+/// an open Companion (fully hidden when it is expanded), so it steps aside.
+fn stepCompanionAsideFor(state: *runtime.AppState, kind: SidebarHitKind) void {
+    switch (kind) {
+        .open_pane, .open_pane_reorder, .new_thread, .new_terminal => if (state.isCompanionEnabled() and state.companion_controller.visibility == .sidecar_open) state.closeCompanion(),
+        else => {},
+    }
+}
+
+/// Runs a rail control's action: a click, or Enter/Space on its focus ring.
+/// A pane row (reorderable or not) focuses its pane.
+fn activatePaletteHit(state: *runtime.AppState, hit: SidebarHit) void {
+    stepCompanionAsideFor(state, hit.kind);
+    switch (hit.kind) {
+        // A hover-revealed rail is hidden: the toggle pins it open.
+        .collapse => state.toggleSidebarHidden(),
+        .workspace_switcher => state.openWorkspaceSwitcher(),
+        .add_workspace => state.openAddWorkspace(true),
+        .new_thread => {
+            if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
+        },
+        .new_terminal => {
+            if (hit.project_index < state.project_controller.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
+        },
+        .open_pane, .open_pane_reorder => {
+            state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, @intCast(hit.thread_index));
+        },
+        .command_palette => {
+            state.openCommandPalette(null);
+        },
+        .settings => {
+            state.openSettingsModal();
+        },
+    }
+}
+
 pub fn handlePaletteWheel(x: f32, y: f32, wheel_y: f32) bool {
+    // The workspace tab strip has no wheel route of its own in main.zig; it
+    // shares the rail's slot (both are navigation chrome outside the panes).
+    if (workspace_strip.handleWheel(x, y, wheel_y)) return true;
     if (wheel_y == 0.0 or !rectContainsPoint(palette_sidebar_rect, x, y)) return false;
     const step = wheel_y * theme.scaledUi(64.0);
     // Overflowing ACTIVE rows own the wheel while the pointer is inside the
@@ -481,10 +1031,13 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
                 state.sidebar_context_menu_anchor_y = y;
+                sidebar_menu_anchor_row = hit.rect;
                 state.sidebar_context_menu_project_index = hit.project_index;
                 state.sidebar_context_menu_thread_index = 0;
                 state.sidebar_context_menu_kind = .project_new_thread;
                 state.sidebar_context_menu_open = true;
+                sidebar_menu_key_index = null;
+                sidebar_menu_key_visible = false;
                 state.blurPaletteComposer();
                 state.noteInteraction();
                 state.markDirty();
@@ -495,10 +1048,13 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
                 state.sidebar_context_menu_anchor_y = y;
+                sidebar_menu_anchor_row = hit.rect;
                 state.sidebar_context_menu_project_index = hit.project_index;
                 state.sidebar_context_menu_thread_index = 0;
                 state.sidebar_context_menu_kind = .project;
                 state.sidebar_context_menu_open = true;
+                sidebar_menu_key_index = null;
+                sidebar_menu_key_visible = false;
                 state.blurPaletteComposer();
                 state.noteInteraction();
                 state.markDirty();
@@ -509,10 +1065,13 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                     state.workspace_header_open_menu_open = false;
                     state.sidebar_context_menu_anchor_x = x;
                     state.sidebar_context_menu_anchor_y = y;
+                    sidebar_menu_anchor_row = hit.rect;
                     state.sidebar_context_menu_project_index = hit.project_index;
                     state.sidebar_context_menu_thread_index = thread_index;
                     state.sidebar_context_menu_kind = .thread;
                     state.sidebar_context_menu_open = true;
+                    sidebar_menu_key_index = null;
+                    sidebar_menu_key_visible = false;
                     state.blurPaletteComposer();
                     state.noteInteraction();
                     state.markDirty();
@@ -713,6 +1272,24 @@ fn renderPaneRowDragOverlay(state: *runtime.AppState) void {
     }, paneTitle(state, pane_row_drag.project_index, project, pane, &term_title_buf), paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
+/// Placeholder title the daemon, CLI and client_core store for an untitled
+/// chat. Kept as-is in storage for compatibility; drawn in sentence case.
+const STORED_NEW_CHAT_TITLE = "New Chat";
+
+/// Chat title as drawn in the rail, tabs, tooltips and drag preview: the
+/// stored "New Chat" placeholder reads "New chat" (as the chat header
+/// shows it); every other title is unchanged.
+pub fn chatDisplayTitle(title: []const u8) []const u8 {
+    return if (std.mem.eql(u8, title, STORED_NEW_CHAT_TITLE)) "New chat" else title;
+}
+
+test "chat display title sentence-cases only the stored placeholder" {
+    try std.testing.expectEqualStrings("New chat", chatDisplayTitle("New Chat"));
+    try std.testing.expectEqualStrings("New Chat ideas", chatDisplayTitle("New Chat ideas"));
+    try std.testing.expectEqualStrings("new chat", chatDisplayTitle("new chat"));
+    try std.testing.expectEqualStrings("Fix sidebar", chatDisplayTitle("Fix sidebar"));
+}
+
 /// Scratch for `Dock.activeProcessLabel`, sized to its buffer contract.
 pub const TerminalTitleBuffer = [96]u8;
 
@@ -728,23 +1305,29 @@ pub fn paneTitle(
     term_title_buf: *TerminalTitleBuffer,
 ) []const u8 {
     return switch (pane.ref) {
-        .chat => |ref| if (ref.thread_index < project.threads.items.len) project.threads.items[ref.thread_index].title else "Chat",
+        .chat => |ref| if (ref.thread_index < project.threads.items.len) chatDisplayTitle(project.threads.items[ref.thread_index].title) else "Chat",
         .terminal => |ref| terminalPaneTitle(state, project_index, ref.dock_id, term_title_buf),
         .browser => browserPaneTitle(pane),
         .file => |ref| std.fs.path.basename(ref.path),
     };
 }
 
-/// Terminal pane label: prefer an agent/notify-provided surface title, then
-/// the terminal's live label (pinned TUI title, OSC title, or cwd), then a
-/// generic fallback. Every surface that names a terminal pane must go through
-/// this so the tab strip and sidebar never disagree.
-fn terminalPaneTitle(
+/// Terminal pane label, the one naming rule for every surface that names a
+/// terminal (sidebar rows, tab strip, drag ghost, pane header). A plain
+/// terminal reads "<shell> · <cwd basename>" (or the user's tab rename),
+/// with " (2)", " (3)"… on later terminals of the same workspace that would
+/// otherwise share the name. An agent TUI keeps its session title (notify
+/// hook, pinned/OSC title), which says more than the shell name.
+pub fn terminalPaneTitle(
     state: *const runtime.AppState,
     project_index: usize,
     dock_id: u32,
     term_title_buf: *TerminalTitleBuffer,
 ) []const u8 {
+    if (plainTerminalName(state, project_index, dock_id, term_title_buf)) |base| {
+        const ordinal = plainTerminalNameOrdinal(state, project_index, dock_id, base);
+        return withDuplicateOrdinal(term_title_buf, base.len, ordinal);
+    }
     const title = blk: {
         if (state.projectTerminalSurface(project_index, dock_id)) |s| if (s.title.len > 0) break :blk s.title;
         if (state.projectTerminalDock(project_index, dock_id)) |dock| {
@@ -758,70 +1341,267 @@ fn terminalPaneTitle(
     return stripLeadingTitleSymbols(title);
 }
 
+/// Base name of a plain (non-agent) terminal written into `buf`: the user's
+/// tab rename, else "<program> · <cwd basename>": the foreground program
+/// while one runs, else (idle shell: the engine reports no foreground
+/// process) the shell the terminal was launched with. Null for agent TUIs.
+fn plainTerminalName(
+    state: *const runtime.AppState,
+    project_index: usize,
+    dock_id: u32,
+    buf: *TerminalTitleBuffer,
+) ?[]const u8 {
+    const dock = state.projectTerminalDock(project_index, dock_id) orelse return null;
+    const surface = state.projectTerminalSurface(project_index, dock_id);
+    var comm_buf: TerminalTitleBuffer = undefined;
+    const process = dock.activeForegroundProcessName(&comm_buf);
+    if (terminalAgentProviderForMetadata(if (surface) |s| s.provider else null, process, dock.activeTabPinnedProvider()) != null) return null;
+    if (dock.activeTabConst()) |tab| if (tab.title) |renamed| {
+        if (renamed.len > 0) return copyInto(buf, renamed);
+    };
+    const shell = process orelse launchProfileShellName(dock.launch_profile.kind, dock.launch_profile.command, dock.launch_profile.label, loginShellPath());
+    const cwd = if (dock.cwd) |path| std.fs.path.basename(path) else "";
+    return formatTerminalName(buf, shell, cwd);
+}
+
+/// Resolved once: the environment does not change under a running Verde.
+var login_shell_cache: ?[]const u8 = null;
+
+/// The login shell the terminal engine launches for shell profiles — the
+/// same rule as `defaultInteractiveShell` in terminal.zig (`$SHELL`, else
+/// the platform default). Cached after the first call, so naming terminals
+/// every frame costs no environment scan.
+fn loginShellPath() []const u8 {
+    if (login_shell_cache) |cached| return cached;
+    const resolved = blk: {
+        if (std.c.getenv("SHELL")) |shell_ptr| {
+            const shell = std.mem.span(shell_ptr);
+            if (shell.len > 0) break :blk shell;
+        }
+        break :blk switch (builtin.os.tag) {
+            .macos => "/bin/zsh",
+            .windows => "cmd.exe",
+            else => "/bin/bash",
+        };
+    };
+    login_shell_cache = resolved;
+    return resolved;
+}
+
+/// Program name for a terminal whose foreground process is unknown (not
+/// yet started, or a platform without /proc): the login shell's basename
+/// for shell profiles, a custom profile's command, the agent CLI for agent
+/// profiles; the profile label or "Terminal" only as a last resort.
+fn launchProfileShellName(kind: TerminalLaunchKind, command: []const []const u8, label: []const u8, login_shell: []const u8) []const u8 {
+    const program = switch (kind) {
+        .shell => login_shell,
+        .custom => if (command.len > 0) command[0] else "",
+        else => @tagName(kind),
+    };
+    const name = std.fs.path.basename(program);
+    if (name.len > 0) return name;
+    return if (label.len > 0) label else "Terminal";
+}
+
+test "terminal name falls back to the shell basename, not \"Terminal\"" {
+    try std.testing.expectEqualStrings("fish", launchProfileShellName(.shell, &.{}, "", "/usr/bin/fish"));
+    try std.testing.expectEqualStrings("nu", launchProfileShellName(.custom, &.{ "/opt/bin/nu", "-l" }, "Nushell", "/bin/bash"));
+    try std.testing.expectEqualStrings("Mine", launchProfileShellName(.custom, &.{}, "Mine", "/bin/bash"));
+    try std.testing.expectEqualStrings("claude", launchProfileShellName(.claude, &.{}, "", "/bin/bash"));
+    try std.testing.expectEqualStrings("Terminal", launchProfileShellName(.custom, &.{}, "", "/bin/bash"));
+}
+
+/// "<shell> · <cwd>" (or just the shell without a cwd), truncated to `buf`.
+fn formatTerminalName(buf: []u8, shell: []const u8, cwd: []const u8) []const u8 {
+    if (cwd.len == 0) return copyInto(buf, shell);
+    return std.fmt.bufPrint(buf, "{s} · {s}", .{ shell, cwd }) catch copyInto(buf, shell);
+}
+
+fn copyInto(buf: []u8, value: []const u8) []const u8 {
+    var len = @min(value.len, buf.len);
+    // Never split a UTF-8 sequence when the value is longer than the buffer.
+    while (len < value.len and len > 0 and (value[len] & 0xC0) == 0x80) len -= 1;
+    @memcpy(buf[0..len], value[0..len]);
+    return buf[0..len];
+}
+
+/// 1-based position of `dock_id` among the workspace's plain terminals named
+/// `base`, in pane order; the first keeps the bare name.
+fn plainTerminalNameOrdinal(state: *const runtime.AppState, project_index: usize, dock_id: u32, base: []const u8) usize {
+    if (project_index >= state.project_controller.projects.items.len) return 1;
+    const layout = &state.project_controller.projects.items[project_index].workspace_layout;
+    var ordinal: usize = 1;
+    for (layout.panes.items) |*pane| {
+        const ref = switch (pane.ref) {
+            .terminal => |terminal_ref| terminal_ref,
+            else => continue,
+        };
+        if (ref.dock_id == dock_id) break;
+        var other_buf: TerminalTitleBuffer = undefined;
+        const other = plainTerminalName(state, project_index, ref.dock_id, &other_buf) orelse continue;
+        if (std.mem.eql(u8, other, base)) ordinal += 1;
+    }
+    return ordinal;
+}
+
+/// Appends " (N)" to the `base_len`-byte name already in `buf` for N ≥ 2,
+/// shortening the name (on a UTF-8 boundary) when the suffix would not fit.
+fn withDuplicateOrdinal(buf: *TerminalTitleBuffer, base_len: usize, ordinal: usize) []const u8 {
+    if (ordinal < 2) return buf[0..base_len];
+    var suffix_buf: [16]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&suffix_buf, " ({d})", .{ordinal}) catch return buf[0..base_len];
+    var keep = @min(base_len, buf.len - suffix.len);
+    while (keep < base_len and keep > 0 and (buf[keep] & 0xC0) == 0x80) keep -= 1;
+    @memcpy(buf[keep .. keep + suffix.len], suffix);
+    return buf[0 .. keep + suffix.len];
+}
+
+test "terminal names: shell · cwd with a duplicate ordinal" {
+    var buf: TerminalTitleBuffer = undefined;
+    const base = formatTerminalName(&buf, "fish", "verde_workspace");
+    try std.testing.expectEqualStrings("fish · verde_workspace", base);
+    try std.testing.expectEqualStrings("fish · verde_workspace", withDuplicateOrdinal(&buf, base.len, 1));
+    const again = formatTerminalName(&buf, "fish", "verde_workspace");
+    try std.testing.expectEqualStrings("fish · verde_workspace (2)", withDuplicateOrdinal(&buf, again.len, 2));
+    try std.testing.expectEqualStrings("Terminal", formatTerminalName(&buf, "Terminal", ""));
+    // A name that fills the buffer gives up its tail to the suffix.
+    const long = [_]u8{'a'} ** 120;
+    const clipped = formatTerminalName(&buf, &long, "");
+    try std.testing.expectEqual(buf.len, clipped.len);
+    const suffixed = withDuplicateOrdinal(&buf, clipped.len, 3);
+    try std.testing.expectEqual(buf.len, suffixed.len);
+    try std.testing.expect(std.mem.endsWith(u8, suffixed, " (3)"));
+}
+
 fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {
     if (!state.sidebar_context_menu_open) return false;
 
     if (rectContainsPoint(sidebar_menu_panel_rect, x, y)) {
-        const pi = state.sidebar_context_menu_project_index;
-        const ti = state.sidebar_context_menu_thread_index;
         var idx = sidebar_menu_row_count;
         while (idx > 0) {
             idx -= 1;
             if (!rectContainsPoint(sidebar_menu_row_rects[idx], x, y)) continue;
-            const enabled = sidebar_menu_row_enabled[idx];
-            const action = sidebar_menu_row_actions[idx];
-            state.closeSidebarContextMenu();
-            state.workspace_header_open_menu_open = false;
-            if (!enabled) return true;
-            state.blurPaletteComposer();
-            state.noteInteraction();
-            switch (action) {
-                .workspace_new_chat => {
-                    if (pi < state.project_controller.projects.items.len) state.createThreadForProject(pi);
-                },
-                .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
-                .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
-                .workspace_herdr_handoff => state.handoffProjectToLocalHerdrFromUi(pi),
-                .workspace_herdr_focus_terminal => _ = state.focusProjectHerdrAttachTerminal(pi),
-                .workspace_herdr_unlink => state.unlinkProjectHerdrFromUi(pi),
-                .workspace_rename => state.beginProjectRename(pi),
-                .workspace_open_settings => state.openWorkspaceSettingsForProject(pi),
-                .workspace_import_codex => state.beginThreadImport(pi, .codex),
-                .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
-                .workspace_import_claude => state.beginThreadImport(pi, .claude),
-                .workspace_archive => state.closeProjectAtIndex(pi),
-                .thread_open_tui => state.openThreadInTui(pi, ti),
-                .thread_open_chat => state.openThreadInChat(pi, ti),
-                .thread_rename => state.beginThreadRename(pi, ti),
-                .thread_regenerate_title => state.regenerateThreadTitleAtIndex(pi, ti),
-                .thread_sync => state.syncThreadFromProvider(pi, ti),
-                .thread_handoff => {
-                    if (pi < state.project_controller.projects.items.len) {
-                        for (state.project_controller.projects.items[pi].workspace_layout.panes.items) |pane| {
-                            switch (pane.ref) {
-                                .chat => |ref| if (ref.thread_index == ti) {
-                                    state.beginThreadHandoff(pi, ti, pane.id);
-                                    break;
-                                },
-                                else => {},
-                            }
-                        }
-                    }
-                },
-                .thread_close_pane => if (threadPaneId(state, pi, ti)) |pane_id| {
-                    _ = state.closeWorkspacePane(pi, pane_id);
-                },
-            }
+            activateSidebarContextMenuRow(state, idx);
             return true;
         }
-        state.closeSidebarContextMenu();
-        state.workspace_header_open_menu_open = false;
-        return true;
     }
 
+    closeSidebarContextMenuFromUi(state);
+    return true;
+}
+
+fn closeSidebarContextMenuFromUi(state: *runtime.AppState) void {
+    sidebar_menu_key_index = null;
+    sidebar_menu_key_visible = false;
     state.closeSidebarContextMenu();
     state.workspace_header_open_menu_open = false;
+}
+
+/// Runs one context-menu row (click, Enter or Space) and closes the menu.
+/// Disabled rows only close it.
+fn activateSidebarContextMenuRow(state: *runtime.AppState, idx: usize) void {
+    if (idx >= sidebar_menu_row_count) return;
+    const pi = state.sidebar_context_menu_project_index;
+    const ti = state.sidebar_context_menu_thread_index;
+    const enabled = sidebar_menu_row_enabled[idx];
+    const action = sidebar_menu_row_actions[idx];
+    closeSidebarContextMenuFromUi(state);
+    if (!enabled) return;
+    state.blurPaletteComposer();
+    state.noteInteraction();
+    switch (action) {
+        .workspace_new_chat => {
+            if (pi < state.project_controller.projects.items.len) state.createThreadForProject(pi);
+        },
+        .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
+        .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
+        .workspace_herdr_handoff => state.handoffProjectToLocalHerdrFromUi(pi),
+        .workspace_herdr_focus_terminal => _ = state.focusProjectHerdrAttachTerminal(pi),
+        .workspace_herdr_unlink => state.unlinkProjectHerdrFromUi(pi),
+        .workspace_rename => state.beginProjectRename(pi),
+        .workspace_open_settings => state.openWorkspaceSettingsForProject(pi),
+        .workspace_import_codex => state.beginThreadImport(pi, .codex),
+        .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
+        .workspace_import_claude => state.beginThreadImport(pi, .claude),
+        .workspace_archive => state.closeProjectAtIndex(pi),
+        .thread_open_tui => state.openThreadInTui(pi, ti),
+        .thread_open_chat => state.openThreadInChat(pi, ti),
+        .thread_rename => state.beginThreadRename(pi, ti),
+        .thread_regenerate_title => state.regenerateThreadTitleAtIndex(pi, ti),
+        .thread_sync => state.syncThreadFromProvider(pi, ti),
+        .thread_handoff => {
+            if (pi < state.project_controller.projects.items.len) {
+                for (state.project_controller.projects.items[pi].workspace_layout.panes.items) |pane| {
+                    switch (pane.ref) {
+                        .chat => |ref| if (ref.thread_index == ti) {
+                            state.beginThreadHandoff(pi, ti, pane.id);
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        },
+        .thread_close_pane => if (threadPaneId(state, pi, ti)) |pane_id| {
+            _ = state.closeWorkspacePane(pi, pane_id);
+        },
+    }
+}
+
+/// Keyboard for the open sidebar context menu (workspace and chat rows):
+/// Up/Down and Tab/Shift+Tab move a visible highlight over enabled rows
+/// (wrapping), Home/End jump, Enter/Space activate, Escape closes. While the
+/// menu is open it is the topmost layer, so every key is consumed.
+pub fn handleContextMenuKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!state.sidebar_context_menu_open) return false;
+    if (!event.down) return true;
+    switch (event.key) {
+        .escape => closeSidebarContextMenuFromUi(state),
+        .up => moveSidebarContextMenuKeyIndex(state, -1),
+        .down => moveSidebarContextMenuKeyIndex(state, 1),
+        .tab => moveSidebarContextMenuKeyIndex(state, if (event.mod.shift) -1 else 1),
+        .home => {
+            sidebar_menu_key_index = null;
+            moveSidebarContextMenuKeyIndex(state, 1);
+        },
+        .end => {
+            sidebar_menu_key_index = null;
+            moveSidebarContextMenuKeyIndex(state, -1);
+        },
+        .@"return", .kp_enter, .space => if (sidebar_menu_key_index) |idx| activateSidebarContextMenuRow(state, idx),
+        else => {},
+    }
     return true;
+}
+
+fn moveSidebarContextMenuKeyIndex(state: *runtime.AppState, delta: i32) void {
+    sidebar_menu_key_visible = true;
+    sidebar_menu_key_index = nextEnabledMenuRow(sidebar_menu_row_enabled[0..sidebar_menu_row_count], sidebar_menu_key_index, delta);
+    state.markDirty();
+}
+
+/// Next enabled row from `current` in direction `delta`, wrapping. With no
+/// current row, Down starts at the first enabled row and Up at the last.
+fn nextEnabledMenuRow(enabled: []const bool, current: ?usize, delta: i32) ?usize {
+    const count = enabled.len;
+    if (count == 0) return null;
+    var index: usize = if (current) |c| @min(c, count - 1) else if (delta > 0) count - 1 else 0;
+    var steps: usize = 0;
+    while (steps < count) : (steps += 1) {
+        index = if (delta > 0) (index + 1) % count else (index + count - 1) % count;
+        if (enabled[index]) return index;
+    }
+    return null;
+}
+
+test "sidebar context menu keyboard skips disabled rows and wraps" {
+    const rows = [_]bool{ true, false, true, true };
+    try std.testing.expectEqual(@as(?usize, 0), nextEnabledMenuRow(&rows, null, 1));
+    try std.testing.expectEqual(@as(?usize, 3), nextEnabledMenuRow(&rows, null, -1));
+    try std.testing.expectEqual(@as(?usize, 2), nextEnabledMenuRow(&rows, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), nextEnabledMenuRow(&rows, 3, 1));
+    try std.testing.expectEqual(@as(?usize, 0), nextEnabledMenuRow(&rows, 2, -1));
+    try std.testing.expectEqual(@as(?usize, null), nextEnabledMenuRow(&[_]bool{ false, false }, null, 1));
 }
 
 fn appendSidebarContextMenuRow(action: SidebarContextMenuAction, enabled: bool, label: []const u8) void {
@@ -830,6 +1610,32 @@ fn appendSidebarContextMenuRow(action: SidebarContextMenuAction, enabled: bool, 
     sidebar_menu_row_enabled[sidebar_menu_row_count] = enabled;
     sidebar_menu_row_labels[sidebar_menu_row_count] = label;
     sidebar_menu_row_count += 1;
+}
+
+/// Leading codicon for a context-menu action; glyphs match the pane and
+/// terminal menus (comment = chat, terminal, edit = rename, close).
+fn sidebarMenuActionGlyph(action: SidebarContextMenuAction) []const u8 {
+    return switch (action) {
+        .workspace_new_chat, .thread_open_chat => "\u{EA6B}", // comment
+        .workspace_open_codex_tui, .workspace_open_terminal, .workspace_herdr_focus_terminal, .thread_open_tui => NF_COD_TERMINAL,
+        .workspace_herdr_handoff => "\u{EAC3}", // cloud-upload
+        .workspace_herdr_unlink => "\u{EA7A}", // device-desktop
+        .workspace_rename, .thread_rename => "\u{EA73}", // edit
+        .workspace_open_settings => "\u{EB51}", // gear
+        .workspace_import_codex, .workspace_import_opencode, .workspace_import_claude => "\u{EA82}", // history
+        .thread_regenerate_title => "\u{EB37}", // refresh
+        .thread_sync => "\u{EA77}", // sync
+        .thread_handoff => "\u{EA9C}", // arrow-right
+        .workspace_archive, .thread_close_pane => NF_COD_CLOSE,
+    };
+}
+
+/// Close actions get the danger colour and a separator above them.
+fn sidebarMenuActionDestructive(action: SidebarContextMenuAction) bool {
+    return switch (action) {
+        .thread_close_pane, .workspace_archive => true,
+        else => false,
+    };
 }
 
 fn openTuiLabel(provider: Provider) []const u8 {
@@ -845,6 +1651,53 @@ fn openTuiLabel(provider: Provider) []const u8 {
         .muse => "Open in TUI: Muse",
         .custom_acp => "Open in TUI",
     };
+}
+
+/// Gap between the right-clicked row and its context menu.
+const CONTEXT_MENU_ANCHOR_GAP_CSS: f32 = 4.0;
+
+/// Top-left of a context menu opened from `row` (at cursor x): just below
+/// the row, flipped above it when it would run off the bottom of `bounds`,
+/// and clamped inside `bounds` (inset by `pad`) as a last resort. Without an
+/// anchor row the menu opens at the cursor.
+fn contextMenuOrigin(
+    cursor_x: f32,
+    cursor_y: f32,
+    row: ?palette.Rect,
+    menu_w: f32,
+    menu_h: f32,
+    bounds: palette.Rect,
+    pad: f32,
+    gap: f32,
+) struct { x: f32, y: f32 } {
+    const top = bounds.y + pad;
+    const bottom = bounds.y + bounds.h - pad;
+    var y = cursor_y;
+    if (row) |r| {
+        y = r.y + r.h + gap;
+        if (y + menu_h > bottom) {
+            const above = r.y - gap - menu_h;
+            if (above >= top) y = above;
+        }
+    }
+    return .{
+        .x = theme.clampf(cursor_x, bounds.x + pad, bounds.x + bounds.w - menu_w - pad),
+        .y = theme.clampf(y, top, bottom - menu_h),
+    };
+}
+
+test "context menu opens below its row and flips above near the bottom" {
+    const bounds: palette.Rect = .{ .x = 0, .y = 0, .w = 300, .h = 600 };
+    const row: palette.Rect = .{ .x = 10, .y = 100, .w = 280, .h = 36 };
+    const below = contextMenuOrigin(50, 118, row, 200, 150, bounds, 6, 4);
+    try std.testing.expectEqual(@as(f32, 140), below.y);
+    try std.testing.expectEqual(@as(f32, 50), below.x);
+    const low_row: palette.Rect = .{ .x = 10, .y = 500, .w = 280, .h = 36 };
+    const above = contextMenuOrigin(250, 518, low_row, 200, 150, bounds, 6, 4);
+    try std.testing.expectEqual(@as(f32, 346), above.y);
+    try std.testing.expectEqual(@as(f32, 94), above.x);
+    const at_cursor = contextMenuOrigin(50, 118, null, 200, 150, bounds, 6, 4);
+    try std.testing.expectEqual(@as(f32, 118), at_cursor.y);
 }
 
 fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect) void {
@@ -929,13 +1782,25 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     const previous_z = state.palette_overlay_batch.setZIndex(SIDEBAR_CONTEXT_MENU_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(sidebar_menu_row_count)) * menu_row_h;
-    var menu_x = state.sidebar_context_menu_anchor_x;
-    var menu_y = state.sidebar_context_menu_anchor_y;
-    menu_x = theme.clampf(menu_x, sidebar_rect.x + pad, sidebar_rect.x + sidebar_rect.w - menu_w - pad);
-    menu_y = theme.clampf(menu_y, sidebar_rect.y + pad, sidebar_rect.y + sidebar_rect.h - menu_h - pad);
+    // Destructive actions sit after a separator, in the danger colour.
+    const separator_h = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    var separator_count: f32 = 0.0;
+    for (sidebar_menu_row_actions[0..sidebar_menu_row_count], 0..) |action, ri| {
+        if (ri > 0 and sidebarMenuActionDestructive(action)) separator_count += 1.0;
+    }
+    const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(sidebar_menu_row_count)) * menu_row_h + separator_count * separator_h;
+    const origin = contextMenuOrigin(
+        state.sidebar_context_menu_anchor_x,
+        state.sidebar_context_menu_anchor_y,
+        sidebar_menu_anchor_row,
+        menu_w,
+        menu_h,
+        sidebar_rect,
+        pad,
+        theme.scaledUi(CONTEXT_MENU_ANCHOR_GAP_CSS),
+    );
 
-    sidebar_menu_panel_rect = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
+    sidebar_menu_panel_rect = context_menu.queuePanel(state, .{ .x = origin.x, .y = origin.y, .w = menu_w, .h = menu_h });
     const clip = sidebar_menu_panel_rect;
 
     const mx = state.transcript_controller.palette_mouse_x;
@@ -945,6 +1810,11 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     var ry = sidebar_menu_panel_rect.y + menu_pad;
     var ri: usize = 0;
     while (ri < sidebar_menu_row_count) : (ri += 1) {
+        const destructive = sidebarMenuActionDestructive(sidebar_menu_row_actions[ri]);
+        if (ri > 0 and destructive) {
+            context_menu.queueSeparator(state, sidebar_menu_panel_rect.x + menu_pad, ry, sidebar_menu_panel_rect.w - menu_pad * 2.0);
+            ry += separator_h;
+        }
         const rr: palette.Rect = .{
             .x = sidebar_menu_panel_rect.x + menu_pad,
             .y = ry,
@@ -953,9 +1823,14 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         };
         sidebar_menu_row_rects[ri] = rr;
 
+        const key_highlight = sidebar_menu_key_visible and sidebar_menu_key_index == ri;
         const row_hover = mouse_ok and sidebar_menu_row_enabled[ri] and rectContainsPoint(rr, mx, my);
-        if (row_hover) context_menu.queueRowHighlight(state, rr);
-        context_menu.queueLabel(state, rr, sidebar_menu_row_labels[ri], context_menu.labelColor(sidebar_menu_row_enabled[ri], row_hover), 0.0, 0.0, clip);
+        context_menu.queueRowState(state, rr, row_hover, key_highlight);
+        // Every item carries a leading icon in the shared reserved column,
+        // like the header and pane menus; Close keeps the danger colour.
+        const text_color = context_menu.actionColor(sidebar_menu_row_enabled[ri], destructive);
+        context_menu.queueIcon(state, rr, sidebarMenuActionGlyph(sidebar_menu_row_actions[ri]), text_color, clip);
+        context_menu.queueLabel(state, rr, sidebar_menu_row_labels[ri], text_color, theme.scaledUi(context_menu.CHECK_SLOT_UI), 0.0, clip);
 
         ry += menu_row_h;
     }
@@ -977,7 +1852,6 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     // Feed switcher recency: the selected workspace is the one in use.
     if (has_selected) workspace_identity.noteUsed(projects[selected_index].id, unixTimestampMs());
     const all_scope = state.sidebar_all_workspaces or !has_selected;
-    open_rows_show_chip = all_scope;
     open_rows_recency_sorted = all_scope;
 
     // Pinned chrome, top to bottom: header (logo + toggle), workspace
@@ -1000,6 +1874,11 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     var cluster_rows: [palette_hits.len]AttentionClusterRow = undefined;
     const cluster_row_count = collectAttentionClusterRows(state, &cluster_rows);
     if (cluster_row_count > 0) sortAttentionClusterRows(cluster_rows[0..cluster_row_count]);
+    frame_active_rows = cluster_rows[0..cluster_row_count];
+    defer frame_active_rows = &.{};
+    // Identity chips mark rows from other workspaces (every row under All
+    // Workspaces); the selected workspace's own rows stay chip-free.
+    open_rows_chip_every_row = all_scope;
     const cluster_layout = attentionClusterLayoutForRail(cluster_row_count, available_list_h);
     const motion_t = attentionMotionStep(state);
     attention_clip = .{
@@ -1033,9 +1912,19 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     // One ordered list drives measuring, focus reveal, and rendering, so the
     // three passes cannot disagree about row positions.
     const open_units = collectOpenUnits(state, all_scope);
+    // A standalone pane already listed in ACTIVE is not repeated in OPEN
+    // (docs/workspace-switcher-sidebar.md: OPEN is "every other open pane"),
+    // so a chat never shows twice. Keyboard ordinals keep using the full
+    // `open_units` list, so Ctrl+N numbering is unchanged.
+    var open_unit_shown: []const bool = &.{};
+    if (state.palette_frame_text_arena.allocator().alloc(bool, open_units.len)) |shown| {
+        for (open_units, shown) |unit, *flag| flag.* = !openUnitShownInActive(state, unit);
+        open_unit_shown = shown;
+    } else |_| {}
     var content_y = open_top + caption_h;
     var focused_row: ?palette.Rect = null;
-    for (open_units) |unit| {
+    for (open_units, 0..) |unit, unit_index| {
+        if (unit_index < open_unit_shown.len and !open_unit_shown[unit_index]) continue;
         const unit_h = openUnitHeight(&projects[unit.project_index].workspace_layout, unit.pane_index);
         if (unit.project_index == selected_index and focused_pane_id != null and
             openUnitContainsPane(&projects[unit.project_index].workspace_layout, unit.pane_index, focused_pane_id.?))
@@ -1065,11 +1954,13 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     } else &.{};
     const row_ordinals = allWorkspacesOrderActive(state);
     for (open_units, 0..) |unit, ordinal| {
+        if (ordinal < open_unit_shown.len and !open_unit_shown[ordinal]) continue;
         y = renderOpenPaneUnit(state, unit, selected_tabs, if (row_ordinals) ordinal else null, x, rail_w, rows_clip, rows_clip, y);
     }
     if (open_units.len > 0) y += theme.scaledUi(4.0);
     if (y == rows_top) {
-        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), rows_clip);
+        const empty_label = if (open_units.len > 0) "Every open pane is active" else "No open panes";
+        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, empty_label, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), rows_clip);
     }
 
     // Scrollbar clips to the OPEN band so the thumb never extends behind the
@@ -1082,7 +1973,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     // row scrolled up under it is covered (same approach as the chrome).
     if (caption_h > 0.0 and open_clip.h > 0.0) {
         queuePaletteRect(state, .{ .x = rect.x, .y = open_top, .w = rect.w - theme.scaledUi(1.0), .h = @min(caption_h, open_clip.h) }, paletteColor(theme.COLOR_PANEL));
-        queuePaletteText(state, .{ .x = x, .y = open_top, .w = rail_w, .h = theme.scaledUi(18.0) }, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), open_clip);
+        queuePaletteText(state, .{ .x = x, .y = open_top, .w = rail_w, .h = theme.scaledUi(18.0) }, "Open", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(SIDEBAR_SECTION_LABEL_FONT_CSS), open_clip);
     }
 
     // Pinned footer band with the global settings gear.
@@ -1141,6 +2032,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const add_rect: palette.Rect = .{ .x = x + rail_w - action_w, .y = switcher_top + (switcher_h - action_w) * 0.5, .w = action_w, .h = action_w };
     renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, add_workspace_hovered, rect);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
+    offerTooltip(state, add_rect, "New workspace");
 
     // Search pill + new chat / new terminal. Under All Workspaces they target
     // the selected (= most recently used) workspace.
@@ -1151,8 +2043,10 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const terminal_rect: palette.Rect = .{ .x = x + rail_w - action_w, .y = search_top, .w = action_w, .h = search_h };
         renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == selected_index, rect);
         addPaletteHit(new_rect, .new_thread, selected_index, 0);
+        offerTooltip(state, new_rect, tooltipWithShortcut(state, "New chat", keyboardBindings(state, "new_thread")));
         renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == selected_index, rect);
         addPaletteHit(terminal_rect, .new_terminal, selected_index, 0);
+        offerTooltip(state, terminal_rect, "New terminal");
     }
 }
 
@@ -1166,8 +2060,9 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     const radius = theme.scaledUi(7.0);
     // No resting chrome: the trigger sits flush on the rail and only shows
     // the accent wash on hover / while the switcher is open.
-    if (hovered) queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), radius);
+    if (hovered) queuePaletteRoundedRect(state, snapRect(rect), paletteColor(hoverFill()), radius);
     addPaletteHit(rect, .workspace_switcher, state.project_controller.selected_index, 0);
+    offerTooltip(state, rect, "Switch workspace");
 
     const projects = state.project_controller.projects.items;
     const chip = theme.scaledUi(22.0);
@@ -1194,7 +2089,7 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
             ""
     else
         "";
-    const label = if (project) |p| p.label else "All Workspaces";
+    const label = if (project) |p| p.label else "All workspaces";
     const label_x = chip_rect.x + chip + theme.scaledUi(10.0);
     const font = theme.scaledUi(14.0);
     queuePaletteText(state, .{
@@ -1380,18 +2275,19 @@ test "sidebar reveals a newly focused row past the viewport edge" {
 }
 
 /// Pinned command-palette trigger, kept deliberately quiet: a search glyph,
-/// muted "Search" label, and the configured shortcut as plain subtle text.
+/// muted "Search" label, and the configured shortcut as plain muted text.
 /// No box/border/badge chrome — it uses the same accent hover wash as list
 /// rows so it reads as part of the rail under any theme.
 fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void {
     const hovered = search_trigger_hovered;
     if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(hoverFill()), theme.scaledUi(6.0));
     }
     addPaletteHit(rect, .command_palette, 0, 0);
+    offerTooltip(state, rect, tooltipWithShortcut(state, "Search chats and commands", keyboardBindings(state, "command_palette")));
 
     const cy = rect.y + rect.h * 0.5;
-    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
+    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(12.5);
     queuePaletteIcon(state, .{
         .x = rect.x + theme.scaledUi(8.0),
@@ -1410,16 +2306,17 @@ fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void
 
     const hint = command_palette.commandPaletteShortcutHint(state);
     if (hint.len == 0) return;
-    const hint_font = theme.scaledUi(10.0);
-    // Same per-char width estimate the rail uses elsewhere for right-aligned
-    // labels; shortcut strings are short ASCII so the error stays invisible.
-    const hint_w = @as(f32, @floatFromInt(hint.len)) * hint_font * 0.54;
-    queuePaletteText(state, .{
+    // Shortcut hint at the "Search" label's size (full-opacity muted text):
+    // the regular UI face reads a step smaller than the bold rail text, so
+    // it does not go below the label beside it.
+    const hint_font = label_font;
+    const hint_w = runtime.paletteUiTextPrefixWidth(hint, hint_font, hint.len);
+    queuePaletteUiText(state, .{
         .x = rect.x + rect.w - hint_w - theme.scaledUi(8.0),
         .y = @round(cy - hint_font * 0.65),
         .w = hint_w + theme.scaledUi(6.0),
         .h = hint_font * 1.3,
-    }, hint, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 210)), hint_font, rect);
+    }, hint, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), hint_font, rect);
 }
 
 const AttentionClusterRow = struct {
@@ -1504,12 +2401,12 @@ fn renderAttentionClusterSection(
         const shown_y = activeRowShownY(row.project_index, row.pane.id, target_y, motion_t);
         const row_rect: palette.Rect = .{ .x = x, .y = rows_top + shown_y, .w = rail_w, .h = row_h };
         if (rowVisible(row_rect, rows_clip)) {
-            // Active rows span every workspace, so they always carry the
-            // workspace chip; OPEN rows follow the scope.
-            const scoped_chip = open_rows_show_chip;
-            open_rows_show_chip = true;
+            // Chips follow `rowShowsWorkspaceChip`, shared with OPEN, so both
+            // sections keep one icon-slot layout.
             renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, rows_clip, true, true, active_index, false);
-            open_rows_show_chip = scoped_chip;
+        } else {
+            // Scrolled out of the cluster: keep it reachable by keyboard.
+            addFocusStop(row_rect, rows_clip, .open_pane, row.project_index, row.pane.id);
         }
     }
 
@@ -1526,7 +2423,7 @@ fn renderAttentionClusterSection(
         .y = clip.y,
         .w = rail_w,
         .h = theme.scaledUi(18.0),
-    }, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
+    }, "Active", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(SIDEBAR_SECTION_LABEL_FONT_CSS), clip);
 
     const divider_band: palette.Rect = .{
         .x = clip.x,
@@ -1582,6 +2479,27 @@ fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionCluste
         }
     }
     return row_count;
+}
+
+/// ACTIVE rows of the current sidebar pass; empty outside it.
+var frame_active_rows: []const AttentionClusterRow = &.{};
+
+fn paneShownInActive(project_index: usize, pane_id: native_state.WorkspacePaneId) bool {
+    for (frame_active_rows) |row| {
+        if (row.project_index == project_index and row.pane.id == pane_id) return true;
+    }
+    return false;
+}
+
+/// True for a standalone OPEN unit whose pane is already an ACTIVE row.
+/// Split tiles stay in OPEN (their miniature is the only view of the tile);
+/// their ACTIVE member just loses the duplicate selected fill.
+fn openUnitShownInActive(state: *const runtime.AppState, unit: OpenUnit) bool {
+    const layout = &state.project_controller.projects.items[unit.project_index].workspace_layout;
+    const pane = layout.panes.items[unit.pane_index];
+    const group_id = layout.scrollGroupIdForPane(pane.id) orelse return false;
+    if (layout.scrollGroupPaneCount(group_id) > 1) return false;
+    return paneShownInActive(unit.project_index, pane.id);
 }
 
 /// Focuses the ACTIVE row at the same sorted position used by the sidebar.
@@ -1732,10 +2650,13 @@ fn renderHerdrRuntimeBadge(state: *runtime.AppState, rect: palette.Rect, label: 
 fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expanded: bool) void {
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(hoverFill()), theme.scaledUi(8.0));
     }
     queueSidebarToggleGlyph(state, rect, expanded, hovered, null);
     addPaletteHit(rect, .collapse, 0, 0);
+    // A hover-revealed (hidden) rail pins open on click; a shown one hides.
+    const label = if (state.isSidebarHidden()) "Keep sidebar open" else "Hide sidebar";
+    offerTooltip(state, rect, tooltipWithShortcut(state, label, keyboardBindings(state, "toggle_sidebar_hidden")));
 }
 
 /// Panel-left codicon centered in `rect` (filled while the rail is shown,
@@ -1744,7 +2665,10 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
 pub fn queueSidebarToggleGlyph(state: *runtime.AppState, rect: palette.Rect, expanded: bool, hovered: bool, clip: ?palette.Rect) void {
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = @min(theme.scaledUi(17.0), rect.h);
-    const glyph = if (expanded) NF_COD_LAYOUT_SIDEBAR_LEFT else NF_COD_LAYOUT_SIDEBAR_LEFT_OFF;
+    // One glyph in the rail header and the collapsed strip: the same action
+    // (show/hide the sidebar) never changes icon; the tooltip says which.
+    _ = expanded;
+    const glyph = NF_COD_LAYOUT_SIDEBAR_LEFT;
     queuePaletteIcon(state, .{
         .x = rect.x + (rect.w - icon_font) * 0.5,
         .y = rect.y + (rect.h - icon_font) * 0.5,
@@ -1770,7 +2694,7 @@ pub fn queueSidePanelToggleGlyph(state: *runtime.AppState, rect: palette.Rect, o
 fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
     const hovered = hover_override orelse (state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y));
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(hoverFill()), theme.scaledUi(8.0));
     }
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1786,7 +2710,7 @@ fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, 
 fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, clip: ?palette.Rect) void {
     const settings_hover = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (settings_hover) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(hoverFill()), theme.scaledUi(8.0));
     }
     const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1797,6 +2721,7 @@ fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, cli
         .h = icon_font,
     }, NF_COD_GEAR, icon_font, paletteColor(fg), clip);
     addPaletteHit(rect, .settings, 0, 0);
+    offerTooltip(state, rect, tooltipWithShortcut(state, "Settings", keyboardBindings(state, "settings")));
 }
 
 fn chatSurfaceStatusForUi(thread: *const native_state.ChatThread) native_state.SurfaceStatus {
@@ -1856,11 +2781,13 @@ fn renderOpenPaneUnit(
         // Under All Workspaces the group gets the same identity chip as a
         // standalone row, in a leading column centred on the whole group.
         const chip = theme.scaledUi(18.0);
-        const chip_column = if (open_rows_show_chip) theme.scaledUi(4.0) + chip + theme.scaledUi(6.0) else 0.0;
+        // Mini-row glyphs land on the standalone rows' icon column.
+        const show_chip = rowShowsWorkspaceChip(state, project_index);
+        const chip_column = if (show_chip) theme.scaledUi(SIDEBAR_ROW_CHIP_X_CSS) + chip + theme.scaledUi(4.0) else 0.0;
         const group_rect: palette.Rect = .{ .x = x + chip_column, .y = y_in, .w = rail_w - badge_column - chip_column, .h = height.row };
         if (rowVisible(.{ .x = x, .y = y_in, .w = rail_w, .h = height.row }, list_clip)) {
-            if (open_rows_show_chip) {
-                const chip_rect: palette.Rect = .{ .x = x + theme.scaledUi(4.0), .y = y_in + (height.row - chip) * 0.5, .w = chip, .h = chip };
+            if (show_chip) {
+                const chip_rect: palette.Rect = .{ .x = x + theme.scaledUi(SIDEBAR_ROW_CHIP_X_CSS), .y = y_in + (height.row - chip) * 0.5, .w = chip, .h = chip };
                 queueWorkspaceChip(state, chip_rect, project, false, clip);
             }
             renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
@@ -1871,7 +2798,11 @@ fn renderOpenPaneUnit(
         return y_in + height.step;
     }
     const row_rect: palette.Rect = .{ .x = x, .y = y_in, .w = rail_w, .h = height.row };
-    if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, tab_index, false);
+    if (rowVisible(row_rect, list_clip)) {
+        renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, tab_index, false);
+    } else {
+        addFocusStop(row_rect, clip, .open_pane_reorder, project_index, pane.id);
+    }
     return y_in + height.step;
 }
 
@@ -1954,7 +2885,7 @@ fn renderOpenPaneGroupSplit(
 /// Renders one live pane row: provider glyph, truncated title, and a trailing
 /// status column ("Working · m:ss" / "Waiting" / "Done" / "Failed"). With
 /// `show_workspace_tag` (attention-cluster rows) the row focuses only (no
-/// reorder drag); the identity chip follows `open_rows_show_chip`.
+/// reorder drag); the identity chip follows `rowShowsWorkspaceChip`.
 fn renderOpenPaneRow(
     state: *runtime.AppState,
     project_index: usize,
@@ -1972,25 +2903,28 @@ fn renderOpenPaneRow(
         if (value.pane_id == pane.id) value else null
     else
         null;
-    const focused = state.project_controller.selected_index == project_index and layout.focused_pane_id == pane.id;
+    // One selected treatment per pane: a split-tile member that is also an
+    // ACTIVE row keeps its selected fill on the ACTIVE row only.
+    const focused = state.project_controller.selected_index == project_index and layout.focused_pane_id == pane.id and
+        (show_workspace_tag or !paneShownInActive(project_index, pane.id));
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    // Accent-tinted fills (not the gray border token) so focus/hover track
-    // the active theme; alphas follow the command palette's selection washes.
+    // Selection is the only accent fill; hover is a neutral tint so a
+    // hovered row never reads as a second selection.
+    // The selected row is the same in every theme: the tint plus a solid
+    // accent bar at the leading edge, with the title in the primary text
+    // colour (accent text on an accent tint read at ~2.4:1).
     if (focused) {
-        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0), clip);
-        // Light palettes soften the wash, so a solid accent bar marks the row.
-        if (theme.isLightPalette()) {
-            const bar_w = theme.scaledUi(3.0);
-            const bar_inset = theme.scaledUi(6.0);
-            queuePaletteRoundedRectClipped(state, snapRect(.{
-                .x = rect.x,
-                .y = rect.y + bar_inset,
-                .w = bar_w,
-                .h = @max(rect.h - bar_inset * 2.0, bar_w),
-            }), paletteColor(theme.accent()), bar_w * 0.5, clip);
-        }
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(selectedRowFill()), theme.scaledUi(7.0), clip);
+        const bar_w = @max(@round(theme.scaledUi(3.0)), 2.0);
+        const bar_inset = theme.scaledUi(if (compact_tile) 5.0 else 8.0);
+        queuePaletteRoundedRectClipped(state, snapRect(.{
+            .x = rect.x,
+            .y = rect.y + bar_inset,
+            .w = bar_w,
+            .h = @max(rect.h - bar_inset * 2.0, bar_w),
+        }), paletteColor(selectedBarColor()), bar_w * 0.5, clip);
     } else if (hovered) {
-        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0), clip);
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(hoverFill()), theme.scaledUi(7.0), clip);
     }
     addClippedPaletteHit(rect, clip, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 
@@ -2001,13 +2935,14 @@ fn renderOpenPaneRow(
     var title_left = theme.scaledUi(leading_pad + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + icon_title_gap);
     const muted = theme.COLOR_TEXT_MUTED;
 
-    // Workspace identity chip under All Workspaces, so rows from different
-    // workspaces stay attributable; single-workspace scope omits it.
-    if (open_rows_show_chip and !compact_tile) {
+    // Workspace identity chip while the rail spans several workspaces, so
+    // rows stay attributable; ACTIVE and OPEN rows share this slot layout.
+    // The chip clears the selected row's accent bar.
+    if (rowShowsWorkspaceChip(state, project_index) and !compact_tile) {
         const chip = theme.scaledUi(18.0);
-        const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(4.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
+        const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(SIDEBAR_ROW_CHIP_X_CSS), .y = cy - chip * 0.5, .w = chip, .h = chip };
         queueWorkspaceChip(state, chip_rect, project, false, clip);
-        const shift = chip + theme.scaledUi(8.0);
+        const shift = chip + theme.scaledUi(SIDEBAR_ROW_CHIP_X_CSS);
         icon_x += shift;
         title_left += shift;
     }
@@ -2027,13 +2962,15 @@ fn renderOpenPaneRow(
     var agent_activity: chat_panel.AgentActivity = .{};
     // A `verde lease run` command of this chat waiting for or holding a lease.
     var lease_status: ?lease_run_status.Status = null;
+    // Uncommitted files this chat owns, shown as "±N" in the status column.
+    var changes_badge: ?GitChangesBadge = null;
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index < project.threads.items.len) {
                 const thread = &project.threads.items[ref.thread_index];
                 queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
-                queueGitChangesDot(state, project, thread, icon_x, cy, clip);
-                title = thread.title;
+                if (!compact_tile) changes_badge = gitChangesBadge(state, project, thread);
+                title = chatDisplayTitle(thread.title);
                 status = chatSurfaceStatusForUi(thread);
                 running = status.? == .working;
                 agent_activity = chatAgentActivity(state, project, thread);
@@ -2075,7 +3012,8 @@ fn renderOpenPaneRow(
                 const mark_color = theme.COLOR_WHITE;
                 queuePaletteAgentTerminalGlyph(state, prov, icon_x, cy, mark_color, clip);
             } else {
-                queuePaletteTerminalMark(state, icon_x, cy, theme.scaledUi(14.0), muted, clip);
+                const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
+                queueTerminalSlotGlyph(state, .{ .x = icon_x, .y = cy - slot * 0.5, .w = slot, .h = slot }, theme.scaledUi(TERMINAL_SLOT_GLYPH_CSS), muted, clip);
             }
             title = terminalPaneTitle(state, project_index, ref.dock_id, &term_title_buf);
         },
@@ -2113,7 +3051,7 @@ fn renderOpenPaneRow(
     }
 
     // Small top-right badge on the existing pane glyph: accent while shown and
-    // muted while hidden. Keeping it above the terminal underscore avoids
+    // muted while hidden. Keeping it in the glyph slot corner avoids
     // changing the row's established icon-to-title spacing.
     if (quick) |quick_state| {
         const badge_size = theme.scaledUi(8.0);
@@ -2153,67 +3091,252 @@ fn renderOpenPaneRow(
             ""
     else
         "";
-    const status_reserve = if (shortcut_label.len > 0)
-        theme.scaledUi(30.0)
-    else if (agents_label.len > 0)
-        theme.scaledUi(SIDEBAR_AGENTS_STATUS_COLUMN_CSS)
-    else if (status_label.len > 0)
-        theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS)
+    // Status words and the "±N" badge share one 12px tier and one face, so
+    // the badge is never the smallest, dimmest text in the row.
+    const status_font = theme.scaledUi(STATUS_TEXT_FONT_CSS);
+    const badge_font = status_font;
+    const status_color_opt: ?[4]f32 = if (shortcut_label.len > 0)
+        null
     else
-        theme.scaledUi(14.0);
-
-    var title_buf = std.mem.zeroes([64:0]u8);
-    const title_chars: usize = @intFromFloat(@max((rect.w - title_left - status_reserve) / theme.scaledUi(7.0), 8.0));
-    const shown = truncatedThreadTitle(&title_buf, title, title_chars);
-
-    const emphasis = focused or hovered;
-    const title_color = if (running)
-        theme.COLOR_GREEN
-    else if (emphasis)
-        theme.COLOR_WHITE
-    else
-        theme.COLOR_TEXT_MUTED;
+        paneStatusColor(status, running) orelse
+            (if (agent_activity.waiting()) chat_panel.agentActivityColor(agent_activity) else null);
+    // One measured layout places the trailing column (status words, mark,
+    // "±N" badge) and ends the title before its leftmost piece, so the
+    // title can never run under the badge whatever the label's width.
+    var badge_text_buf: [16]u8 = undefined;
+    const badge_text = if (changes_badge) |badge| gitChangesBadgeText(&badge_text_buf, badge.files) else "";
+    const trailing = rowTrailingLayout(.{
+        .row_right = rect.x + rect.w,
+        .key_tip = shortcut_label.len > 0,
+        .has_mark = status_color_opt != null,
+        .label_w = if (status_label.len > 0) text_measure.textWidth(SIDEBAR_ROW_TITLE_ROLE, status_font, status_label) else 0.0,
+        .badge_w = if (shortcut_label.len > 0 or badge_text.len == 0) 0.0 else text_measure.textWidth(SIDEBAR_ROW_TITLE_ROLE, badge_font, badge_text),
+        .min_column = if (shortcut_label.len > 0)
+            0.0
+        else if (agents_label.len > 0)
+            theme.scaledUi(SIDEBAR_AGENTS_STATUS_COLUMN_CSS)
+        else if (status_label.len > 0)
+            theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS)
+        else
+            0.0,
+        .scale = theme.scaledUi(1.0),
+    });
 
     const title_font = theme.scaledUi(13.5);
+    // Measured, codepoint-safe ellipsis in the title's own face (rows draw
+    // with the batch default role), never a per-character width guess.
+    var title_buf: [160]u8 = undefined;
+    const shown = workspace_strip.ellipsize(&title_buf, title, @max(trailing.title_right - (rect.x + title_left), 0.0), title_font, SIDEBAR_ROW_TITLE_ROLE);
+
+    // Accent stays on the indicators (bar, status pip); running and selected
+    // titles use the primary text colour so they read on the accent tint.
+    const emphasis = focused or hovered or running;
+    const title_color = if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+
     const title_line = title_font * 1.30;
     queuePaletteText(state, .{
         .x = rect.x + title_left,
         .y = @round(rect.y + (rect.h - title_line) * 0.5),
-        .w = rect.w - title_left - theme.scaledUi(12.0),
+        .w = @max(trailing.title_right - (rect.x + title_left), 0.0),
         .h = title_line,
     }, shown, paletteColor(title_color), title_font, clip);
 
-    // Trailing status column: pulsing pip plus the status text in the same
+    // Trailing status column: a status mark plus the status text in the same
     // color. The at-a-glance words/elapsed-time are what the expanded rail
-    // offers over the collapsed rail's bare dots.
+    // offers over the collapsed rail's bare dots. Marks differ by shape, not
+    // only colour: done = check, failed = cross, working = pulsing dot in a
+    // ring, waiting = pulsing dot.
+    // The "±N" changes badge leads the status mark, or ends the row alone.
     if (shortcut_label.len > 0) {
         renderSidebarShortcutKeyTip(state, rect, clip, shortcut_label);
-    } else if (paneStatusColor(status, running) orelse
-        (if (agent_activity.waiting()) chat_panel.agentActivityColor(agent_activity) else null)) |status_color|
-    {
-        const pip_color = if (agent_activity.attention > 0) theme.COLOR_YELLOW else status_color;
+    } else if (status_color_opt) |status_color| {
+        const pip_color = if (agent_activity.attention > 0) theme.warning() else status_color;
         const animated = running or agent_activity.waiting() or (if (status) |s| s == .working or s == .waiting else false);
         const pulse: f32 = if (animated) attentionPulse(state, project_index) else 1.0;
-        const dot = theme.scaledUi(6.0);
-        const status_font = theme.scaledUi(11.0);
-        // Approximate right-alignment with the same per-char width heuristic
-        // the title truncation uses; labels are short and near-uniform.
-        const est_w = @as(f32, @floatFromInt(status_label.len)) * status_font * 0.54;
-        const label_x = rect.x + rect.w - theme.scaledUi(10.0) - est_w;
-        queuePaletteRoundedRectClipped(state, .{
-            .x = label_x - dot - theme.scaledUi(6.0),
-            .y = cy - dot * 0.5,
-            .w = dot,
-            .h = dot,
-        }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5, clip);
+        const label_x = trailing.label_x;
+        const mark_kind: StatusMark = if (agents_label.len > 0)
+            .dot
+        else
+            statusMarkFor(status, running);
+        queueStatusMark(state, mark_kind, trailing.mark_cx, cy, pip_color, pulse, clip);
+        if (changes_badge) |badge| queueGitChangesBadge(state, badge, trailing.badge_right, cy, badge_font, rowBacking(focused, hovered), rect, clip);
         if (status_label.len > 0) {
+            // On the selected row's accent tint the words use the primary
+            // text colour (status-coloured text on a tint of a similar hue
+            // read poorly); the mark alone carries the status colour.
+            const label_color = if (focused) theme.COLOR_WHITE else pip_color;
             queuePaletteText(state, .{
                 .x = label_x,
                 .y = @round(cy - status_font * 0.65),
-                .w = est_w + theme.scaledUi(8.0),
+                .w = trailing.label_w + theme.scaledUi(8.0),
                 .h = status_font * 1.3,
-            }, status_label, paletteColor(pip_color), status_font, clip);
+            }, status_label, paletteColor(label_color), status_font, clip);
         }
+    } else if (changes_badge) |badge| {
+        queueGitChangesBadge(state, badge, trailing.badge_right, cy, badge_font, rowBacking(focused, hovered), rect, clip);
+    }
+}
+
+/// Inputs to `rowTrailingLayout`, in device pixels (`scale` = one UI px).
+const RowTrailingInput = struct {
+    row_right: f32,
+    /// The Ctrl-number key tip replaces the whole column (badge included).
+    key_tip: bool = false,
+    has_mark: bool = false,
+    label_w: f32 = 0.0,
+    /// Measured "±N" text width; 0 without a badge.
+    badge_w: f32 = 0.0,
+    /// Stable minimum for the label + mark, so the title does not twitch as
+    /// a "Working · m:ss" timer ticks between digit widths.
+    min_column: f32 = 0.0,
+    scale: f32 = 1.0,
+};
+
+/// Geometry of a row's trailing column, right to left: status words, mark,
+/// "±N" badge. `title_right` ends the title `TITLE_TRAILING_GAP_CSS` before
+/// the leftmost of them (or the row's end padding when there is none).
+const RowTrailingLayout = struct {
+    title_right: f32,
+    label_x: f32,
+    label_w: f32,
+    mark_cx: f32,
+    badge_left: f32,
+    badge_right: f32,
+};
+
+/// Space between the title and the trailing column.
+const TITLE_TRAILING_GAP_CSS: f32 = 8.0;
+/// Row end padding after the status words (or the lone badge).
+const STATUS_RIGHT_INSET_CSS: f32 = 10.0;
+/// Title end padding when the row has no trailing column at all.
+const TITLE_RIGHT_INSET_CSS: f32 = 14.0;
+/// Width the Ctrl-number key tip takes at the row's end.
+const KEY_TIP_COLUMN_CSS: f32 = 30.0;
+
+fn rowTrailingLayout(in: RowTrailingInput) RowTrailingLayout {
+    const right = in.row_right - STATUS_RIGHT_INSET_CSS * in.scale;
+    if (in.key_tip) {
+        return .{ .title_right = in.row_right - KEY_TIP_COLUMN_CSS * in.scale, .label_x = right, .label_w = 0.0, .mark_cx = right, .badge_left = right, .badge_right = right };
+    }
+    var out: RowTrailingLayout = .{ .title_right = in.row_right - TITLE_RIGHT_INSET_CSS * in.scale, .label_x = right - in.label_w, .label_w = in.label_w, .mark_cx = right, .badge_left = right, .badge_right = right };
+    // Left edge of the status group (mark + words), or the row end without one.
+    var group_left = right;
+    if (in.has_mark) {
+        out.mark_cx = out.label_x - STATUS_MARK_GAP_CSS * in.scale;
+        group_left = @min(out.mark_cx - STATUS_MARK_RADIUS_CSS * in.scale, right - in.min_column);
+    }
+    var leftmost = group_left;
+    if (in.badge_w > 0.0) {
+        out.badge_right = if (in.has_mark) out.mark_cx - (STATUS_MARK_RADIUS_CSS + CHANGES_BADGE_GAP_CSS) * in.scale else right;
+        out.badge_left = out.badge_right - in.badge_w;
+        leftmost = @min(leftmost, out.badge_left);
+    } else {
+        out.badge_left = group_left;
+        out.badge_right = group_left;
+    }
+    if (in.has_mark or in.badge_w > 0.0) out.title_right = @min(out.title_right, leftmost - TITLE_TRAILING_GAP_CSS * in.scale);
+    return out;
+}
+
+test "sidebar row title always ends before the changes badge and status" {
+    // Measured widths at 1.25x for the live labels; the badge texts span
+    // "±1" to "±999". Selection, hover, chips and split tiles do not move
+    // the trailing column (they only shift where the title starts), so
+    // every status × badge × scale combination covers them.
+    const labels = [_]f32{ 0.0, 28.0, 34.0, 41.0, 83.0, 96.0, 128.0 }; // none, Done, Failed, Waiting, Working · 1:21, Working · 12:34, Waiting · 2 agents
+    const badges = [_]f32{ 0.0, 14.0, 22.0, 31.0 };
+    const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
+    const row_right: f32 = 300.0;
+    for (scales) |scale| for (labels) |label_w| for ([_]bool{ false, true }) |has_mark| for (badges) |badge_w| {
+        if (label_w > 0.0 and !has_mark) continue; // status words always come with a mark
+        for ([_]f32{ 0.0, 96.0 * scale, 118.0 * scale }) |min_column| {
+            const layout = rowTrailingLayout(.{ .row_right = row_right, .has_mark = has_mark, .label_w = label_w * scale, .badge_w = badge_w * scale, .min_column = min_column, .scale = scale });
+            const gap = TITLE_TRAILING_GAP_CSS * scale;
+            if (badge_w > 0.0) {
+                // Title rect [.., title_right) never meets the badge rect.
+                try std.testing.expect(layout.title_right + gap <= layout.badge_left + 0.001);
+                try std.testing.expect(layout.badge_right <= row_right);
+            }
+            if (has_mark) {
+                const mark_left = layout.mark_cx - STATUS_MARK_RADIUS_CSS * scale;
+                try std.testing.expect(layout.title_right + gap <= mark_left + 0.001);
+                // The badge sits left of the mark, never under it.
+                if (badge_w > 0.0) try std.testing.expect(layout.badge_right <= mark_left);
+                try std.testing.expect(layout.title_right + gap <= layout.label_x + 0.001);
+            }
+            try std.testing.expect(layout.title_right <= row_right);
+        }
+    };
+    // The live regression: selected running row, "Working · 1:21" + "±26".
+    const live = rowTrailingLayout(.{ .row_right = 300.0, .has_mark = true, .label_w = 104.0, .badge_w = 28.0, .min_column = 120.0, .scale = 1.25 });
+    try std.testing.expect(live.title_right + 10.0 <= live.badge_left + 0.001);
+    // Key tip replaces the column: title stops before it.
+    const tip = rowTrailingLayout(.{ .row_right = 300.0, .key_tip = true, .badge_w = 28.0, .scale = 1.0 });
+    try std.testing.expectEqual(@as(f32, 270.0), tip.title_right);
+}
+
+/// Face sidebar row titles are drawn in: `queuePaletteText` sets no role,
+/// so the batch default applies (Palette's `default_font_role`).
+const SIDEBAR_ROW_TITLE_ROLE: palette.FontRole = .prose_bold;
+
+/// Distance from a status mark's centre to its label.
+const STATUS_MARK_GAP_CSS: f32 = 9.0;
+/// Half the widest status mark (the 12px working ring / check glyph).
+const STATUS_MARK_RADIUS_CSS: f32 = 6.0;
+
+/// Shape of a pane status mark; shared by sidebar rows and strip tabs so
+/// a state reads the same everywhere and never by colour alone.
+pub const StatusMark = enum { dot, working, check, cross };
+
+/// Status → mark shape (working ring, done check, failed cross, else dot).
+pub fn statusMarkFor(status: ?native_state.SurfaceStatus, running: bool) StatusMark {
+    if (running) return .working;
+    const s = status orelse return .dot;
+    return switch (s) {
+        .working => .working,
+        .done => .check,
+        .@"error" => .cross,
+        .waiting, .idle => .dot,
+    };
+}
+
+/// Draws a status mark centred at (`cx`, `cy`). `pulse` (0..1) breathes the
+/// dot of animated marks; the working ring and settled glyphs stay solid.
+/// The working ring is drawn here at full strength in every theme (a faint
+/// ring vanished on light tints and read as a plain dot); themes only
+/// supply the colour.
+pub fn queueStatusMark(state: *runtime.AppState, kind: StatusMark, cx: f32, cy: f32, color: [4]f32, pulse: f32, clip: palette.Rect) void {
+    switch (kind) {
+        .dot, .working => {
+            const dot = theme.scaledUi(if (kind == .working) 5.0 else 6.0);
+            queuePaletteRoundedRectClipped(state, .{
+                .x = cx - dot * 0.5,
+                .y = cy - dot * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.withAlpha(color, @intFromFloat(pulse * 255.0))), dot * 0.5, clip);
+            if (kind == .working) {
+                const ring = theme.scaledUi(12.0);
+                const stroke = @max(@round(theme.scaledUi(1.5)), 1.0);
+                state.palette_overlay_batch.rectBorderClipped(state.allocator, snapRect(.{
+                    .x = cx - ring * 0.5,
+                    .y = cy - ring * 0.5,
+                    .w = ring,
+                    .h = ring,
+                }), paletteColor(color), ring * 0.5, stroke, clip) catch {};
+            }
+        },
+        .check, .cross => {
+            const size = theme.scaledUi(12.0);
+            const glyph = if (kind == .check) NF_COD_CHECK else NF_COD_CLOSE;
+            const glyph_w = text_measure.textWidth(.icon, size, glyph);
+            queuePaletteIcon(state, .{
+                .x = cx - glyph_w * 0.5,
+                .y = cy - size * 0.65,
+                .w = glyph_w,
+                .h = size * 1.3,
+            }, glyph, size, paletteColor(color), clip);
+        },
     }
 }
 
@@ -2341,6 +3464,8 @@ pub const PanePip = struct {
     color: [4]f32,
     animated: bool,
     rank: u8,
+    /// Shape cue so the strip matches the sidebar rows (check = done, ...).
+    mark: StatusMark = .dot,
 };
 
 pub fn panePip(
@@ -2378,7 +3503,7 @@ pub fn panePip(
         .done => 1,
         .idle => if (running) 2 else 0,
     };
-    return .{ .color = color, .animated = running or s == .working or s == .waiting, .rank = rank };
+    return .{ .color = color, .animated = running or s == .working or s == .waiting, .rank = rank, .mark = statusMarkFor(status, running) };
 }
 
 /// Pulse alpha (0.35..1.0) for an animated pip; see `attentionPulse`.
@@ -2389,16 +3514,18 @@ pub fn pipPulse(state: *runtime.AppState, project_index: usize) f32 {
 /// Maps a terminal surface status (and chat running state) to a sidebar status
 /// pip color, or null when the pane needs no attention indicator.
 fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
+    // Shared status roles: running never shares a hue with done/success,
+    // even in themes whose accent is green (Verde Dark/Light).
     if (status) |s| {
         return switch (s) {
-            .working => theme.COLOR_GREEN,
-            .waiting => theme.COLOR_YELLOW,
-            .@"error" => theme.COLOR_DIFF_REMOVE,
-            .done => theme.success(),
-            .idle => if (running) theme.COLOR_GREEN else null,
+            .working => theme.statusRunning(),
+            .waiting => theme.warning(),
+            .@"error" => theme.statusFailed(),
+            .done => theme.statusSuccess(),
+            .idle => if (running) theme.statusRunning() else null,
         };
     }
-    if (running) return theme.COLOR_GREEN;
+    if (running) return theme.statusRunning();
     return null;
 }
 
@@ -2430,7 +3557,13 @@ fn intersectRects(a: palette.Rect, b: palette.Rect) ?palette.Rect {
     return .{ .x = left, .y = top, .w = right - left, .h = bottom - top };
 }
 
+/// Registers a pinned control's hit region and its keyboard Tab stop.
 fn addPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
+    addFocusStop(rect, palette_sidebar_rect, kind, project_index, thread_index);
+    appendPaletteHit(rect, kind, project_index, thread_index);
+}
+
+fn appendPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
     if (palette_hit_count >= palette_hits.len) return;
     palette_hits[palette_hit_count] = .{
         .rect = rect,
@@ -2441,8 +3574,11 @@ fn addPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize,
     palette_hit_count += 1;
 }
 
+/// A scrolling row: the hit is clipped to the list, the Tab stop keeps the
+/// unclipped rect so keyboard focus can scroll it fully into view.
 fn addClippedPaletteHit(rect: palette.Rect, clip: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
-    if (intersectRects(rect, clip)) |hit_rect| addPaletteHit(hit_rect, kind, project_index, thread_index);
+    addFocusStop(rect, clip, kind, project_index, thread_index);
+    if (intersectRects(rect, clip)) |hit_rect| appendPaletteHit(hit_rect, kind, project_index, thread_index);
 }
 
 fn renderSidebarOverflowScrollbar(
@@ -2461,7 +3597,17 @@ fn renderSidebarOverflowScrollbar(
     const thumb_h = @max(theme.scaledUi(34.0), track.h * (track.h / (track.h + max_scroll_y)));
     const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll_y);
     queuePaletteRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
-    queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
+    // Shared thumb colour: quiet at rest, firmer while the pointer is over
+    // the scrollbar edge of the list.
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const hover_band: palette.Rect = .{ .x = clip.x + clip.w - theme.scaledUi(12.0), .y = clip.y, .w = theme.scaledUi(12.0), .h = clip.h };
+    if (scrollbar_band_count < scrollbar_bands.len) {
+        scrollbar_bands[scrollbar_band_count] = hover_band;
+        scrollbar_band_count += 1;
+    }
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(hover_band, mx, my);
+    queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(hovered)), theme.scaledUi(2.0));
 }
 
 fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
@@ -2504,13 +3650,14 @@ const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
 const NF_COD_HISTORY = "\u{EA82}";
 const NF_COD_SEARCH = "\u{EA6D}";
+const NF_COD_CHECK = "\u{EAB2}";
+const NF_COD_CLOSE = "\u{EA76}";
 // Font Awesome's overlapping-window mark. It badges floating panes without
 // replacing the pane-kind/provider glyph users already recognize.
 const NF_FA_WINDOW_RESTORE = "\u{F2D2}";
 // Panel-style sidebar toggle (VS Code's layout-sidebar-left): filled left pane
 // while the rail is expanded, hollow "off" variant while collapsed.
 const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";
-const NF_COD_LAYOUT_SIDEBAR_LEFT_OFF = "\u{EC02}";
 const NF_COD_LAYOUT_SIDEBAR_RIGHT = "\u{EBF4}";
 const NF_COD_LAYOUT_SIDEBAR_RIGHT_OFF = "\u{EC00}";
 
@@ -2685,18 +3832,6 @@ pub fn stripLeadingTitleSymbols(title: []const u8) []const u8 {
     return title;
 }
 
-/// Truncates a thread title for narrow sidebar rows.
-fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:0]const u8 {
-    const bounded_max = @min(buffer.len - 1, max_len);
-    if (value.len <= bounded_max) return std.fmt.bufPrintZ(buffer, "{s}", .{value}) catch value[0..bounded_max :0];
-    if (bounded_max <= 3) return "...";
-    const prefix_len = bounded_max - 3;
-    @memcpy(buffer[0..prefix_len], value[0..prefix_len]);
-    @memcpy(buffer[prefix_len..bounded_max], "...");
-    buffer[bounded_max] = 0;
-    return buffer[0..bounded_max :0];
-}
-
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
 }
@@ -2723,26 +3858,86 @@ pub fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}d", .{days}) catch "…";
 }
 
-/// Small dot at the provider glyph's lower-right corner when the chat owns
-/// uncommitted git changes; amber when a file needs an ownership decision.
-fn queueGitChangesDot(
-    state: *runtime.AppState,
-    project: *const native_state.Project,
-    thread: *const native_state.ChatThread,
-    icon_x: f32,
-    center_y: f32,
-    clip: palette.Rect,
-) void {
+/// Uncommitted-change counts a chat row shows as its "±N" badge, or null
+/// when the chat owns no uncommitted files.
+const GitChangesBadge = struct { files: u32, attention: u32 };
+
+fn gitChangesBadge(state: *runtime.AppState, project: *const native_state.Project, thread: *const native_state.ChatThread) ?GitChangesBadge {
     state.ensureGitChangesSummary(project.id);
-    if (!thread.committed) return;
-    const summary = state.gitChangesThreadSummary(thread.local_thread_id) orelse return;
-    if (summary.files == 0) return;
-    const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-    const dot = theme.scaledUi(7.0);
-    const cx = icon_x + slot - dot * 0.35;
-    const dot_cy = center_y + slot * 0.5 - dot * 0.35;
-    const color = if (summary.attention > 0) theme.COLOR_YELLOW else theme.COLOR_TEXT_MUTED;
-    queuePaletteRoundedRectClipped(state, snapRect(.{ .x = cx - dot * 0.5, .y = dot_cy - dot * 0.5, .w = dot, .h = dot }), paletteColor(color), dot * 0.5, clip);
+    if (!thread.committed) return null;
+    const summary = state.gitChangesThreadSummary(thread.local_thread_id) orelse return null;
+    if (summary.files == 0) return null;
+    return .{ .files = summary.files, .attention = summary.attention };
+}
+
+/// Gap between the "±N" changes badge and the status mark.
+const CHANGES_BADGE_GAP_CSS: f32 = 8.0;
+/// Status words and "±N" badge text size (UI px): the 12px floor.
+const STATUS_TEXT_FONT_CSS: f32 = 12.0;
+
+/// Muted "±N" text badge in the trailing status column, right-aligned at
+/// `right`; hovering it explains the count.
+fn queueGitChangesBadge(state: *runtime.AppState, badge: GitChangesBadge, right: f32, cy: f32, font: f32, backing: [4]f32, row: palette.Rect, clip: palette.Rect) void {
+    var text_buf: [16]u8 = undefined;
+    const text = gitChangesBadgeText(&text_buf, badge.files);
+    // Same face as the status words beside it (rows draw with the batch
+    // default role), measured the same way the trailing layout measured it.
+    const w = text_measure.textWidth(SIDEBAR_ROW_TITLE_ROLE, font, text);
+    const rect: palette.Rect = .{ .x = right - w, .y = @round(cy - font * 0.65), .w = w, .h = font * 1.3 };
+    queuePaletteText(state, .{ .x = rect.x, .y = rect.y, .w = w + theme.scaledUi(4.0), .h = rect.h }, text, paletteColor(readableMutedOn(backing)), font, clip);
+    if (intersectRects(rect, clip)) |target| {
+        var label_buf: [80]u8 = undefined;
+        // Just right of the rail, level with this row, so the explanation
+        // covers neither neighbouring row nor this row's status; the
+        // fallback still keeps it off the row below, which the eye reads next.
+        const next_row: palette.Rect = .{ .x = row.x, .y = row.y + row.h, .w = row.w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS) };
+        offerTooltipBeside(state, target, gitChangesBadgeLabel(&label_buf, badge.files, badge.attention), &.{next_row}, clip.x + clip.w + theme.scaledUi(8.0));
+    }
+}
+
+/// WCAG AA body-text contrast for small meta text.
+const META_TEXT_MIN_CONTRAST: f32 = 4.5;
+
+/// Muted text that still reads at ≥4.5:1 on `backing` (opaque): the muted
+/// tier, mixed toward the primary text colour only as far as needed.
+fn readableMutedOn(backing: [4]f32) [4]f32 {
+    var color = theme.COLOR_TEXT_MUTED;
+    var amount: f32 = 0.0;
+    while (theme.contrastRatio(color, backing) < META_TEXT_MIN_CONTRAST and amount < 1.0) {
+        amount = @min(amount + 0.1, 1.0);
+        color = theme.mix(theme.COLOR_TEXT_MUTED, theme.COLOR_WHITE, amount);
+    }
+    return color;
+}
+
+/// Opaque fill under a pane row: selected accent tint, neutral hover, or
+/// the bare panel. Mirrors the fills `renderOpenPaneRow` draws.
+fn rowBacking(focused: bool, hovered: bool) [4]f32 {
+    if (focused) return selectedRowFill();
+    if (hovered) return hoverFill();
+    return .{ theme.COLOR_PANEL[0], theme.COLOR_PANEL[1], theme.COLOR_PANEL[2], 1.0 };
+}
+
+fn gitChangesBadgeText(buf: []u8, files: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "±{d}", .{files}) catch "±";
+}
+
+/// Tooltip for the "±N" changes badge: "3 uncommitted files" plus how many
+/// need an ownership decision.
+/// Plain-language "±N" tooltip. `files` are the uncommitted files this chat
+/// changed; `attention` counts those also changed by another chat or with
+/// no clear owner (git_changes_protocol `ThreadSummary.attention`).
+fn gitChangesBadgeLabel(buf: []u8, files: u32, attention: u32) []const u8 {
+    const noun = if (files == 1) "file" else "files";
+    if (attention == 0) return std.fmt.bufPrint(buf, "{d} changed {s}", .{ files, noun }) catch "Changed files";
+    return std.fmt.bufPrint(buf, "{d} changed {s} · {d} not clearly owned by this chat", .{ files, noun, attention }) catch "Changed files";
+}
+
+test "git changes badge tooltip explains the count" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("1 changed file", gitChangesBadgeLabel(&buf, 1, 0));
+    try std.testing.expectEqualStrings("22 changed files · 18 not clearly owned by this chat", gitChangesBadgeLabel(&buf, 22, 18));
+    try std.testing.expectEqualStrings("4 changed files · 1 not clearly owned by this chat", gitChangesBadgeLabel(&buf, 4, 1));
 }
 
 pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
@@ -2753,6 +3948,62 @@ pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x
         .w = image_size,
         .h = image_size,
     }, clip);
+}
+
+/// Compact pane-kind glyph fitted in a square `slot`: the chat's provider
+/// logo, a terminal's agent logo (or the terminal glyph), the browser globe, or the file
+/// type icon. Used by the workspace tab strip so tabs carry the same identity
+/// cue as sidebar rows.
+pub fn queuePaneGlyph(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+    slot: palette.Rect,
+    clip: palette.Rect,
+) void {
+    const cy = slot.y + slot.h * 0.5;
+    switch (pane.ref) {
+        .chat => |ref| {
+            if (ref.thread_index >= project.threads.items.len) return;
+            const provider = terminalAgentProviderFromChatProvider(project.threads.items[ref.thread_index].provider);
+            queuePaletteProviderGlyphInRect(state, provider, slot, clip);
+        },
+        .terminal => |ref| {
+            var comm_buf: [96]u8 = undefined;
+            var foreground_process: ?[]const u8 = null;
+            var pinned_provider: ?[]const u8 = null;
+            if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                foreground_process = dock.activeForegroundProcessName(&comm_buf);
+                pinned_provider = dock.activeTabPinnedProvider();
+            }
+            const surface = state.projectTerminalSurface(project_index, ref.dock_id);
+            if (terminalAgentProviderForMetadata(if (surface) |sf| sf.provider else null, foreground_process, pinned_provider)) |prov| {
+                queuePaletteProviderGlyphInRect(state, prov, slot, clip);
+            } else {
+                queueTerminalSlotGlyph(state, slot, slot.h * 0.85, theme.COLOR_TEXT_MUTED, clip);
+            }
+        },
+        .browser => {
+            const globe_size = slot.h * 0.8;
+            if (intersectRects(slot, clip)) |visible| {
+                if (visible.w + 0.5 >= slot.w) globe_icon.queue(state, slot.x + slot.w * 0.5, cy, globe_size, paletteColor(theme.COLOR_TEXT_MUTED));
+            }
+        },
+        .file => |ref| {
+            const icon = file_icons.forFile(std.fs.path.basename(ref.path));
+            const glyph_size = slot.h * 0.8;
+            const glyph_w = text_measure.textWidth(.icon, glyph_size, icon.glyph);
+            queuePaletteIcon(
+                state,
+                .{ .x = slot.x + (slot.w - glyph_w) * 0.5, .y = cy - glyph_size * 0.65, .w = glyph_w, .h = glyph_size * 1.3 },
+                icon.glyph,
+                glyph_size,
+                paletteColor(theme.legibleOn(icon.color, theme.background())),
+                clip,
+            );
+        },
+    }
 }
 
 pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: native_state.AgentTuiHistoryProvider, x: f32, center_y: f32, clip: palette.Rect) void {
@@ -2889,25 +4140,42 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
 }
 
 /// Composite glyph for an agent running in a terminal pane: the provider logo
-/// sits in the upper-left, a font-safe `>_` prompt mark in the lower-right, and
-/// a diagonal slash divides them.
+/// followed by a small terminal mark.
 fn queuePaletteAgentTerminalGlyph(state: *runtime.AppState, provider: TerminalAgentProvider, x: f32, center_y: f32, term_color: [4]f32, clip: palette.Rect) void {
-    // Provider logo, then a `>_` prompt — laid out horizontally and vertically
-    // centered. Kept deliberately simple (no diagonal/divider primitives) so it
+    // Provider logo, then the terminal mark — laid out horizontally and
+    // vertically centered. Kept deliberately simple (no diagonal/divider primitives) so it
     // renders cleanly at sidebar size.
     const logo = theme.scaledUi(15.0);
     queuePaletteProviderGlyphInRect(state, provider, .{ .x = x, .y = center_y - logo * 0.5, .w = logo, .h = logo }, clip);
     queuePaletteTerminalMark(state, x + logo + theme.scaledUi(1.0), center_y, theme.scaledUi(11.0), term_color, clip);
 }
 
-/// Draws a font-safe `>_` shell-prompt mark for terminal panes.
+/// Unscaled size of the terminal glyph in a row's 22px icon slot; matches
+/// the optical size of the provider logos beside it.
+const TERMINAL_SLOT_GLYPH_CSS: f32 = 18.0;
+
+/// Codicon terminal glyph centred in an icon `slot`, so terminal rows and
+/// tabs share the provider logos' slot (and the rail's "New terminal" icon)
+/// instead of a smaller, left-hugging `>_` text mark.
+fn queueTerminalSlotGlyph(state: *runtime.AppState, slot: palette.Rect, size: f32, color: [4]f32, clip: palette.Rect) void {
+    const glyph_w = text_measure.textWidth(.icon, size, NF_COD_TERMINAL);
+    queuePaletteIcon(state, .{
+        .x = slot.x + (slot.w - glyph_w) * 0.5,
+        .y = slot.y + (slot.h - size * 1.3) * 0.5,
+        .w = glyph_w,
+        .h = size * 1.3,
+    }, NF_COD_TERMINAL, size, paletteColor(color), clip);
+}
+
+/// Small codicon terminal mark trailing an agent logo (agent TUI rows).
 fn queuePaletteTerminalMark(state: *runtime.AppState, x: f32, center_y: f32, size: f32, color: [4]f32, clip: ?palette.Rect) void {
-    queuePaletteText(state, .{
+    const glyph_w = text_measure.textWidth(.icon, size, NF_COD_TERMINAL);
+    queuePaletteIcon(state, .{
         .x = x,
-        .y = center_y - size * 0.62,
-        .w = size * 1.9,
-        .h = size * 1.25,
-    }, ">_", paletteColor(color), size, clip);
+        .y = center_y - size * 0.65,
+        .w = glyph_w,
+        .h = size * 1.3,
+    }, NF_COD_TERMINAL, size, paletteColor(color), clip);
 }
 
 /// Draws a thick line segment between two points using two triangles.

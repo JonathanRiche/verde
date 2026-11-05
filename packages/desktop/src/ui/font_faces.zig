@@ -6,7 +6,6 @@
 const std = @import("std");
 const palette = @import("palette");
 
-pub const cal_sans = @embedFile("../assets/fonts/CalSans-Regular.ttf");
 pub const noto_sans_regular = @embedFile("../assets/fonts/NotoSans-Regular.ttf");
 pub const noto_sans_bold = @embedFile("../assets/fonts/NotoSans-Bold.ttf");
 pub const noto_sans_italic = @embedFile("../assets/fonts/NotoSans-Italic.ttf");
@@ -23,8 +22,11 @@ pub const noto_emoji = @embedFile("../assets/fonts/NotoEmoji-Regular.ttf");
 /// Paths are read while `palette.fonts.Fonts.init` runs.
 pub fn bundled(mono_path: ?[]const u8, math_path: ?[]const u8) palette.fonts.FaceSet {
     return .{
-        .ui = .{ .memory = cal_sans },
-        // ui_bold and prose_bold both resolve to Noto Sans Bold.
+        // Chrome and body share one family: Noto Sans Regular for the ui role.
+        // (Cal Sans, the old display face, collapsed word spaces at chrome
+        // sizes: "Openbrowser", "Fullaccess".) ui_bold and prose_bold both
+        // resolve to Noto Sans Bold.
+        .ui = .{ .memory = noto_sans_regular },
         .bold = .{ .memory = noto_sans_bold },
         .prose = .{ .memory = noto_sans_regular },
         .italic = .{ .memory = noto_sans_italic },

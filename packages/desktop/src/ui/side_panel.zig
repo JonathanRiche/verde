@@ -17,6 +17,7 @@ const host = @import("host.zig");
 const palette = @import("palette");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
+const tooltip = @import("tooltip.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const changes_view = @import("side_panel_changes.zig");
@@ -31,14 +32,13 @@ const WorkspacePaneId = workspace_layout.WorkspacePaneId;
 
 const HEADER_H_UI: f32 = 36.0;
 const HEADER_PAD_X_UI: f32 = 10.0;
-const VIEW_TAB_PAD_X_UI: f32 = 10.0;
+const VIEW_TAB_W_UI: f32 = 30.0;
 const VIEW_TAB_GAP_UI: f32 = 2.0;
 const VIEW_TAB_H_UI: f32 = 26.0;
 const VIEW_TAB_RADIUS_UI: f32 = 6.0;
 const LABEL_FONT_UI: f32 = 13.0;
-const ICON_BUTTON_UI: f32 = 26.0;
+const ICON_BUTTON_UI: f32 = 30.0;
 const ICON_FONT_UI: f32 = 15.0;
-const BADGE_UI: f32 = 6.0;
 /// Pointer slop either side of the panel's left edge for resizing.
 const RESIZE_GRIP_UI: f32 = 4.0;
 /// Below these widths the panel stays hidden (its open state is kept).
@@ -60,19 +60,31 @@ const NF_COD_LINK_EXTERNAL = "\u{EB14}";
 const NF_COD_GLOBE = "\u{EB01}";
 const NF_COD_HUBOT = "\u{EB08}";
 const NF_COD_SOURCE_CONTROL = "\u{EA68}";
-const NF_COD_FILES = "\u{EAF0}";
+const NF_COD_FOLDER = "\u{EA83}";
 
 /// View tabs in header order.
-const VIEW_TABS = [_]struct { view: SidePanelView, label: []const u8, glyph: []const u8 }{
-    .{ .view = .browser, .label = "Browser", .glyph = NF_COD_GLOBE },
-    .{ .view = .agents, .label = "Agents", .glyph = NF_COD_HUBOT },
-    .{ .view = .changes, .label = "Changes", .glyph = NF_COD_SOURCE_CONTROL },
-    .{ .view = .files, .label = "Files", .glyph = NF_COD_FILES },
+const VIEW_TABS = [_]struct { view: SidePanelView, hint: []const u8, glyph: []const u8 }{
+    .{ .view = .browser, .hint = "Browser · Ctrl+F6 for panel controls", .glyph = NF_COD_GLOBE },
+    .{ .view = .agents, .hint = "Agents · Ctrl+F6 for panel controls", .glyph = NF_COD_HUBOT },
+    .{ .view = .changes, .hint = "Changes · Ctrl+F6 for panel controls", .glyph = NF_COD_SOURCE_CONTROL },
+    .{ .view = .files, .hint = "Files · Ctrl+F6 for panel controls", .glyph = NF_COD_FOLDER },
 };
 
 pub const HitKind = enum { view_tab, file_tab, file_close, pop_out, close, open_browser };
 
 const Hit = struct { rect: palette.Rect, kind: HitKind, view: SidePanelView = .browser, pane_id: WorkspacePaneId = 0 };
+
+const HeaderKey = struct {
+    kind: HitKind,
+    view: SidePanelView,
+    pane_id: WorkspacePaneId,
+
+    fn fromHit(hit: Hit) HeaderKey {
+        return .{ .kind = hit.kind, .view = hit.view, .pane_id = hit.pane_id };
+    }
+};
+const HeaderFocus = struct { key: HeaderKey, project: usize, tab: WorkspacePaneId };
+var header_focus: ?HeaderFocus = null;
 
 var hits: [64]Hit = undefined;
 var hit_count: usize = 0;
@@ -153,12 +165,11 @@ pub fn render(state: *runtime.AppState, workspace: palette.Rect, rect: palette.R
     renderHeader(state, header_rect, view, file_pane);
     queueRect(state, .{ .x = header_rect.x, .y = rect.y + header_h, .w = header_rect.w, .h = stroke }, paletteColor(theme.borderMuted()));
 
-    const body: palette.Rect = .{
-        .x = rect.x + stroke,
-        .y = rect.y + header_h + stroke,
-        .w = rect.w - stroke,
-        .h = @max(rect.h - header_h - stroke, 0.0),
-    };
+    // The launcher is 44 display units plus its edge inset and shadow.
+    // Shorten the actual viewport (and hits), so the final row can scroll
+    // completely above it in every panel view, including native web content.
+    const bottom_safe_area: f32 = if (state.isCompanionEnabled()) @round(60.0 * theme.displayScaleFactor()) else 0.0;
+    const body = panelBodyRect(rect, header_h, stroke, bottom_safe_area);
     body_rect = body;
     body_view = view;
     switch (view) {
@@ -196,37 +207,42 @@ pub fn render(state: *runtime.AppState, workspace: palette.Rect, rect: palette.R
     }
 }
 
+fn panelBodyRect(rect: palette.Rect, header_h: f32, stroke: f32, bottom_safe_area: f32) palette.Rect {
+    return .{
+        .x = rect.x + stroke,
+        .y = rect.y + header_h + stroke,
+        .w = @max(rect.w - stroke, 0.0),
+        .h = @max(rect.h - header_h - stroke - bottom_safe_area, 0.0),
+    };
+}
+
+test "side panel viewport reserves launcher safe area and clamps small panels" {
+    const rect = palette.Rect{ .x = 900, .y = 40, .w = 400, .h = 760 };
+    const full = panelBodyRect(rect, 36, 1, 0);
+    const safe = panelBodyRect(rect, 36, 1, 60);
+    try std.testing.expectEqual(full.x, safe.x);
+    try std.testing.expectEqual(full.y, safe.y);
+    try std.testing.expectEqual(full.w, safe.w);
+    try std.testing.expectEqual(@as(f32, 60), full.h - safe.h);
+    try std.testing.expectEqual(rect.y + rect.h - 60, safe.y + safe.h);
+    const tiny = panelBodyRect(.{ .w = 0, .h = 40 }, 36, 1, 60);
+    try std.testing.expectEqual(@as(f32, 0), tiny.w);
+    try std.testing.expectEqual(@as(f32, 0), tiny.h);
+}
+
 fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelView, file_pane: ?WorkspacePaneId) void {
     const pad = theme.scaledUi(HEADER_PAD_X_UI);
-    const font = theme.scaledUi(LABEL_FONT_UI);
     const icon_font = theme.scaledUi(ICON_FONT_UI);
     const tab_h = theme.scaledUi(VIEW_TAB_H_UI);
     const tab_y = rect.y + (rect.h - tab_h) * 0.5;
-    const tab_pad = theme.scaledUi(VIEW_TAB_PAD_X_UI);
     const gap = theme.scaledUi(VIEW_TAB_GAP_UI);
-    const dot = theme.scaledUi(BADGE_UI);
-    const agents_active = if (state.sidePanelChatPaneId()) |pane_id| chat_panel.agentActivityForPane(state, pane_id).waiting() else false;
-
     var file_buffer: [64]WorkspacePaneId = undefined;
     const files = dockedFiles(state, &file_buffer);
 
-    // Labels when they fit beside the actions (and a file tab or two), else
-    // icon-only tabs.
-    const actions_w = theme.scaledUi(ICON_BUTTON_UI) * 2.0 + theme.scaledUi(4.0) + pad;
-    const files_min_w = @as(f32, @floatFromInt(@min(files.len, 2))) * theme.scaledUi(FILE_TAB_MIN_W_UI);
-    var labels_w: f32 = 0.0;
-    for (VIEW_TABS) |entry| {
-        labels_w += runtime.paletteUiTextPrefixWidth(entry.label, font, entry.label.len) + tab_pad * 2.0 + gap;
-        if (entry.view == .agents and agents_active) labels_w += dot + theme.scaledUi(6.0);
-    }
-    const compact = pad + labels_w + actions_w + files_min_w > rect.w;
-
+    // Stable icon tabs leave docked file names room without changing targets.
     var x = rect.x + pad;
     for (VIEW_TABS) |entry| {
-        const content_w = if (compact) icon_font else runtime.paletteUiTextPrefixWidth(entry.label, font, entry.label.len);
-        const badge_w = if (entry.view == .agents and agents_active) dot + theme.scaledUi(if (compact) 3.0 else 6.0) else 0.0;
-        const inner_pad = if (compact) theme.scaledUi(6.0) else tab_pad;
-        const tab = snap(.{ .x = x, .y = tab_y, .w = content_w + badge_w + inner_pad * 2.0, .h = tab_h });
+        const tab = snap(.{ .x = x, .y = tab_y, .w = theme.scaledUi(VIEW_TAB_W_UI), .h = tab_h });
         const selected = entry.view == view;
         const hovered = mouseIn(state, tab);
         if (selected or hovered) {
@@ -234,30 +250,13 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelVie
             queueRounded(state, tab, paletteColor(fill), theme.scaledUi(VIEW_TAB_RADIUS_UI), rect);
         }
         const color = if (selected) theme.COLOR_WHITE else if (hovered) theme.raise(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
-        if (compact) {
-            queueIcon(state, .{
-                .x = tab.x + inner_pad,
-                .y = tab.y + (tab.h - icon_font) * 0.5,
-                .w = icon_font,
-                .h = icon_font,
-            }, entry.glyph, paletteColor(color), icon_font, rect);
-        } else {
-            const line_h = font * 1.25;
-            queueText(state, .{
-                .x = tab.x + inner_pad,
-                .y = tab.y + (tab.h - line_h) * 0.5,
-                .w = content_w + theme.scaledUi(2.0),
-                .h = line_h,
-            }, entry.label, paletteColor(color), font, rect);
-        }
-        if (badge_w > 0.0) {
-            queueRounded(state, .{
-                .x = tab.x + tab.w - inner_pad - dot,
-                .y = tab.y + (tab.h - dot) * 0.5,
-                .w = dot,
-                .h = dot,
-            }, paletteColor(theme.COLOR_GREEN), dot * 0.5, rect);
-        }
+        queueIcon(state, .{
+            .x = tab.x + (tab.w - icon_font) * 0.5,
+            .y = tab.y + (tab.h - icon_font) * 0.5,
+            .w = icon_font,
+            .h = icon_font,
+        }, entry.glyph, paletteColor(color), icon_font, rect);
+        tooltip.queueAvoiding(state, tab, entry.hint, &.{rect});
         addHit(.{ .rect = tab, .kind = .view_tab, .view = entry.view });
         x = tab.x + tab.w + gap;
     }
@@ -268,11 +267,13 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelVie
     const close_rect = snap(.{ .x = right - button, .y = rect.y + (rect.h - button) * 0.5, .w = button, .h = button });
     renderIconButton(state, close_rect, NF_COD_CLOSE, rect);
     addHit(.{ .rect = close_rect, .kind = .close });
+    tooltip.queueAvoiding(state, close_rect, "Close side panel", &.{rect});
     right = close_rect.x - theme.scaledUi(4.0);
     if ((view == .browser and state.sidePanelBrowserPaneId() != null) or view == .file) {
         const pop_rect = snap(.{ .x = right - button, .y = close_rect.y, .w = button, .h = button });
         renderIconButton(state, pop_rect, NF_COD_LINK_EXTERNAL, rect);
         addHit(.{ .rect = pop_rect, .kind = .pop_out });
+        tooltip.queueAvoiding(state, pop_rect, "Move to own tab", &.{rect});
     }
 
     if (files.len > 0) {
@@ -281,6 +282,9 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelVie
         queueRect(state, snap(.{ .x = x + gap, .y = rect.y + (rect.h - divider_h) * 0.5, .w = stroke, .h = divider_h }), paletteColor(theme.borderMuted()));
         const strip: palette.Rect = .{ .x = x + gap * 2.0 + stroke, .y = rect.y, .w = @max(close_rect.x - button - theme.scaledUi(8.0) - (x + gap * 2.0 + stroke), 0.0), .h = rect.h };
         renderFileTabs(state, strip, tab_y, tab_h, files, if (view == .file) file_pane else null);
+    }
+    if (headerFocusHit(state)) |hit| {
+        state.palette_overlay_batch.panel(state.allocator, hit.rect, .{ .a = 0 }, paletteColor(theme.accent()), theme.scaledUi(VIEW_TAB_RADIUS_UI), @max(@round(theme.scaledUi(1)), 1)) catch {};
     }
 }
 
@@ -429,6 +433,119 @@ fn renderBrowserEmpty(state: *runtime.AppState, rect: palette.Rect) void {
         .h = line_h,
     }, label, paletteColor(theme.foregroundOn(fill)), body_font * 1.08, button);
     addHit(.{ .rect = button, .kind = .open_browser });
+}
+
+/// Clear keyboard-only chrome focus when a click or another region takes focus.
+pub fn clearHeaderFocus(state: *runtime.AppState) void {
+    if (header_focus == null) return;
+    header_focus = null;
+    state.markDirty();
+}
+
+fn headerFocusHit(state: *runtime.AppState) ?Hit {
+    const focus = header_focus orelse return null;
+    if (panel_rect != null and state.isSidePanelOpen() and
+        focus.project == state.project_controller.selected_index and
+        focus.tab == state.sidePanelTabId())
+    {
+        for (hits[0..hit_count]) |hit| {
+            if (std.meta.eql(focus.key, HeaderKey.fromHit(hit))) return hit;
+        }
+    }
+    header_focus = null;
+    return null;
+}
+
+fn focusHeaderHit(state: *runtime.AppState, hit: Hit) void {
+    header_focus = .{ .key = HeaderKey.fromHit(hit), .project = state.project_controller.selected_index, .tab = state.sidePanelTabId() orelse return };
+    state.markDirty();
+}
+
+/// Ctrl+F6 reaches panel chrome from any pane; F6 also works from its body.
+/// Tab treats the view tabs as one stop; arrows choose within that group.
+/// Unhandled typing returns immediately to its existing input surface.
+pub fn handleHeaderKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!event.down) return false;
+    const current = headerFocusHit(state);
+    const enter = event.key == .f6 and !event.mod.shift and !event.mod.alt and
+        (event.mod.ctrl or bodyHasKeyboard(state));
+    if (panel_rect == null or !state.isSidePanelOpen() or hit_count == 0) {
+        clearHeaderFocus(state);
+        return false;
+    }
+    if (enter) {
+        if (event.repeat) return true;
+        if (current != null) {
+            clearHeaderFocus(state);
+        } else {
+            for (hits[0..hit_count]) |hit| {
+                const panel = state.currentSidePanel() orelse return false;
+                const active_view = if (panel.view == .file) panel.return_view else panel.view;
+                if (hit.kind == .view_tab and hit.view == active_view) {
+                    focusHeaderHit(state, hit);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+    const selected = current orelse return false;
+    const panel = state.currentSidePanel() orelse return false;
+    const active_view = if (panel.view == .file) panel.return_view else panel.view;
+    switch (event.key) {
+        .lshift, .rshift, .lctrl, .rctrl, .lalt, .ralt, .lgui, .rgui => return true,
+        else => {},
+    }
+    if (event.mod.primary() or event.mod.alt) {
+        clearHeaderFocus(state);
+        return false;
+    }
+    switch (event.key) {
+        .escape, .f6 => clearHeaderFocus(state),
+        .@"return", .kp_enter, .space => {
+            if (!event.repeat) activate(state, selected);
+            if (!state.isSidePanelOpen()) clearHeaderFocus(state);
+            state.markDirty();
+        },
+        .tab, .left, .right, .up, .down, .home, .end => {
+            var stops: [hits.len]Hit = undefined;
+            var count: usize = 0;
+            const arrows_in_group = selected.kind == .view_tab and event.key != .tab;
+            for (hits[0..hit_count]) |hit| {
+                if (hit.kind == .open_browser) continue;
+                if (arrows_in_group) {
+                    if (hit.kind != .view_tab) continue;
+                } else if (hit.kind == .view_tab and hit.view != (if (selected.kind == .view_tab) selected.view else active_view)) continue;
+                stops[count] = hit;
+                count += 1;
+            }
+            if (count == 0) {
+                clearHeaderFocus(state);
+                return false;
+            }
+            std.mem.sort(Hit, stops[0..count], {}, struct {
+                fn less(_: void, a: Hit, b: Hit) bool {
+                    return a.rect.x < b.rect.x;
+                }
+            }.less);
+            var index: usize = 0;
+            for (stops[0..count], 0..) |hit, i| {
+                if (std.meta.eql(HeaderKey.fromHit(hit), HeaderKey.fromHit(selected))) {
+                    index = i;
+                    break;
+                }
+            }
+            const backwards = event.key == .left or event.key == .up or (event.key == .tab and event.mod.shift);
+            const next = if (event.key == .home) 0 else if (event.key == .end) count - 1 else (index + (if (backwards) count - 1 else 1)) % count;
+            focusHeaderHit(state, stops[next]);
+        },
+        else => {
+            clearHeaderFocus(state);
+            return false;
+        },
+    }
+    return true;
 }
 
 /// Clicks on the panel: chrome and resize grip first, then the selected
@@ -698,4 +815,92 @@ fn queueIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, co
 
 fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
+}
+
+test "side panel header keeps icon targets stable and releases keyboard ownership" {
+    const storage_mod = @import("../state/storage.zig");
+    const app_config = @import("../app/config.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    defer {
+        clearHeaderFocus(&state);
+        resetHitCache();
+        body_focused = false;
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    try state.project_controller.projects.append(allocator, try runtime.Project.init(allocator, "panel-header", "Header", "/tmp/header", 0));
+    state.project_controller.selected_index = 0;
+    state.setSidePanelView(.agents);
+    state.terminal_controller.focused = true;
+    state.transcript_controller.palette_mouse_in_workspace = false;
+    for ([_]f32{ 300, 480, 800 }) |width| {
+        resetHitCache();
+        const rect = palette.Rect{ .x = 900, .y = 20, .w = theme.scaledUi(width), .h = theme.scaledUi(HEADER_H_UI) };
+        panel_rect = rect;
+        const start = state.palette_overlay_batch.commands.items.len;
+        renderHeader(&state, rect, .agents, null);
+        var tabs: usize = 0;
+        for (hits[0..hit_count]) |hit| {
+            if (hit.kind != .view_tab) continue;
+            try std.testing.expectEqual(VIEW_TABS[tabs].view, hit.view);
+            try std.testing.expectApproxEqAbs(theme.scaledUi(VIEW_TAB_W_UI), hit.rect.w, 1);
+            try std.testing.expect(hit.rect.x + hit.rect.w < rect.x + rect.w - theme.scaledUi(ICON_BUTTON_UI));
+            tabs += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), tabs);
+        var icons: usize = 0;
+        for (state.palette_overlay_batch.commands.items[start..]) |command| {
+            if (command.kind != .text) continue;
+            try std.testing.expectEqual(palette.FontRole.icon, command.font_role.?);
+            if (icons < VIEW_TABS.len) try std.testing.expectEqualStrings(VIEW_TABS[icons].glyph, command.text);
+            icons += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 5), icons); // Four views and Close.
+    }
+    const enter = palette.event.KeyEvent{ .key = .f6, .mod = .{ .ctrl = true } };
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(handleHeaderKeyDown(&state, &enter));
+    try std.testing.expectEqual(SidePanelView.agents, header_focus.?.key.view);
+    // A separate Shift press must preserve focus before Shift+Tab.
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .lshift, .mod = .{ .shift = true } }));
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .tab, .mod = .{ .shift = true } }));
+    try std.testing.expectEqual(HitKind.close, header_focus.?.key.kind);
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(SidePanelView.agents, header_focus.?.key.view);
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .right }));
+    try std.testing.expectEqual(SidePanelView.changes, header_focus.?.key.view);
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .@"return" }));
+    try std.testing.expectEqual(SidePanelView.changes, state.currentSidePanel().?.view);
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .right }));
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .space }));
+    try std.testing.expectEqual(SidePanelView.files, state.currentSidePanel().?.view);
+    try std.testing.expect(handleHeaderKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(header_focus == null);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(handleHeaderKeyDown(&state, &enter));
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(header_focus == null);
+    try std.testing.expect(handleHeaderKeyDown(&state, &enter));
+    state.setSidePanelOpen(false); // Stale, still-painted hit regions cannot capture keys.
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(!handleHeaderKeyDown(&state, &enter));
+    state.setSidePanelOpen(true);
+    try std.testing.expect(handleHeaderKeyDown(&state, &enter));
+    clearHeaderFocus(&state); // Mirror primary mouse-down routing.
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(handleHeaderKeyDown(&state, &enter));
+    resetHitCache(); // Panel stopped painting after a tab/workspace transition.
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(!handleHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(!handleHeaderKeyDown(&state, &enter));
 }

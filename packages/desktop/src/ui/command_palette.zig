@@ -16,6 +16,7 @@ const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const workspace_identity = @import("workspace_identity.zig");
+const text_measure = @import("text_measure.zig");
 const native_state = @import("../state.zig");
 const app_config = @import("../app/config.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -36,6 +37,10 @@ const HEADER_H_CSS: f32 = 26.0;
 const INPUT_H_CSS: f32 = 38.0;
 const FOOTER_H_CSS: f32 = 30.0;
 const PAD_CSS: f32 = 14.0;
+/// Section captions ("Recent chats", "Commands"): sentence case, sidebar size.
+const SECTION_LABEL_FONT_CSS: f32 = 12.0;
+/// Workspace switcher gear button (hit square and hover wash).
+const SWITCHER_GEAR_CSS: f32 = 26.0;
 
 const Section = enum { threads, panes, workspaces, app };
 
@@ -90,81 +95,81 @@ const KeybindRef = enum {
 
 /// Static command table — add a row here to add a palette entry.
 const STATIC_COMMANDS = [_]Command{
-    .{ .id = "thread.new", .title = "New Chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
-    .{ .id = "thread.choose_model", .title = "Choose Chat Model", .keywords = "provider initial picker", .section = .threads, .keybind = .chat_model_picker, .run = runChooseChatModel, .enabled = hasFocusedGuiChat },
-    .{ .id = "thread.run_config", .title = "Configure Reasoning and Run Settings", .keywords = "effort speed access permissions", .section = .threads, .keybind = .chat_run_config, .run = runChatRunConfig, .enabled = hasFocusedGuiChat },
-    .{ .id = "thread.choose_directory", .title = "Choose Chat Working Directory", .keywords = "cwd folder path scratch home project", .section = .threads, .keybind = .chat_directory_picker, .run = runChooseChatDirectory, .enabled = hasFocusedGuiChat },
-    .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
-    .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
-    .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
+    .{ .id = "thread.new", .title = "New chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
+    .{ .id = "thread.choose_model", .title = "Choose chat model", .keywords = "provider initial picker", .section = .threads, .keybind = .chat_model_picker, .run = runChooseChatModel, .enabled = hasFocusedGuiChat },
+    .{ .id = "thread.run_config", .title = "Configure reasoning and run settings", .keywords = "effort speed access permissions", .section = .threads, .keybind = .chat_run_config, .run = runChatRunConfig, .enabled = hasFocusedGuiChat },
+    .{ .id = "thread.choose_directory", .title = "Choose chat working directory", .keywords = "cwd folder path scratch home project", .section = .threads, .keybind = .chat_directory_picker, .run = runChooseChatDirectory, .enabled = hasFocusedGuiChat },
+    .{ .id = "thread.rename_current", .title = "Rename current chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
+    .{ .id = "thread.regenerate_title", .title = "Regenerate chat title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
+    .{ .id = "thread.sync_current", .title = "Sync current thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
     .{ .id = "thread.review_changes", .title = "Review & commit changes", .keywords = "git commit push diff changes stage", .section = .threads, .run = runReviewChanges, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.commit_and_push", .title = "Commit & push", .keywords = "git commit push changes quick", .section = .threads, .run = runCommitAndPush, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.push", .title = "Push", .keywords = "git push branch upstream publish", .section = .threads, .run = runPush, .enabled = hasFocusedCommittedGuiChat },
-    .{ .id = "thread.handoff_current", .title = "Handoff Current Chat or TUI", .keywords = "transfer provider model agent continue context", .section = .threads, .run = runHandoffCurrent, .enabled = canHandoffFocusedPane },
-    .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for Current Thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
-    .{ .id = "thread.open_current_tui", .title = "Open Current Thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
-    .{ .id = "thread.archive_current", .title = "Archive Current Thread", .keywords = "delete remove chat", .section = .threads, .run = runArchiveCurrentThread, .enabled = currentThreadNotPending },
-    .{ .id = "thread.import_codex", .title = "Import Codex Thread", .keywords = "resume session", .section = .threads, .run = runImportCodex, .enabled = hasProjects },
-    .{ .id = "thread.import_opencode", .title = "Import OpenCode Thread", .keywords = "resume session", .section = .threads, .run = runImportOpencode, .enabled = hasProjects },
-    .{ .id = "thread.import_claude", .title = "Import Claude Thread", .keywords = "resume session", .section = .threads, .run = runImportClaude, .enabled = hasProjects },
-    .{ .id = "pane.split_chat_right", .title = "Split Chat Right", .keywords = "vsplit vertical pane", .section = .panes, .keybind = .workspace_split_chat_vertical, .run = runSplitChatRight, .enabled = hasProjects },
-    .{ .id = "pane.split_chat_down", .title = "Split Chat Down", .keywords = "hsplit horizontal pane stacked", .section = .panes, .keybind = .workspace_split_chat_horizontal, .run = runSplitChatDown, .enabled = hasProjects },
-    .{ .id = "pane.split_terminal_right", .title = "Split Terminal Right", .keywords = "vsplit vertical shell", .section = .panes, .keybind = .workspace_split_terminal_vertical, .run = runSplitTerminalRight, .enabled = hasProjects },
-    .{ .id = "pane.split_terminal_down", .title = "Split Terminal Down", .keywords = "hsplit horizontal shell stacked", .section = .panes, .keybind = .workspace_split_terminal_horizontal, .run = runSplitTerminalDown, .enabled = hasProjects },
-    .{ .id = "pane.terminal", .title = "Open Terminal Pane", .keywords = "shell console", .section = .panes, .keybind = .toggle_terminal, .run = runOpenTerminal, .enabled = hasProjects },
-    .{ .id = "pane.browser", .title = "Toggle Browser", .keywords = "web url preview side panel", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
-    .{ .id = "pane.side_panel", .title = "Toggle Side Panel", .keywords = "right panel browser agents linked chats preview", .section = .panes, .keybind = .toggle_side_panel, .run = runToggleSidePanel, .enabled = hasProjects },
-    .{ .id = "pane.side_panel_agents", .title = "Show Linked Agents", .keywords = "side panel right linked chats subagents children", .section = .panes, .run = runShowSidePanelAgents, .enabled = hasProjects },
-    .{ .id = "pane.side_panel_changes", .title = "Show Changes", .keywords = "side panel right git diff uncommitted modified files review", .section = .panes, .run = runShowSidePanelChanges, .enabled = hasProjects },
-    .{ .id = "pane.side_panel_files", .title = "Show Files", .keywords = "side panel right file explorer tree browse workspace folders", .section = .panes, .run = runShowSidePanelFiles, .enabled = hasProjects },
-    .{ .id = "browser.tab.new", .title = "Browser: New Tab", .keywords = "web page create", .section = .panes, .run = runNewBrowserTab, .enabled = hasBrowserPane },
-    .{ .id = "browser.tab.duplicate", .title = "Browser: Duplicate Active Tab", .keywords = "web page copy", .section = .panes, .run = runDuplicateBrowserTab, .enabled = hasBrowserTab },
-    .{ .id = "browser.tab.pin", .title = "Browser: Pin or Unpin Active Tab", .keywords = "web page keep", .section = .panes, .run = runToggleBrowserTabPinned, .enabled = hasBrowserTab },
-    .{ .id = "browser.tab.move_left", .title = "Browser: Move Active Tab Left", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabLeft, .enabled = canMoveBrowserTabLeft },
-    .{ .id = "browser.tab.move_right", .title = "Browser: Move Active Tab Right", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabRight, .enabled = canMoveBrowserTabRight },
-    .{ .id = "browser.tab.close", .title = "Browser: Close Active Tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
-    .{ .id = "browser.cookies.import", .title = "Browser: Import Cookies\xE2\x80\xA6", .keywords = "cookies login session import sign in firefox chrome", .section = .panes, .run = runImportCookies, .enabled = hasBrowserPane },
-    .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
-    .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = canZoomFocusedPane },
-    .{ .id = "pane.previous", .title = "Previous Pane", .keywords = "niri scroll focus left up back", .section = .panes, .keybind = .workspace_previous_pane, .run = runPreviousPane, .enabled = canFocusPreviousPane },
-    .{ .id = "pane.next", .title = "Next Pane", .keywords = "niri scroll focus right down forward", .section = .panes, .keybind = .workspace_next_pane, .run = runNextPane, .enabled = canFocusNextPane },
-    .{ .id = "pane.float", .title = "Float Focused Pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
-    .{ .id = "pane.quick_toggle", .title = "New or Toggle Quick Terminal", .keywords = "create show hide scratch floating overlay", .section = .panes, .keybind = .workspace_toggle_quick_pane, .run = runToggleQuickPane, .enabled = hasProjects },
-    .{ .id = "pane.quick_maximize", .title = "Maximize or Restore Quick Pane", .keywords = "floating overlay", .section = .panes, .run = runMaximizeQuickPane, .enabled = hasQuickPane },
-    .{ .id = "pane.quick_minimize", .title = "Minimize Quick Pane", .keywords = "hide floating overlay", .section = .panes, .run = runMinimizeQuickPane, .enabled = hasQuickPane },
-    .{ .id = "pane.quick_pin", .title = "Pin or Unpin Quick Pane", .keywords = "floating dim backdrop", .section = .panes, .run = runPinQuickPane, .enabled = hasQuickPane },
-    .{ .id = "pane.quick_tile", .title = "Return Quick Pane to Tile", .keywords = "dock floating", .section = .panes, .run = runTileQuickPane, .enabled = hasQuickPane },
-    .{ .id = "workspace.scrolling_use_global", .title = "Scrolling Layout: Use Global Default", .keywords = "niri panes mode inherit reset", .section = .workspaces, .run = runScrollingUseGlobal, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
-    .{ .id = "workspace.runtime_default_current", .title = "Use Current Chat Runtime as Workspace Default", .keywords = "local remote new chat thread route", .section = .workspaces, .run = runUseCurrentRuntimeDefault, .enabled = hasFocusedGuiChat },
-    .{ .id = "workspace.runtime_default_local", .title = "Use Local as Workspace Runtime Default", .keywords = "remote new chat thread route reset", .section = .workspaces, .run = runUseLocalRuntimeDefault, .enabled = hasProjects },
-    .{ .id = "workspace.open_settings", .title = "Workspace: Open Settings", .keywords = "default runtime local remote profile connections configure", .section = .workspaces, .run = runOpenWorkspaceSettings, .enabled = hasCommandTargetProject },
-    .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory create", .section = .workspaces, .run = runAddWorkspace },
-    .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
-    .{ .id = "workspace.reopen", .title = "Reopen Last Closed Workspace", .keywords = "restore archived project", .section = .workspaces, .run = runReopenWorkspace, .enabled = hasClosedWorkspaces },
-    .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh openai", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
-    .{ .id = "workspace.claude_tui", .title = "Start New Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
-    .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
-    .{ .id = "workspace.cursor_tui", .title = "Start New Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
-    .{ .id = "workspace.grok_tui", .title = "Start New Grok TUI", .keywords = "agent terminal workspace fresh xai grok build", .section = .workspaces, .run = runOpenGrokTui, .enabled = hasProjectsAndGrok },
-    .{ .id = "workspace.muse_tui", .title = "Start New Muse TUI", .keywords = "agent terminal workspace fresh meta muse code", .section = .workspaces, .run = runOpenMuseTui, .enabled = hasProjects },
-    .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
-    .{ .id = "workspace.antigravity_tui", .title = "Start New Antigravity TUI", .keywords = "agent terminal workspace fresh google gemini agy antigravity", .section = .workspaces, .run = runOpenAntigravityTui, .enabled = hasProjectsAndAntigravity },
-    .{ .id = "app.antigravity_setup", .title = "Set Up Antigravity CLI", .keywords = "install google gemini agy agent provider tui", .section = .app, .run = runAntigravitySetup, .enabled = antigravitySetupNeeded },
-    .{ .id = "app.antigravity_sign_in", .title = "Sign In to Antigravity", .keywords = "login google account gemini agy agent provider auth", .section = .app, .run = runAntigravitySignIn, .enabled = antigravityInstalled },
-    .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
-    .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
-    .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
-    .{ .id = "app.navigate_back", .title = "Go Back", .keywords = "previous history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_back, .run = runNavigateBack, .enabled = canNavigateBack },
-    .{ .id = "app.navigate_forward", .title = "Go Forward", .keywords = "next history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_forward, .run = runNavigateForward, .enabled = canNavigateForward },
-    .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
-    .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .keybind = .settings, .run = runSettings },
-    .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
+    .{ .id = "thread.handoff_current", .title = "Handoff current chat or TUI", .keywords = "transfer provider model agent continue context", .section = .threads, .run = runHandoffCurrent, .enabled = canHandoffFocusedPane },
+    .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for current thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
+    .{ .id = "thread.open_current_tui", .title = "Open current thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
+    .{ .id = "thread.archive_current", .title = "Archive current thread", .keywords = "delete remove chat", .section = .threads, .run = runArchiveCurrentThread, .enabled = currentThreadNotPending },
+    .{ .id = "thread.import_codex", .title = "Import Codex thread", .keywords = "resume session", .section = .threads, .run = runImportCodex, .enabled = hasProjects },
+    .{ .id = "thread.import_opencode", .title = "Import OpenCode thread", .keywords = "resume session", .section = .threads, .run = runImportOpencode, .enabled = hasProjects },
+    .{ .id = "thread.import_claude", .title = "Import Claude thread", .keywords = "resume session", .section = .threads, .run = runImportClaude, .enabled = hasProjects },
+    .{ .id = "pane.split_chat_right", .title = "Split chat right", .keywords = "vsplit vertical pane", .section = .panes, .keybind = .workspace_split_chat_vertical, .run = runSplitChatRight, .enabled = hasProjects },
+    .{ .id = "pane.split_chat_down", .title = "Split chat down", .keywords = "hsplit horizontal pane stacked", .section = .panes, .keybind = .workspace_split_chat_horizontal, .run = runSplitChatDown, .enabled = hasProjects },
+    .{ .id = "pane.split_terminal_right", .title = "Split terminal right", .keywords = "vsplit vertical shell", .section = .panes, .keybind = .workspace_split_terminal_vertical, .run = runSplitTerminalRight, .enabled = hasProjects },
+    .{ .id = "pane.split_terminal_down", .title = "Split terminal down", .keywords = "hsplit horizontal shell stacked", .section = .panes, .keybind = .workspace_split_terminal_horizontal, .run = runSplitTerminalDown, .enabled = hasProjects },
+    .{ .id = "pane.terminal", .title = "Open terminal pane", .keywords = "shell console", .section = .panes, .keybind = .toggle_terminal, .run = runOpenTerminal, .enabled = hasProjects },
+    .{ .id = "pane.browser", .title = "Toggle browser", .keywords = "web url preview side panel", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
+    .{ .id = "pane.side_panel", .title = "Toggle side panel", .keywords = "right panel browser agents linked chats preview", .section = .panes, .keybind = .toggle_side_panel, .run = runToggleSidePanel, .enabled = hasProjects },
+    .{ .id = "pane.side_panel_agents", .title = "Show linked agents", .keywords = "side panel right linked chats subagents children", .section = .panes, .run = runShowSidePanelAgents, .enabled = hasProjects },
+    .{ .id = "pane.side_panel_changes", .title = "Show changes", .keywords = "side panel right git diff uncommitted modified files review", .section = .panes, .run = runShowSidePanelChanges, .enabled = hasProjects },
+    .{ .id = "pane.side_panel_files", .title = "Show files", .keywords = "side panel right file explorer tree browse workspace folders", .section = .panes, .run = runShowSidePanelFiles, .enabled = hasProjects },
+    .{ .id = "browser.tab.new", .title = "Browser: New tab", .keywords = "web page create", .section = .panes, .run = runNewBrowserTab, .enabled = hasBrowserPane },
+    .{ .id = "browser.tab.duplicate", .title = "Browser: Duplicate active tab", .keywords = "web page copy", .section = .panes, .run = runDuplicateBrowserTab, .enabled = hasBrowserTab },
+    .{ .id = "browser.tab.pin", .title = "Browser: Pin or unpin active tab", .keywords = "web page keep", .section = .panes, .run = runToggleBrowserTabPinned, .enabled = hasBrowserTab },
+    .{ .id = "browser.tab.move_left", .title = "Browser: Move active tab left", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabLeft, .enabled = canMoveBrowserTabLeft },
+    .{ .id = "browser.tab.move_right", .title = "Browser: Move active tab right", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabRight, .enabled = canMoveBrowserTabRight },
+    .{ .id = "browser.tab.close", .title = "Browser: Close active tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
+    .{ .id = "browser.cookies.import", .title = "Browser: Import cookies\xE2\x80\xA6", .keywords = "cookies login session import sign in firefox chrome", .section = .panes, .run = runImportCookies, .enabled = hasBrowserPane },
+    .{ .id = "pane.close", .title = "Close pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
+    .{ .id = "pane.zoom", .title = "Zoom pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = canZoomFocusedPane },
+    .{ .id = "pane.previous", .title = "Previous pane", .keywords = "niri scroll focus left up back", .section = .panes, .keybind = .workspace_previous_pane, .run = runPreviousPane, .enabled = canFocusPreviousPane },
+    .{ .id = "pane.next", .title = "Next pane", .keywords = "niri scroll focus right down forward", .section = .panes, .keybind = .workspace_next_pane, .run = runNextPane, .enabled = canFocusNextPane },
+    .{ .id = "pane.float", .title = "Float focused pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
+    .{ .id = "pane.quick_toggle", .title = "New or toggle quick terminal", .keywords = "create show hide scratch floating overlay", .section = .panes, .keybind = .workspace_toggle_quick_pane, .run = runToggleQuickPane, .enabled = hasProjects },
+    .{ .id = "pane.quick_maximize", .title = "Maximize or restore quick pane", .keywords = "floating overlay", .section = .panes, .run = runMaximizeQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_minimize", .title = "Minimize quick pane", .keywords = "hide floating overlay", .section = .panes, .run = runMinimizeQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_pin", .title = "Pin or unpin quick pane", .keywords = "floating dim backdrop", .section = .panes, .run = runPinQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_tile", .title = "Return quick pane to tile", .keywords = "dock floating", .section = .panes, .run = runTileQuickPane, .enabled = hasQuickPane },
+    .{ .id = "workspace.scrolling_use_global", .title = "Scrolling layout: Use global default", .keywords = "niri panes mode inherit reset", .section = .workspaces, .run = runScrollingUseGlobal, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_automatic", .title = "Scrolling layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_always", .title = "Scrolling layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_disabled", .title = "Scrolling layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset scrolling pane widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
+    .{ .id = "workspace.runtime_default_current", .title = "Use current chat runtime as workspace default", .keywords = "local remote new chat thread route", .section = .workspaces, .run = runUseCurrentRuntimeDefault, .enabled = hasFocusedGuiChat },
+    .{ .id = "workspace.runtime_default_local", .title = "Use Local as workspace runtime default", .keywords = "remote new chat thread route reset", .section = .workspaces, .run = runUseLocalRuntimeDefault, .enabled = hasProjects },
+    .{ .id = "workspace.open_settings", .title = "Workspace: Open settings", .keywords = "default runtime local remote profile connections configure", .section = .workspaces, .run = runOpenWorkspaceSettings, .enabled = hasCommandTargetProject },
+    .{ .id = "workspace.add", .title = "Add workspace", .keywords = "new project folder directory create", .section = .workspaces, .run = runAddWorkspace },
+    .{ .id = "workspace.rename", .title = "Rename workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
+    .{ .id = "workspace.close", .title = "Close workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
+    .{ .id = "workspace.reopen", .title = "Reopen last closed workspace", .keywords = "restore archived project", .section = .workspaces, .run = runReopenWorkspace, .enabled = hasClosedWorkspaces },
+    .{ .id = "workspace.codex_tui", .title = "Start new Codex TUI", .keywords = "agent terminal workspace fresh openai", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
+    .{ .id = "workspace.claude_tui", .title = "Start new Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
+    .{ .id = "workspace.opencode_tui", .title = "Start new OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
+    .{ .id = "workspace.cursor_tui", .title = "Start new Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
+    .{ .id = "workspace.grok_tui", .title = "Start new Grok TUI", .keywords = "agent terminal workspace fresh xai grok build", .section = .workspaces, .run = runOpenGrokTui, .enabled = hasProjectsAndGrok },
+    .{ .id = "workspace.muse_tui", .title = "Start new Muse TUI", .keywords = "agent terminal workspace fresh meta muse code", .section = .workspaces, .run = runOpenMuseTui, .enabled = hasProjects },
+    .{ .id = "app.grok_setup", .title = "Set up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
+    .{ .id = "workspace.antigravity_tui", .title = "Start new Antigravity TUI", .keywords = "agent terminal workspace fresh google gemini agy antigravity", .section = .workspaces, .run = runOpenAntigravityTui, .enabled = hasProjectsAndAntigravity },
+    .{ .id = "app.antigravity_setup", .title = "Set up Antigravity CLI", .keywords = "install google gemini agy agent provider tui", .section = .app, .run = runAntigravitySetup, .enabled = antigravitySetupNeeded },
+    .{ .id = "app.antigravity_sign_in", .title = "Sign in to Antigravity", .keywords = "login google account gemini agy agent provider auth", .section = .app, .run = runAntigravitySignIn, .enabled = antigravityInstalled },
+    .{ .id = "workspace.amp_tui", .title = "Start new Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
+    .{ .id = "workspace.herdr_handoff", .title = "Handoff workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
+    .{ .id = "workspace.herdr_focus_terminal", .title = "Open/focus Herdr terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
+    .{ .id = "workspace.herdr_unlink", .title = "Run workspace locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
+    .{ .id = "app.navigate_back", .title = "Go back", .keywords = "previous history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_back, .run = runNavigateBack, .enabled = canNavigateBack },
+    .{ .id = "app.navigate_forward", .title = "Go forward", .keywords = "next history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_forward, .run = runNavigateForward, .enabled = canNavigateForward },
+    .{ .id = "app.history", .title = "History: This workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
+    .{ .id = "app.settings", .title = "Open settings", .keywords = "preferences config options", .section = .app, .keybind = .settings, .run = runSettings },
+    .{ .id = "app.sidebar", .title = "Toggle sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
 };
 
 const ThreadRef = struct { project: usize, thread: usize };
@@ -186,7 +191,7 @@ const ResultRef = union(enum) {
     closed_workspace: usize,
     /// Workspace switcher: widen the sidebar list to every workspace.
     all_workspaces,
-    /// Workspace switcher: collapsible "Closed Workspaces" group header
+    /// Workspace switcher: collapsible "Closed workspaces" group header
     /// carrying how many closed workspaces it holds.
     closed_section: usize,
     /// Workspace switcher footer row: open the Add Workspace flow.
@@ -319,9 +324,16 @@ pub fn registerHits(
     while (i < result_count) : (i += 1) {
         if (results[i].ref == .header) continue;
         if (!rowVisible(row_rects[i])) continue;
-        queueHit(state, row_rects[i], .command_palette_row, i);
+        // Clip to the list viewport like the row painting, so a half-scrolled
+        // row never takes clicks over the search field.
+        const row_hit = intersectRects(row_rects[i], list_rect);
+        if (row_hit.w <= 0.0 or row_hit.h <= 0.0) continue;
+        queueHit(state, row_hit, .command_palette_row, i);
         if (switcherMode(state)) {
-            if (gear_rects[i]) |gear| queueHit(state, gear, .command_palette_row_settings, i);
+            if (gear_rects[i]) |gear| {
+                const gear_hit = intersectRects(gear, list_rect);
+                if (gear_hit.w > 0.0 and gear_hit.h > 0.0) queueHit(state, gear_hit, .command_palette_row_settings, i);
+            }
         }
     }
     if (state.command_controller.action_menu_open) {
@@ -568,7 +580,10 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
 /// Renders the palette overlay: scrim, chrome, search field, scope line,
 /// result rows, optional action submenu, footer key hints, and scrollbar.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.command_controller.open) return;
+    if (!state.command_controller.open) {
+        switcher_seeded = false;
+        return;
+    }
     computeLayout(state, width, height);
     if (switcherMode(state)) return renderSwitcher(state, width, height);
 
@@ -601,7 +616,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         const thumb_h = @max(theme.scaledUi(28.0), track.h * (track.h / (track.h + max_scroll_y)));
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll_y);
         queueRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
-        queueRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
+        queueRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(listHovered(state))), theme.scaledUi(2.0));
     }
 }
 
@@ -613,6 +628,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 /// function of state + window size; cheap enough to run twice per frame.
 fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
     if (switcherMode(state)) return computeSwitcherLayout(state, width, height);
+    switcher_seeded = false;
     const modal_w = theme.clampf(width * 0.46, theme.scaledUi(480.0), theme.scaledUi(720.0));
     const modal_h = theme.clampf(height * 0.62, theme.scaledUi(340.0), theme.scaledUi(640.0));
     // Anchored in the upper third like launcher UIs, so results grow downward
@@ -627,7 +643,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
         .w = modal_rect.w - pad * 2.0,
         .h = theme.scaledUi(INPUT_H_CSS),
     };
-    const scope_h = theme.scaledUi(22.0);
+    // Only a scoped history view has a scope line; the global view needs no
+    // caption (it was plain, non-interactive "All workspaces" text).
+    const scope_h = if (state.command_controller.scope_project != null) theme.scaledUi(22.0) else theme.scaledUi(4.0);
     const list_top = input_rect.y + input_rect.h + scope_h + theme.scaledUi(4.0);
     const footer_h = theme.scaledUi(FOOTER_H_CSS);
     list_rect = .{
@@ -639,8 +657,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
 
     rebuildResults(state);
 
-    // Row geometry: headers are shorter than selectable rows.
-    var y = list_rect.y - scroll_y;
+    // Row geometry: headers are shorter than selectable rows. A leading
+    // section label gets 8px of air below the scope line.
+    const lead: f32 = if (result_count > 0 and results[0].ref == .header) theme.scaledUi(8.0) else 0.0;
+    var y = list_rect.y - scroll_y + lead;
     var i: usize = 0;
     while (i < result_count) : (i += 1) {
         const h = if (results[i].ref == .header) theme.scaledUi(HEADER_H_CSS) else theme.scaledUi(ROW_H_CSS);
@@ -657,7 +677,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
     }
 
     // Re-derive row rects after any scroll adjustment so hits match visuals.
-    y = list_rect.y - scroll_y;
+    y = list_rect.y - scroll_y + lead;
     i = 0;
     while (i < result_count) : (i += 1) {
         const h = if (results[i].ref == .header) theme.scaledUi(HEADER_H_CSS) else theme.scaledUi(ROW_H_CSS);
@@ -672,6 +692,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
 /// its rows, no scope line or footer.
 fn computeSwitcherLayout(state: *runtime.AppState, width: f32, height: f32) void {
     rebuildResults(state);
+    if (!switcher_seeded) {
+        switcher_seeded = true;
+        seedSwitcherSelection(state);
+    }
     const anchor = sidebar.workspaceSwitcherAnchor();
     const margin = theme.scaledUi(8.0);
     const pad = theme.scaledUi(SWITCHER_PAD_CSS);
@@ -704,16 +728,39 @@ fn computeSwitcherLayout(state: *runtime.AppState, width: f32, height: f32) void
     state.command_controller.action_menu_open = false;
 }
 
+/// Set once per switcher opening: the first frame highlights the row that
+/// carries the check (the current workspace, or All workspaces), so the
+/// keyboard starts where the user is instead of on the top row.
+var switcher_seeded: bool = false;
+
+fn seedSwitcherSelection(state: *runtime.AppState) void {
+    if (state.commandPaletteQuery().len > 0) return;
+    var i: usize = 0;
+    while (i < result_count) : (i += 1) {
+        const current = switch (results[i].ref) {
+            .all_workspaces => state.sidebar_all_workspaces,
+            .workspace => |pi| !state.sidebar_all_workspaces and pi == state.project_controller.selected_index,
+            else => false,
+        };
+        if (!current) continue;
+        state.command_controller.selected = i;
+        reveal_selected = true;
+        return;
+    }
+}
+
 fn layoutSwitcherRows() void {
     const row_h = theme.scaledUi(SWITCHER_ROW_H_CSS);
-    const gear_size = theme.scaledUi(26.0);
+    const gear_size = theme.scaledUi(SWITCHER_GEAR_CSS);
     var y = list_rect.y - scroll_y;
     var i: usize = 0;
     while (i < result_count) : (i += 1) {
         row_rects[i] = .{ .x = list_rect.x, .y = y, .w = list_rect.w, .h = row_h };
         gear_rects[i] = switch (results[i].ref) {
+            // Same fixed gear slot the row renderer uses (switcherSlots), so
+            // the hit region, hover square and glyph always line up.
             .workspace => .{
-                .x = list_rect.x + list_rect.w - gear_size - theme.scaledUi(4.0),
+                .x = switcherSlots(row_rects[i]).gear_x,
                 .y = y + (row_h - gear_size) * 0.5,
                 .w = gear_size,
                 .h = gear_size,
@@ -750,11 +797,11 @@ fn openWorkspaceRecencyMs(project: *const native_state.Project) i64 {
     return at;
 }
 
-/// Switcher rows: All Workspaces, open workspaces by recency, New workspace,
-/// then a collapsible "Closed Workspaces" group (all filtered by the query).
+/// Switcher rows: All workspaces, open workspaces by recency, New workspace,
+/// then a collapsible "Closed workspaces" group (all filtered by the query).
 fn buildWorkspaceSwitcher(state: *runtime.AppState, query: []const u8) void {
     const has_query = query.len > 0;
-    if (!has_query or fuzzyScore("All Workspaces", query) != null) appendResult(.all_workspaces);
+    if (!has_query or fuzzyScore("All workspaces", query) != null) appendResult(.all_workspaces);
 
     var entries: [MAX_CANDIDATES]SwitcherEntry = undefined;
     var entry_count: usize = 0;
@@ -853,23 +900,23 @@ fn buildSuggestions(state: *runtime.AppState) void {
         }
     }
     if (recent_count > 0) {
-        appendResult(.{ .header = "RECENT CHATS" });
+        appendResult(.{ .header = "Recent chats" });
         for (recent[0..recent_count]) |entry| appendResult(.{ .thread = entry.ref });
     }
-    appendResult(.{ .header = "COMMANDS" });
+    appendResult(.{ .header = "Commands" });
     for (STATIC_COMMANDS, 0..) |command, ci| {
         if (!command.enabled(state)) continue;
         appendResult(.{ .command = ci });
     }
     if (state.project_controller.projects.items.len > 1) {
-        appendResult(.{ .header = "WORKSPACES" });
+        appendResult(.{ .header = "Workspaces" });
         for (state.project_controller.projects.items, 0..) |_, pi| {
             if (pi == state.project_controller.selected_index) continue;
             appendResult(.{ .workspace = pi });
         }
     }
     if (state.project_controller.archived_projects.items.len > 0) {
-        appendResult(.{ .header = "CLOSED WORKSPACES" });
+        appendResult(.{ .header = "Closed workspaces" });
         var remaining = state.project_controller.archived_projects.items.len;
         while (remaining > 0) {
             remaining -= 1;
@@ -1219,12 +1266,12 @@ fn computeActionMenuLayout(state: *runtime.AppState) void {
     const can_sync = thread.provider_thread_id != null and !pending;
     const in_tui = state.threadIsOpenInTui(tr.project, tr.thread);
 
-    appendAction(.open_new, "Open in New Pane", true);
-    appendAction(.replace, "Replace Current Pane", true);
-    appendAction(.open_tui, if (in_tui) "Open as Chat" else "Open in TUI", in_tui or can_sync);
-    appendAction(.sync, "Sync Thread", can_sync);
-    appendAction(.handoff, "Handoff to Another Agent", !pending);
-    appendAction(.archive, "Archive Thread", !pending);
+    appendAction(.open_new, "Open in new pane", true);
+    appendAction(.replace, "Replace current pane", true);
+    appendAction(.open_tui, if (in_tui) "Open as chat" else "Open in TUI", in_tui or can_sync);
+    appendAction(.sync, "Sync thread", can_sync);
+    appendAction(.handoff, "Handoff to another agent", !pending);
+    appendAction(.archive, "Archive thread", !pending);
 
     const row_h = theme.scaledUi(32.0);
     const menu_w = theme.scaledUi(220.0);
@@ -1522,11 +1569,11 @@ fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8
         if (thread.provider_thread_id == null) return "Thread has no provider session id yet.";
     }
     if (std.mem.eql(u8, id, "workspace.reopen")) return "No closed workspaces to reopen.";
-    if (std.mem.eql(u8, id, "workspace.grok_tui")) return "Grok Build is not installed. Run “Set Up Grok Build” first.";
+    if (std.mem.eql(u8, id, "workspace.grok_tui")) return "Grok Build is not installed. Run “Set up Grok Build” first.";
     if (std.mem.eql(u8, id, "app.grok_setup")) return "Grok Build is already installed.";
-    if (std.mem.eql(u8, id, "workspace.antigravity_tui")) return "Antigravity CLI is not installed. Run “Set Up Antigravity CLI” first.";
+    if (std.mem.eql(u8, id, "workspace.antigravity_tui")) return "Antigravity CLI is not installed. Run “Set up Antigravity CLI” first.";
     if (std.mem.eql(u8, id, "app.antigravity_setup")) return "Antigravity CLI is already installed.";
-    if (std.mem.eql(u8, id, "app.antigravity_sign_in")) return "Antigravity CLI is not installed. Run “Set Up Antigravity CLI” first.";
+    if (std.mem.eql(u8, id, "app.antigravity_sign_in")) return "Antigravity CLI is not installed. Run “Set up Antigravity CLI” first.";
     if (std.mem.eql(u8, id, "workspace.herdr_focus_terminal")) return "Current workspace is not linked to Herdr.";
     if (std.mem.eql(u8, id, "workspace.herdr_unlink")) return "Current workspace is already running locally.";
     return "Command is unavailable right now.";
@@ -1882,20 +1929,30 @@ fn runToggleSidebar(state: *runtime.AppState) void {
 
 /// Search field with selection highlight + caret, matching the metrics
 /// `layout.zig` uses for modal text hit-testing (font 14, +10px text inset).
+/// Left/right text inset of the palette and switcher search field: at least
+/// 12px, or the field's corner radius when larger, like the composers.
+/// `layout.zig` maps clicks and drags with the same inset.
+pub fn searchTextInset() f32 {
+    return @max(theme.scaledUi(12.0), theme.scaledUi(SEARCH_FIELD_RADIUS_UI));
+}
+
+const SEARCH_FIELD_RADIUS_UI: f32 = 7.0;
+
 fn renderSearchField(state: *runtime.AppState) void {
     const focused = state.palette_modal_text_focus == .command_palette;
     const value = state.commandPaletteQuery();
     const border = if (focused) theme.COLOR_GREEN else theme.COLOR_PANEL_MUTED;
     // Recessed field: darker than the (opaque) panel so it reads as an input,
     // matching the sidebar's selected-workspace card treatment.
-    queueRoundedRect(state, input_rect, paletteColor(theme.background()), theme.scaledUi(7.0));
-    queueBorder(state, input_rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
+    queueRoundedRect(state, input_rect, paletteColor(theme.background()), theme.scaledUi(SEARCH_FIELD_RADIUS_UI));
+    queueBorder(state, input_rect, paletteColor(border), theme.scaledUi(SEARCH_FIELD_RADIUS_UI), theme.scaledUi(1.0));
 
     const font_size = theme.scaledUi(14.0);
     const line_height = font_size * 1.25;
-    const text_x = input_rect.x + theme.scaledUi(10.0);
+    const inset = searchTextInset();
+    const text_x = input_rect.x + inset;
     const text_y = input_rect.y + (input_rect.h - line_height) * 0.5;
-    const text_w = input_rect.w - theme.scaledUi(20.0);
+    const text_w = input_rect.w - inset * 2.0;
 
     if (focused) {
         state.modal_text_input_rect = input_rect;
@@ -1920,12 +1977,16 @@ fn renderSearchField(state: *runtime.AppState) void {
     const placeholder = if (switcherMode(state)) "Search workspaces" else "Search threads and commands...";
     const shown = if (value.len > 0) value else placeholder;
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
-    queueRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = line_height }, shown, paletteColor(color), font_size, input_rect);
+    const caret_w = @max(@round(theme.scaledUi(1.0)), 1.0);
+    // The placeholder starts one caret width plus 3px in, so the idle caret
+    // never sits on its first letter (same as the shared composer).
+    const shown_x = if (value.len > 0) text_x else text_x + caret_w + theme.scaledUi(3.0);
+    queueRoleText(state, .{ .x = shown_x, .y = text_y, .w = text_w - (shown_x - text_x), .h = line_height }, shown, paletteColor(color), font_size, input_rect);
 
     if (focused) {
         const clamped_cursor = @min(state.command_controller.cursor, value.len);
         const cursor_x = text_x + runtime.paletteUiTextPrefixWidth(value, font_size, clamped_cursor);
-        queueRect(state, .{ .x = cursor_x, .y = text_y, .w = theme.scaledUi(1.0), .h = line_height }, paletteColor(theme.COLOR_WHITE));
+        queueRect(state, .{ .x = cursor_x, .y = text_y, .w = caret_w, .h = line_height }, paletteColor(theme.COLOR_WHITE));
     }
 }
 
@@ -1938,7 +1999,7 @@ fn renderScopeLine(state: *runtime.AppState) void {
                 break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+Shift+P for all)", .{state.project_controller.projects.items[pi].label}) catch "history";
             }
         }
-        break :blk "All workspaces";
+        return;
     };
     queueText(state, .{
         .x = input_rect.x + theme.scaledUi(2.0),
@@ -1949,7 +2010,7 @@ fn renderScopeLine(state: *runtime.AppState) void {
 }
 
 /// Result rows: section headers, command rows with keybind hints, thread rows
-/// with provider glyph + workspace + open badge + relative time.
+/// with provider glyph + workspace + "closed" label + relative time.
 fn renderRows(state: *runtime.AppState) void {
     if (result_count == 0) {
         queueText(state, .{
@@ -1976,7 +2037,8 @@ fn renderRows(state: *runtime.AppState) void {
                     .y = rect.y + rect.h - theme.scaledUi(18.0),
                     .w = rect.w - theme.scaledUi(8.0),
                     .h = theme.scaledUi(16.0),
-                }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), row_clip);
+                    // Sentence case at 12px, like the sidebar's "Active" / "Open".
+                }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(SECTION_LABEL_FONT_CSS), row_clip);
             },
             .command => |ci| renderCommandRow(state, i, ci, rect, row_clip),
             .thread => |tr| renderThreadRow(state, i, tr, rect, row_clip),
@@ -1997,18 +2059,25 @@ fn renderRowBackground(state: *runtime.AppState, row_index: usize, rect: palette
     // doesn't poke into the input/footer chrome.
     const bg_rect = intersectRects(rect, row_clip);
     if (bg_rect.w <= 0.0 or bg_rect.h <= 0.0) return;
-    if (selected) {
-        // Accent tint rather than a lighter-gray card: on the dark panel a
-        // translucent accent keeps the active row distinct and on-brand, and
-        // stays independent of the theme-derived (possibly light) panel tokens.
-        // Slightly stronger when also hovered for feedback.
-        const bg = theme.withAlpha(theme.COLOR_GREEN, if (hovered) 76 else 56);
-        queueRoundedRect(state, bg_rect, paletteColor(bg), theme.scaledUi(7.0));
-    } else if (hovered) {
-        // Neutral light wash over the dark panel; theme-independent so hover
-        // never collapses into the surface on light color0/color8 themes.
-        queueRoundedRect(state, bg_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(7.0));
-    }
+    const fill = rowHighlightFill(selected, hovered) orelse return;
+    queueRoundedRect(state, bg_rect, paletteColor(fill), theme.scaledUi(7.0));
+}
+
+/// Shared list-row highlight for the palette, the workspace switcher and the
+/// composer slash menu: a neutral tint of the text colour (works on dark and
+/// light palettes), firmer for the keyboard selection than for hover, and
+/// never an accent wash. Null when the row is neither.
+pub fn rowHighlightFill(selected: bool, hovered: bool) ?[4]f32 {
+    if (selected) return theme.withAlpha(theme.COLOR_WHITE, if (hovered) 34 else 28);
+    if (hovered) return theme.withAlpha(theme.COLOR_WHITE, 16);
+    return null;
+}
+
+/// Owning-workspace column sized to its label (12px UI text plus padding),
+/// capped so long names still leave the title most of the row.
+fn workspaceColumnWidth(label: []const u8, row_w: f32) f32 {
+    const natural = text_measure.textWidth(.ui, theme.scaledUi(12.0), label) + theme.scaledUi(16.0);
+    return @min(natural, row_w * 0.3);
 }
 
 fn renderCommandRow(state: *runtime.AppState, row_index: usize, command_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
@@ -2023,7 +2092,7 @@ fn renderCommandRow(state: *runtime.AppState, row_index: usize, command_index: u
 
     const hint = keybindHintFor(state, command.keybind);
     const hint_w = if (hint.len > 0) theme.scaledUi(110.0) else theme.scaledUi(0.0);
-    queueText(state, .{
+    queueFittedText(state, .{
         .x = rect.x + theme.scaledUi(34.0),
         .y = text_y,
         .w = rect.w - theme.scaledUi(34.0) - hint_w - theme.scaledUi(12.0),
@@ -2051,14 +2120,16 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
 
     sidebar.queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, row_clip);
 
+    // Most recent chats are open, so only the rarer state is labelled:
+    // chats not open in any pane read "closed", like daemon history rows.
     const is_open = threadOpenPaneId(project, tr.thread) != null;
     const time_w = theme.scaledUi(56.0);
-    const open_w = if (is_open) theme.scaledUi(42.0) else 0.0;
+    const open_w = if (!is_open) theme.scaledUi(48.0) else 0.0;
     // Show the owning workspace when results span workspaces (global scope).
     const show_workspace = state.command_controller.scope_project == null;
-    const workspace_w = if (show_workspace) theme.scaledUi(96.0) else 0.0;
+    const workspace_w = if (show_workspace) workspaceColumnWidth(project.label, rect.w) else 0.0;
     const title_x = rect.x + theme.scaledUi(42.0);
-    queueText(state, .{
+    queueFittedText(state, .{
         .x = title_x,
         .y = text_y,
         .w = rect.w - (title_x - rect.x) - workspace_w - open_w - time_w - theme.scaledUi(16.0),
@@ -2070,13 +2141,13 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     const relative_time = sidebar.formatRelativeTime(&time_buf, thread.last_activity_at);
     right -= time_w;
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
-    if (is_open) {
+    if (!is_open) {
         right -= open_w;
-        queueText(state, .{ .x = right, .y = text_y, .w = open_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
+        queueText(state, .{ .x = right, .y = text_y, .w = open_w, .h = font_size * 1.3 }, "closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
     if (show_workspace) {
         right -= workspace_w;
-        queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+        queueFittedText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
 }
 
@@ -2096,9 +2167,16 @@ fn renderHistoryRow(state: *runtime.AppState, row_index: usize, history_index: u
     const time_w = theme.scaledUi(56.0);
     const closed_w = theme.scaledUi(48.0);
     const show_workspace = state.command_controller.scope_project == null;
-    const workspace_w = if (show_workspace) theme.scaledUi(96.0) else 0.0;
+    var label: []const u8 = item.workspace_id;
+    for (state.project_controller.projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, item.workspace_id)) {
+            label = project.label;
+            break;
+        }
+    }
+    const workspace_w = if (show_workspace) workspaceColumnWidth(label, rect.w) else 0.0;
     const title_x = rect.x + theme.scaledUi(42.0);
-    queueText(state, .{
+    queueFittedText(state, .{
         .x = title_x,
         .y = text_y,
         .w = rect.w - (title_x - rect.x) - workspace_w - closed_w - time_w - theme.scaledUi(16.0),
@@ -2114,14 +2192,7 @@ fn renderHistoryRow(state: *runtime.AppState, row_index: usize, history_index: u
     queueText(state, .{ .x = right, .y = text_y, .w = closed_w, .h = font_size * 1.3 }, "closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     if (show_workspace) {
         right -= workspace_w;
-        var label: []const u8 = item.workspace_id;
-        for (state.project_controller.projects.items) |*project| {
-            if (std.mem.eql(u8, project.id, item.workspace_id)) {
-                label = project.label;
-                break;
-            }
-        }
-        queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+        queueFittedText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
 }
 
@@ -2153,9 +2224,9 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     }
     const status_w = theme.scaledUi(52.0);
     const time_w = theme.scaledUi(56.0);
-    const workspace_w = if (state.command_controller.scope_project == null) theme.scaledUi(96.0) else 0.0;
+    const workspace_w = if (state.command_controller.scope_project == null) workspaceColumnWidth(project.label, rect.w) else 0.0;
     const title_x = rect.x + theme.scaledUi(54.0);
-    queueText(state, .{
+    queueFittedText(state, .{
         .x = title_x,
         .y = text_y,
         .w = rect.w - (title_x - rect.x) - workspace_w - status_w - time_w - theme.scaledUi(16.0),
@@ -2169,10 +2240,11 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     right -= time_w;
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     right -= status_w;
-    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (is_open) "open" else "saved", paletteColor(if (is_open) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+    // Same rule as chat rows: only the rarer, not-open state is labelled.
+    if (!is_open) queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, "saved", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     if (state.command_controller.scope_project == null) {
         right -= workspace_w;
-        queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+        queueFittedText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
 }
 
@@ -2254,7 +2326,7 @@ fn renderSwitcher(state: *runtime.AppState, width: f32, height: f32) void {
         if (!rowVisible(rect)) continue;
         const row_clip = intersectRects(rect, list_rect);
         if (row_clip.w <= 0.0 or row_clip.h <= 0.0) continue;
-        renderRowBackground(state, i, rect, row_clip);
+        renderSwitcherRowBackground(state, i, rect, row_clip);
         renderSwitcherRow(state, i, rect, row_clip);
     }
     if (max_scroll_y > 1.0) {
@@ -2266,7 +2338,7 @@ fn renderSwitcher(state: *runtime.AppState, width: f32, height: f32) void {
         };
         const thumb_h = @max(theme.scaledUi(24.0), track.h * (track.h / (track.h + max_scroll_y)));
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll_y);
-        queueRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 160)), theme.scaledUi(2.0));
+        queueRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(listHovered(state))), theme.scaledUi(2.0));
     }
 }
 
@@ -2275,6 +2347,31 @@ const SWITCHER_GEAR_GLYPH = "\u{EB51}";
 const SWITCHER_ADD_GLYPH = "\u{EA60}";
 const SWITCHER_CHEVRON_RIGHT_GLYPH = "\u{EAB6}";
 const SWITCHER_CHEVRON_DOWN_GLYPH = "\u{EAB4}";
+
+/// Switcher highlight: a neutral tint (keyboard selection firmer than hover),
+/// never the accent wash; the current workspace is marked only by its check.
+fn renderSwitcherRowBackground(state: *runtime.AppState, row_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
+    const selected = state.command_controller.selected == row_index;
+    const hovered = hovered_row != null and hovered_row.? == row_index;
+    const fill = rowHighlightFill(selected, hovered) orelse return;
+    const bg_rect = intersectRects(rect, row_clip);
+    if (bg_rect.w <= 0.0 or bg_rect.h <= 0.0) return;
+    queueRoundedRect(state, bg_rect, paletteColor(fill), theme.scaledUi(7.0));
+}
+
+/// Fixed trailing columns shared by every switcher row, right to left:
+/// gear, an always-reserved check slot, then the shortcut, so "Alt+N" hints
+/// line up whether or not a row is current or has a gear.
+const SwitcherSlots = struct { gear_x: f32, check_x: f32, hint_x: f32, hint_w: f32 };
+
+fn switcherSlots(rect: palette.Rect) SwitcherSlots {
+    const gear_size = theme.scaledUi(SWITCHER_GEAR_CSS);
+    const gear_x = rect.x + rect.w - gear_size - theme.scaledUi(4.0);
+    const check_w = theme.scaledUi(20.0);
+    const check_x = gear_x - theme.scaledUi(4.0) - check_w;
+    const hint_w = theme.scaledUi(56.0);
+    return .{ .gear_x = gear_x, .check_x = check_x, .hint_x = check_x - theme.scaledUi(4.0) - hint_w, .hint_w = hint_w };
+}
 
 fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     const emphasis = state.command_controller.selected == row_index or (hovered_row != null and hovered_row.? == row_index);
@@ -2285,17 +2382,17 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
     const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + (rect.h - chip_size) * 0.5, .w = chip_size, .h = chip_size };
     const label_x = chip_rect.x + chip_size + theme.scaledUi(10.0);
     const right_edge = rect.x + rect.w - theme.scaledUi(6.0);
-    const text_color = paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+    const slots = switcherSlots(rect);
+    // Labels in the primary text color on every row (muted read as disabled).
+    const text_color = paletteColor(theme.COLOR_WHITE);
 
     switch (results[row_index].ref) {
         .all_workspaces => {
             sidebar.queueWorkspaceChip(state, chip_rect, null, false, row_clip);
             const hint = switcherShowAllHint(state);
-            const hint_w = if (hint.len > 0) theme.scaledUi(56.0) else 0.0;
-            const check_w = theme.scaledUi(22.0);
-            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - hint_w - check_w, .h = line_h }, "All Workspaces", text_color, font_size, row_clip);
-            if (state.sidebar_all_workspaces) queueSwitcherIcon(state, right_edge - check_w, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
-            if (hint.len > 0) queueText(state, .{ .x = right_edge - check_w - hint_w, .y = text_y, .w = hint_w, .h = line_h }, hint, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = slots.hint_x - label_x - theme.scaledUi(4.0), .h = line_h }, "All workspaces", text_color, font_size, row_clip);
+            if (state.sidebar_all_workspaces) queueSwitcherIcon(state, slots.check_x, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
+            if (hint.len > 0) queueSwitcherHint(state, slots, text_y, line_h, hint, row_clip);
         },
         .workspace => |pi| {
             if (pi >= state.project_controller.projects.items.len) return;
@@ -2305,18 +2402,9 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
             const current = !state.sidebar_all_workspaces and pi == state.project_controller.selected_index;
             var hint_buf_local: [32]u8 = undefined;
             const hint = workspaceSelectHintFor(state, &hint_buf_local, pi);
-            const hint_w = if (hint.len > 0) theme.scaledUi(52.0) else 0.0;
-            const check_w = if (current) theme.scaledUi(20.0) else 0.0;
-            var right = gear.x - theme.scaledUi(4.0);
-            if (current) {
-                right -= check_w;
-                queueSwitcherIcon(state, right, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
-            }
-            if (hint.len > 0) {
-                right -= hint_w;
-                queueText(state, .{ .x = right, .y = text_y, .w = hint_w, .h = line_h }, hint, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
-            }
-            queueText(state, .{ .x = label_x, .y = text_y, .w = right - label_x - theme.scaledUi(4.0), .h = line_h }, project.label, text_color, font_size, row_clip);
+            if (current) queueSwitcherIcon(state, slots.check_x, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
+            if (hint.len > 0) queueSwitcherHint(state, slots, text_y, line_h, hint, row_clip);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = slots.hint_x - label_x - theme.scaledUi(4.0), .h = line_h }, project.label, text_color, font_size, row_clip);
             const gear_hovered = hovered_gear != null and hovered_gear.? == row_index;
             if (gear_hovered) queueRoundedRect(state, gear, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)), theme.scaledUi(6.0));
             queueSwitcherIcon(state, gear.x + (gear.w - theme.scaledUi(20.0)) * 0.5, rect, SWITCHER_GEAR_GLYPH, if (gear_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, row_clip);
@@ -2335,7 +2423,7 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
             var count_buf: [16]u8 = undefined;
             const count_text = std.fmt.bufPrint(&count_buf, "{d}", .{count}) catch "";
             const count_w = theme.scaledUi(32.0);
-            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - count_w, .h = line_h }, "Closed Workspaces", paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - count_w, .h = line_h }, "Closed workspaces", paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
             queueText(state, .{ .x = right_edge - count_w, .y = text_y, .w = count_w, .h = line_h }, count_text, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
         },
         .new_workspace => {
@@ -2344,6 +2432,20 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
         },
         else => {},
     }
+}
+
+/// Scrollbar thumbs brighten while the pointer is over the result list.
+fn listHovered(state: *const runtime.AppState) bool {
+    const x = state.transcript_controller.palette_mouse_x;
+    const y = state.transcript_controller.palette_mouse_y;
+    return x >= list_rect.x and x <= list_rect.x + list_rect.w and y >= list_rect.y and y <= list_rect.y + list_rect.h;
+}
+
+/// Right-aligned shortcut hint inside the fixed hint column.
+fn queueSwitcherHint(state: *runtime.AppState, slots: SwitcherSlots, text_y: f32, line_h: f32, hint: []const u8, clip: palette.Rect) void {
+    const font = theme.scaledUi(12.0);
+    const w = @min(text_measure.textWidth(.ui, font, hint), slots.hint_w);
+    queueText(state, .{ .x = slots.hint_x + slots.hint_w - w, .y = text_y, .w = w + 1.0, .h = line_h }, hint, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
 }
 
 /// Codicon centered vertically in `row`, in a 20px square starting at `x`.
@@ -2384,7 +2486,7 @@ fn renderActionMenu(state: *runtime.AppState) void {
         const rect = action_rects[i];
         const selected = state.command_controller.action_selected == i;
         if (selected and action_enabled[i]) {
-            queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(7.0));
+            queueRoundedRect(state, rect, paletteColor(rowHighlightFill(true, false).?), theme.scaledUi(7.0));
         }
         const color = if (!action_enabled[i])
             theme.COLOR_TEXT_SUBTLE
@@ -2402,7 +2504,7 @@ fn renderActionMenu(state: *runtime.AppState) void {
 }
 
 fn renderFooter(state: *runtime.AppState) void {
-    const font_size = theme.scaledUi(11.5);
+    const font_size = theme.scaledUi(12.0);
     const y = modal_rect.y + modal_rect.h - theme.scaledUi(FOOTER_H_CSS) + theme.scaledUi(6.0);
     queueRect(state, .{
         .x = modal_rect.x + theme.scaledUi(1.0),
@@ -2415,7 +2517,7 @@ fn renderFooter(state: *runtime.AppState) void {
         .y = y,
         .w = modal_rect.w - theme.scaledUi(PAD_CSS) * 2.0,
         .h = font_size * 1.4,
-    }, "Enter New Pane    " ++ keybinds.PRIMARY_MODIFIER_LABEL ++ "+Enter Replace    Tab Actions    Esc Close", paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, modal_rect);
+    }, "Enter new pane    " ++ keybinds.PRIMARY_MODIFIER_LABEL ++ "+Enter replace    Tab actions    Esc close", paletteColor(theme.COLOR_TEXT_MUTED), font_size, modal_rect);
 }
 
 // ---------------------------------------------------------------------------
@@ -2562,6 +2664,35 @@ fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, co
     ) catch |err| {
         log.warn("failed to queue palette text: {s}", .{@errorName(err)});
     };
+}
+
+/// `queueText` that shortens `value` with a trailing ellipsis when it is
+/// wider than `rect`, so long titles never end in a hard clip.
+fn queueFittedText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    var buf: [512]u8 = undefined;
+    queueText(state, rect, ellipsizeToWidth(&buf, value, font_size, rect.w), color, font_size, clip);
+}
+
+/// Longest UTF-8-safe prefix of `value` plus "…" that fits `max_w`, measured
+/// with the face `fixedText` draws (as settings_modal does); `value` itself
+/// when it already fits.
+fn ellipsizeToWidth(buf: []u8, value: []const u8, font_size: f32, max_w: f32) []const u8 {
+    if (text_measure.textWidth(.prose_bold, font_size, value) <= max_w) return value;
+    const ellipsis = "\u{2026}";
+    if (buf.len <= ellipsis.len or max_w <= 0.0) return "";
+    const budget = max_w - text_measure.textWidth(.prose_bold, font_size, ellipsis);
+    var lo: usize = 0;
+    var hi: usize = @min(value.len, buf.len - ellipsis.len);
+    while (lo < hi) {
+        var mid = lo + (hi - lo + 1) / 2;
+        while (mid > lo and mid < value.len and (value[mid] & 0xC0) == 0x80) mid -= 1;
+        if (mid == lo) break;
+        if (text_measure.textWidth(.prose_bold, font_size, value[0..mid]) <= budget) lo = mid else hi = mid - 1;
+    }
+    const kept = std.mem.trimEnd(u8, value[0..lo], " ");
+    @memcpy(buf[0..kept.len], kept);
+    @memcpy(buf[kept.len .. kept.len + ellipsis.len], ellipsis);
+    return buf[0 .. kept.len + ellipsis.len];
 }
 
 fn queueRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {

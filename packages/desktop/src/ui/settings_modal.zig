@@ -3411,6 +3411,24 @@ fn providerReadinessColor(readiness: runtime.ProviderReadiness) [4]f32 {
 
 /// Same wording as the "Connect an AI provider" dialog rows (layout.zig
 /// `renderProviderReadinessRow`) so both surfaces describe a provider alike.
+/// Status line for an enabled provider that cannot run yet (half-state
+/// switch): what is on and what it still needs.
+fn providerBlockedReason(readiness: runtime.ProviderReadiness) []const u8 {
+    return switch (readiness) {
+        .signed_out => "Enabled \u{00B7} sign in to use",
+        .missing => "Enabled \u{00B7} install to use",
+        else => "Enabled \u{00B7} not available yet",
+    };
+}
+
+fn providerBlockedTooltip(readiness: runtime.ProviderReadiness) []const u8 {
+    return switch (readiness) {
+        .signed_out => "Enabled \u{00B7} sign-in needed",
+        .missing => "Enabled \u{00B7} CLI not installed",
+        else => "Enabled \u{00B7} could not verify",
+    };
+}
+
 fn providerReadinessBadge(readiness: runtime.ProviderReadiness) []const u8 {
     return switch (readiness) {
         .checking => "Checking…",
@@ -3496,7 +3514,11 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
         const version = snapshot.versionForProvider(provider);
         const action = providerAction(&snapshot, provider);
         const needs_node = readiness == .missing and snapshot.requirementForProvider(provider) == .node;
-        drawSwitchRow(state, row, "", enabled, isControlHovered(state, providerRowControl(index)), clip);
+        // Enabled but unusable (not signed in, not installed) gets its own
+        // half-state switch instead of reading as a working "on".
+        const blocked = enabled and (readiness == .signed_out or readiness == .missing or readiness == .unavailable);
+        drawSwitchRowState(state, row, "", enabled, blocked, isControlHovered(state, providerRowControl(index)), clip);
+        if (blocked) tooltip.queue(state, switchTrackRect(row), providerBlockedTooltip(readiness));
 
         const logo_rect: palette.Rect = .{ .x = row.x + inset, .y = row.y + (row.h - logo) * 0.5, .w = logo, .h = logo };
         const label = providerDisplayName(provider);
@@ -3534,7 +3556,8 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
         queueRoundedRectClipped(state, .{ .x = name_x, .y = line_y + (line_h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
         const status_x = name_x + dot + theme.scaledUi(6.0);
         const status_room = @max(update.x - theme.scaledUi(10.0) - status_x, 0.0);
-        const status = if (needs_node) PROVIDER_NEEDS_NODE_BADGE else providerReadinessBadge(readiness);
+        // A half-state switch says why: on, but not usable until set up.
+        const status = if (needs_node) PROVIDER_NEEDS_NODE_BADGE else if (blocked) providerBlockedReason(readiness) else providerReadinessBadge(readiness);
         var status_buf: [64]u8 = undefined;
         const status_text = ellipsizedText(&status_buf, status, status_font, status_room);
         queueText(state, .{ .x = status_x, .y = line_y, .w = status_room, .h = line_h }, status_text, paletteColor(if (enabled) textLabel() else textHint()), status_font, clip);
@@ -5614,6 +5637,11 @@ fn toggleReducedMotionPart(motion: *app_config.ReducedMotion, part: app_config.R
 const ROW_HOVER_BLEED_UI: f32 = 8.0;
 
 fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8, on: bool, hovered: bool, clip: palette.Rect) void {
+    drawSwitchRowState(state, rect, label, on, false, hovered, clip);
+}
+
+/// `blocked`: switched on but the thing it enables cannot run yet.
+fn drawSwitchRowState(state: *runtime.AppState, rect: palette.Rect, label: []const u8, on: bool, blocked: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered) {
         const bleed = theme.scaledUi(ROW_HOVER_BLEED_UI);
         queueRoundedRectClipped(state, .{ .x = rect.x - bleed, .y = rect.y, .w = rect.w + bleed * 2.0, .h = rect.h }, paletteColor(controlHoverSurface()), radiusSm(), clip);
@@ -5625,14 +5653,26 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
         .h = theme.scaledUi(16.0),
     }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 
+    const track = switchTrackRect(rect);
+    if (on and blocked) drawBlockedSwitchTrack(state, track, clip) else drawSwitchTrack(state, track, on, false, clip);
+}
+
+/// The switch track at a switch row's right edge.
+fn switchTrackRect(rect: palette.Rect) palette.Rect {
     const track_w = theme.scaledUi(40.0);
     const track_h = theme.scaledUi(22.0);
-    drawSwitchTrack(state, .{
-        .x = rect.x + rect.w - track_w,
-        .y = rect.y + (rect.h - track_h) * 0.5,
-        .w = track_w,
-        .h = track_h,
-    }, on, false, clip);
+    return .{ .x = rect.x + rect.w - track_w, .y = rect.y + (rect.h - track_h) * 0.5, .w = track_w, .h = track_h };
+}
+
+/// Half-state switch: knob in the "on" position on a neutral track with an
+/// accent hairline, so "enabled but needs sign-in / install" never looks
+/// like a working provider's filled accent switch nor like "off".
+fn drawBlockedSwitchTrack(state: *runtime.AppState, track: palette.Rect, clip: palette.Rect) void {
+    queuePanelClipped(state, track, controlSurface(), theme.mix(controlSurface(), theme.accent(), 0.7), track.h * 0.5, clip);
+    const knob_pad = theme.scaledUi(3.0);
+    const knob = track.h - knob_pad * 2.0;
+    const knob_rect: palette.Rect = .{ .x = track.x + track.w - knob_pad - knob, .y = track.y + knob_pad, .w = knob, .h = knob };
+    queueRoundedRectClipped(state, knob_rect, paletteColor(theme.mix(controlSurface(), theme.accent(), 0.7)), knob * 0.5, clip);
 }
 
 /// The switch alone (track and knob); `hovered` brightens an off track.

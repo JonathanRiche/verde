@@ -657,6 +657,29 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return text_layout.contentHeight(self.buffer.items, self.textMetrics(), self.textRect().w, true);
         }
 
+        /// Bounds height that shows the wrapped prompt (at least `min_lines`
+        /// lines, plus `extra_text_h` reserved under the text) inside this
+        /// component's chrome: frame padding, inner toolbar, and the outside
+        /// directory strip. Hosts clamp it to their own maximum so the editor
+        /// grows with its content and scrolls once it stops growing. Uses the
+        /// current bounds' width for wrapping.
+        pub fn preferredHeight(self: *const Component, min_lines: f32, extra_text_h: f32) f32 {
+            const metrics = self.textMetrics();
+            const text_h = @max(self.contentHeight(), metrics.line_height * min_lines) + extra_text_h;
+            return @ceil(text_h + self.chromeHeight());
+        }
+
+        /// `preferredHeight` for an empty prompt: chrome plus `lines` lines.
+        pub fn minimumHeight(self: *const Component, lines: f32) f32 {
+            return @ceil(self.textMetrics().line_height * lines + self.chromeHeight());
+        }
+
+        fn chromeHeight(self: *const Component) f32 {
+            var chrome = self.scaled(config.padding_y) * 2.0 + self.scaled(config.toolbar_height) + self.scaled(config.toolbar_gap);
+            if (self.directoryOutside()) chrome += self.scaled(config.toolbar_height) + self.scaled(config.toolbar_gap);
+            return chrome;
+        }
+
         pub fn maxScrollY(self: *const Component) f32 {
             return scroll.maxOffsetY(self.scrollMetrics());
         }
@@ -906,6 +929,13 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
             try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            if (self.buffer.items.len == 0) {
+                // The caret sits at the text origin; start the placeholder one
+                // caret width plus a hair later so it never draws over the
+                // first letter ("|Ask…").
+                const shift = self.placeholderCaretShift();
+                for (runs.items) |*run| run.x += shift;
+            }
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             if (self.focused) {
@@ -1122,20 +1152,40 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             );
         }
 
+        /// Stroked chevron-down, matching the chevron settings selects and
+        /// header dropdowns use, so every popover trigger shares one glyph.
         fn renderDisclosureArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, color: draw.Color) !void {
             const m = @max(@min(rect.w, rect.h), 1.0);
             const cx = rect.x + rect.w * 0.5;
             const cy = rect.y + rect.h * 0.5;
-            const half_h = m * 0.18;
-            const half_w = m * 0.14;
-            try batch.triangleClipped(
-                allocator,
-                .{ .x = cx - half_w, .y = cy - half_h },
-                .{ .x = cx - half_w, .y = cy + half_h },
-                .{ .x = cx + half_w, .y = cy },
-                color,
-                rect,
-            );
+            const half_w = m * 0.20;
+            const half_h = m * 0.10;
+            const thickness = @max(m * 0.075, 1.25);
+            const left: draw.Vec2 = .{ .x = cx - half_w, .y = cy - half_h };
+            const apex: draw.Vec2 = .{ .x = cx, .y = cy + half_h };
+            const right: draw.Vec2 = .{ .x = cx + half_w, .y = cy - half_h };
+            try strokeSegment(allocator, batch, left, apex, thickness, color, rect);
+            try strokeSegment(allocator, batch, apex, right, thickness, color, rect);
+        }
+
+        fn strokeSegment(allocator: std.mem.Allocator, batch: *draw.RenderBatch, p: draw.Vec2, q: draw.Vec2, thickness: f32, color: draw.Color, clip: draw.Rect) !void {
+            const dx = q.x - p.x;
+            const dy = q.y - p.y;
+            const len = @max(@sqrt(dx * dx + dy * dy), 0.001);
+            // Extend each end by half the stroke so the two arms overlap at the apex.
+            const ux = dx / len;
+            const uy = dy / len;
+            const ext = thickness * 0.5;
+            const a: draw.Vec2 = .{ .x = p.x - ux * ext, .y = p.y - uy * ext };
+            const b: draw.Vec2 = .{ .x = q.x + ux * ext, .y = q.y + uy * ext };
+            const nx = -uy * thickness * 0.5;
+            const ny = ux * thickness * 0.5;
+            const c0: draw.Vec2 = .{ .x = a.x + nx, .y = a.y + ny };
+            const c1: draw.Vec2 = .{ .x = a.x - nx, .y = a.y - ny };
+            const c2: draw.Vec2 = .{ .x = b.x - nx, .y = b.y - ny };
+            const c3: draw.Vec2 = .{ .x = b.x + nx, .y = b.y + ny };
+            try batch.triangleClipped(allocator, c0, c1, c2, color, clip);
+            try batch.triangleClipped(allocator, c0, c2, c3, color, clip);
         }
 
         fn renderSeparator(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
@@ -1666,6 +1716,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
         }
 
+        fn placeholderCaretShift(self: *const Component) f32 {
+            return @max(self.scaled(1.5), 1.0) + self.scaled(3.0);
+        }
+
         fn placeholderText(self: *const Component) []const u8 {
             return if (self.placeholder_buffer.items.len > 0) self.placeholder_buffer.items else config.placeholder;
         }
@@ -2149,4 +2203,21 @@ test "composer prompt uses injected metrics for cursor and hit testing" {
     try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 20.4, .y = prompt.textRect().y + 2 } }));
     try std.testing.expectEqual(@as(usize, 1), prompt.cursor);
     try std.testing.expectEqual(@as(f32, prompt.textRect().x + 20), prompt.cursorRect().x);
+}
+
+test "composer prompt preferred height grows with wrapped text from a line floor" {
+    const Prompt = ComposerPrompt(.{ .x = 0, .y = 0, .width = 260, .height = 150 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    prompt.setFontMetrics(.{
+        .font_size = 10,
+        .line_height = 18,
+        .advance = proportionalAdvance,
+    });
+    const empty_h = prompt.preferredHeight(2.0, 0.0);
+    try std.testing.expectEqual(prompt.minimumHeight(2.0), empty_h);
+    try std.testing.expectEqual(empty_h + 18.0, prompt.preferredHeight(3.0, 0.0));
+    try prompt.setText(std.testing.allocator, "one\ntwo\nthree\nfour");
+    try std.testing.expectEqual(empty_h + 2.0 * 18.0, prompt.preferredHeight(2.0, 0.0));
+    try std.testing.expectEqual(empty_h + 2.0 * 18.0 + 5.0, prompt.preferredHeight(2.0, 5.0));
 }

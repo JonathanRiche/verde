@@ -23,9 +23,12 @@ const runtime_log = @import("runtime/log.zig");
 const stb_image = @import("media/stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const onboarding_ui = @import("ui/onboarding_modal.zig");
 const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const workspace_strip_ui = @import("ui/workspace_strip.zig");
 const side_panel_ui = @import("ui/side_panel.zig");
+const tooltip_ui = @import("ui/tooltip.zig");
+const context_menu_ui = @import("ui/context_menu.zig");
 const agent_prompt_popover_ui = @import("ui/agent_prompt_popover.zig");
 const file_viewer_ui = @import("ui/file_viewer.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
@@ -313,7 +316,9 @@ fn mainInner(init: std.process.Init) !void {
     const system_math_font_path = try systemMathFontPath(allocator);
     defer if (system_math_font_path) |path| allocator.free(path);
     const font_faces: palette.fonts.FaceSet = .{
-        .ui = .{ .memory = CAL_SANS_BYTES },
+        // One UI family: Cal Sans collapsed its word spaces at small chrome
+        // sizes and clashed with the Noto Sans bold/prose faces.
+        .ui = .{ .memory = NOTO_SANS_REGULAR_BYTES },
         // ui_bold and prose_bold both resolve to Noto Sans Bold.
         .bold = .{ .memory = NOTO_SANS_BOLD_BYTES },
         .prose = .{ .memory = NOTO_SANS_REGULAR_BYTES },
@@ -859,7 +864,7 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
         applySystemCursor(cache, cursor);
         return;
     }
-    if (!modalHitAtMouse(state)) {
+    if (!modalHitAtMouse(state) and toastMayOwnPointer(state)) {
         if (ui_layout.providerUpdateToastSystemCursorAt(mouse_x, mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
             return;
@@ -1919,7 +1924,12 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             // Files may have been committed or edited outside Verde.
             state.refreshSelectedWorkspaceGitChanges(false);
         },
+        .mouse_leave => {
+            tooltip_ui.notePointer(-1, -1);
+        },
         .focus_lost => {
+            transient_keys = .{};
+            tooltip_ui.notePointer(-1, -1);
             state.window_input_focus = false;
             state.alt_shortcut_hints_visible = false;
             state.ctrl_shortcut_hints_visible = false;
@@ -1931,6 +1941,8 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             state.blurCompanionComposer();
         },
         .key_down => |*key_event| {
+            const popovers_before = popoverSnapshot(state);
+            defer reconcilePopovers(state, popovers_before);
             // Any new key-down supersedes a pending text_input swallow; the
             // swallow only ever targets the event immediately following the
             // chord-completing key.
@@ -1956,6 +1968,29 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             if ((state.runtimeCredentialModalOpen() or state.runtimeTrustProposal() != null) and
                 ui_layout.handlePaletteKeyDown(state, key_event))
             {
+                transient_keys.capture(key_event);
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // A modal or transient menu must own the key before terminal,
+            // prefix shortcuts, or persistent companion captures see it.
+            if (terminal_panel_ui.standaloneMenuOpen() and onboarding_ui.onTop(state) and
+                terminal_panel_ui.handleStandaloneMenuKeyDown(state, key_event))
+            {
+                if (key_event.key == .space) state.prefix_swallow_text_input = true;
+                transient_keys.capture(key_event);
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (ui_layout.paletteModalOpen(state)) {
+                if (ui_layout.handlePaletteKeyDown(state, key_event)) transient_keys.capture(key_event);
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            const menu_owned_key = transientMenuOwnsText(state);
+            if (routeTransientMenuKey(state, key_event)) {
+                transient_keys.capture(key_event);
+                if (menu_owned_key) state.prefix_swallow_text_input = true;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1965,6 +2000,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 return true;
             }
             if (state.isCompanionEnabled() and state.companion_controller.menu != .none) {
+                transient_keys.capture(key_event);
                 // True Palette modals remain above an open Companion menu.
                 // Otherwise the menu owns keys before pane/browser input.
                 if (ui_layout.handlePaletteKeyDown(state, key_event)) {
@@ -1980,6 +2016,29 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 return true;
             }
             if (ui_layout.handleCompanionTextShortcut(state, key_event, isPrimaryModifierPressed(key_event.mod))) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (!state.prefix_armed and !state.prefix_navigate and !agent_prompt_popover_ui.isOpen() and !state.companion_composer.focused and sidebar_ui.handleKeyboardFocusKeyDown(state, key_event)) {
+                // Sidebar focus replaces pane-header focus; returning to the
+                // terminal must not revive a stale header ring and eat Tab.
+                workspace_panes_ui.clearPaneHeaderFocus();
+                side_panel_ui.clearHeaderFocus(state);
+                transient_keys.capture(key_event);
+                if (key_event.key == .space) state.prefix_swallow_text_input = true;
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (!state.prefix_armed and !state.prefix_navigate and !agent_prompt_popover_ui.isOpen() and !state.companion_composer.focused and side_panel_ui.handleHeaderKeyDown(state, key_event)) {
+                workspace_panes_ui.clearPaneHeaderFocus();
+                transient_keys.capture(key_event);
+                if (key_event.key == .space) state.prefix_swallow_text_input = true;
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (!state.prefix_armed and !state.prefix_navigate and !agent_prompt_popover_ui.isOpen() and !state.companion_composer.focused and workspace_panes_ui.handlePaneHeaderKeyDown(state, key_event)) {
+                transient_keys.capture(key_event);
+                if (key_event.key == .space) state.prefix_swallow_text_input = true;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2039,6 +2098,8 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             // A focused side panel body (Changes / Files) owns navigation keys
             // before pane bindings, so Ctrl+W closes the panel, not a pane.
             if (side_panel_ui.handleKeyDown(state, key_event, action)) {
+                transient_keys.capture(key_event);
+                if (key_event.key == .space) state.prefix_swallow_text_input = true;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2256,6 +2317,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             if (key_event.hidScancode() == .lshift or key_event.hidScancode() == .rshift) {
                 state.shift_shortcut_hints_visible = false;
             }
+            const captured_by_menu = transient_keys.release(key_event);
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input platform key_up key=0x{x} scancode={} focused={} visible={}",
@@ -2266,10 +2328,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.isCompanionEnabled() and state.companion_controller.menu != .none) {
-                syncWindowTextInput(window, state);
-                return true;
-            }
+            if (captured_by_menu) return true;
             if (state.isNativeBrowserSurfaceFocused()) {
                 state.browser_controller.address_focused = false;
                 syncWindowTextInput(window, state);
@@ -2284,6 +2343,9 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             }
         },
         .text_input => |text_event| {
+            // Setup-terminal context menus must never eat pasted auth codes.
+            if (terminal_panel_ui.standaloneMenuOpen()) terminal_panel_ui.closeMenu();
+            if (transientMenuOwnsText(state)) return true;
             if (state.prefix_swallow_text_input) {
                 state.prefix_swallow_text_input = false;
                 return true;
@@ -2359,6 +2421,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             }
         },
         .mouse_motion => |*motion_event| {
+            tooltip_ui.notePointer(motion_event.x, motion_event.y);
             if (sidebar_ui.finishThreadDragIfMouseReleased(state, motion_event.x, motion_event.y, motion_event.state)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2411,6 +2474,13 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             _ = state.handleBrowserMouse(browserMouseMotionEvent(motion_event));
         },
         .mouse_button_down, .mouse_button_up => |*button_event| {
+            if (button_event.down and button_event.button == 1) {
+                sidebar_ui.clearKeyboardFocus(state);
+                side_panel_ui.clearHeaderFocus(state);
+            }
+            if (button_event.down) tooltip_ui.notePress(button_event.x, button_event.y);
+            const popovers_before = popoverSnapshot(state);
+            defer reconcilePopovers(state, popovers_before);
             if (handleNavigationMouseButton(state, keyboard, button_event)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2464,6 +2534,28 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // Route existing menu panels before pane bodies; dismissals never
+            // leave a floating header menu behind a side-panel click.
+            if (button_event.button == 1 and chat_panel_ui.headerMenuOpen(state) and
+                chat_panel_ui.handleWorkspaceHeaderPaletteMouseButton(state, button_event.x, button_event.y, button_event.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (workspace_panes_ui.menuOpen() and
+                workspace_panes_ui.handlePaneChromeMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (terminal_panel_ui.menuOpen() and terminal_panel_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (button_event.button == 1 and browser_ui.menuOpen(state) and browser_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             // The sidebar context menu is a Palette overlay and can extend
             // across workspace panes when the rail is collapsed. Route its
             // clicks, and the right-click that opens it, before pane/browser
@@ -2501,13 +2593,14 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            // The provider update card floats over the top-right of the workspace.
-            if (button_event.button == 1 and !modalHitAtMouse(state) and ui_layout.handleProviderUpdateToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
+            // Toasts paint below menus and pickers, so their hit regions must
+            // yield to those same layers even where the rectangles overlap.
+            if (button_event.button == 1 and toastMayOwnPointer(state) and !modalHitAtMouse(state) and ui_layout.handleProviderUpdateToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // The git outcome card floats over the bottom of the workspace.
-            if (button_event.button == 1 and ui_layout.handleGitToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
+            if (button_event.button == 1 and toastMayOwnPointer(state) and ui_layout.handleGitToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -3317,6 +3410,125 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const palette.event.Key
 /// Escape as the user's keymap resolves it. The physical position is only a
 /// fallback when the host reported no layout data: with caps:swapescape or a
 /// virtual-keyboard keymap, the physical Escape key types something else.
+// Each event may open one transient layer. Reconcile at its end so a
+// newly opened menu dismisses siblings even when its handler returns early.
+var transient_keys: context_menu_ui.KeyReleaseCapture = .{};
+const PopoverSnapshot = [9]bool;
+fn popoverSnapshot(state: *const AppState) PopoverSnapshot {
+    return .{
+        chat_panel_ui.headerMenuOpen(state),
+        workspace_panes_ui.menuOpen(),
+        state.sidebar_context_menu_open,
+        terminal_panel_ui.menuRequested(),
+        browser_ui.menuOpen(state),
+        composerPopoverOpen(state),
+        state.companion_controller.menu != .none,
+        agent_prompt_popover_ui.isOpen(),
+        ui_layout.paletteModalOpen(state),
+    };
+}
+
+fn composerPopoverOpen(state: *const AppState) bool {
+    return state.composer_controller.model_picker.isOpen() or state.composer_controller.directory_picker.isOpen() or
+        state.composer_controller.runtime_picker.isOpen() or state.composer_controller.run_config_open;
+}
+
+fn reconcilePopovers(state: *AppState, before: PopoverSnapshot) void {
+    const after = popoverSnapshot(state);
+    // Includes keyboard and outside-click dismissal, even if pointer position
+    // is unchanged. Stale modal hit geometry must not hide a close transition.
+    if (!std.meta.eql(before, after)) tooltip_ui.resetDelay();
+    var opened: ?usize = null;
+    for (after, before, 0..) |is_open, was_open, i| {
+        if (is_open and !was_open) opened = i;
+    }
+    const keep = opened orelse return;
+    if (keep != 0 and after[0]) chat_panel_ui.closeHeaderMenus(state);
+    if (keep != 1 and after[1]) workspace_panes_ui.closeMenu();
+    if (keep != 2 and after[2]) state.closeSidebarContextMenu();
+    if (keep != 3 and after[3]) terminal_panel_ui.closeMenu();
+    if (keep != 4 and after[4]) browser_ui.closeMenus(state);
+    if (keep != 5 and after[5]) {
+        state.closePaletteModelPicker();
+        state.closePaletteDirectoryPicker();
+        state.closePaletteRuntimePicker();
+        state.closeRunConfigPopover();
+    }
+    if (keep != 6 and after[6]) state.companion_controller.closeMenu();
+    if (keep != 7 and after[7]) agent_prompt_popover_ui.close(state);
+    state.markDirty();
+}
+
+fn transientMenuOwnsText(state: *const AppState) bool {
+    return chat_panel_ui.headerMenuOpen(state) or workspace_panes_ui.menuOpen() or state.sidebar_context_menu_open or
+        terminal_panel_ui.workspaceMenuOpen() or browser_ui.menuOpen(state);
+}
+
+/// Toast hit regions and cursors follow their visual position below popovers.
+fn toastMayOwnPointer(state: *const AppState) bool {
+    return !transientMenuOwnsText(state) and !composerPopoverOpen(state) and
+        !agent_prompt_popover_ui.isOpen() and
+        !(state.isCompanionEnabled() and state.companion_controller.menu != .none);
+}
+
+test "toast pointer routing yields to open menus and composer pickers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{ .companion_enabled = true }, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    try std.testing.expect(toastMayOwnPointer(&state));
+    state.workspace_header_open_menu_open = true;
+    try std.testing.expect(!toastMayOwnPointer(&state));
+    state.workspace_header_open_menu_open = false;
+    state.sidebar_context_menu_open = true;
+    try std.testing.expect(!toastMayOwnPointer(&state));
+    state.sidebar_context_menu_open = false;
+    inline for (.{ "model_picker", "directory_picker", "runtime_picker" }) |picker| {
+        @field(state.composer_controller, picker).open = true;
+        try std.testing.expect(!toastMayOwnPointer(&state));
+        @field(state.composer_controller, picker).open = false;
+        try std.testing.expect(toastMayOwnPointer(&state));
+    }
+    state.composer_controller.run_config_open = true;
+    try std.testing.expect(!toastMayOwnPointer(&state));
+    state.composer_controller.run_config_open = false;
+    state.companion_controller.menu = .brain;
+    try std.testing.expect(!toastMayOwnPointer(&state));
+    // A disabled Companion or an unpainted/hidden browser menu cannot steal
+    // the pointer from an otherwise available toast through stale flags.
+    state.app_config.companion_enabled = false;
+    state.browser_controller.toolbar_overflow_open = true;
+    state.browser_controller.inspector_menu_open = true;
+    state.browser_controller.context_menu_open = true;
+    try std.testing.expect(toastMayOwnPointer(&state));
+    state.companion_controller.menu = .none;
+    browser_ui.closeMenus(&state);
+    try std.testing.expect(toastMayOwnPointer(&state));
+}
+
+fn routeTransientMenuKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
+    if (agent_prompt_popover_ui.isOpen()) return agent_prompt_popover_ui.handleKeyDown(state, event);
+    if (state.companion_controller.menu != .none) return false; // Companion owns its own menu routing below.
+    if (composerPopoverOpen(state)) {
+        _ = state.routePaletteComposerKeyDown(event);
+        return true;
+    }
+    if (chat_panel_ui.headerMenuOpen(state)) return chat_panel_ui.handleHeaderMenuKeyDown(state, event);
+    if (workspace_panes_ui.handleMenuKeyDown(state, event)) return true;
+    if (state.sidebar_context_menu_open) return sidebar_ui.handleContextMenuKeyDown(state, event);
+    if (terminal_panel_ui.workspaceMenuOpen()) return terminal_panel_ui.handlePaletteKeyDown(state, event);
+    if (browser_ui.menuOpen(state)) return browser_ui.handlePaletteKeyDown(state, event);
+    return false;
+}
+
 fn isEscapeKey(event: *const palette.event.KeyEvent) bool {
     return event.key == .escape or (event.key == .unknown and event.hidScancode() == .escape);
 }

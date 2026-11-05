@@ -25,6 +25,8 @@ const onboarding_modal = @import("onboarding_modal.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const agent_prompt_popover = @import("agent_prompt_popover.zig");
 const companion = @import("companion.zig");
+const chat_panel = @import("chat_panel.zig");
+const side_panel = @import("side_panel.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
 const commit_sheet = @import("commit_sheet.zig");
 const git_changes = @import("../state/git_changes_controller.zig");
@@ -34,6 +36,7 @@ const profiler = @import("../runtime/profiler.zig");
 const app_config = @import("../app/config.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const utils = @import("../utils.zig");
+const tooltip = @import("tooltip.zig");
 
 const RootLayout = struct {
     sidebar: palette.Rect,
@@ -232,6 +235,12 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
     // The expanded Companion covers the workspace area but not the sidebar.
     state.companion_controller.workspace_left = root_layout.workspace.x;
+    // The floating panel starts below the pane header row so the header's
+    // actions (Commit, folder, split, more) stay visible and clickable.
+    companion.pane_header_bottom = split.content.y + chat_panel.paneHeaderHeight(split.content);
+    // ...and docks inside the pane area left of an open right side panel,
+    // never over its rows (panes give up `companion.paneReserve`).
+    companion.pane_area = side_panel.split(state, split.content).content;
     companion.render(state, width, height);
     state.palette_overlay_batch.restoreZIndex(companion_z);
     // The which-key panel must sit above pane-local layers (composer, pane
@@ -241,9 +250,6 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     agent_prompt_popover.render(state, width, height);
     renderPrefixStatusBar(state, split.content);
     renderPrefixWhichKey(state, split.content);
-    // Same layer as the popover, queued before modals: any dialog or palette
-    // opened over the card covers it.
-    renderProviderUpdateToast(state, split.content);
     state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
@@ -265,41 +271,324 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderRuntimeTrustModal(state, width, height);
     renderPairingApprovalModal(state, width, height);
     debug_window.render(state, width, height);
-    // Notices report the result of actions taken inside modals (Settings,
-    // provider setup, folder browser), so they draw above every modal and
-    // its dimmed backdrop rather than behind them.
-    const toast_z = state.palette_overlay_batch.setZIndex(NOTICE_TOAST_Z);
-    renderNoticeToast(state, split.content);
-    state.palette_overlay_batch.restoreZIndex(toast_z);
+    renderToasts(state, toastArea(state, split.content), width, height);
+}
+
+/// Toasts sit just above pane content and composer overlays but below every
+/// popover, menu, picker, tooltip, the Companion and modals, so an open menu
+/// is never covered by a toast.
+const TOAST_Z: i32 = 132;
+
+/// Top-right stack for the git and provider-update cards: just under the
+/// focused pane's header row (clear of its Commit / folder / split / more
+/// buttons), left of an open right panel and the Companion, stacking down.
+/// `bottom` is the lowest edge a card may reach (above the composer).
+const ToastStack = struct {
+    right: f32,
+    /// Top of the next card; moves down as cards are placed.
+    top: f32,
+    bottom: f32,
+    max_w: f32,
+
+    /// Claims a `w` by `h` slot at the stack's top-right and moves the
+    /// anchor below it.
+    fn place(self: *ToastStack, w: f32, h: f32) palette.Rect {
+        const rect: palette.Rect = .{ .x = self.right - w, .y = self.top, .w = w, .h = h };
+        self.top = rect.y + h + theme.scaledUi(TOAST_STACK_GAP_UI);
+        return rect;
+    }
+
+    fn fits(self: *const ToastStack, h: f32) bool {
+        return self.top + h <= self.bottom;
+    }
+};
+const TOAST_STACK_GAP_UI: f32 = 8.0;
+/// Gap between the pane header row and the first card.
+const TOAST_HEADER_GAP_UI: f32 = 8.0;
+/// Space between the toast stack and the composer card below it.
+const TOAST_COMPOSER_GAP_UI: f32 = 12.0;
+
+/// Right edge and first top of the stack for the focused `pane` inside the
+/// toast `area` (the pane area left of the right panel and the docked
+/// Companion): the pane's top-right corner under its header row.
+fn toastStackAnchor(pane: palette.Rect, area: palette.Rect, header_h: f32) struct { right: f32, top: f32 } {
+    const margin = theme.scaledUi(NOTICE_TOAST_MARGIN_UI);
+    const pane_right = @min(pane.x + pane.w, area.x + area.w);
+    return .{ .right = pane_right - margin, .top = pane.y + header_h + theme.scaledUi(TOAST_HEADER_GAP_UI) };
+}
+
+/// Height of the band the floating top-right git / provider-update cards
+/// occupy over `pane_rect` (the pane's full rect, header included): from the
+/// top of the pane's body (under its header row) to 8px below the last card;
+/// zero when none is shown. Header tooltips steer clear of it. Uses the cards drawn last frame (toasts are drawn after
+/// the panes), so it trails a newly shown card by one frame.
+pub fn topCardReserve(state: *runtime.AppState, pane_rect: palette.Rect) f32 {
+    if (state.gitToastView() == null and state.providerUpdateToastView() == null) return 0.0;
+    return cardStackReserve(&.{ git_toast_card, provider_update_toast_card }, pane_rect, chat_panel.paneHeaderHeight(pane_rect));
+}
+
+fn cardStackReserve(cards: []const ?palette.Rect, pane_rect: palette.Rect, header_h: f32) f32 {
+    var stack_bottom: ?f32 = null;
+    for (cards) |maybe_card| {
+        const card = maybe_card orelse continue;
+        // Only cards drawn over this pane.
+        if (card.x >= pane_rect.x + pane_rect.w or card.x + card.w <= pane_rect.x) continue;
+        if (card.y < pane_rect.y or card.y >= pane_rect.y + pane_rect.h) continue;
+        stack_bottom = @max(stack_bottom orelse card.y + card.h, card.y + card.h);
+    }
+    const bottom = stack_bottom orelse return 0.0;
+    return @max(bottom + theme.scaledUi(TOAST_STACK_GAP_UI) - (pane_rect.y + header_h), 0.0);
+}
+
+test "top card reserve covers the card stack over its own pane only" {
+    theme.applyTheme(1.0);
+    const pane: palette.Rect = .{ .x = 380.0, .y = 0.0, .w = 1200.0, .h = 900.0 };
+    const other: palette.Rect = .{ .x = 1580.0, .y = 0.0, .w = 400.0, .h = 900.0 };
+    const git: palette.Rect = .{ .x = 1200.0, .y = 68.0, .w = 360.0, .h = 70.0 };
+    const update: palette.Rect = .{ .x = 1220.0, .y = 146.0, .w = 340.0, .h = 90.0 };
+    // Header 60px: body starts at 60, stack ends at 236, plus the 8px gap.
+    try std.testing.expectApproxEqAbs(@as(f32, 236.0 + 8.0 - 60.0), cardStackReserve(&.{ git, update }, pane, 60.0), 0.01);
+    try std.testing.expectEqual(@as(f32, 0.0), cardStackReserve(&.{ git, update }, other, 60.0));
+    try std.testing.expectEqual(@as(f32, 0.0), cardStackReserve(&.{ null, null }, pane, 60.0));
+}
+
+fn toastStack(state: *runtime.AppState, area: palette.Rect, width: f32, height: f32) ToastStack {
+    const margin = theme.scaledUi(NOTICE_TOAST_MARGIN_UI);
+    const reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
+    var pane = focusedPane(state, area).pane;
+    // The focused pane rect may extend under the side panel's split edge;
+    // the area already stops left of it.
+    if (pane.w <= 0.0 or pane.x >= area.x + area.w) pane = area;
+    const anchor = toastStackAnchor(pane, area, chat_panel.paneHeaderHeight(pane));
+    var right = anchor.right;
+    const top = anchor.top;
+    var bottom = @min(pane.y + pane.h, area.y + area.h) - reserve - margin;
+    const composer = &state.composer_controller;
+    if (composer.toolbar_overlay_valid and composer.input_bounds_valid and
+        composer.input_max[0] > pane.x and composer.input_min[0] < pane.x + pane.w)
+    {
+        bottom = @min(bottom, composer.input_min[1] - theme.scaledUi(TOAST_COMPOSER_GAP_UI));
+    }
+    if (companion.occupiedRect(state, width, height)) |occupied| {
+        // A floating Companion panel sharing the stack's band pushes it left.
+        if (occupied.y < bottom and occupied.y + occupied.h > top and occupied.x < right) {
+            right = @min(right, occupied.x - margin);
+        }
+    }
+    return .{ .right = right, .top = top, .bottom = bottom, .max_w = @max(right - pane.x - margin, 0.0) };
+}
+
+fn renderToasts(state: *runtime.AppState, area: palette.Rect, width: f32, height: f32) void {
+    var stack = toastStack(state, area, width, height);
+    // Notices and git results report actions taken inside modals (Settings,
+    // provider setup, folder browser): while a modal is open they draw above
+    // it and its backdrop; otherwise they stay under menus and popovers.
+    const notice_z = state.palette_overlay_batch.setZIndex(if (hasPaletteModal(state)) NOTICE_TOAST_Z else TOAST_Z);
+    renderNoticeToast(state, &stack, area);
+    state.palette_overlay_batch.restoreZIndex(notice_z);
+    // The provider update card never outranks a dialog or palette.
+    const provider_z = state.palette_overlay_batch.setZIndex(TOAST_Z);
+    renderProviderUpdateToast(state, &stack);
+    state.palette_overlay_batch.restoreZIndex(provider_z);
+    header_update_slot = null;
 }
 
 // Notice toast (item 11): `setSidebarNotice` text ("Copied selection.",
-// "Chat pane closed.", ...) as a small pill at the bottom centre of the
-// workspace, below pane headers so it never covers header icons. Timing and
+// "Chat pane closed.", ...) as a small pill centred above the composer
+// stack (see `noticeAnchor`); the git and provider cards stack top-right.
+// Timing and
 // frame pacing live in AppState (`noticeToast*`); this only draws.
-const NOTICE_TOAST_FONT_UI: f32 = 13.0;
-const NOTICE_TOAST_PAD_X_UI: f32 = 14.0;
-const NOTICE_TOAST_PAD_Y_UI: f32 = 8.0;
+// Compact (about 26px tall) so it fits the gap above the composer stack.
+const NOTICE_TOAST_FONT_UI: f32 = 12.5;
+const NOTICE_TOAST_PAD_X_UI: f32 = 12.0;
+const NOTICE_TOAST_PAD_Y_UI: f32 = 5.0;
 const NOTICE_TOAST_MARGIN_UI: f32 = 18.0;
 const NOTICE_TOAST_RISE_UI: f32 = 10.0;
 const NOTICE_TOAST_MAX_W_UI: f32 = 560.0;
 const NOTICE_TOAST_MAX_LINES: f32 = 4.0;
 
-fn renderNoticeToast(state: *runtime.AppState, workspace_rect: palette.Rect) void {
-    // Git actions (Commit, Commit & push, Push, Pull & push) draw their own
-    // card; a plain notice stacks above it.
-    var workspace = workspace_rect;
-    if (renderGitToast(state, workspace_rect)) |card_top| {
-        const reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
-        workspace.h = @max(card_top - theme.scaledUi(8.0) + theme.scaledUi(NOTICE_TOAST_MARGIN_UI) + reserve - workspace.y, 0.0);
+/// Toasts sit over the pane area left of an open right side panel, so they
+/// never cover the panel's header or its first rows.
+fn toastArea(state: *runtime.AppState, workspace: palette.Rect) palette.Rect {
+    var panes = side_panel.split(state, workspace).content;
+    // ...and left of the docked Companion column.
+    panes.w = @max(panes.w - companion.paneReserve(state, panes), 0.0);
+    return panes;
+}
+
+/// Neutral toast edge (accent is reserved for focus and primary actions).
+fn toastBorder() [4]f32 {
+    return theme.COLOR_PANEL_MUTED;
+}
+
+/// One bordered toast shell with a whole-pixel stroke (crisp chrome: a single
+/// `panel` command rather than a border fill under an inset fill).
+fn queueToastShell(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, border: palette.Color, radius: f32) void {
+    state.palette_overlay_batch.panel(state.allocator, rect, fill, border, radius, @max(@round(theme.scaledUi(1.0)), 1.0)) catch |err| {
+        runtime.log.warn("failed to queue toast shell: {s}", .{@errorName(err)});
+    };
+}
+
+/// Ghost close button: a 28px hit square that shows a hover wash over the
+/// whole target, with a muted glyph that brightens on hover.
+fn queueToastCloseButton(state: *runtime.AppState, close: palette.Rect, alpha: f32, clip: palette.Rect) void {
+    const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, close);
+    if (hovered) {
+        // An opaque, clearly lighter square over the card fill (panel_muted
+        // nearly matched panel_alt on some palettes and the hover vanished).
+        var hover_bg = paletteColor(theme.mix(theme.COLOR_PANEL_ALT, theme.COLOR_WHITE, 0.14));
+        hover_bg.a *= alpha;
+        queuePaletteRoundedRect(state, close, hover_bg, theme.scaledUi(6.0));
     }
+    var close_color = paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+    close_color.a *= alpha;
+    const glyph = theme.scaledUi(14.0);
+    queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, close_color, glyph, .icon, clip, false);
+}
+
+/// Where a short notice pill sits: centred on `center_x`, its bottom at
+/// `bottom`, never wider than `max_w`.
+const NoticeAnchor = struct {
+    center_x: f32,
+    bottom: f32,
+    max_w: f32,
+    /// Anchored on the focused chat's visible transcript.
+    chat: bool = false,
+    /// Right-align the pill to this x instead of centring on `center_x`.
+    right_edge: ?f32 = null,
+    /// Place the pill's top here instead of its bottom at `bottom`.
+    top: ?f32 = null,
+};
+
+/// Centres the pill on the anchor's column and keeps it inside `area`.
+fn noticePillRect(anchor: NoticeAnchor, area: palette.Rect, pill_w: f32, pill_h: f32) palette.Rect {
+    const wanted_x = if (anchor.right_edge) |right| right - pill_w else anchor.center_x - pill_w * 0.5;
+    const x = std.math.clamp(wanted_x, area.x, @max(area.x + area.w - pill_w, area.x));
+    const y = if (anchor.top) |top| top else anchor.bottom - pill_h;
+    return .{ .x = x, .y = y, .w = pill_w, .h = pill_h };
+}
+
+/// Anchor for a chat pane: centred on its content column, just above the
+/// transcript viewport's bottom edge, which sits above the composer row and
+/// everything stacked on it (waiting banner, background commands, follow-up
+/// and approval cards), so the pill never covers those.
+fn chatNoticeAnchor(column: palette.Rect, transcript_clip: palette.Rect) NoticeAnchor {
+    return .{
+        .center_x = column.x + column.w * 0.5,
+        .bottom = transcript_clip.y + transcript_clip.h - theme.scaledUi(NOTICE_TOAST_GAP_UI),
+        .max_w = column.w,
+        .chat = true,
+    };
+}
+
+/// The focused pane's notice anchor: its chat content column, else the
+/// bottom centre of the focused pane (terminal, browser, file), else the
+/// bottom centre of the pane area.
+/// The focused pane's rect and, when it is a chat whose transcript geometry
+/// was laid out inside it this frame, that transcript's content column and
+/// viewport (`clip`, which ends where the composer stack begins).
+const FocusedPane = struct { pane: palette.Rect, chat: ?struct { column: palette.Rect, clip: palette.Rect } = null };
+
+fn focusedPane(state: *runtime.AppState, area: palette.Rect) FocusedPane {
+    var result: FocusedPane = .{ .pane = area };
+    if (state.project_controller.projects.items.len == 0) return result;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    const focused = layout.focusedPane() orelse return result;
+    if (workspace_panes.recordedPaneRect(focused.id)) |rect| result.pane = rect;
+    if (focused.ref != .chat) return result;
+    const transcript = &state.transcript_controller;
+    const column = transcript.palette_column;
+    const clip = transcript.palette_clip;
+    const pane = result.pane;
+    if (column.w > 0.0 and clip.h > 0.0 and clip.x >= pane.x - 1.0 and clip.x + clip.w <= pane.x + pane.w + 1.0) {
+        result.chat = .{ .column = column, .clip = clip };
+    }
+    return result;
+}
+
+fn noticeAnchor(state: *runtime.AppState, area: palette.Rect) NoticeAnchor {
+    const margin = theme.scaledUi(NOTICE_TOAST_MARGIN_UI);
+    const reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
+    const focused = focusedPane(state, area);
+    if (focused.chat) |chat| {
+        // Following the tail, the transcript's bottom spacing is the free
+        // gap above the composer stack. Scrolled up there is no gap, so the
+        // pill tucks into the composer card's top padding band instead.
+        if (state.transcript_controller.auto_follow_suspended) {
+            if (composerBandAnchor(state, focused.pane)) |anchor| return anchor;
+        }
+        return chatNoticeAnchor(chat.column, chat.clip);
+    }
+    const pane = focused.pane;
+    return .{ .center_x = pane.x + pane.w * 0.5, .bottom = pane.y + pane.h - reserve - margin, .max_w = pane.w - margin * 2.0 };
+}
+
+/// Inside the focused composer's top padding band, right-aligned so it stays
+/// clear of the placeholder / first words; null without a live composer.
+fn composerBandAnchor(state: *runtime.AppState, pane: palette.Rect) ?NoticeAnchor {
+    const composer = &state.composer_controller;
+    if (!composer.toolbar_overlay_valid or !composer.input_bounds_valid) return null;
+    const left = composer.input_min[0];
+    const right = composer.input_max[0];
+    if (right <= pane.x or left >= pane.x + pane.w or right - left < theme.scaledUi(200.0)) return null;
+    const inset = theme.scaledUi(6.0);
+    return .{
+        .center_x = right - inset,
+        .bottom = 0.0,
+        .max_w = (right - left) * 0.5,
+        .chat = true,
+        .right_edge = right - inset * 2.0,
+        .top = composer.input_min[1] + inset,
+    };
+}
+
+/// Pill colours with the text held at 4.5:1 or better against the opaque
+/// fill (theme panel roles can sit close to the text colour on some
+/// Omarchy palettes, which left notices faint).
+fn noticeColors() struct { fill: [4]f32, text: [4]f32 } {
+    const fill = theme.raise(theme.background(), 0.08);
+    const text = if (theme.contrastRatio(theme.COLOR_WHITE, fill) >= 4.5) theme.COLOR_WHITE else theme.foregroundOn(fill);
+    return .{ .fill = fill, .text = text };
+}
+
+/// Space between the pill and the composer stack below it: the pill sits in
+/// the transcript's bottom spacing, never over the last card's border.
+const NOTICE_TOAST_GAP_UI: f32 = 4.0;
+
+/// The send path's "Waiting for <provider> reply..." notice repeats what the
+/// focused chat already shows as its pending "Working · Waiting for streamed
+/// output..." card, so it is dropped while that card is on screen.
+fn noticeDuplicatesPendingCard(state: *runtime.AppState, text: []const u8, anchor: NoticeAnchor) bool {
+    if (!anchor.chat) return false;
+    if (!std.mem.startsWith(u8, text, "Waiting for ") or !std.mem.endsWith(u8, text, " reply...")) return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    const send_state = state.currentThread().send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    return send_state.status == .pending;
+}
+
+test "only the provider wait notice can duplicate the pending card" {
+    const chat_anchor: NoticeAnchor = .{ .center_x = 0.0, .bottom = 0.0, .max_w = 100.0, .chat = true };
+    // Other notices and non-chat anchors never qualify (no state access).
+    var state: runtime.AppState = undefined;
+    try std.testing.expect(!noticeDuplicatesPendingCard(&state, "Terminal pane created.", chat_anchor));
+    try std.testing.expect(!noticeDuplicatesPendingCard(&state, "Waiting for Claude reply...", .{ .center_x = 0.0, .bottom = 0.0, .max_w = 100.0 }));
+}
+
+fn renderNoticeToast(state: *runtime.AppState, stack: *ToastStack, area: palette.Rect) void {
+    // Git actions (Commit, Commit & push, Push, Pull & push) draw their own
+    // card in the bottom-right stack.
+    renderGitToast(state, stack);
     const toast = state.noticeToast() orelse return;
-    if (workspace.w <= 0.0 or workspace.h <= 0.0) return;
+    const anchor = noticeAnchor(state, area);
+    if (anchor.max_w <= theme.scaledUi(80.0)) return;
+    if (noticeDuplicatesPendingCard(state, toast.text, anchor)) return;
     const font_size = theme.scaledUi(NOTICE_TOAST_FONT_UI);
     const text_h = font_size * 1.25;
     const pad_x = theme.scaledUi(NOTICE_TOAST_PAD_X_UI);
     const pad_y = theme.scaledUi(NOTICE_TOAST_PAD_Y_UI);
-    const max_w = @min(@max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(80.0)), theme.scaledUi(NOTICE_TOAST_MAX_W_UI));
+    const max_w = @min(anchor.max_w, theme.scaledUi(NOTICE_TOAST_MAX_W_UI));
     const avail_w = max_w - pad_x * 2.0;
     // Measure with the `.ui` role and draw with the same role below; the
     // untyped overlay text path falls back to the prose face, which is wider
@@ -313,37 +602,33 @@ fn renderNoticeToast(state: *runtime.AppState, workspace_rect: palette.Rect) voi
     const text_w = if (wrap) avail_w else measured_w;
     const pill_w = text_w + pad_x * 2.0;
     const pill_h = text_h * lines + pad_y * 2.0;
-    // Keep clear of the prefix status bar when a chord is armed.
-    const bottom_reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
-    const settled_y = workspace.y + workspace.h - bottom_reserve - theme.scaledUi(NOTICE_TOAST_MARGIN_UI) - pill_h;
+    var slot = noticePillRect(anchor, area, pill_w, pill_h);
+    // Stay above a git card in the bottom-right stack if they would meet.
+    if (git_toast_card) |card| {
+        if (slot.x < card.x + card.w and slot.x + slot.w > card.x and slot.y + slot.h > card.y) slot.y = card.y - theme.scaledUi(TOAST_STACK_GAP_UI) - pill_h;
+    }
     const rise_offset = (1.0 - toast.rise) * theme.scaledUi(NOTICE_TOAST_RISE_UI);
-    const pill: palette.Rect = .{
-        .x = workspace.x + (workspace.w - pill_w) * 0.5,
-        .y = settled_y + rise_offset,
-        .w = pill_w,
-        .h = pill_h,
-    };
+    const pill: palette.Rect = .{ .x = slot.x, .y = slot.y + rise_offset, .w = pill_w, .h = pill_h };
+    // Only the short slide-in / fade-out (`noticeToastPhase`) lowers alpha;
+    // held notices draw at full opacity.
     const alpha = std.math.clamp(toast.alpha, 0.0, 1.0);
     if (alpha <= 0.0) return;
-    var bg = paletteColor(theme.COLOR_PANEL_ALT);
+    const notice_colors = noticeColors();
+    var bg = paletteColor(notice_colors.fill);
     bg.a *= alpha;
-    var border = paletteColor(if (toast.persistent) theme.COLOR_YELLOW else theme.borderMuted());
+    var border = paletteColor(if (toast.persistent) theme.COLOR_YELLOW else toastBorder());
     border.a *= alpha;
-    var fg = paletteColor(theme.COLOR_WHITE);
+    var fg = paletteColor(notice_colors.text);
     fg.a *= alpha;
-    // Rounded shell as two anti-aliased fills (border colour under an inset
-    // fill) instead of a stroked border, which aliases on a pill radius.
     // A multi-line card keeps a single-line pill's corner radius instead of
     // turning into a stadium.
     const radius = (text_h + pad_y * 2.0) * 0.5;
-    const inset = theme.scaledUi(1.0);
-    queuePaletteRoundedRect(state, pill, border, radius);
-    queuePaletteRoundedRect(state, .{ .x = pill.x + inset, .y = pill.y + inset, .w = pill.w - inset * 2.0, .h = pill.h - inset * 2.0 }, bg, radius - inset);
+    queueToastShell(state, pill, bg, border, radius);
     const text_rect: palette.Rect = .{ .x = pill.x + pad_x, .y = pill.y + pad_y, .w = text_w, .h = text_h * lines };
     queuePaletteRoleText(state, text_rect, toast.text, fg, font_size, .ui, pill, wrap);
 }
 
-// Git outcome card: bottom-centre, above the notice pill. A spinner while a
+// Git outcome card: the first slot of the top-right toast stack. A spinner while a
 // git action runs, then a green check (auto-dismisses), amber warning or red
 // error (stay until dismissed). Title, muted detail, × and, for a rejected
 // push, a Pull & push button. State and timing live in
@@ -356,7 +641,8 @@ const GIT_TOAST_GAP_UI: f32 = 10.0;
 const GIT_TOAST_MAX_W_UI: f32 = 480.0;
 const GIT_TOAST_MIN_W_UI: f32 = 260.0;
 const GIT_TOAST_RADIUS_UI: f32 = 10.0;
-const GIT_TOAST_CLOSE_UI: f32 = 20.0;
+/// Ghost close button hit square (at least 24px; hover wash covers it).
+const GIT_TOAST_CLOSE_UI: f32 = 28.0;
 const GIT_TOAST_BUTTON_H_UI: f32 = 26.0;
 const GIT_TOAST_DETAIL_MAX_LINES: f32 = 3.0;
 const GIT_TOAST_SPINNER_DOTS: usize = 8;
@@ -365,21 +651,26 @@ const NF_COD_WARNING = "\u{EA6C}";
 const NF_COD_ERROR = "\u{EA87}";
 const NF_COD_CLOSE = "\u{EA76}";
 
+/// Gap between a toast's close hit square and the card's top/right edges.
+fn toastCloseInset() f32 {
+    return theme.scaledUi(6.0);
+}
+
 /// Last drawn card geometry, for pointer routing (`handleGitToastMouseButton`).
 var git_toast_card: ?palette.Rect = null;
 var git_toast_close: ?palette.Rect = null;
 var git_toast_action: ?palette.Rect = null;
 var git_toast_dismissible: bool = false;
 
-/// Draws the git card; returns its top edge, or null when nothing is shown.
-fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
+/// Draws the git card into the bottom slot of the toast stack.
+fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
     git_toast_card = null;
     git_toast_close = null;
     git_toast_action = null;
-    const view = state.gitToastView() orelse return null;
-    if (workspace.w <= 0.0 or workspace.h <= 0.0) return null;
+    const view = state.gitToastView() orelse return;
+    if (stack.max_w <= theme.scaledUi(120.0) or stack.bottom <= stack.top) return;
     const alpha = std.math.clamp(view.alpha, 0.0, 1.0);
-    if (alpha <= 0.0) return null;
+    if (alpha <= 0.0) return;
     const pad = theme.scaledUi(GIT_TOAST_PAD_UI);
     const gap = theme.scaledUi(GIT_TOAST_GAP_UI);
     const icon_size = theme.scaledUi(GIT_TOAST_ICON_UI);
@@ -396,7 +687,7 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
         0.0;
 
     // Width: fit the title/detail, clamped to the workspace and a max.
-    const max_w = @min(@max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(120.0)), theme.scaledUi(GIT_TOAST_MAX_W_UI));
+    const max_w = @min(stack.max_w, theme.scaledUi(GIT_TOAST_MAX_W_UI));
     const chrome_w = pad * 2.0 + icon_size + gap + (if (view.pull_push) button_w + gap else 0.0) + (if (view.dismissible) close_size + gap * 0.5 else 0.0);
     const title_w = runtime.paletteUiTextPrefixWidth(view.title, title_font, view.title.len) + title_font * 0.35;
     const detail_w = if (view.detail.len > 0) runtime.paletteUiTextPrefixWidth(view.detail, detail_font, view.detail.len) + detail_font * 0.35 else 0.0;
@@ -409,11 +700,12 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
     const text_block_h = title_h + (if (detail_lines > 0.0) theme.scaledUi(2.0) + detail_line_h * detail_lines else 0.0);
     const card_h = @max(text_block_h, @max(icon_size, if (view.pull_push) theme.scaledUi(GIT_TOAST_BUTTON_H_UI) else 0.0)) + pad * 2.0;
 
-    const bottom_reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
-    const settled_y = workspace.y + workspace.h - bottom_reserve - theme.scaledUi(NOTICE_TOAST_MARGIN_UI) - card_h;
+    if (!stack.fits(card_h)) return;
+    const slot = stack.place(card_w, card_h);
+    // Drops in from just above its slot (the stack hangs from the header).
     const card: palette.Rect = snapRect(.{
-        .x = workspace.x + (workspace.w - card_w) * 0.5,
-        .y = settled_y + (1.0 - view.rise) * theme.scaledUi(NOTICE_TOAST_RISE_UI),
+        .x = slot.x,
+        .y = slot.y - (1.0 - view.rise) * theme.scaledUi(NOTICE_TOAST_RISE_UI),
         .w = card_w,
         .h = card_h,
     });
@@ -426,7 +718,7 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
     };
     var bg = paletteColor(theme.COLOR_PANEL_ALT);
     bg.a *= alpha;
-    var border = paletteColor(if (view.tone == .running or view.tone == .success) theme.borderMuted() else tone_color);
+    var border = paletteColor(if (view.tone == .running or view.tone == .success) toastBorder() else tone_color);
     border.a *= alpha;
     var accent = paletteColor(tone_color);
     accent.a *= alpha;
@@ -435,11 +727,7 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
     var detail_color = paletteColor(theme.COLOR_TEXT_MUTED);
     detail_color.a *= alpha;
 
-    // Shell: border colour under an inset fill (anti-aliased, like the pill).
-    const radius = theme.scaledUi(GIT_TOAST_RADIUS_UI);
-    const inset = theme.scaledUi(1.0);
-    queuePaletteRoundedRect(state, card, border, radius);
-    queuePaletteRoundedRect(state, .{ .x = card.x + inset, .y = card.y + inset, .w = card.w - inset * 2.0, .h = card.h - inset * 2.0 }, bg, radius - inset);
+    queueToastShell(state, card, bg, border, theme.scaledUi(GIT_TOAST_RADIUS_UI));
 
     // State icon, vertically centred on the title line.
     const icon_rect: palette.Rect = .{ .x = card.x + pad, .y = card.y + pad + (title_h - icon_size) * 0.5, .w = icon_size, .h = icon_size };
@@ -465,17 +753,10 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
 
     var right = card.x + card.w - pad;
     if (view.dismissible) {
-        const close: palette.Rect = .{ .x = right - close_size, .y = card.y + pad + (title_h - close_size) * 0.5, .w = close_size, .h = close_size };
-        const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, close);
-        if (hovered) {
-            var hover_bg = paletteColor(theme.COLOR_PANEL_MUTED);
-            hover_bg.a *= alpha;
-            queuePaletteRoundedRect(state, close, hover_bg, theme.scaledUi(5.0));
-        }
-        var close_color = paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
-        close_color.a *= alpha;
-        const glyph = theme.scaledUi(13.0);
-        queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, close_color, glyph, .icon, card, false);
+        // The larger hit square tucks into the right padding so the glyph
+        // stays where the old 20px button drew it.
+        const close: palette.Rect = snapRect(.{ .x = card.x + card.w - toastCloseInset() - close_size, .y = card.y + @max(pad + (title_h - close_size) * 0.5, toastCloseInset()), .w = close_size, .h = close_size });
+        queueToastCloseButton(state, close, alpha, card);
         git_toast_close = close;
         right = close.x - gap * 0.5;
     }
@@ -500,7 +781,6 @@ fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
     }
     git_toast_card = card;
     git_toast_dismissible = view.dismissible;
-    return card.y;
 }
 
 /// Eight dots on a ring, the head brightest; steps on the toast's wake tick
@@ -541,15 +821,15 @@ pub fn handleGitToastMouseButton(state: *runtime.AppState, x: f32, y: f32, down:
     return true;
 }
 
-// Provider CLI update card: top-right of the workspace, just below the pane
-// headers so it never covers header icons or the composer's send button.
+// Provider CLI update card: in the top-right toast stack under the pane
+// header (see `ToastStack`), below a git card when both show, clear of the
+// header buttons, the composer, the side panel and the Companion.
 // Says which provider CLI is out of date (installed → latest); the Update
 // button or a click anywhere on the card runs the same command as Settings >
 // Providers > Update, and × hides it for this session. State lives in
 // settings_controller (`providerUpdateToastView`); this draws and records
 // hit rects.
 const PROVIDER_UPDATE_TOAST_W_UI: f32 = 340.0;
-const PROVIDER_UPDATE_TOAST_TOP_UI: f32 = 64.0;
 const NF_COD_CLOUD_DOWNLOAD = "\u{EAC2}";
 
 /// Last drawn card geometry, for pointer routing (`handleProviderUpdateToastMouseButton`).
@@ -557,15 +837,137 @@ var provider_update_toast_card: ?palette.Rect = null;
 var provider_update_toast_close: ?palette.Rect = null;
 var provider_update_toast_action: ?palette.Rect = null;
 
-fn renderProviderUpdateToast(state: *runtime.AppState, workspace: palette.Rect) void {
+/// The provider's own logo, as in the model picker; the download glyph
+/// stands in until its texture is loaded.
+fn queueProviderUpdateLogo(state: *runtime.AppState, provider: anytype, icon_rect: palette.Rect, clip: palette.Rect) void {
+    const logo = state.providerLogoTexture(provider);
+    if (logo != null and logo.?.valid and logo.?.texture_id != 0) {
+        const cached = logo.?;
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_rect.x, icon_rect.y, icon_rect.w, icon_rect.h));
+        const tint = theme.providerLogoTint(@tagName(provider));
+        state.palette_overlay_batch.image(state.allocator, snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }), palette.TextureId.init(cached.texture_id), .{
+            .x = 0.0,
+            .y = 0.0,
+            .w = 1.0,
+            .h = 1.0,
+        }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, clip) catch {};
+    } else {
+        queuePaletteRoleText(state, icon_rect, NF_COD_CLOUD_DOWNLOAD, paletteColor(theme.accent()), icon_rect.w, .icon, clip, false);
+    }
+}
+
+// Header form of the provider update notice: a split chip
+// (`[logo Update Grok 1.0.77 | ×]`) in the focused chat pane's header row,
+// left of the git button and styled like it. The pane header reserves its
+// slot (`setHeaderUpdateSlot`) when the row has room; otherwise the card
+// floats in the top-right stack. Living in the header, it covers no
+// transcript.
+pub const HEADER_UPDATE_CHIP_H_UI: f32 = 28.0;
+const HEADER_UPDATE_CHIP_PAD_X_UI: f32 = 10.0;
+const HEADER_UPDATE_CHIP_ICON_UI: f32 = 14.0;
+const HEADER_UPDATE_CHIP_GAP_UI: f32 = 6.0;
+const HEADER_UPDATE_CHIP_FONT_UI: f32 = 12.5;
+const HEADER_UPDATE_CHIP_VERSION_FONT_UI: f32 = 11.5;
+const HEADER_UPDATE_CHIP_CLOSE_W_UI: f32 = 28.0;
+
+/// Set by the focused chat pane's header this frame (headers draw before
+/// toasts); consumed and cleared by `renderToasts`.
+var header_update_slot: ?palette.Rect = null;
+
+pub fn setHeaderUpdateSlot(rect: palette.Rect) void {
+    header_update_slot = rect;
+}
+
+/// Width the header must leave for the update chip, or 0 when no provider
+/// update is shown.
+pub fn headerUpdateChipWidth(state: *runtime.AppState) f32 {
+    const view = state.providerUpdateToastView() orelse return 0.0;
+    var label_buf: [96]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "Update {s}", .{view.name}) catch "Update";
+    return headerUpdateChipMainWidth(label, view.latest.slice()) + theme.scaledUi(HEADER_UPDATE_CHIP_CLOSE_W_UI);
+}
+
+fn headerUpdateChipMainWidth(label: []const u8, version: []const u8) f32 {
+    const gap = theme.scaledUi(HEADER_UPDATE_CHIP_GAP_UI);
+    const font = theme.scaledUi(HEADER_UPDATE_CHIP_FONT_UI);
+    const version_font = theme.scaledUi(HEADER_UPDATE_CHIP_VERSION_FONT_UI);
+    var w = theme.scaledUi(HEADER_UPDATE_CHIP_PAD_X_UI) * 2.0 + theme.scaledUi(HEADER_UPDATE_CHIP_ICON_UI) + gap +
+        runtime.paletteUiTextPrefixWidth(label, font, label.len);
+    if (version.len > 0) w += gap + runtime.paletteUiTextPrefixWidth(version, version_font, version.len);
+    return @ceil(w);
+}
+
+fn renderProviderUpdateChip(state: *runtime.AppState, view: anytype, slot: palette.Rect) void {
+    var label_buf: [96]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "Update {s}", .{view.name}) catch "Update";
+    const version = view.latest.slice();
+    const close_w = theme.scaledUi(HEADER_UPDATE_CHIP_CLOSE_W_UI);
+    const main_w = @max(slot.w - close_w, 0.0);
+    const main: palette.Rect = .{ .x = slot.x, .y = slot.y, .w = main_w, .h = slot.h };
+    const close: palette.Rect = .{ .x = slot.x + main_w, .y = slot.y, .w = close_w, .h = slot.h };
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
+    const main_hover = mouse_ok and pointInRect(mx, my, main);
+    const close_hover = mouse_ok and pointInRect(mx, my, close);
+
+    // Same split-button shell as the header's git button.
+    const radius = theme.scaledUi(7.0);
+    const hairline = paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28));
+    const hover_fill = paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, 0.13));
+    queuePaletteRoundedRect(state, slot, paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, 0.07)), radius);
+    if (main_hover) state.palette_overlay_batch.roundedRectClipped(state.allocator, slot, hover_fill, radius, main) catch {};
+    if (close_hover) state.palette_overlay_batch.roundedRectClipped(state.allocator, slot, hover_fill, radius, close) catch {};
+    queuePaletteBorder(state, slot, hairline, radius, theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, .{ .x = close.x, .y = slot.y + theme.scaledUi(6.0), .w = theme.scaledUi(1.0), .h = slot.h - theme.scaledUi(12.0) }, hairline, 0.0);
+
+    const pad_x = theme.scaledUi(HEADER_UPDATE_CHIP_PAD_X_UI);
+    const gap = theme.scaledUi(HEADER_UPDATE_CHIP_GAP_UI);
+    const icon = theme.scaledUi(HEADER_UPDATE_CHIP_ICON_UI);
+    var x = main.x + pad_x;
+    queueProviderUpdateLogo(state, view.provider, .{ .x = x, .y = slot.y + (slot.h - icon) * 0.5, .w = icon, .h = icon }, slot);
+    x += icon + gap;
+    const font = theme.scaledUi(HEADER_UPDATE_CHIP_FONT_UI);
+    const label_w = runtime.paletteUiTextPrefixWidth(label, font, label.len);
+    const label_color = if (main_hover) theme.COLOR_WHITE else theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.25);
+    queuePaletteRoleText(state, .{ .x = x, .y = slot.y + (slot.h - font * 1.25) * 0.5, .w = label_w + font * 0.35, .h = font * 1.25 }, label, paletteColor(label_color), font, .ui, main, false);
+    x += label_w + gap;
+    if (version.len > 0) {
+        const version_font = theme.scaledUi(HEADER_UPDATE_CHIP_VERSION_FONT_UI);
+        const version_w = runtime.paletteUiTextPrefixWidth(version, version_font, version.len) + version_font * 0.35;
+        queuePaletteRoleText(state, .{ .x = x, .y = slot.y + (slot.h - version_font * 1.25) * 0.5, .w = version_w, .h = version_font * 1.25 }, version, paletteColor(theme.COLOR_TEXT_MUTED), version_font, .ui, main, false);
+    }
+    const glyph = theme.scaledUi(12.0);
+    queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, paletteColor(if (close_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), glyph, .icon, slot, false);
+
+    // The chip drops the card's detail line; its tooltip carries it.
+    var tip_buf: [224]u8 = undefined;
+    const installed = provider_cli_version.shortVersion(view.installed.slice());
+    const more_suffix: []const u8 = if (view.more == 0) "" else if (view.more == 1) " · 1 more provider has an update" else " · more providers have updates";
+    const tip = if (installed.len > 0 and version.len > 0)
+        std.fmt.bufPrint(&tip_buf, "{s} CLI {s} \u{2192} {s}{s}", .{ view.name, installed, version, more_suffix }) catch label
+    else
+        std.fmt.bufPrint(&tip_buf, "A newer {s} CLI is published{s}", .{ view.name, more_suffix }) catch label;
+    tooltip.queue(state, main, tip);
+    tooltip.queue(state, close, "Hide for this session");
+
+    provider_update_toast_card = slot;
+    provider_update_toast_close = close;
+    provider_update_toast_action = main;
+}
+
+fn renderProviderUpdateToast(state: *runtime.AppState, stack: *ToastStack) void {
     provider_update_toast_card = null;
     provider_update_toast_close = null;
     provider_update_toast_action = null;
     const view = state.providerUpdateToastView() orelse return;
+    if (header_update_slot) |slot| {
+        renderProviderUpdateChip(state, view, slot);
+        return;
+    }
     const pad = theme.scaledUi(GIT_TOAST_PAD_UI);
     const gap = theme.scaledUi(GIT_TOAST_GAP_UI);
-    const margin = theme.scaledUi(NOTICE_TOAST_MARGIN_UI);
-    const card_w = @min(theme.scaledUi(PROVIDER_UPDATE_TOAST_W_UI), workspace.w - margin * 2.0);
+    const card_w = @min(theme.scaledUi(PROVIDER_UPDATE_TOAST_W_UI), stack.max_w);
     if (card_w < theme.scaledUi(200.0)) return;
     const icon_size = theme.scaledUi(GIT_TOAST_ICON_UI);
     const title_font = theme.scaledUi(GIT_TOAST_TITLE_FONT_UI);
@@ -593,39 +995,15 @@ fn renderProviderUpdateToast(state: *runtime.AppState, workspace: palette.Rect) 
     const text_w = @max(card_w - text_x_offset - pad - close_size - gap * 0.5, theme.scaledUi(40.0));
     const text_block_h = title_h + theme.scaledUi(2.0) + detail_h;
     const card_h = pad * 2.0 + text_block_h + gap + button_h;
-    if (workspace.h < card_h + theme.scaledUi(PROVIDER_UPDATE_TOAST_TOP_UI) + margin) return;
-    const card: palette.Rect = snapRect(.{
-        .x = workspace.x + workspace.w - margin - card_w,
-        .y = workspace.y + theme.scaledUi(PROVIDER_UPDATE_TOAST_TOP_UI),
-        .w = card_w,
-        .h = card_h,
-    });
+    if (!stack.fits(card_h)) return;
+    const card: palette.Rect = snapRect(stack.place(card_w, card_h));
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
 
-    // Shell: border colour under an inset fill, like the git card.
-    const radius = theme.scaledUi(GIT_TOAST_RADIUS_UI);
-    const inset = theme.scaledUi(1.0);
-    queuePaletteRoundedRect(state, card, paletteColor(theme.accent()), radius);
-    queuePaletteRoundedRect(state, .{ .x = card.x + inset, .y = card.y + inset, .w = card.w - inset * 2.0, .h = card.h - inset * 2.0 }, paletteColor(theme.COLOR_PANEL_ALT), radius - inset);
+    queueToastShell(state, card, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(toastBorder()), theme.scaledUi(GIT_TOAST_RADIUS_UI));
 
     const icon_rect: palette.Rect = .{ .x = card.x + pad, .y = card.y + pad + (title_h - icon_size) * 0.5, .w = icon_size, .h = icon_size };
-    // The provider's own logo, as in the model picker; the download glyph
-    // stands in until its texture is loaded.
-    const logo = state.providerLogoTexture(view.provider);
-    if (logo != null and logo.?.valid and logo.?.texture_id != 0) {
-        const cached = logo.?;
-        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_rect.x, icon_rect.y, icon_rect.w, icon_rect.h));
-        const tint = theme.providerLogoTint(@tagName(view.provider));
-        state.palette_overlay_batch.image(state.allocator, snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }), palette.TextureId.init(cached.texture_id), .{
-            .x = 0.0,
-            .y = 0.0,
-            .w = 1.0,
-            .h = 1.0,
-        }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, card) catch {};
-    } else {
-        queuePaletteRoleText(state, icon_rect, NF_COD_CLOUD_DOWNLOAD, paletteColor(theme.accent()), icon_size, .icon, card, false);
-    }
+    queueProviderUpdateLogo(state, view.provider, icon_rect, card);
 
     const text_x = card.x + text_x_offset;
     const text_y = card.y + pad;
@@ -633,23 +1011,23 @@ fn renderProviderUpdateToast(state: *runtime.AppState, workspace: palette.Rect) 
     queuePaletteRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = title_h }, title, paletteColor(theme.COLOR_WHITE), title_font, .ui, text_clip, false);
     queuePaletteRoleText(state, .{ .x = text_x, .y = text_y + title_h + theme.scaledUi(2.0), .w = text_w, .h = detail_h }, detail, paletteColor(theme.COLOR_TEXT_MUTED), detail_font, .ui, text_clip, false);
 
-    const close: palette.Rect = .{ .x = card.x + card.w - pad - close_size, .y = card.y + pad + (title_h - close_size) * 0.5, .w = close_size, .h = close_size };
+    const close: palette.Rect = snapRect(.{ .x = card.x + card.w - toastCloseInset() - close_size, .y = card.y + @max(pad + (title_h - close_size) * 0.5, toastCloseInset()), .w = close_size, .h = close_size });
     const close_hovered = pointInRect(mouse_x, mouse_y, close);
-    if (close_hovered) queuePaletteRoundedRect(state, close, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0));
-    const glyph = theme.scaledUi(13.0);
-    queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, paletteColor(if (close_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), glyph, .icon, card, false);
+    queueToastCloseButton(state, close, 1.0, card);
 
     const button: palette.Rect = snapRect(.{ .x = text_x, .y = card.y + card.h - pad - button_h, .w = button_w, .h = button_h });
     const button_hovered = pointInRect(mouse_x, mouse_y, card) and !close_hovered;
-    const fill_color = if (button_hovered) theme.raise(theme.accent(), 0.06) else theme.accent();
-    queuePaletteRoundedRect(state, button, paletteColor(fill_color), theme.scaledUi(6.0));
+    // Same secondary button as Settings › Providers "Update" (one style for
+    // one action): raised neutral fill, faint hairline, primary text.
+    const fill_color = theme.mix(theme.background(), theme.COLOR_WHITE, if (button_hovered) 0.22 else 0.16);
+    queueToastShell(state, button, paletteColor(fill_color), paletteColor(theme.withAlpha(theme.COLOR_WHITE, 30)), theme.scaledUi(6.0));
     const label_w = runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + button_font * 0.35;
     queuePaletteRoleText(state, .{
         .x = button.x + (button.w - label_w) * 0.5,
         .y = button.y + (button.h - button_font * 1.25) * 0.5,
         .w = label_w,
         .h = button_font * 1.25,
-    }, button_label, paletteColor(theme.foregroundOn(fill_color)), button_font, .ui, button, false);
+    }, button_label, paletteColor(theme.COLOR_WHITE), button_font, .ui, button, false);
 
     provider_update_toast_card = card;
     provider_update_toast_close = close;
@@ -1016,6 +1394,61 @@ pub fn selectedPrefixHelpTarget(state: *const runtime.AppState) ?keybinds.Prefix
     const count = @min(prefixHelpMatchIndexes(bindings, state.prefixHelpQuery(), &matches), prefix_help_shown);
     if (state.prefix_help_selected >= count) return null;
     return bindings[matches[state.prefix_help_selected]].target;
+}
+
+test "scrolled-up notice pill tucks into the composer's top band" {
+    theme.applyTheme(1.0);
+    const area: palette.Rect = .{ .x = 380.0, .y = 0.0, .w = 1600.0, .h = 800.0 };
+    // Composer card from x 700 to 1660, its top edge at y 610.
+    const anchor: NoticeAnchor = .{ .center_x = 0.0, .bottom = 0.0, .max_w = 480.0, .chat = true, .right_edge = 1648.0, .top = 616.0 };
+    const pill = noticePillRect(anchor, area, 180.0, 26.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1648.0), pill.x + pill.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 616.0), pill.y, 0.01);
+    try std.testing.expect(pill.y > 610.0);
+}
+
+test "git and provider cards stack down from under the pane header" {
+    theme.applyTheme(1.0);
+    // Pane 380..2000 wide, but a right panel starts at 1640: the toast area
+    // stops there, so cards stay left of the panel.
+    const pane: palette.Rect = .{ .x = 380.0, .y = 0.0, .w = 1620.0, .h = 1000.0 };
+    const area: palette.Rect = .{ .x = 380.0, .y = 0.0, .w = 1260.0, .h = 1000.0 };
+    const header_h: f32 = 60.0;
+    const anchor = toastStackAnchor(pane, area, header_h);
+    try std.testing.expect(anchor.right <= area.x + area.w);
+    // Clear of the header row and its buttons.
+    try std.testing.expect(anchor.top >= pane.y + header_h);
+    var stack: ToastStack = .{ .right = anchor.right, .top = anchor.top, .bottom = 900.0, .max_w = 600.0 };
+    const git = stack.place(320.0, 70.0);
+    const provider = stack.place(340.0, 90.0);
+    try std.testing.expectApproxEqAbs(anchor.top, git.y, 0.01);
+    try std.testing.expect(provider.y >= git.y + git.h);
+    try std.testing.expectApproxEqAbs(anchor.right, git.x + git.w, 0.01);
+    try std.testing.expectApproxEqAbs(anchor.right, provider.x + provider.w, 0.01);
+    try std.testing.expect(stack.fits(100.0));
+    try std.testing.expect(!stack.fits(800.0));
+}
+
+test "notice pill centres on the chat content column above the composer stack" {
+    theme.applyTheme(1.0);
+    // Content column 700..1660, transcript viewport ending at y=560; the
+    // composer (and its waiting banner) start below that, at y=610.
+    const column: palette.Rect = .{ .x = 700.0, .y = 60.0, .w = 960.0, .h = 500.0 };
+    const clip: palette.Rect = .{ .x = 380.0, .y = 60.0, .w = 1600.0, .h = 500.0 };
+    const composer_top: f32 = 610.0;
+    const area: palette.Rect = .{ .x = 380.0, .y = 0.0, .w = 1600.0, .h = 800.0 };
+    const anchor = chatNoticeAnchor(column, clip);
+    const pill = noticePillRect(anchor, area, 200.0, 30.0);
+    try std.testing.expectApproxEqAbs(column.x + column.w * 0.5, pill.x + pill.w * 0.5, 0.01);
+    try std.testing.expect(pill.y + pill.h <= clip.y + clip.h);
+    try std.testing.expect(pill.y + pill.h < composer_top);
+    try std.testing.expect(anchor.max_w <= column.w);
+    // Near a pane edge the pill shifts inside the area instead of clipping.
+    const edge = noticePillRect(.{ .center_x = area.x + 20.0, .bottom = 500.0, .max_w = 400.0 }, area, 200.0, 30.0);
+    try std.testing.expectApproxEqAbs(area.x, edge.x, 0.01);
+    // Held notices are readable: text at 4.5:1 or better on the opaque fill.
+    const notice_colors = noticeColors();
+    try std.testing.expect(theme.contrastRatio(notice_colors.text, notice_colors.fill) >= 4.5);
 }
 
 test "prefix cheat-sheet filter matches labels and keys case-insensitively" {
@@ -2239,6 +2672,15 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
 /// Click into a modal text field: place the cursor at the click x, set the
 /// selection anchor, and prime a drag. Double-click selects the word under
 /// the pointer; triple-click selects all.
+/// Text inset that a modal field draws with, so clicks and drags land on the
+/// same character as the drawn caret and selection.
+fn modalInputTextInset(focus: runtime.PaletteModalTextFocus) f32 {
+    return switch (focus) {
+        .command_palette => command_palette.searchTextInset(),
+        else => theme.scaledUi(10.0),
+    };
+}
+
 fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocus, rect: palette.Rect, x: f32, clicks: u8) void {
     if (state.palette_modal_text_focus != focus) {
         state.palette_modal_text_focus = focus;
@@ -2246,7 +2688,7 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
     }
     const value = focusedValue(state);
     const font_size = theme.scaledUi(14.0);
-    const text_x = rect.x + theme.scaledUi(10.0);
+    const text_x = rect.x + modalInputTextInset(focus);
     const rel = @max(x - text_x, 0.0);
     const offset = focusedMetricOffsetForClickX(state, value, font_size, rel);
     const cursor = focusedCursor(state) orelse return;
@@ -2276,7 +2718,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
         const value = focusedValue(state);
         const rect = state.modal_text_input_rect;
         if (rect.w > 0.0) {
-            const text_x = rect.x + theme.scaledUi(10.0);
+            const text_x = rect.x + modalInputTextInset(state.palette_modal_text_focus);
             const rel = @max(x - text_x, 0.0);
             const offset = focusedMetricOffsetForClickX(state, value, state.modal_text_input_font_size, rel);
             if (focusedCursor(state)) |cursor| cursor.* = offset;
@@ -2297,11 +2739,13 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         // credential-modal chrome blurs its field. Both still own text input:
         // an SDL text_input paired with an already-consumed key-down must not
         // fall through into the obscured composer, browser, or terminal.
-        // Workspace Settings has no editable field but likewise owns text
-        // input while open.
+        // Workspace Settings and the Settings drawer have no editable field
+        // but likewise own text input while open (the Companion composer
+        // behind the settings scrim may still hold focus).
         return state.runtimeCredentialModalOpen() or
             state.runtimeTrustProposal() != null or
             state.workspaceSettingsOpen() or
+            state.settings_controller.modal_visible or
             state.commitSheetOpen();
     }
     if (state.palette_modal_text_focus == .runtime_credential) {

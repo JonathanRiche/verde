@@ -64,6 +64,9 @@ pub fn State(
         run_config_open: bool = false,
         popover_restore_focus: bool = false,
         run_config_focused_row: usize = 0,
+        /// The run-config popover draws its focus ring only after keyboard
+        /// input; opening it or clicking a stepper clears this.
+        run_config_focus_visible: bool = false,
         run_config_last_tick_ms: i64 = 0,
         run_steppers: [3]RunStepper,
         run_stepper_contexts: [3]RunStepperContext = .{ .{}, .{}, .{} },

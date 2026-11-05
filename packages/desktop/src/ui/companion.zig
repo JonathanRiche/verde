@@ -10,6 +10,7 @@ const app_config = @import("../app/config.zig");
 const controller = @import("../state/companion_controller.zig");
 const live_voice = @import("../state/live_voice_controller.zig");
 const companion_roster = @import("../state/companion_roster.zig");
+const provider_models = @import("../state/provider_models.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
@@ -157,7 +158,6 @@ pub const Geometry = struct {
     header: palette.Rect,
     avatar: palette.Rect,
     name_button: palette.Rect,
-    brain_button: palette.Rect,
     prev_button: palette.Rect,
     next_button: palette.Rect,
     new_button: palette.Rect,
@@ -777,14 +777,14 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const avatar: palette.Rect = .{ .x = header.x + 12.0 * s, .y = header.y + 9.0 * s, .w = 44.0 * s, .h = 46.0 * s };
     const text_x = avatar.x + avatar.w + 10.0 * s;
     const text_right = (if (switcher) prev_button.x else live_button.x) - 8.0 * s;
-    const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
-    const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
-    // The chip shows whole " · " segments that fit (provider · model ·
-    // reasoning, dropping from the right), never a word cut mid-way.
-    const brain_room = @max(text_right - text_x - 40.0 * s, 0.0);
-    const brain_label = brainChipLabel(companion.identity.brain.slice(), META_FONT * s, brain_room);
-    const brain_w = @min(text_measure.textWidth(.ui, META_FONT * s, brain_label) + 40.0 * s, @max(text_right - text_x, 0.0));
-    const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 34.0 * s, .w = brain_w + 4.0 * s, .h = 22.0 * s };
+    // One row, vertically centred on the avatar: the name with its menu
+    // caret. The model lives in the composer's model chip (like the chat
+    // composer), so the header no longer repeats it in a truncated chip.
+    const row_h = 24.0 * s;
+    const row_y = header.y + (header.h - row_h) * 0.5;
+    const row_w = @max(text_right - text_x, 0.0);
+    const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, row_w);
+    const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = row_y, .w = name_w + 4.0 * s, .h = row_h };
 
     // Body stack between header and footer: inbox, crew, conversation, approval.
     // The schedules view takes the inbox, crew, and conversation's place.
@@ -838,7 +838,6 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .header = header,
         .avatar = avatar,
         .name_button = name_button,
-        .brain_button = brain_button,
         .prev_button = prev_button,
         .next_button = next_button,
         .new_button = new_button,
@@ -964,7 +963,6 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
             companion.addHit(geometry.conversation, .body);
             companion.addHit(geometry.name_button, .companion_menu);
             companion.addHit(geometry.avatar, .companion_menu);
-            companion.addHit(geometry.brain_button, .brain_menu);
             if (companion.identity.count > 1) {
                 companion.addHit(geometry.prev_button, .switch_prev);
                 companion.addHit(geometry.next_button, .switch_next);
@@ -1201,12 +1199,7 @@ fn headerTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32)
         if (pointInRect(geometry.next_button, x, y)) return .{ .target = geometry.next_button, .label = "Next companion" };
     }
     if (pointInRect(geometry.name_button, x, y) or pointInRect(geometry.avatar, x, y))
-        return .{ .target = geometry.name_button, .label = "Companions, past conversations, rename, orders" };
-    // The chip may show only its leading segments; the tooltip names all.
-    if (pointInRect(geometry.brain_button, x, y)) {
-        const brain = companion.identity.brain.slice();
-        return .{ .target = geometry.brain_button, .label = if (brain.len == 0) "Change provider, model, reasoning" else framePrint(state, "{s} · change provider, model, reasoning", .{brain}) };
-    }
+        return .{ .target = geometry.name_button, .label = "Switch companion, past conversations, rename, standing orders" };
     return null;
 }
 
@@ -1232,11 +1225,115 @@ fn brainChipLabel(label: []const u8, font: f32, max_w: f32) []const u8 {
     }
     if (count < 2) return label;
     const model = prettyModelName(&brain_model_buf, stripProviderPrefix(parts[1], parts[0]));
-    if (count >= 3) {
-        const with_level = std.fmt.bufPrint(&brain_label_buf, "{s}{s}{s}", .{ model, separator, parts[2] }) catch model;
-        if (text_measure.textWidth(.ui, font, with_level) <= max_w) return with_level;
+    const full = if (count >= 3)
+        std.fmt.bufPrint(&brain_label_buf, "{s}{s}{s}", .{ model, separator, parts[2] }) catch model
+    else
+        std.fmt.bufPrint(&brain_label_buf, "{s}", .{model}) catch model;
+    if (text_measure.textWidth(.ui, font, full) <= max_w) return full;
+    // The full label does not fit: show the model's short name alone
+    // ("Default (Wonder 1.0) · Low" → "Wonder 1.0"); the tooltip has the rest.
+    const short = if (std.mem.startsWith(u8, model, "Default (") and std.mem.endsWith(u8, model, ")")) model["Default (".len .. model.len - 1] else model;
+    return std.fmt.bufPrint(&brain_label_buf, "{s}", .{short}) catch short;
+}
+
+/// The brain label with an unset model resolved the way the main composer
+/// resolves it: "Muse" or "Muse · default" becomes
+/// "Muse · Default (Wonder 1.0)" (the remembered model for that provider,
+/// else its built-in default). Unchanged when a model is set or none can be
+/// resolved.
+fn brainLabel(state: *runtime.AppState) []const u8 {
+    const label = state.companion_controller.identity.brain.slice();
+    const separator = " \u{00B7} ";
+    const provider_end = std.mem.indexOf(u8, label, separator) orelse label.len;
+    const after_provider = if (provider_end < label.len) label[provider_end + separator.len ..] else "";
+    const model_end = std.mem.indexOf(u8, after_provider, separator) orelse after_provider.len;
+    const model = after_provider[0..model_end];
+    if (model.len > 0 and !std.ascii.eqlIgnoreCase(model, "default")) return label;
+    const provider = companionProvider(state) orelse return label;
+    var default_buf: [96]u8 = undefined;
+    const default_label = resolvedDefaultModelLabel(state, provider, label[0..provider_end], &default_buf) orelse return label;
+    const rest = after_provider[model_end..];
+    return std.fmt.bufPrint(&brain_resolved_buf, "{s}{s}{s}{s}", .{ label[0..provider_end], separator, default_label, rest }) catch label;
+}
+
+var brain_resolved_buf: [192]u8 = undefined;
+
+/// The Companion's model name as its header chip spells it, at full width
+/// ("Default (Wonder Full 1.0) · Low", or "Opus 4.1 · High"), copied into
+/// `buf`. The composer footer uses this so header and footer read the same.
+pub fn modelLabel(state: *runtime.AppState, buf: []u8) []const u8 {
+    const text = brainChipLabel(brainLabel(state), 1.0, std.math.floatMax(f32));
+    var n = @min(text.len, buf.len);
+    // Never cut inside a multi-byte codepoint (the " · " separator).
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) n -= 1;
+    @memcpy(buf[0..n], text[0..n]);
+    return buf[0..n];
+}
+
+/// Provider of the active companion: its thread's, else the roster entry's.
+fn companionProvider(state: *runtime.AppState) ?runtime.Provider {
+    if (state.activeCompanionThread()) |thread| return thread.provider;
+    const companion = state.companion_roster.activeConst() orelse return null;
+    return std.meta.stringToEnum(runtime.Provider, companion.provider.slice());
+}
+
+/// "Default (<short model name>)" for `provider`, or null when no concrete
+/// model can be named (the provider's own "default" alias with no label).
+fn resolvedDefaultModelLabel(state: *runtime.AppState, provider: runtime.Provider, provider_name: []const u8, buf: []u8) ?[]const u8 {
+    var ref: []const u8 = builtinDefaultModel(provider) orelse return null;
+    if (std.meta.stringToEnum(app_config.ChatProvider, @tagName(provider))) |config_provider| {
+        if (state.app_config.remembered_models[@intFromEnum(config_provider)]) |entry| {
+            if (entry.model.len > 0) ref = entry.model;
+        }
     }
-    return std.fmt.bufPrint(&brain_label_buf, "{s}", .{model}) catch model;
+    const label = staticModelLabel(provider, ref) orelse ref;
+    if (std.mem.startsWith(u8, label, "Default (")) return label;
+    if (std.ascii.eqlIgnoreCase(label, "default")) return null;
+    var pretty_buf: [96]u8 = undefined;
+    const short = prettyModelName(&pretty_buf, stripProviderPrefix(label, provider_name));
+    return std.fmt.bufPrint(buf, "Default ({s})", .{short}) catch null;
+}
+
+fn builtinDefaultModel(provider: runtime.Provider) ?[]const u8 {
+    return switch (provider) {
+        .codex => provider_models.DEFAULT_CODEX_MODEL,
+        .opencode => provider_models.DEFAULT_OPENCODE_MODEL,
+        .claude => provider_models.DEFAULT_CLAUDE_MODEL,
+        .cursor => provider_models.DEFAULT_CURSOR_MODEL,
+        .pi => provider_models.DEFAULT_PI_MODEL,
+        .fx => provider_models.DEFAULT_FX_MODEL,
+        .antigravity => provider_models.DEFAULT_ANTIGRAVITY_MODEL,
+        .grok => provider_models.DEFAULT_GROK_MODEL,
+        .muse => provider_models.DEFAULT_MUSE_MODEL,
+        .custom_acp => null,
+    };
+}
+
+/// Label of `ref` in the provider's built-in model table, if listed.
+fn staticModelLabel(provider: runtime.Provider, ref: []const u8) ?[]const u8 {
+    const options: []const provider_models.ModelOption = switch (provider) {
+        .codex => &provider_models.CODEX_MODEL_OPTIONS,
+        .opencode => &provider_models.OPENCODE_MODEL_OPTIONS,
+        .claude => &provider_models.CLAUDE_MODEL_OPTIONS,
+        .cursor => &provider_models.CURSOR_MODEL_OPTIONS,
+        .pi => &provider_models.PI_MODEL_OPTIONS,
+        .fx => &provider_models.FX_MODEL_OPTIONS,
+        .antigravity => &provider_models.ANTIGRAVITY_MODEL_OPTIONS,
+        .grok => &provider_models.GROK_MODEL_OPTIONS,
+        .muse => &provider_models.MUSE_MODEL_OPTIONS,
+        .custom_acp => return null,
+    };
+    for (options) |option| {
+        const value = option.value orelse continue;
+        if (std.mem.eql(u8, value, ref)) return option.label;
+    }
+    return null;
+}
+
+test "unset companion model resolves to the provider default's short name" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Wonder 1.0", prettyModelName(&buf, stripProviderPrefix(staticModelLabel(.muse, provider_models.DEFAULT_MUSE_MODEL).?, "Muse")));
+    try std.testing.expect(std.mem.startsWith(u8, staticModelLabel(.claude, provider_models.DEFAULT_CLAUDE_MODEL).?, "Default ("));
 }
 
 /// "muse-wonder-full-1.0" under provider "Muse" → "wonder-full-1.0": the
@@ -1279,6 +1376,8 @@ test "companion brain chip prefers the model's readable name" {
     try std.testing.expectEqualStrings("Wonder Full 1.0", brainChipLabel(full, 12.0, 1.0));
     try std.testing.expectEqualStrings("Opus 4.1", brainChipLabel("Claude \u{00B7} Opus 4.1", 12.0, 10_000.0));
     try std.testing.expectEqualStrings("New-chat default", brainChipLabel("New-chat default", 12.0, 10_000.0));
+    // Too narrow for the full resolved label: the short model name alone.
+    try std.testing.expectEqualStrings("Wonder 1.0", brainChipLabel("Muse \u{00B7} Default (Wonder 1.0) \u{00B7} Low", 12.0, 1.0));
 }
 
 fn renderHeaderTooltip(state: *runtime.AppState, geometry: Geometry) void {
@@ -1317,20 +1416,6 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     queueBoldText(state, .{ .x = name_rect.x + 4.0 * s, .y = name_rect.y + 2.0 * s, .w = name_w, .h = 20.0 * s }, truncatedText(state, .ui_bold, 15.0 * s, name_w, identity.name.slice()), color(chrome.text), 15.0 * s, header);
     const caret_x = name_rect.x + 4.0 * s + @min(text_measure.textWidth(.ui_bold, 15.0 * s, identity.name.slice()), name_w) + 6.0 * s;
     queueChevronDown(state, .{ .x = caret_x, .y = name_rect.y + (name_rect.h - 13.0 * s) * 0.5, .w = 13.0 * s, .h = 13.0 * s }, color(chrome.text_muted), header);
-
-    const brain = geometry.brain_button;
-    // Composer-chip style: a borderless rounded chip that brightens on hover,
-    // label then chevron; no decorative status dot.
-    const brain_hovered = headerButtonHovered(state, brain);
-    const brain_fill = opaqueOver(surface(), chrome.menu_hover);
-    queueRoundedRect(state, brain, color(if (brain_hovered) opaqueOver(brain_fill, chrome.menu_hover) else brain_fill), 8.0 * s);
-    const brain_w = @max(brain.w - 36.0 * s, 0.0);
-    // Frame copy: the chip label lives in a scratch buffer that the next
-    // geometry pass (hit testing) overwrites before the batch is drawn.
-    const brain_label = framePrint(state, "{s}", .{brainChipLabel(identity.brain.slice(), META_FONT * s, brain_w)});
-    queueText(state, .{ .x = brain.x + 10.0 * s, .y = brain.y + (brain.h - 17.0 * s) * 0.5, .w = brain_w, .h = 17.0 * s }, truncatedText(state, .ui, META_FONT * s, brain_w, brain_label), color(if (brain_hovered) chrome.text else chrome.text_muted), META_FONT * s, brain);
-    const brain_chevron = 12.0 * s;
-    queueIcon(state, .{ .x = brain.x + brain.w - 8.0 * s - brain_chevron, .y = brain.y + (brain.h - brain_chevron) * 0.5, .w = brain_chevron, .h = brain_chevron }, NF_COD_CHEVRON_DOWN, color(chrome.text_muted), brain);
 
     if (identity.count > 1) {
         renderHeaderButton(state, geometry.prev_button, "‹");
@@ -4853,8 +4938,7 @@ test "header plus starts a new conversation and every header control has a toolt
     const cases = .{
         .{ geometry.new_button, "New conversation with Juniper" },
         .{ geometry.close_button, "Minimize" },
-        .{ geometry.brain_button, "provider, model, reasoning" },
-        .{ geometry.name_button, "Companions, past conversations, rename, orders" },
+        .{ geometry.name_button, "Switch companion, past conversations, rename, standing orders" },
     };
     inline for (cases) |case| {
         state.palette_overlay_batch.clear();
@@ -4935,7 +5019,6 @@ test "schedules view replaces the conversation and stays inside the window acros
         try std.testing.expect(geometry.schedules.y >= geometry.header.y + geometry.header.h);
         try std.testing.expect(geometry.schedules.y + geometry.schedules.h <= geometry.footer.y + 0.5);
         try std.testing.expect(rectInside(geometry.schedules_button, geometry.header));
-        try std.testing.expect(geometry.schedules_button.x >= geometry.brain_button.x + geometry.brain_button.w or geometry.schedules_button.y >= geometry.brain_button.y + geometry.brain_button.h);
         const layout = schedulesLayout(&state, geometry);
         try std.testing.expectEqual(@as(usize, 3), layout.row_count);
         for (layout.rows[0..layout.row_count], 0..) |row, index| {

@@ -18,13 +18,17 @@ const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
+const tooltip = @import("tooltip.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
 const file_viewer = @import("file_viewer.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
+const layout_ui = @import("layout.zig");
 const theme = @import("theme.zig");
+const text_measure = @import("text_measure.zig");
 const sidebar_ui = @import("sidebar.zig");
 const side_panel = @import("side_panel.zig");
+const companion = @import("companion.zig");
 const workspace_suggestions = @import("../state/workspace_suggestions.zig");
 const workspace_strip = @import("workspace_strip.zig");
 const utils = @import("../utils.zig");
@@ -41,8 +45,6 @@ const CHAT_PANE_HEADER_RIGHT_RESERVE_CSS: f32 = PANE_CHROME_CONTROL_SIZE_CSS * 2
     PANE_CHROME_CONTROL_GAP_CSS + PANE_CHROME_RIGHT_MARGIN_CSS;
 const BROWSER_TOOLBAR_RIGHT_RESERVE_CSS: f32 = PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS;
 const ZOOM_ICON_SIZE_CSS: f32 = 17.0;
-const TERMINAL_ZOOM_HOVER_WIDTH_CSS: f32 = 112.0;
-const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
 const INACTIVE_BORDER_WIDTH_CSS: f32 = 1.0;
 const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
 /// A lone pane has no siblings to tell apart, so its focus/status frame is a
@@ -184,6 +186,86 @@ const QuickPaneDrag = struct {
     workspace: palette.Rect,
 };
 var quick_pane_drag: ?QuickPaneDrag = null;
+const MenuKeyboardRow = struct { hit: WorkspacePaneHit, submenu: bool };
+var menu_keyboard_rows: [32]MenuKeyboardRow = undefined;
+var menu_keyboard_count: usize = 0;
+var menu_focus_action: ?WorkspacePaneAction = null;
+var menu_keyboard_submenu: bool = false;
+var rendering_submenu: bool = false;
+const HeaderFocus = struct { pane_id: runtime.WorkspacePaneId, action: WorkspacePaneAction };
+var terminal_header_focus: ?HeaderFocus = null;
+
+pub fn menuOpen() bool {
+    return split_menu_open_for != null;
+}
+
+pub fn closeMenu() void {
+    split_menu_open_for = null;
+    menu_focus_action = null;
+    menu_keyboard_submenu = false;
+}
+
+/// An open pane menu owns keys before the terminal or chat underneath it.
+pub fn handleMenuKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!menuOpen()) return false;
+    defer state.markDirty();
+    if (!event.down) return true;
+    switch (event.key) {
+        .escape, .tab => closeMenu(),
+        .left => {
+            menu_keyboard_submenu = false;
+            menu_focus_action = .toggle_split_menu;
+        },
+        .right => {
+            if (menu_focus_action == .toggle_split_menu) {
+                menu_keyboard_submenu = true;
+                menu_focus_action = .split_chat_left;
+            }
+        },
+        .up, .down, .home, .end => {
+            var candidates: [32]WorkspacePaneAction = undefined;
+            var count: usize = 0;
+            var current: ?usize = null;
+            for (menu_keyboard_rows[0..menu_keyboard_count]) |row| {
+                if (row.submenu != menu_keyboard_submenu) continue;
+                if (menu_focus_action == row.hit.action) current = count;
+                candidates[count] = row.hit.action;
+                count += 1;
+            }
+            if (count > 0) {
+                const index = switch (event.key) {
+                    .home => 0,
+                    .end => count - 1,
+                    .up => if (current) |i| (i + count - 1) % count else count - 1,
+                    else => if (current) |i| (i + 1) % count else 0,
+                };
+                menu_focus_action = candidates[index];
+            }
+        },
+        .@"return", .space => {
+            const action = menu_focus_action orelse return true;
+            if (action == .toggle_split_menu) {
+                menu_keyboard_submenu = true;
+                menu_focus_action = .split_chat_left;
+            } else {
+                for (menu_keyboard_rows[0..menu_keyboard_count]) |row| {
+                    if (row.hit.action != action) continue;
+                    _ = handlePaletteMouseButton(state, row.hit.rect.x + row.hit.rect.w * 0.5, row.hit.rect.y + row.hit.rect.h * 0.5, 1, true, false, false);
+                    break;
+                }
+            }
+        },
+        else => {},
+    }
+    return true;
+}
+
+fn recordMenuRow(hit: WorkspacePaneHit) void {
+    if (menu_keyboard_count == menu_keyboard_rows.len) return;
+    menu_keyboard_rows[menu_keyboard_count] = .{ .hit = hit, .submenu = rendering_submenu };
+    menu_keyboard_count += 1;
+}
+
 var split_menu_open_for: ?runtime.WorkspacePaneId = null;
 var split_menu_rect: palette.Rect = .{};
 var split_submenu_rect: palette.Rect = .{};
@@ -675,6 +757,8 @@ pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
         }
     }
     const pane_rect = rect orelse return false;
+    menu_focus_action = null;
+    menu_keyboard_submenu = false;
     split_menu_link_len = 0;
     split_menu_show_paste = false;
     split_menu_kind = .chat_context;
@@ -1118,12 +1202,15 @@ fn paneIsLone(layout: *const runtime.WorkspaceLayout, pane_id: runtime.Workspace
 
 /// Renders workspace panes while transcripts use their destination sidebar width.
 pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rect: palette.Rect, workspace_target_width: f32) void {
-    // The focused tab's side panel takes the right edge; panes tile the rest.
+    // Reserve from the full pane area, never last frame's reduced rect:
+    // [panes][Companion][right panel] must have stable geometry each frame.
     side_panel.resetHitCache();
     const panel_split = side_panel.split(state, workspace_rect);
     frame_workspace_rect = workspace_rect;
-    const rect = panel_split.content;
-    const target_workspace_width = if (panel_split.panel) |panel| @max(workspace_target_width - panel.w, 0.0) else workspace_target_width;
+    const companion_reserve = companion.paneReserve(state, panel_split.content);
+    var rect = panel_split.content;
+    rect.w = @max(rect.w - companion_reserve, 0.0);
+    const target_workspace_width = @max((if (panel_split.panel) |panel| workspace_target_width - panel.w else workspace_target_width) - companion_reserve, 0.0);
     tickPaneMotion(state, rect);
     last_workspace_rect = rect;
     focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion.pane_layout, theme.MOTION_BASE_MS);
@@ -1539,6 +1626,17 @@ fn quickPaneRect(quick: runtime.FloatingQuickPane, workspace: palette.Rect) pale
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, ctrl_down: bool, shift_down: bool) bool {
+    if (down) terminal_header_focus = null;
+    if (menuOpen() and button == 1 and down) {
+        for (menu_keyboard_rows[0..menu_keyboard_count]) |row| {
+            if (row.hit.action == .toggle_split_menu and rectContains(row.hit.rect, x, y)) {
+                menu_keyboard_submenu = true;
+                menu_focus_action = null;
+                state.noteInteraction();
+                return true;
+            }
+        }
+    }
     if (button == 3 and down) {
         // Right-click on a pane opens the pane context menu anchored at the cursor.
         var ri: usize = hit_cache.count;
@@ -1548,6 +1646,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             if (hit.action != .focus) continue;
             if (!rectContains(hit.rect, x, y)) continue;
             _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+            menu_focus_action = null;
+            menu_keyboard_submenu = false;
             captureContextLink(state, x, y);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
@@ -1567,6 +1667,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             const pane_rect = pane_rects[ri];
             if (!rectContains(pane_rect.rect, x, y)) continue;
             _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
+            menu_focus_action = null;
+            menu_keyboard_submenu = false;
             captureContextLink(state, x, y);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
@@ -1777,6 +1879,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
 
 /// Handles pane chrome before browser and terminal content can consume its click.
 pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    if (down) terminal_header_focus = null;
     // An open pane menu floats above native browser content, which would
     // otherwise consume the press first; the menu must own it so rows
     // activate and outside presses dismiss it.
@@ -1799,6 +1902,9 @@ pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, but
         const hit = hit_cache.hits[i];
         if (!rectContains(hit.rect, x, y)) continue;
         switch (hit.action) {
+            .close => {
+                if (down) _ = state.closeCurrentProjectWorkspacePane(hit.pane_id);
+            },
             .maximize => {
                 if (down) _ = state.toggleCurrentProjectWorkspacePaneMaximized(hit.pane_id);
             },
@@ -1868,7 +1974,7 @@ fn contextLink() []const u8 {
 }
 
 fn contextLinkEditorLabel() []const u8 {
-    if (split_menu_link_editor_label_len == 0) return "Open in Editor";
+    if (split_menu_link_editor_label_len == 0) return "Open in editor";
     return split_menu_link_editor_label_buf[0..split_menu_link_editor_label_len];
 }
 
@@ -1888,7 +1994,7 @@ fn contextLinkRows(rows: *[9]ContextLinkRow) usize {
             rows[count] = .{ .action = .open_link_verde_viewer, .label = "Open in Verde" };
             count += 1;
             if (split_menu_link_nvim_pane) {
-                rows[count] = .{ .action = .open_link_nvim_pane, .label = "Open in Neovim (Verde Terminal)" };
+                rows[count] = .{ .action = .open_link_nvim_pane, .label = "Open in Neovim (Verde terminal)" };
                 count += 1;
             }
             if (split_menu_link_editors[0]) {
@@ -1907,23 +2013,23 @@ fn contextLinkRows(rows: *[9]ContextLinkRow) usize {
                 rows[count] = .{ .action = .open_link_zed, .label = "Open in Zed" };
                 count += 1;
             }
-            rows[count] = .{ .action = .open_link_system, .label = "Open with System Default" };
+            rows[count] = .{ .action = .open_link_system, .label = "Open with system default" };
             count += 1;
-            rows[count] = .{ .action = .open_link_reveal, .label = "Reveal in File Manager" };
+            rows[count] = .{ .action = .open_link_reveal, .label = "Reveal in file manager" };
             count += 1;
-            rows[count] = .{ .action = .copy_link, .label = "Copy Path" };
+            rows[count] = .{ .action = .copy_link, .label = "Copy path" };
             count += 1;
         },
         .web => {
-            rows[count] = .{ .action = .open_link_verde_browser, .label = "Open in Verde Browser" };
+            rows[count] = .{ .action = .open_link_verde_browser, .label = "Open in Verde browser" };
             count += 1;
-            rows[count] = .{ .action = .open_link_system_browser, .label = "Open in System Browser" };
+            rows[count] = .{ .action = .open_link_system_browser, .label = "Open in system browser" };
             count += 1;
-            rows[count] = .{ .action = .copy_link, .label = "Copy Link" };
+            rows[count] = .{ .action = .copy_link, .label = "Copy link" };
             count += 1;
         },
         .other => {
-            rows[count] = .{ .action = .copy_link, .label = "Copy Link" };
+            rows[count] = .{ .action = .copy_link, .label = "Copy link" };
             count += 1;
         },
     }
@@ -1932,6 +2038,9 @@ fn contextLinkRows(rows: *[9]ContextLinkRow) usize {
 
 fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
     _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+    state.blurPaletteComposer();
+    menu_focus_action = null;
+    menu_keyboard_submenu = false;
     split_menu_show_paste = false;
     split_menu_kind = .split_button;
     split_menu_anchor = hit.rect;
@@ -1944,6 +2053,12 @@ fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
 
 /// Returns the system cursor for interactive workspace pane chrome.
 pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
+    if (menuOpen()) {
+        for (menu_keyboard_rows[0..menu_keyboard_count]) |row| {
+            if (rectContains(row.hit.rect, x, y)) return .pointer;
+        }
+        if (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y)) return .default;
+    }
     if (resize_drag) |hit| return resizeSystemCursor(hit.axis);
     if (file_viewer.systemCursorAt(x, y)) |cursor| return cursor;
     var i: usize = hit_cache.count;
@@ -1975,6 +2090,10 @@ fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) palette.platform.CursorS
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, motion_dx: f32, motion_dy: f32, ctrl_down: bool) bool {
+    if (motion_dx != 0 or motion_dy != 0) {
+        menu_focus_action = null;
+        menu_keyboard_submenu = false;
+    }
     if (file_viewer.handleMouseMotion(state, x, y)) return true;
     if (quick_pane_drag) |drag| {
         const dx = (x - drag.start_x) / @max(drag.workspace.w, 1.0);
@@ -3404,13 +3523,13 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     const maximized = state.isCurrentProjectWorkspacePaneMaximized(pane_id);
     // Zoom is hidden for a lone pane, so its slot collapses too.
     const zoom_slot_css: f32 = if (state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0;
-    const reserve = if (kind == .chat)
+    const reserve = if (kind == .chat or kind == .terminal)
         theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS - (PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) + zoom_slot_css + (if (paneShowsSidePanelToggle(state, kind)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0))
     else
         0.0;
     const header_h = switch (kind) {
         .chat => chat_panel.paneHeaderHeight(rect),
-        .terminal => terminal_panel.paneHeaderHeight(),
+        .terminal => terminal_panel.paneHeaderHeight(rect),
         .browser => 0.0,
         .file => file_viewer.headerHeight(),
     };
@@ -3422,11 +3541,14 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             // eased rect); the daemon gets one resize once the rect settles.
             terminal_panel.defer_resize_for_motion = viewport_clip == null and moving_pane_id == pane_id;
             defer terminal_panel.defer_resize_for_motion = false;
+            const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @min(header_h, rect.h) };
+            const terminal_rect = palette.Rect{ .x = rect.x, .y = rect.y + header_rect.h, .w = rect.w, .h = @max(rect.h - header_rect.h, 0) };
             if (viewport_clip) |clip| {
-                terminal_panel.renderDockAtForDockWithin(state, rect, dock_id, reserve, clip);
+                terminal_panel.renderDockAtForDockWithin(state, terminal_rect, dock_id, reserve, clip);
             } else {
-                terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
+                terminal_panel.renderDockAtForDockWithReserve(state, terminal_rect, dock_id, reserve);
             }
+            renderTerminalPaneHeader(state, pane_id, dock_id, header_rect);
         },
         .browser => {
             // One live page at a time: a second visible browser waits its turn.
@@ -3443,11 +3565,12 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     // instead of the former window-blocking modal.
     handoff_sheet.renderForPane(state, pane_id, rect);
     renderInactivePaneFade(state, pane_id, rect);
-    if (kind == .chat and header_h > 0.0) {
+    if ((kind == .chat or kind == .terminal) and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
         renderPaneOverlay(state, pane_id, header_rect);
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
+    if (kind == .terminal) renderTerminalHeaderFocus(state, pane_id);
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const lone = !maximized and paneIsLone(layout, pane_id);
     if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), maximized, lone)) {
@@ -3502,7 +3625,14 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
 /// beside the sidebar divider as a doubled line. It draws only the edges that
 /// face other app chrome, and its sidebar-facing edge replaces the divider.
 fn queuePaneFrame(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, width: f32, lone: bool) void {
-    if (!lone) {
+    const bounds = frame_workspace_rect;
+    const under_strip = workspace_strip.isVisible(state) and @abs(@round(rect.y) - @round(bounds.y)) <= 0.5;
+    const panel_split = side_panel.split(state, bounds);
+    const companion_reserve = companion.paneReserve(state, panel_split.content);
+    const column_edge = panel_split.content.x + @max(panel_split.content.w - companion_reserve, 0.0);
+    const against_panel = (panel_split.panel != null or companion_reserve > 0.0) and
+        @abs(@round(rect.x + rect.w) - @round(column_edge)) <= 0.5;
+    if (!lone and !under_strip and !against_panel) {
         queueBorder(state, rect, color, 0.0, width);
         return;
     }
@@ -3511,28 +3641,26 @@ fn queuePaneFrame(state: *runtime.AppState, rect: palette.Rect, color: palette.C
     const top = @round(rect.y);
     const right = @round(rect.x + rect.w);
     const bottom = @round(rect.y + rect.h);
-    const bounds = frame_workspace_rect;
     const edge_epsilon: f32 = 0.5;
     const at_window_top = top <= edge_epsilon;
     const at_window_bottom = bottom >= @round(bounds.y + bounds.h) - edge_epsilon;
     const at_window_right = right >= @round(bounds.x + bounds.w) - edge_epsilon;
     const at_window_left = left <= edge_epsilon;
     const meets_sidebar = !at_window_left and left <= @round(bounds.x) + edge_epsilon;
-    if (!at_window_top) queueRect(state, .{ .x = left, .y = top, .w = right - left, .h = stroke }, color);
-    if (!at_window_bottom) queueRect(state, .{ .x = left, .y = bottom - stroke, .w = right - left, .h = stroke }, color);
-    if (!at_window_right) queueRect(state, .{ .x = right - stroke, .y = top, .w = stroke, .h = bottom - top }, color);
-    if (meets_sidebar) {
+    if ((!lone or !at_window_top) and !under_strip) queueRect(state, .{ .x = left, .y = top, .w = right - left, .h = stroke }, color);
+    if (!lone or !at_window_bottom) queueRect(state, .{ .x = left, .y = bottom - stroke, .w = right - left, .h = stroke }, color);
+    if ((!lone or !at_window_right) and !against_panel) queueRect(state, .{ .x = right - stroke, .y = top, .w = stroke, .h = bottom - top }, color);
+    if (lone and meets_sidebar) {
         // Paint over the sidebar's own divider so the seam stays one line.
         queueRect(state, .{ .x = left - stroke, .y = top, .w = stroke, .h = bottom - top }, color);
-    } else if (!at_window_left) {
+    } else if (!lone or !at_window_left) {
         queueRect(state, .{ .x = left, .y = top, .w = stroke, .h = bottom - top }, color);
     }
 }
 
-/// Chat headers carry the side panel toggle only while the tab strip (its
-/// usual home) is hidden.
+/// Terminal controls stay stable; chat headers defer to the visible tab strip.
 fn paneShowsSidePanelToggle(state: *runtime.AppState, kind: runtime.WorkspacePaneKind) bool {
-    return kind == .chat and !workspace_strip.isVisible(state);
+    return kind == .terminal or (kind == .chat and !workspace_strip.isVisible(state));
 }
 
 // Top-right zoom control for chat, terminal, and browser workspace panes.
@@ -3546,22 +3674,23 @@ fn renderZoomControl(
 ) void {
     // A lone pane in its tab has nothing to zoom over.
     const can_zoom = state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id);
+    if (kind == .terminal and !state.isCurrentProjectWorkspacePaneFocused(pane_id)) return;
     const control_size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
     const margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
     // Browser owns the far-right close action; keep zoom immediately to its left.
     const split_reserve = if (kind == .chat or kind == .terminal or kind == .browser or kind == .file)
-        theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS)
+        theme.scaledUi((PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) * (if (kind == .terminal) @as(f32, 2) else 1))
     else
         0.0;
-    // With the tab strip hidden, the side panel toggle sits between zoom and
-    // the pane menu; zoom shifts one slot left to make room.
+    // The side panel toggle sits between zoom and the pane menu; zoom
+    // shifts one slot left to make room whenever that toggle is present.
     const side_toggle = paneShowsSidePanelToggle(state, kind);
     const toggle_reserve = if (side_toggle) theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) else 0.0;
     const control_rect: palette.Rect = .{
         .x = pane_rect.x + pane_rect.w - margin - split_reserve - toggle_reserve - control_size,
         .y = switch (kind) {
             .chat => pane_rect.y + @max((header_h - control_size) * 0.5, theme.scaledUi(4.0)),
-            .terminal => pane_rect.y + margin,
+            .terminal => pane_rect.y + (header_h - control_size) * 0.5,
             .browser => pane_rect.y + (browser_panel.paneToolbarActionRowHeight() - control_size) * 0.5,
             .file => pane_rect.y + (file_viewer.headerHeight() - control_size) * 0.5,
         },
@@ -3579,19 +3708,12 @@ fn renderZoomControl(
         const toggle_hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(toggle_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
         const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z);
         defer state.palette_overlay_batch.restoreZIndex(previous_z);
+        if (toggle_hovered) queueRounded(state, toggle_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
         sidebar_ui.queueSidePanelToggleGlyph(state, toggle_rect, state.isSidePanelOpen(), toggle_hovered, pane_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_side_panel, .rect = toggle_rect });
+        tooltip.queueAvoiding(state, toggle_rect, if (state.isSidePanelOpen()) "Hide side panel" else "Show side panel", &.{.{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = if (kind == .browser) browser_panel.paneToolbarActionRowHeight() else header_h }});
     }
     if (!can_zoom) return;
-    if (kind == .terminal and !maximized and !state.alt_shortcut_hints_visible) {
-        const hover_rect: palette.Rect = .{
-            .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
-            .y = pane_rect.y,
-            .w = theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
-            .h = theme.scaledUi(TERMINAL_ZOOM_HOVER_HEIGHT_CSS),
-        };
-        if (!rectContains(hover_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) return;
-    }
 
     const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
@@ -3624,20 +3746,6 @@ fn renderZoomControl(
             var label_buf: [16]u8 = undefined;
             renderPaneShortcutKeyTip(state, control_rect, pane_rect, keybinds.formatAltKeyTip(&label_buf, config.workspace_toggle_maximize));
         }
-    }
-
-    if (kind == .terminal) {
-        const split_rect: palette.Rect = .{
-            .x = pane_rect.x + pane_rect.w - margin - control_size,
-            .y = control_rect.y,
-            .w = control_size,
-            .h = control_size,
-        };
-        const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
-        const split_emphasized = rectContains(split_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or menu_open_here;
-        renderSplitTriggerButton(state, split_rect, menu_open_here, split_emphasized, pane_rect);
-        appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
-        if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
     }
 }
 
@@ -3677,13 +3785,159 @@ fn renderInactivePaneFade(state: *runtime.AppState, pane_id: runtime.WorkspacePa
     queueRect(state, rect, paletteColor(theme.withAlpha(theme.background(), INACTIVE_PANE_FADE_ALPHA)));
 }
 
+fn renderTerminalPaneHeader(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, dock_id: u32, rect: palette.Rect) void {
+    // Terminal chrome stays outside the PTY grid and shares chat-pane controls.
+    if (state.currentProjectTerminalDock(dock_id) == null) return;
+    appendHit(.{ .pane_id = pane_id, .action = .focus, .rect = rect });
+    queueRect(state, rect, paletteColor(theme.background()));
+    const stroke = @max(@round(theme.scaledUi(1)), 1);
+    queueRect(state, .{ .x = rect.x, .y = @round(rect.y + rect.h) - stroke, .w = rect.w, .h = stroke }, paletteColor(theme.borderMuted()));
+    const font = theme.scaledUi(18);
+    const pad = theme.scaledUi(28);
+    var title_buf: sidebar_ui.TerminalTitleBuffer = undefined;
+    const label = sidebar_ui.terminalPaneTitle(state, state.project_controller.selected_index, dock_id, &title_buf);
+    const buttons: f32 = (if (state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id)) @as(f32, 3) else 2) +
+        (if (paneShowsSidePanelToggle(state, .terminal)) @as(f32, 1) else 0);
+    const right_reserve = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS + (PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) * buttons);
+    const line_h = theme.scaledUi(32);
+    // Provider update chip, as in chat pane headers (the layout's toast pass
+    // draws it): left of the pane controls when the title keeps 160px.
+    var title_right = rect.x + rect.w - right_reserve;
+    if (state.isCurrentProjectWorkspacePaneFocused(pane_id)) {
+        const update_w = layout_ui.headerUpdateChipWidth(state);
+        if (update_w > 0.0) {
+            const chip_h = theme.scaledUi(layout_ui.HEADER_UPDATE_CHIP_H_UI);
+            const chip_x = title_right - theme.scaledUi(8) - update_w;
+            if (chip_x - theme.scaledUi(16) - (rect.x + pad) >= theme.scaledUi(160)) {
+                layout_ui.setHeaderUpdateSlot(.{ .x = @round(chip_x), .y = @round(rect.y + (rect.h - chip_h) * 0.5), .w = @round(update_w), .h = @round(chip_h) });
+                title_right = chip_x - theme.scaledUi(16);
+            }
+        }
+    }
+    const title_rect = palette.Rect{ .x = rect.x + pad, .y = rect.y + @max((rect.h - line_h) * 0.5, theme.scaledUi(4)), .w = @max(title_right - rect.x - pad, 0), .h = line_h };
+    var title_end = label.len;
+    var shown = label;
+    while (text_measure.textWidth(.prose_bold, font, shown) > title_rect.w and title_end > 0) {
+        title_end -= 1;
+        while (title_end > 0 and (label[title_end] & 0xC0) == 0x80) title_end -= 1;
+        shown = std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s}…", .{label[0..title_end]}) catch "";
+    }
+    state.palette_overlay_batch.roleText(state.allocator, title_rect, stableText(state, shown), paletteColor(theme.COLOR_WHITE), font, .prose_bold, null, title_rect) catch {};
+    tooltip.queueAvoiding(state, title_rect, label, &.{rect});
+    if (!state.isCurrentProjectWorkspacePaneFocused(pane_id)) return;
+    const size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
+    const close_rect = palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS) - size, .y = rect.y + (rect.h - size) * 0.5, .w = size, .h = size };
+    const hovered = rectContains(close_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    if (hovered) queueRounded(state, close_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5));
+    const icon = theme.scaledUi(15);
+    queueIcon(state, .{ .x = close_rect.x + (size - icon) * 0.5, .y = close_rect.y + (size - icon) * 0.5, .w = icon, .h = icon }, "\u{EA76}", paletteColor(if (hovered) theme.danger() else theme.COLOR_TEXT_MUTED), icon, rect);
+    appendHit(.{ .pane_id = pane_id, .action = .close, .rect = close_rect });
+    if (!menuOpen()) tooltip.queueAvoiding(state, close_rect, "Close terminal pane · F6 for pane controls", &.{rect});
+}
+
+fn renderTerminalHeaderFocus(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId) void {
+    const focus = terminal_header_focus orelse return;
+    if (focus.pane_id != pane_id or !state.isCurrentProjectWorkspacePaneFocused(pane_id) or !state.terminal_controller.focused) return;
+    const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z + 1);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+    for (hit_cache.hits[0..hit_cache.count]) |hit| {
+        if (hit.pane_id == pane_id and hit.action == focus.action) {
+            queueBorder(state, hit.rect, paletteColor(theme.accent()), theme.scaledUi(5), @max(@round(theme.scaledUi(1)), 1));
+            break;
+        }
+    }
+}
+
+/// Drop pane-header keyboard ownership when another surface takes focus.
+pub fn clearPaneHeaderFocus() void {
+    terminal_header_focus = null;
+}
+
+/// F6 moves between the terminal and its header without stealing the PTY's Tab.
+/// Once in the header, Tab/arrows traverse controls and Escape returns to input.
+pub fn handlePaneHeaderKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!state.terminal_controller.focused or state.project_controller.projects.items.len == 0) {
+        terminal_header_focus = null;
+        return false;
+    }
+    const pane_id = state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
+    if (state.workspacePaneKindById(pane_id) != .terminal) {
+        terminal_header_focus = null;
+        return false;
+    }
+    var controls: [4]WorkspacePaneHit = undefined;
+    var count: usize = 0;
+    for (hit_cache.hits[0..hit_cache.count]) |hit| {
+        if (hit.pane_id != pane_id or (hit.action != .maximize and hit.action != .toggle_side_panel and hit.action != .toggle_split_menu and hit.action != .close)) continue;
+        if (count == controls.len) break;
+        controls[count] = hit;
+        count += 1;
+    }
+    if (count == 0) {
+        terminal_header_focus = null;
+        return false;
+    }
+    std.mem.sort(WorkspacePaneHit, controls[0..count], {}, struct {
+        fn less(_: void, a: WorkspacePaneHit, b: WorkspacePaneHit) bool {
+            return a.rect.x < b.rect.x;
+        }
+    }.less);
+    var current: ?usize = null;
+    if (terminal_header_focus) |focus| for (controls[0..count], 0..) |hit, index| {
+        if (focus.pane_id == pane_id and focus.action == hit.action) {
+            current = index;
+            break;
+        }
+    };
+    // Modifiers arrive as separate key-downs before chords such as Shift+Tab.
+    // Preserve a valid header focus, including when Ctrl/Alt are already set
+    // on their own press; ordinary modified shortcuts still pass through.
+    if (current != null) switch (event.key) {
+        .lshift, .rshift, .lctrl, .rctrl, .lalt, .ralt, .lgui, .rgui => return true,
+        else => {},
+    };
+    if (event.mod.primary() or event.mod.alt) {
+        terminal_header_focus = null;
+        return false;
+    }
+    if (event.key == .f6) {
+        if (event.repeat) return true;
+        terminal_header_focus = if (current == null) .{ .pane_id = pane_id, .action = controls[0].action } else null;
+    } else if (current) |index| {
+        switch (event.key) {
+            .escape => terminal_header_focus = null,
+            .tab, .left, .right => {
+                const backwards = event.key == .left or (event.key == .tab and event.mod.shift);
+                const next = (index + (if (backwards) count - 1 else 1)) % count;
+                terminal_header_focus = .{ .pane_id = pane_id, .action = controls[next].action };
+            },
+            .@"return", .kp_enter, .space => {
+                const hit = controls[index];
+                _ = handlePaneChromeMouseButton(state, hit.rect.x + hit.rect.w * 0.5, hit.rect.y + hit.rect.h * 0.5, 1, true);
+                if (hit.action == .toggle_side_panel or hit.action == .maximize) {
+                    terminal_header_focus = .{ .pane_id = pane_id, .action = hit.action };
+                }
+            },
+            else => {
+                terminal_header_focus = null;
+                return false;
+            },
+        }
+    } else {
+        terminal_header_focus = null;
+        return false;
+    }
+    state.markDirty();
+    return true;
+}
+
 fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, header_rect: palette.Rect) void {
     const focused = state.isCurrentProjectWorkspacePaneFocused(pane_id);
     // Focus hit covers the header area only, registered first so it sits at lowest
     // priority. Clicks on icons (registered later) take precedence; clicks on the
     // chat panel's own buttons (Open/Browser) are resolved by chat_panel before
     // this handler runs.
-    appendHit(.{ .pane_id = pane_id, .action = .focus, .rect = header_rect });
+    if (state.workspacePaneKindById(pane_id) != .terminal) appendHit(.{ .pane_id = pane_id, .action = .focus, .rect = header_rect });
 
     const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
     // Render only when focused — non-focused panes keep their panel header clean.
@@ -3691,7 +3945,7 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
         // Split trigger (+): always visible on focused pane, brightens on direct hover.
         const split_w = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
         const split_h = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
-        const right_margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
+        const right_margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS + (if (state.workspacePaneKindById(pane_id) == .terminal) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0));
         const split_x = header_rect.x + header_rect.w - right_margin - split_w;
         const split_y = header_rect.y + (header_rect.h - split_h) * 0.5;
         const split_rect = palette.Rect{ .x = split_x, .y = split_y, .w = split_w, .h = split_h };
@@ -3704,13 +3958,11 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
 }
 
 fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active: bool, emphasized: bool, clip: palette.Rect) void {
-    _ = clip;
+    if (!menuOpen()) tooltip.queueAvoiding(state, rect, "Pane actions", &.{clip});
     if (active) {
-        queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-        queueBorder(state, rect, paletteColor(theme.accent()), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        state.palette_overlay_batch.panel(state.allocator, context_menu.snap(rect), paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), paletteColor(theme.accent()), theme.scaledUi(5.0), @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
     } else if (emphasized) {
-        queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
-        queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        state.palette_overlay_batch.panel(state.allocator, context_menu.snap(rect), paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
     }
     const icon_color = if (active or emphasized)
         theme.COLOR_WHITE
@@ -3737,6 +3989,8 @@ fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active
 
 fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect) void {
     const pane_id = split_menu_open_for orelse return;
+    menu_keyboard_count = 0;
+    rendering_submenu = false;
     const previous_z = state.palette_overlay_batch.setZIndex(PANE_CONTEXT_MENU_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
@@ -3761,10 +4015,12 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const zoom_count: usize = if (state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id)) 1 else 0;
     const command_count: usize = link_row_count + chat_command_count + attach_count + zoom_count + 2;
     const split_count: usize = 8;
-    const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h +
+    const group_separator_h = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    const chat_separator_h: f32 = if (chat_command_count > 0) group_separator_h else 0.0;
+    const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h + group_separator_h + chat_separator_h +
         @as(f32, @floatFromInt(command_count)) * row_h +
         @as(f32, @floatFromInt(command_count - 1)) * row_gap;
-    const submenu_h = menu_pad_top + menu_pad_bottom +
+    const submenu_h = menu_pad_top + menu_pad_bottom + group_separator_h +
         @as(f32, @floatFromInt(split_count)) * row_h +
         @as(f32, @floatFromInt(split_count - 1)) * row_gap;
 
@@ -3796,27 +4052,34 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     if (is_chat_context) {
         if (copy_count > 0) y = renderContextMenuRow(state, pane_id, .copy_selection, "Copy", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         if (paste_count > 0) y = renderContextMenuRow(state, pane_id, .paste_into_prompt, "Paste", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
-        y = renderContextMenuRow(state, pane_id, .new_chat_thread, "New Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
-        y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        y = renderContextMenuRow(state, pane_id, .new_chat_thread, "New chat thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh chat thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     }
-    if (attach_count > 0) y = renderContextMenuRow(state, pane_id, .attach_browser_to_tab, "Attach to Tab", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+    if (chat_command_count > 0) {
+        context_menu.queueSeparator(state, menu_rect.x + menu_pad_x, y, row_rect_w);
+        y += chat_separator_h;
+    }
+    if (attach_count > 0) y = renderContextMenuRow(state, pane_id, .attach_browser_to_tab, "Attach to tab", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     if (zoom_count > 0) {
-        const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
+        const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom pane" else "Zoom pane";
         y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     }
-    const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
+    const split_trigger_rect = renderContextMenuStaticRow(state, "Split pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
+    recordMenuRow(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_trigger_rect });
     y = split_trigger_rect.y + split_trigger_rect.h + row_gap;
-    _ = renderContextMenuRow(state, pane_id, .close, "Close Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h);
+    context_menu.queueSeparator(state, menu_rect.x + menu_pad_x, y, row_rect_w);
+    y += group_separator_h;
+    _ = renderContextMenuRow(state, pane_id, .close, "Close pane", menu_rect, menu_pad_x, y, row_rect_w, row_h);
 
     const rows = [_]MenuRow{
-        .{ .action = .split_chat_left, .label = "Chat Left" },
-        .{ .action = .split_chat_right, .label = "Chat Right" },
-        .{ .action = .split_chat_up, .label = "Chat Above" },
-        .{ .action = .split_chat_down, .label = "Chat Below" },
-        .{ .action = .split_terminal_left, .label = "Terminal Left" },
-        .{ .action = .split_terminal_right, .label = "Terminal Right" },
-        .{ .action = .split_terminal_up, .label = "Terminal Above" },
-        .{ .action = .split_terminal_down, .label = "Terminal Below" },
+        .{ .action = .split_chat_left, .label = "Chat left" },
+        .{ .action = .split_chat_right, .label = "Chat right" },
+        .{ .action = .split_chat_up, .label = "Chat above" },
+        .{ .action = .split_chat_down, .label = "Chat below" },
+        .{ .action = .split_terminal_left, .label = "Terminal left" },
+        .{ .action = .split_terminal_right, .label = "Terminal right" },
+        .{ .action = .split_terminal_up, .label = "Terminal above" },
+        .{ .action = .split_terminal_down, .label = "Terminal below" },
     };
 
     var submenu_x = menu_rect.x + menu_rect.w + theme.scaledUi(6.0);
@@ -3828,12 +4091,17 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     if (submenu_y > submenu_max_y) submenu_y = submenu_max_y;
     if (submenu_y < workspace_rect.y + theme.scaledUi(8.0)) submenu_y = workspace_rect.y + theme.scaledUi(8.0);
     const submenu_rect = context_menu.snap(.{ .x = submenu_x, .y = submenu_y, .w = submenu_w, .h = submenu_h });
-    const submenu_visible = rectContains(split_trigger_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or rectContains(submenu_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    const submenu_visible = menu_keyboard_submenu or rectContains(split_trigger_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or rectContains(submenu_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (submenu_visible) {
+        rendering_submenu = true;
         split_submenu_rect = context_menu.queuePanel(state, submenu_rect);
         y = submenu_rect.y + menu_pad_top;
         const submenu_row_w = submenu_rect.w - menu_pad_x * 2.0;
-        for (rows) |row| {
+        for (rows, 0..) |row, index| {
+            if (index == 4) {
+                context_menu.queueSeparator(state, submenu_rect.x + menu_pad_x, y, submenu_row_w);
+                y += group_separator_h;
+            }
             y = renderContextMenuRow(state, pane_id, row.action, row.label, submenu_rect, menu_pad_x, y, submenu_row_w, row_h) + row_gap;
         }
     }
@@ -3850,11 +4118,13 @@ fn renderContextMenuStaticRow(
     arrow: bool,
 ) palette.Rect {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
-    const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (hovered) context_menu.queueRowHighlight(state, rect);
+    const keyboard_focused = menu_focus_action == .toggle_split_menu;
+    const hovered = keyboard_focused or rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    context_menu.queueRowState(state, rect, hovered, keyboard_focused);
     const text_color = context_menu.labelColor(true, hovered);
     const trailing = if (arrow) theme.scaledUi(context_menu.CHEVRON_SLOT_UI) else 0.0;
-    context_menu.queueLabel(state, rect, label, text_color, 0.0, trailing, menu_rect);
+    context_menu.queueIcon(state, rect, "\u{EB56}", text_color, menu_rect);
+    context_menu.queueLabel(state, rect, label, text_color, theme.scaledUi(context_menu.CHECK_SLOT_UI), trailing, menu_rect);
     if (arrow) context_menu.queueChevron(state, rect, text_color, menu_rect);
     return rect;
 }
@@ -3871,9 +4141,23 @@ fn renderContextMenuRow(
     h: f32,
 ) f32 {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
-    const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (hovered) context_menu.queueRowHighlight(state, rect);
-    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, hovered), 0.0, 0.0, menu_rect);
+    const keyboard_focused = menu_focus_action == action;
+    const hovered = keyboard_focused or rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    recordMenuRow(.{ .pane_id = pane_id, .action = action, .rect = rect });
+    context_menu.queueRowState(state, rect, hovered, keyboard_focused);
+    const text_color = context_menu.actionColor(true, action == .close);
+    const glyph: []const u8 = switch (action) {
+        .close => "\u{EA76}",
+        .maximize => if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) NF_MD_ARROW_COLLAPSE else NF_MD_ARROW_EXPAND,
+        .copy_selection, .copy_link => "\u{EBCC}",
+        .paste_into_prompt => "\u{EB9D}",
+        .new_chat_thread, .split_chat_left, .split_chat_right, .split_chat_up, .split_chat_down => "\u{EA6B}",
+        .refresh_chat_thread => "\u{EB37}",
+        .split_terminal_left, .split_terminal_right, .split_terminal_up, .split_terminal_down => "\u{EA85}",
+        else => "\u{EB14}",
+    };
+    context_menu.queueIcon(state, rect, glyph, text_color, menu_rect);
+    context_menu.queueLabel(state, rect, label, text_color, theme.scaledUi(context_menu.CHECK_SLOT_UI), 0.0, menu_rect);
     appendHit(.{ .pane_id = pane_id, .action = action, .rect = rect });
     return rect.y + rect.h;
 }
@@ -4280,4 +4564,365 @@ test "fresh install first frames render with no workspaces and onboarding open" 
             ui_layout.renderRoot(&state, size[0], size[1]);
         }
     }
+}
+
+test "pane menu keys own navigation and dismiss before underlying pane input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        closeMenu();
+        menu_keyboard_count = 0;
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    split_menu_open_for = 1;
+    menu_keyboard_count = 0;
+    rendering_submenu = false;
+    recordMenuRow(.{ .pane_id = 1, .action = .copy_selection, .rect = .{} });
+    recordMenuRow(.{ .pane_id = 1, .action = .toggle_split_menu, .rect = .{} });
+    recordMenuRow(.{ .pane_id = 1, .action = .close, .rect = .{} });
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .down }));
+    try std.testing.expectEqual(WorkspacePaneAction.copy_selection, menu_focus_action.?);
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .down }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_split_menu, menu_focus_action.?);
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .right }));
+    try std.testing.expect(menu_keyboard_submenu);
+    try std.testing.expectEqual(WorkspacePaneAction.split_chat_left, menu_focus_action.?);
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .left }));
+    try std.testing.expect(!menu_keyboard_submenu);
+    // A non-navigation key is consumed rather than typing into the pane.
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(!menuOpen());
+    try std.testing.expect(!handleMenuKeyDown(&state, &.{ .key = .down }));
+    split_menu_open_for = 1;
+    try std.testing.expect(handleMenuKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(!menuOpen());
+}
+
+test "terminal header focus preserves PTY input and ignores stale controls" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    const previous_hits = hit_cache;
+    defer {
+        hit_cache = previous_hits;
+        terminal_header_focus = null;
+        sidebar_ui.clearKeyboardFocus(&state);
+        closeMenu();
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    var project = try runtime.Project.init(allocator, "terminal-header", "Header", "/tmp/header", 0);
+    project.workspace_layout.deinit(allocator);
+    const pane_id = try project.workspace_layout.createTerminalPane(allocator, 0);
+    project.workspace_layout.root = try workspace_layout.WorkspaceLayout.createLeafNode(allocator, pane_id);
+    project.workspace_layout.focused_pane_id = pane_id;
+    try state.project_controller.projects.append(allocator, project);
+    state.project_controller.selected_index = 0;
+    state.terminal_controller.focused = true;
+    // The title and controls occupy the same header band as a chat pane.
+    const pane_rect = palette.Rect{ .x = 10, .y = 20, .w = 720, .h = 600 };
+    const header_h = terminal_panel.paneHeaderHeight(pane_rect);
+    try std.testing.expectEqual(chat_panel.paneHeaderHeight(pane_rect), header_h);
+    const command_start = state.palette_overlay_batch.commands.items.len;
+    renderTerminalPaneHeader(&state, pane_id, 0, .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = header_h });
+    var title_buf: sidebar_ui.TerminalTitleBuffer = undefined;
+    const title = sidebar_ui.terminalPaneTitle(&state, 0, 0, &title_buf);
+    var found_title = false;
+    for (state.palette_overlay_batch.commands.items[command_start..]) |command| {
+        if (command.kind != .text or !std.mem.eql(u8, command.text, title)) continue;
+        found_title = true;
+        try std.testing.expectEqual(theme.scaledUi(18), command.font_size);
+        try std.testing.expectEqual(palette.FontRole.prose_bold, command.font_role.?);
+        try std.testing.expect(command.rect.y >= pane_rect.y);
+        try std.testing.expect(command.rect.y + command.rect.h <= pane_rect.y + header_h);
+    }
+    try std.testing.expect(found_title);
+    hit_cache.count = 0;
+    // Deliberately register in reverse visual order, as rendering does.
+    appendHit(.{ .pane_id = pane_id, .action = .close, .rect = .{ .x = 680, .y = 0, .w = 30, .h = 30 } });
+    appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = .{ .x = 640, .y = 0, .w = 30, .h = 30 } });
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
+    // The shared side-panel control is reachable before More and Close.
+    state.app_config.workspace_tabs = .always;
+    try std.testing.expect(!paneShowsSidePanelToggle(&state, .chat));
+    try std.testing.expect(paneShowsSidePanelToggle(&state, .terminal));
+    state.app_config.workspace_tabs = .disabled;
+    hit_cache.count = 0;
+    renderTerminalPaneHeader(&state, pane_id, 0, .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = header_h });
+    renderPaneOverlay(&state, pane_id, .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = header_h });
+    renderZoomControl(&state, pane_id, .terminal, pane_rect, header_h, false);
+    try std.testing.expectEqual(paneShowsSidePanelToggle(&state, .chat), paneShowsSidePanelToggle(&state, .terminal));
+    try std.testing.expect(paneShowsSidePanelToggle(&state, .terminal));
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_side_panel, terminal_header_focus.?.action);
+    try std.testing.expect(!state.isSidePanelOpen());
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .@"return" }));
+    try std.testing.expect(state.isSidePanelOpen());
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_side_panel, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .space }));
+    try std.testing.expect(!state.isSidePanelOpen());
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_side_panel, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_split_menu, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(WorkspacePaneAction.close, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .tab, .mod = .{ .shift = true } }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_split_menu, terminal_header_focus.?.action);
+    clearPaneHeaderFocus();
+    hit_cache.count = 0;
+    appendHit(.{ .pane_id = pane_id, .action = .close, .rect = .{ .x = 680, .y = 0, .w = 30, .h = 30 } });
+    appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = .{ .x = 640, .y = 0, .w = 30, .h = 30 } });
+    // Mirror main's sidebar-before-pane routing. The rail must own
+    // Shift+F6 even when the PTY, or its header, currently has focus.
+    state.sidebar_hidden = false;
+    state.sidebar_collapsed = false;
+    sidebar_ui.renderPalette(&state, .{ .x = 0, .y = 0, .w = 280, .h = 700 });
+    for ([_]bool{ false, true }) |start_in_header| {
+        if (start_in_header) try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+        const enter = palette.event.KeyEvent{ .key = .f6, .mod = .{ .shift = true } };
+        try std.testing.expect(sidebar_ui.handleKeyboardFocusKeyDown(&state, &enter));
+        clearPaneHeaderFocus();
+        try std.testing.expect(sidebar_ui.hasKeyboardFocus());
+        try std.testing.expect(!state.terminal_controller.focused);
+        try std.testing.expect(sidebar_ui.handleKeyboardFocusKeyDown(&state, &.{ .key = .escape }));
+        clearPaneHeaderFocus();
+        try std.testing.expect(!sidebar_ui.hasKeyboardFocus());
+        try std.testing.expect(state.terminal_controller.focused);
+        const tab = palette.event.KeyEvent{ .key = .tab };
+        try std.testing.expect(!sidebar_ui.handleKeyboardFocusKeyDown(&state, &tab));
+        try std.testing.expect(!handlePaneHeaderKeyDown(&state, &tab));
+        try std.testing.expect(!terminal_panel.handlePaletteKeyDown(&state, &tab));
+    }
+    // Clicking elsewhere clears the rail's ring and releases ordinary keys.
+    try std.testing.expect(sidebar_ui.handleKeyboardFocusKeyDown(&state, &.{ .key = .f6, .mod = .{ .shift = true } }));
+    sidebar_ui.clearKeyboardFocus(&state);
+    try std.testing.expect(!sidebar_ui.hasKeyboardFocus());
+    try std.testing.expect(!sidebar_ui.handleKeyboardFocusKeyDown(&state, &.{ .key = .tab }));
+    state.terminal_controller.focused = true;
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_split_menu, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(WorkspacePaneAction.close, terminal_header_focus.?.action);
+    // Real hosts deliver the modifier press before the modified Tab event.
+    for ([_]palette.event.KeyEvent{
+        .{ .key = .lshift, .scancode = 42, .mod = .{ .shift = true } },
+        .{ .key = .rshift, .scancode = 54, .mod = .{ .shift = true } },
+        .{ .key = .lctrl, .mod = .{ .ctrl = true } },
+        .{ .key = .rctrl, .mod = .{ .ctrl = true } },
+        .{ .key = .lalt, .mod = .{ .alt = true } },
+        .{ .key = .ralt, .mod = .{ .alt = true } },
+        .{ .key = .lgui, .mod = .{ .super = true } },
+        .{ .key = .rgui, .mod = .{ .super = true } },
+    }) |modifier| {
+        try std.testing.expect(handlePaneHeaderKeyDown(&state, &modifier));
+        try std.testing.expectEqual(WorkspacePaneAction.close, terminal_header_focus.?.action);
+    }
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .lshift, .scancode = 42, .mod = .{ .shift = true } }));
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .tab, .mod = .{ .shift = true } }));
+    try std.testing.expectEqual(WorkspacePaneAction.toggle_split_menu, terminal_header_focus.?.action);
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(terminal_header_focus == null);
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .@"return" }));
+    try std.testing.expect(menuOpen());
+    closeMenu();
+    try std.testing.expect(handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+    hit_cache.count = 0; // The pane stopped painting after a workspace change.
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .tab }));
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .f6 }));
+    try std.testing.expect(terminal_header_focus == null);
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .lshift, .mod = .{ .shift = true } }));
+    try std.testing.expect(!handlePaneHeaderKeyDown(&state, &.{ .key = .character, .codepoint = 'a' }));
+    // Toggling the rail/tab strip must retain the same controls and geometry,
+    // including a split layout where Zoom is available. More must not paint
+    // a second hit over the terminal's Close control.
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+    const other_pane = try layout.createTerminalPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, pane_id, other_pane, .horizontal, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(pane_id, other_pane));
+    layout.focused_pane_id = pane_id;
+    try std.testing.expect(state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id));
+    var original: [4]WorkspacePaneHit = undefined;
+    for ([_]bool{ false, true }) |collapsed| {
+        state.sidebar_collapsed = collapsed;
+        state.app_config.workspace_tabs = .always;
+        hit_cache.count = 0;
+        renderTerminalPaneHeader(&state, pane_id, 0, .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = header_h });
+        renderPaneOverlay(&state, pane_id, .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = header_h });
+        renderZoomControl(&state, pane_id, .terminal, pane_rect, header_h, false);
+        var controls: [4]WorkspacePaneHit = undefined;
+        var count: usize = 0;
+        for (hit_cache.hits[0..hit_cache.count]) |hit| {
+            if (hit.action == .focus) continue;
+            try std.testing.expect(count < controls.len);
+            controls[count] = hit;
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), count);
+        std.mem.sort(WorkspacePaneHit, &controls, {}, struct {
+            fn less(_: void, a: WorkspacePaneHit, b: WorkspacePaneHit) bool {
+                return a.rect.x < b.rect.x;
+            }
+        }.less);
+        for ([_]WorkspacePaneAction{ .maximize, .toggle_side_panel, .toggle_split_menu, .close }, 0..) |action, index| {
+            try std.testing.expectEqual(action, controls[index].action);
+            if (index > 0) try std.testing.expect(controls[index - 1].rect.x + controls[index - 1].rect.w <= controls[index].rect.x);
+            if (collapsed) try std.testing.expectEqual(original[index].rect, controls[index].rect);
+        }
+        original = controls;
+    }
+}
+
+test "pane frame leaves the tab strip neutral and retains interior tile edges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    const previous_bounds = frame_workspace_rect;
+    defer {
+        frame_workspace_rect = previous_bounds;
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "frame-edges", "Edges", "/tmp/edges", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+    state.app_config.workspace_tabs = .always;
+    frame_workspace_rect = .{ .x = 100, .y = 40, .w = 800, .h = 600 };
+    const tile: palette.Rect = .{ .x = 100, .y = 40, .w = 350, .h = 300 };
+    const start = state.palette_overlay_batch.commands.items.len;
+    queuePaneFrame(&state, tile, paletteColor(theme.accent()), 2, false);
+    var saw_bottom = false;
+    for (state.palette_overlay_batch.commands.items[start..]) |command| {
+        try std.testing.expect(!(command.rect.y == tile.y and command.rect.w == tile.w and command.rect.h == 2));
+        if (command.rect.y == tile.y + tile.h - 2 and command.rect.w == tile.w) saw_bottom = true;
+    }
+    try std.testing.expect(saw_bottom);
+    const inner: palette.Rect = .{ .x = 100, .y = 360, .w = 350, .h = 240 };
+    const inner_start = state.palette_overlay_batch.commands.items.len;
+    queuePaneFrame(&state, inner, paletteColor(theme.accent()), 2, false);
+    try std.testing.expectEqual(@as(usize, 1), state.palette_overlay_batch.commands.items.len - inner_start);
+    try std.testing.expectEqual(@as(f32, 2), state.palette_overlay_batch.commands.items[inner_start].border_width);
+}
+
+test "companion pane reserve reflows tiled zoomed and scrolling paint and hit geometry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{ .companion_enabled = true, .workspace_panes_per_view = 1, .reduced_motion = .{ .pane_layout = true, .pane_scroll = true } }, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    const previous_bounds = frame_workspace_rect;
+    const previous_last = last_workspace_rect;
+    const previous_area = companion.pane_area;
+    const previous_hits = hit_cache;
+    defer {
+        frame_workspace_rect = previous_bounds;
+        last_workspace_rect = previous_last;
+        companion.pane_area = previous_area;
+        hit_cache = previous_hits;
+        pane_rect_count = 0;
+        pane_rect_slot_count = 0;
+        side_panel.resetHitCache();
+        terminal_panel.resetHitCache();
+        chat_panel.resetWorkspaceHeaderHitCache();
+        chat_panel.resetTranscriptHitCache();
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    var project = try runtime.Project.init(allocator, "companion-reflow", "Reflow", "/tmp/reflow", 0);
+    project.workspace_layout.deinit(allocator);
+    const first = try project.workspace_layout.createTerminalPane(allocator, 0);
+    project.workspace_layout.root = try workspace_layout.WorkspaceLayout.createLeafNode(allocator, first);
+    const second = try project.workspace_layout.createTerminalPane(allocator, 1);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first, second, .vertical, true);
+    try std.testing.expect(project.workspace_layout.joinPaneToScrollGroup(first, second));
+    project.workspace_layout.focused_pane_id = first;
+    try state.project_controller.projects.append(allocator, project);
+    state.project_controller.selected_index = 0;
+    state.terminal_controller.focused = true;
+    state.transcript_controller.palette_mouse_in_workspace = false;
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    const workspace = palette.Rect{ .x = 100, .y = 40, .w = theme.scaledUi(2400), .h = theme.scaledUi(800) };
+    for ([_]bool{ false, true }) |panel_open| {
+        if (panel_open) state.setSidePanelView(.agents) else state.setSidePanelOpen(false);
+        const split = side_panel.split(&state, workspace);
+        companion.pane_area = split.content;
+        const reserve = companion.paneReserve(&state, split.content);
+        try std.testing.expect(reserve > 0);
+        const right = split.content.x + split.content.w - reserve;
+        for ([_]app_config.WorkspaceScrollMode{ .disabled, .always }) |mode| {
+            state.app_config.workspace_scroll_mode = mode;
+            for ([_]bool{ false, true }) |zoom| {
+                state.project_controller.projects.items[0].workspace_layout.maximized_pane_id = if (zoom) first else null;
+                for (0..3) |_| {
+                    state.palette_overlay_batch.clear();
+                    renderAtWithTranscriptLayoutWidth(&state, workspace, workspace.w);
+                    try std.testing.expectEqual(mode == .always, scrolling_layout_rendered);
+                    try std.testing.expectApproxEqAbs(right, last_workspace_rect.x + last_workspace_rect.w, 0.01);
+                    try std.testing.expectEqual(@as(usize, if (zoom) 1 else 2), pane_rect_count);
+                    for (pane_rects[0..pane_rect_count]) |entry| {
+                        try std.testing.expect(entry.rect.x + entry.rect.w <= right + 0.5);
+                        try std.testing.expectEqual(entry.pane_id, paneIdAt(entry.rect.x + entry.rect.w * 0.5, entry.rect.y + entry.rect.h * 0.5).?);
+                    }
+                    for (hit_cache.hits[0..hit_cache.count]) |hit| try std.testing.expect(hit.rect.x + hit.rect.w <= right + 0.5);
+                    try std.testing.expect(paneIdAt(right + reserve * 0.5, workspace.y + 100) == null);
+                }
+            }
+        }
+    }
+    // Near the docking threshold the reduced width would no longer qualify.
+    // Re-evaluating against that reduced width would oscillate on each frame.
+    state.setSidePanelOpen(false);
+    const threshold = palette.Rect{ .x = 100, .y = 40, .w = 1000 * theme.displayScaleFactor(), .h = 600 * theme.displayScaleFactor() };
+    companion.pane_area = threshold;
+    const reserve = companion.paneReserve(&state, threshold);
+    try std.testing.expect(reserve > 0);
+    try std.testing.expectEqual(@as(f32, 0), companion.paneReserve(&state, .{ .w = threshold.w - reserve, .h = threshold.h }));
+    for (0..3) |_| {
+        state.palette_overlay_batch.clear();
+        renderAtWithTranscriptLayoutWidth(&state, threshold, threshold.w);
+        try std.testing.expectApproxEqAbs(threshold.w - reserve, last_workspace_rect.w, 0.01);
+    }
+    // The Companion owns the shared seam, just as the right panel does.
+    const frame_start = state.palette_overlay_batch.commands.items.len;
+    queuePaneFrame(&state, last_workspace_rect, paletteColor(theme.accent()), 2, false);
+    for (state.palette_overlay_batch.commands.items[frame_start..]) |command| {
+        try std.testing.expect(!(command.rect.x == @round(last_workspace_rect.x + last_workspace_rect.w) - 2 and command.rect.w == 2 and command.rect.h == @round(last_workspace_rect.h)));
+    }
+    state.companion_controller.expanded = true;
+    renderAtWithTranscriptLayoutWidth(&state, threshold, threshold.w);
+    try std.testing.expectEqual(threshold, last_workspace_rect);
 }

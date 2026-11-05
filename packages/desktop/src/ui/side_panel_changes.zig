@@ -27,6 +27,7 @@ const palette = @import("palette");
 
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
+const tooltip = @import("tooltip.zig");
 const text_measure = @import("text_measure.zig");
 const file_icons = @import("file_icons.zig");
 const diff_render = @import("diff_render.zig");
@@ -38,7 +39,7 @@ const AppState = runtime.AppState;
 const PAD_UI: f32 = 12.0;
 const TITLE_ROW_UI: f32 = 34.0;
 const STATS_ROW_UI: f32 = 24.0;
-const CHIP_H_UI: f32 = 24.0;
+const CHIP_H_UI: f32 = 28.0;
 const CHIP_GAP_UI: f32 = 6.0;
 const REPO_ROW_UI: f32 = 28.0;
 const FILE_ROW_UI: f32 = 30.0;
@@ -74,6 +75,8 @@ const FileRef = struct {
 
 const HitKind = union(enum) {
     refresh,
+    chips_previous,
+    chips_next,
     commit,
     retry,
     layout: diff_render.Layout,
@@ -113,6 +116,17 @@ var file_rows_count: usize = 0;
 var mouse: ?diff_render.Point = null;
 var list_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var max_scroll: f32 = 0.0;
+var chip_viewport: palette.Rect = .{};
+var chip_scroll_x: f32 = 0.0;
+var chip_max_scroll: f32 = 0.0;
+var painted_chip_scroll_x: f32 = 0.0;
+var painted_list_scroll_y: f32 = 0.0;
+var chip_generation: u64 = 0;
+var focus_stops: [MAX_HITS]Hit = undefined;
+var focus_count: usize = 0;
+var keyboard_focus: ?HitKind = null;
+var keyboard_active = false;
+var body_keyboard_focused = false;
 
 /// Line selection in one file's diff (view indices), while dragging and
 /// after; mirrored into `workspace_changes.selection` on release.
@@ -142,13 +156,22 @@ var ask_rect: ?palette.Rect = null;
 
 pub fn resetHitCache() void {
     hit_count = 0;
+    focus_count = 0;
+    chip_viewport = .{};
     row_used = 0;
     file_rows_count = 0;
     ask_span = null;
     ask_rect = null;
 }
 
+fn recordFocus(rect: palette.Rect, kind: HitKind) void {
+    if (focus_count == focus_stops.len) return;
+    focus_stops[focus_count] = .{ .rect = rect, .kind = kind };
+    focus_count += 1;
+}
+
 fn pushHit(rect: palette.Rect, kind: HitKind) void {
+    recordFocus(rect, kind);
     if (hit_count >= MAX_HITS) return;
     hits[hit_count] = .{ .rect = rect, .kind = kind };
     hit_count += 1;
@@ -160,8 +183,10 @@ fn pushClippedHit(rect: palette.Rect, kind: HitKind, clip: palette.Rect) void {
     const y0 = @max(rect.y, clip.y);
     const x1 = @min(rect.x + rect.w, clip.x + clip.w);
     const y1 = @min(rect.y + rect.h, clip.y + clip.h);
-    if (x1 <= x0 or y1 <= y0) return;
-    pushHit(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 }, kind);
+    recordFocus(rect, kind);
+    if (x1 <= x0 or y1 <= y0 or hit_count >= MAX_HITS) return;
+    hits[hit_count] = .{ .rect = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 }, .kind = kind };
+    hit_count += 1;
 }
 
 // ------------------------------------------------------------------
@@ -169,7 +194,10 @@ fn pushClippedHit(rect: palette.Rect, kind: HitKind, clip: palette.Rect) void {
 // ------------------------------------------------------------------
 
 pub fn render(state: *AppState, rect: palette.Rect, focused: bool) void {
-    _ = focused;
+    // Header filters and scrolling file list share keyboard focus identities.
+    body_keyboard_focused = focused;
+    if (!focused) keyboard_active = false;
+    defer renderKeyboardFocus(state, rect);
     const model = &state.workspace_changes;
     const pad = theme.scaledUi(PAD_UI);
     const clip = rect;
@@ -214,19 +242,30 @@ fn renderTitleRow(state: *AppState, rect: palette.Rect, y: f32, data: ?changes.W
     const model = &state.workspace_changes;
     const pad = theme.scaledUi(PAD_UI);
     const row_h = theme.scaledUi(TITLE_ROW_UI);
-    const button_h = theme.scaledUi(26.0);
+    const button_h = theme.scaledUi(28.0);
     const button_y = y + (row_h - button_h) * 0.5;
 
-    const commit_w = theme.scaledUi(78.0);
+    const commit_w = theme.scaledUi(98.0);
     const commit_rect = palette.Rect{ .x = rect.x + rect.w - pad - commit_w, .y = button_y, .w = commit_w, .h = button_h };
-    diff_render.renderActionButton(state, commit_rect, "Commit…", true, clip, mouse);
-    pushHit(commit_rect, .commit);
+    // Match the chat header's Git control; this opens the workspace commit sheet.
+    const commit_hovered = pointIn(commit_rect);
+    state.palette_overlay_batch.panel(state.allocator, snapRect(commit_rect), paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, if (commit_hovered) 0.13 else 0.07)), paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)), theme.scaledUi(7.0), @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
+    const commit_icon_w = theme.scaledUi(14.0);
+    queueIcon(state, .{ .x = commit_rect.x + theme.scaledUi(10.0), .y = commit_rect.y, .w = commit_icon_w, .h = commit_rect.h }, "\u{EAFC}", paletteColor(theme.accent()), commit_icon_w, clip);
+    const commit_font = theme.scaledUi(12.5);
+    queueLabel(state, .{ .x = commit_rect.x + theme.scaledUi(30.0), .y = commit_rect.y + (commit_rect.h - commit_font * 1.4) * 0.5, .w = commit_rect.w - theme.scaledUi(38.0), .h = commit_font * 1.4 }, "Commit…", paletteColor(if (commit_hovered) theme.COLOR_WHITE else theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.25)), commit_font, clip);
+    const commit_tip = if (data) |result|
+        std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "Commit workspace changes · {d} files total. The chat header counts files changed by that chat.", .{changes.totals(result, .{}).files}) catch "Commit workspace changes"
+    else
+        "Commit workspace changes. The chat header counts files changed by that chat.";
+    tooltip.queueAvoiding(state, commit_rect, commit_tip, &.{.{ .x = rect.x, .y = y, .w = rect.w, .h = row_h }});
 
     const refresh_rect = palette.Rect{ .x = commit_rect.x - theme.scaledUi(6.0) - button_h, .y = button_y, .w = button_h, .h = button_h };
     const refresh_hovered = pointIn(refresh_rect);
     if (refresh_hovered) queueRounded(state, refresh_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)), theme.scaledUi(6.0), clip);
     queueIcon(state, refresh_rect, NF_REFRESH, paletteColor(if (model.loading) theme.accent() else if (refresh_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
     pushHit(refresh_rect, .refresh);
+    pushHit(commit_rect, .commit);
 
     // "repo · branch" for one repository with changes, else "N repositories".
     var buf: [256]u8 = undefined;
@@ -235,8 +274,16 @@ fn renderTitleRow(state: *AppState, rect: palette.Rect, y: f32, data: ?changes.W
     if (data) |result| {
         var with_files: usize = 0;
         var only: ?changes.WorkspaceRepo = null;
+        const active = model.filter();
         for (result.repos) |repo| {
-            if (repo.files.len > 0 or repo.too_many_files) {
+            var visible = repo.too_many_files and model.filter_kind == .all;
+            for (repo.files) |file| {
+                if (active.matches(file)) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (visible) {
                 with_files += 1;
                 only = repo;
             }
@@ -265,6 +312,14 @@ fn renderTitleRow(state: *AppState, rect: palette.Rect, y: f32, data: ?changes.W
 }
 
 fn renderStatsRow(state: *AppState, rect: palette.Rect, y: f32, result: changes.WorkspaceResult, clip: palette.Rect) f32 {
+    const first_focus = focus_count;
+    // Right-anchored controls paint from right to left, but Tab follows the
+    // visible order (Expand all, then the layout segments).
+    defer std.mem.sort(Hit, focus_stops[first_focus..focus_count], {}, struct {
+        fn less(_: void, a: Hit, b: Hit) bool {
+            return a.rect.x < b.rect.x;
+        }
+    }.less);
     const model = &state.workspace_changes;
     const pad = theme.scaledUi(PAD_UI);
     const row_h = theme.scaledUi(STATS_ROW_UI);
@@ -277,10 +332,10 @@ fn renderStatsRow(state: *AppState, rect: palette.Rect, y: f32, result: changes.
     x = queueLabelRun(state, x, text_y, files, theme.COLOR_TEXT_MUTED, font, clip) + theme.scaledUi(10.0);
     var add_buf: [32]u8 = undefined;
     const adds = std.fmt.bufPrint(&add_buf, "+{d}", .{totals.additions}) catch "";
-    x = queueLabelRun(state, x, text_y, adds, theme.COLOR_DIFF_ADD, font, clip) + theme.scaledUi(6.0);
+    x = queueLabelRun(state, x, text_y, adds, theme.statusSuccess(), font, clip) + theme.scaledUi(6.0);
     var del_buf: [32]u8 = undefined;
     const dels = std.fmt.bufPrint(&del_buf, "\u{2212}{d}", .{totals.deletions}) catch "";
-    x = queueLabelRun(state, x, text_y, dels, theme.COLOR_DIFF_REMOVE, font, clip) + theme.scaledUi(10.0);
+    x = queueLabelRun(state, x, text_y, dels, theme.danger(), font, clip) + theme.scaledUi(10.0);
 
     var right = rect.x + rect.w - pad;
     const list_w = rect.w;
@@ -318,15 +373,45 @@ fn allExpanded(state: *AppState, result: changes.WorkspaceResult) bool {
 
 fn renderChips(state: *AppState, rect: palette.Rect, y_start: f32, clip: palette.Rect) f32 {
     const model = &state.workspace_changes;
-    // A lone "All" chip filters nothing.
-    if (model.chips.len <= 1) return y_start;
+    if (model.chips.len <= 1) {
+        chip_max_scroll = 0;
+        return y_start;
+    }
+    if (chip_generation != model.generation) {
+        chip_generation = model.generation;
+        chip_scroll_x = 0;
+        keyboard_focus = null;
+    }
     const pad = theme.scaledUi(PAD_UI);
     const chip_h = theme.scaledUi(CHIP_H_UI);
     const gap = theme.scaledUi(CHIP_GAP_UI);
-    const font = theme.scaledUi(SMALL_FONT_UI + 0.5);
+    const font = theme.scaledUi(12.0);
     const max_label_w = theme.scaledUi(150.0);
-    var x = rect.x + pad;
-    var y = y_start + theme.scaledUi(4.0);
+    const y = y_start + theme.scaledUi(4.0);
+    const button = chip_h;
+    const previous = palette.Rect{ .x = rect.x + pad, .y = y, .w = button, .h = chip_h };
+    const next = palette.Rect{ .x = rect.x + rect.w - pad - button, .y = y, .w = button, .h = chip_h };
+    chip_viewport = .{ .x = previous.x + button + gap, .y = y, .w = @max(next.x - gap - previous.x - button - gap, 1.0), .h = chip_h };
+    // Measure the whole strip before painting so shrinking/filtering cannot
+    // leave one frame at an out-of-range offset with no visible chips.
+    var content_w: f32 = 0;
+    for (model.chips) |chip| {
+        var count_buf: [16]u8 = undefined;
+        const count = std.fmt.bufPrint(&count_buf, "{d}", .{chip.files}) catch "";
+        const count_w = text_measure.textWidth(.ui, font, count);
+        const raw: []const u8 = switch (chip.kind) {
+            .all => "All",
+            .unassigned => "Unassigned",
+            .thread => chip.title,
+        };
+        const label = elideEnd(state, raw, font, @min(max_label_w, @max(chip_viewport.w - count_w - theme.scaledUi(26.0), 1)));
+        content_w += text_measure.textWidth(.ui, font, label) + count_w + theme.scaledUi(26.0) + gap;
+    }
+    chip_max_scroll = @max(content_w - gap - chip_viewport.w, 0);
+    chip_scroll_x = std.math.clamp(chip_scroll_x, 0, chip_max_scroll);
+    painted_chip_scroll_x = chip_scroll_x;
+    if (chip_scroll_x > 0) pushHit(previous, .chips_previous);
+    var x = chip_viewport.x - chip_scroll_x;
     for (model.chips, 0..) |chip, index| {
         var count_buf: [16]u8 = undefined;
         const count = std.fmt.bufPrint(&count_buf, "{d}", .{chip.files}) catch "";
@@ -335,32 +420,43 @@ fn renderChips(state: *AppState, rect: palette.Rect, y_start: f32, clip: palette
             .unassigned => "Unassigned",
             .thread => chip.title,
         };
-        const label = elideEnd(state, label_raw, font, max_label_w);
-        const label_w = text_measure.textWidth(.ui, font, label);
         const count_w = text_measure.textWidth(.ui, font, count);
+        const label = elideEnd(state, label_raw, font, @min(max_label_w, @max(chip_viewport.w - count_w - theme.scaledUi(26.0), 1)));
+        const label_w = text_measure.textWidth(.ui, font, label);
         const chip_w = label_w + count_w + theme.scaledUi(26.0);
-        if (x + chip_w > rect.x + rect.w - pad and x > rect.x + pad) {
-            x = rect.x + pad;
-            y += chip_h + gap;
-        }
         const chip_rect = palette.Rect{ .x = x, .y = y, .w = chip_w, .h = chip_h };
         const selected = switch (chip.kind) {
             .all => model.filter_kind == .all,
             .unassigned => model.filter_kind == .unassigned,
             .thread => model.filter_kind == .thread and std.mem.eql(u8, model.filter_thread orelse "", chip.thread_id),
         };
-        const hovered = pointIn(chip_rect);
-        const fill = if (selected) theme.withAlpha(theme.accent(), 48) else if (hovered) theme.withAlpha(theme.COLOR_PANEL_MUTED, 230) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 120);
-        const border = if (selected) theme.withAlpha(theme.accent(), 170) else theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 60);
-        queueShell(state, chip_rect, paletteColor(fill), paletteColor(border), chip_h * 0.5, clip);
+        const hovered = pointIn(chip_rect) and pointIn(chip_viewport);
+        const fill = if (selected) theme.wash(theme.accent(), 40) else if (hovered) theme.raise(theme.COLOR_PANEL_MUTED, 0.06) else theme.COLOR_PANEL_MUTED;
+        const border = if (selected) theme.withAlpha(theme.accent(), 170) else theme.borderMuted();
+        queueShell(state, chip_rect, paletteColor(fill), paletteColor(border), chip_h * 0.5, chip_viewport);
         const text_y = y + (chip_h - font * 1.4) * 0.5;
         const label_x = x + theme.scaledUi(10.0);
-        queueLabel(state, .{ .x = label_x, .y = text_y, .w = label_w, .h = font * 1.4 }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font, clip);
-        queueLabel(state, .{ .x = label_x + label_w + theme.scaledUi(6.0), .y = text_y, .w = count_w, .h = font * 1.4 }, count, paletteColor(theme.COLOR_TEXT_SUBTLE), font, clip);
-        pushHit(chip_rect, .{ .chip = @intCast(index) });
+        queueLabel(state, .{ .x = label_x, .y = text_y, .w = label_w, .h = font * 1.4 }, label, paletteColor(theme.COLOR_WHITE), font, chip_viewport);
+        queueLabel(state, .{ .x = label_x + label_w + theme.scaledUi(6.0), .y = text_y, .w = count_w, .h = font * 1.4 }, count, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font, chip_viewport);
+        pushClippedHit(chip_rect, .{ .chip = @intCast(index) }, chip_viewport);
+        if (hovered) tooltip.queue(state, clippedRect(chip_rect, chip_viewport), label_raw);
         x += chip_w + gap;
     }
+    for ([_]struct { rect: palette.Rect, glyph: []const u8, kind: HitKind, enabled: bool }{
+        .{ .rect = previous, .glyph = NF_CHEVRON_RIGHT, .kind = .chips_previous, .enabled = chip_scroll_x > 0 },
+        .{ .rect = next, .glyph = NF_CHEVRON_RIGHT, .kind = .chips_next, .enabled = chip_scroll_x < chip_max_scroll },
+    }, 0..) |entry, index| {
+        if (pointIn(entry.rect)) queueRounded(state, entry.rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6), clip);
+        queueIcon(state, entry.rect, if (index == 0) "\u{EAB5}" else entry.glyph, paletteColor(if (entry.enabled) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(14), clip);
+        if (entry.enabled and index == 1) pushHit(entry.rect, entry.kind);
+    }
     return y + chip_h + theme.scaledUi(2.0);
+}
+
+fn clippedRect(rect: palette.Rect, clip: palette.Rect) palette.Rect {
+    const x = @max(rect.x, clip.x);
+    const y = @max(rect.y, clip.y);
+    return .{ .x = x, .y = y, .w = @max(@min(rect.x + rect.w, clip.x + clip.w) - x, 0), .h = @max(@min(rect.y + rect.h, clip.y + clip.h) - y, 0) };
 }
 
 fn renderEmpty(state: *AppState, rect: palette.Rect, message: []const u8, is_error: bool) void {
@@ -371,7 +467,7 @@ fn renderEmpty(state: *AppState, rect: palette.Rect, message: []const u8, is_err
         .y = rect.y + pad,
         .w = @max(rect.w - pad * 2.0, 0.0),
         .h = font * 1.4,
-    }, elideEnd(state, message, font, @max(rect.w - pad * 2.0, 0.0)), paletteColor(if (is_error) theme.COLOR_DIFF_REMOVE else theme.COLOR_TEXT_MUTED), font, rect);
+    }, elideEnd(state, message, font, @max(rect.w - pad * 2.0, 0.0)), paletteColor(if (is_error) theme.danger() else theme.COLOR_TEXT_MUTED), font, rect);
     if (is_error) {
         const retry = palette.Rect{ .x = rect.x + pad, .y = rect.y + pad + font * 1.4 + theme.scaledUi(10.0), .w = theme.scaledUi(64.0), .h = theme.scaledUi(26.0) };
         diff_render.renderActionButton(state, retry, "Retry", false, rect, mouse);
@@ -383,9 +479,9 @@ fn renderErrorStrip(state: *AppState, rect: palette.Rect, message: []const u8) v
     const font = theme.scaledUi(SMALL_FONT_UI);
     const h = theme.scaledUi(22.0);
     const strip = palette.Rect{ .x = rect.x, .y = rect.y + rect.h - h, .w = rect.w, .h = h };
-    queueRect(state, strip, paletteColor(theme.withAlpha(theme.COLOR_DIFF_REMOVE, 40)), rect);
+    queueRect(state, strip, paletteColor(theme.withAlpha(theme.danger(), 40)), rect);
     const pad = theme.scaledUi(PAD_UI);
-    queueLabel(state, .{ .x = strip.x + pad, .y = strip.y + (h - font * 1.4) * 0.5, .w = strip.w - pad * 2.0, .h = font * 1.4 }, elideEnd(state, message, font, strip.w - pad * 2.0), paletteColor(theme.COLOR_DIFF_REMOVE), font, rect);
+    queueLabel(state, .{ .x = strip.x + pad, .y = strip.y + (h - font * 1.4) * 0.5, .w = strip.w - pad * 2.0, .h = font * 1.4 }, elideEnd(state, message, font, strip.w - pad * 2.0), paletteColor(theme.danger()), font, rect);
 }
 
 /// One expanded file's diff block: what to draw and how tall it is.
@@ -440,11 +536,12 @@ fn renderList(state: *AppState, rect: palette.Rect, result: changes.WorkspaceRes
     const code_font = theme.scaledUi(CODE_FONT_UI);
     const layout = diff_render.layoutForWidth(state, rect.w - pad * 2.0);
     const totals = changes.totals(result, active);
-    const show_repo_headers = result.repos.len > 1 and totals.repos_with_files > 0;
+    const show_repo_headers = totals.repos_with_files > 1;
 
     // Clamp scroll against last frame's content height first so a shrinking
     // list never leaves the view scrolled into empty space.
     model.scroll_y = std.math.clamp(model.scroll_y, 0.0, max_scroll);
+    painted_list_scroll_y = model.scroll_y;
     const top = rect.y - model.scroll_y;
     var y = top;
 
@@ -475,7 +572,13 @@ fn renderList(state: *AppState, rect: palette.Rect, result: changes.WorkspaceRes
             const ref = FileRef{ .repo = @intCast(repo_index), .file = @intCast(file_index), .serial = serial };
             const expanded = model.isExpanded(repo.root, file.path);
             const row_rect = palette.Rect{ .x = rect.x, .y = y, .w = rect.w, .h = row_h };
-            if (y + row_h >= rect.y and y <= rect.y + rect.h) renderFileRow(state, row_rect, repo, file, ref, expanded, rect);
+            if (y + row_h >= rect.y and y <= rect.y + rect.h) {
+                renderFileRow(state, row_rect, repo, file, ref, expanded, rect);
+            } else {
+                // Keep off-screen controls in the same focus order as their rows.
+                recordFocus(row_rect, .{ .toggle_file = ref });
+                recordFocus(row_rect, .{ .open_file = ref });
+            }
             y += row_h;
             if (!expanded) continue;
             const block = diffBlock(state, repo, file, layout, line_h);
@@ -542,11 +645,7 @@ fn renderFileRow(
     x += chevron_w + theme.scaledUi(4.0);
     // Status letter.
     const letter = changes.statusLetter(file);
-    const letter_color = switch (letter[0]) {
-        'A', 'U' => theme.COLOR_DIFF_ADD,
-        'D' => theme.COLOR_DIFF_REMOVE,
-        else => theme.COLOR_YELLOW,
-    };
+    const letter_color = theme.COLOR_TEXT_MUTED;
     const letter_w = theme.scaledUi(12.0);
     queueCenteredLabel(state, .{ .x = x, .y = rect.y, .w = letter_w, .h = rect.h }, letter, paletteColor(letter_color), small, clip);
     x += letter_w + theme.scaledUi(6.0);
@@ -554,41 +653,29 @@ fn renderFileRow(
     const name = std.fs.path.basename(file.path);
     const icon = file_icons.forFile(name);
     const icon_w = theme.scaledUi(16.0);
-    queueIcon(state, .{ .x = x, .y = rect.y, .w = icon_w, .h = rect.h }, icon.glyph, paletteColor(theme.legibleOn(icon.color, theme.background())), theme.scaledUi(13.0), clip);
+    queueIcon(state, .{ .x = x, .y = rect.y, .w = icon_w, .h = rect.h }, icon.glyph, paletteColor(theme.legibleOn(icon.color, theme.COLOR_PANEL)), theme.scaledUi(14.0), clip);
     x += icon_w + theme.scaledUi(6.0);
 
-    // Right side: owner chip, then the +/- bar and counts.
+    // Keep the trailing column for the diff counts.
     var right = rect.x + rect.w - pad;
-    var owner_buf: [32]u8 = undefined;
-    const owner = changes.ownerLabel(&owner_buf, file);
-    if (owner.len > 0 and rect.w > theme.scaledUi(300.0)) {
-        const owner_label = elideEnd(state, owner, small, theme.scaledUi(96.0));
-        const owner_w = text_measure.textWidth(.ui, small, owner_label) + theme.scaledUi(14.0);
-        const owner_rect = palette.Rect{ .x = right - owner_w, .y = rect.y + (rect.h - theme.scaledUi(18.0)) * 0.5, .w = owner_w, .h = theme.scaledUi(18.0) };
-        const tint = switch (ownershipTone(file)) {
-            .attention => theme.COLOR_YELLOW,
-            .normal => theme.accent(),
-        };
-        queueShell(state, owner_rect, paletteColor(theme.withAlpha(tint, 30)), paletteColor(theme.withAlpha(tint, 110)), owner_rect.h * 0.5, clip);
-        queueCenteredLabel(state, owner_rect, owner_label, paletteColor(theme.COLOR_TEXT_MUTED), small, clip);
-        right = owner_rect.x - theme.scaledUi(8.0);
-    }
     if (!file.binary) {
         const bar_w = theme.scaledUi(5.0) * @as(f32, @floatFromInt(BAR_BLOCKS)) + theme.scaledUi(1.5) * @as(f32, @floatFromInt(BAR_BLOCKS - 1));
-        renderChangeBar(state, right - bar_w, rect.y + rect.h * 0.5, file.additions, file.deletions, clip);
-        right -= bar_w + theme.scaledUi(6.0);
+        if (rect.w >= theme.scaledUi(480.0)) {
+            renderChangeBar(state, right - bar_w, rect.y + rect.h * 0.5, file.additions, file.deletions, clip);
+            right -= bar_w + theme.scaledUi(6.0);
+        }
         var del_buf: [24]u8 = undefined;
         const dels = std.fmt.bufPrint(&del_buf, "\u{2212}{d}", .{file.deletions}) catch "";
         const del_w = text_measure.textWidth(.ui, small, dels);
         if (file.deletions > 0) {
-            queueLabel(state, .{ .x = right - del_w, .y = rect.y + (rect.h - small * 1.4) * 0.5, .w = del_w, .h = small * 1.4 }, dels, paletteColor(theme.COLOR_DIFF_REMOVE), small, clip);
+            queueLabel(state, .{ .x = right - del_w, .y = rect.y + (rect.h - small * 1.4) * 0.5, .w = del_w, .h = small * 1.4 }, dels, paletteColor(theme.danger()), small, clip);
             right -= del_w + theme.scaledUi(4.0);
         }
         var add_buf: [24]u8 = undefined;
         const adds = std.fmt.bufPrint(&add_buf, "+{d}", .{file.additions}) catch "";
         const add_w = text_measure.textWidth(.ui, small, adds);
         if (file.additions > 0) {
-            queueLabel(state, .{ .x = right - add_w, .y = rect.y + (rect.h - small * 1.4) * 0.5, .w = add_w, .h = small * 1.4 }, adds, paletteColor(theme.COLOR_DIFF_ADD), small, clip);
+            queueLabel(state, .{ .x = right - add_w, .y = rect.y + (rect.h - small * 1.4) * 0.5, .w = add_w, .h = small * 1.4 }, adds, paletteColor(theme.statusSuccess()), small, clip);
             right -= add_w;
         }
         right -= theme.scaledUi(8.0);
@@ -602,16 +689,17 @@ fn renderFileRow(
     const path_w = @max(right - x, 0.0);
     const dir = if (std.fs.path.dirname(file.path)) |value| value else "";
     const name_w = @min(text_measure.textWidth(.ui, font, name), path_w);
-    const name_shown = elideEnd(state, name, font, path_w);
+    const name_shown = elideFilename(state.palette_frame_text_arena.allocator(), name, font, path_w);
     const dir_room = path_w - name_w;
     var dir_shown: []const u8 = "";
-    if (dir.len > 0 and dir_room > theme.scaledUi(24.0)) {
+    if (dir.len > 0 and dir_room > 0.0) {
         const with_slash = std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s}/", .{dir}) catch "";
-        dir_shown = elideStart(state, with_slash, font, dir_room);
+        dir_shown = elideDirectory(state.palette_frame_text_arena.allocator(), with_slash, font, dir_room);
     }
     const dir_w = text_measure.textWidth(.ui, font, dir_shown);
     const path_rect = palette.Rect{ .x = x, .y = rect.y + theme.scaledUi(4.0), .w = dir_w + name_w, .h = rect.h - theme.scaledUi(8.0) };
     const path_hovered = pointIn(path_rect);
+    if (name_w < text_measure.textWidth(.ui, font, name) or (dir.len > 0 and (dir_shown.len != dir.len + 1 or !std.mem.startsWith(u8, dir_shown, dir)))) tooltip.queue(state, path_rect, file.path);
     if (dir_shown.len > 0) queueLabel(state, .{ .x = x, .y = text_y, .w = dir_w, .h = font * 1.4 }, dir_shown, paletteColor(theme.COLOR_TEXT_SUBTLE), font, clip);
     queueLabel(state, .{ .x = x + dir_w, .y = text_y, .w = name_w, .h = font * 1.4 }, name_shown, paletteColor(if (path_hovered) theme.accent() else theme.COLOR_WHITE), font, clip);
     if (path_hovered) {
@@ -620,13 +708,6 @@ fn renderFileRow(
     // Pushed after the row hit so it wins the lookup (hits search backwards).
     pushClippedHit(path_rect, .{ .open_file = ref }, clip);
     _ = repo;
-}
-
-const Tone = enum { normal, attention };
-
-fn ownershipTone(file: changes.WorkspaceFile) Tone {
-    if (std.mem.eql(u8, file.ownership, "shared") or std.mem.eql(u8, file.ownership, "unclear")) return .attention;
-    return .normal;
 }
 
 /// GitHub-style five-block bar: green share of additions, red of deletions.
@@ -649,7 +730,7 @@ fn renderChangeBar(state: *AppState, x: f32, center_y: f32, additions: u32, dele
     }
     var index: usize = 0;
     while (index < BAR_BLOCKS) : (index += 1) {
-        const color = if (index < green) theme.COLOR_DIFF_ADD else if (index < green + red) theme.COLOR_DIFF_REMOVE else theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 70);
+        const color = if (index < green) theme.statusSuccess() else if (index < green + red) theme.danger() else theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 70);
         queueRounded(state, .{
             .x = x + @as(f32, @floatFromInt(index)) * (block + gap),
             .y = center_y - block * 0.5,
@@ -778,12 +859,8 @@ fn renderScrollbar(state: *AppState, rect: palette.Rect, content_h: f32) void {
     const thumb_h = @max(rect.h * rect.h / content_h, theme.scaledUi(24.0));
     const travel = rect.h - thumb_h;
     const ratio = if (max_scroll > 0.0) model.scroll_y / max_scroll else 0.0;
-    queueRounded(state, .{
-        .x = rect.x + rect.w - track_w - theme.scaledUi(2.0),
-        .y = rect.y + travel * ratio,
-        .w = track_w,
-        .h = thumb_h,
-    }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 90)), track_w * 0.5, rect);
+    const thumb = palette.Rect{ .x = rect.x + rect.w - track_w - theme.scaledUi(2.0), .y = rect.y + travel * ratio, .w = track_w, .h = thumb_h };
+    queueRounded(state, thumb, paletteColor(theme.withAlpha(if (pointIn(thumb)) theme.COLOR_TEXT_SUBTLE else theme.borderMuted(), if (pointIn(thumb)) 220 else 128)), track_w * 0.5, rect);
 }
 
 // ------------------------------------------------------------------
@@ -840,6 +917,7 @@ fn fileFor(state: *AppState, ref: FileRef) ?struct { repo: changes.WorkspaceRepo
 pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     _ = clicks;
     mouse = .{ .x = x, .y = y };
+    keyboard_active = false;
     if (!down) {
         if (dragging) {
             dragging = false;
@@ -850,6 +928,7 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
     // Chrome hits first: the pinned header and the Ask agent chip sit over
     // diff rows.
     if (hitAt(x, y)) |hit| {
+        keyboard_focus = hit.kind;
         activate(state, hit.kind);
         state.markDirty();
         return true;
@@ -884,6 +963,8 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
 
 fn activate(state: *AppState, kind: HitKind) void {
     switch (kind) {
+        .chips_previous => scrollChips(state, -chip_viewport.w * 0.8),
+        .chips_next => scrollChips(state, chip_viewport.w * 0.8),
         .refresh, .retry => state.refreshWorkspaceChangesNow(),
         .commit => state.openWorkspaceChangesCommit(),
         .expand_all => state.toggleAllWorkspaceChangesFiles(),
@@ -942,9 +1023,92 @@ fn hoverKey(x: f32, y: f32) u64 {
 }
 
 pub fn handleWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {
-    _ = x;
-    _ = y;
+    if (rectContains(chip_viewport, x, y)) {
+        scrollChips(state, -wheel_y * theme.scaledUi(WHEEL_STEP_UI));
+        return true;
+    }
     scrollBy(state, -wheel_y * theme.scaledUi(WHEEL_STEP_UI));
+    return true;
+}
+
+fn scrollChips(state: *AppState, delta: f32) void {
+    chip_scroll_x = std.math.clamp(chip_scroll_x + delta, 0, chip_max_scroll);
+    state.markDirty();
+}
+
+fn renderKeyboardFocus(state: *AppState, rect: palette.Rect) void {
+    if (!keyboard_active or !body_keyboard_focused) return;
+    const focused = keyboard_focus orelse return;
+    for (focus_stops[0..focus_count]) |stop| {
+        if (!std.meta.eql(stop.kind, focused)) continue;
+        const clip = switch (stop.kind) {
+            .chip => chip_viewport,
+            .toggle_file, .open_file => list_rect,
+            else => rect,
+        };
+        state.palette_overlay_batch.rectBorderClipped(state.allocator, snapRect(stop.rect), paletteColor(theme.accent()), theme.scaledUi(5), @max(@round(theme.scaledUi(1)), 1), clip) catch {};
+        break;
+    }
+}
+
+fn revealControl(state: *AppState, hit: Hit) void {
+    switch (hit.kind) {
+        .chip => {
+            // Several navigation keys can arrive before the next paint. Hits
+            // still use the painted offset, so translate to the current one.
+            const x = hit.rect.x + painted_chip_scroll_x - chip_scroll_x;
+            if (x < chip_viewport.x) scrollChips(state, x - chip_viewport.x) else if (x + hit.rect.w > chip_viewport.x + chip_viewport.w) scrollChips(state, x + hit.rect.w - chip_viewport.x - chip_viewport.w);
+        },
+        .toggle_file, .open_file => {
+            const y = hit.rect.y + painted_list_scroll_y - state.workspace_changes.scroll_y;
+            if (y < list_rect.y) scrollBy(state, y - list_rect.y) else if (y + hit.rect.h > list_rect.y + list_rect.h) scrollBy(state, y + hit.rect.h - list_rect.y - list_rect.h);
+        },
+        else => {},
+    }
+}
+
+fn handleControlKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
+    if (focus_count == 0 or event.mod.primary() or event.mod.alt) return false;
+    var current: ?usize = null;
+    if (keyboard_focus) |focused| for (focus_stops[0..focus_count], 0..) |stop, index| {
+        if (std.meta.eql(stop.kind, focused)) {
+            current = index;
+            break;
+        }
+    };
+    if (event.key == .tab) {
+        const backwards = event.mod.shift;
+        var index = if (current) |i| (i + focus_count + (if (backwards) focus_count - 1 else 1)) % focus_count else if (backwards) focus_count - 1 else 0;
+        // Filters form one tab stop; arrows traverse the choices within it.
+        var seen: usize = 0;
+        while (current != null and focus_stops[current.?].kind == .chip and focus_stops[index].kind == .chip and seen < focus_count) : (seen += 1) {
+            index = (index + (if (backwards) focus_count - 1 else 1)) % focus_count;
+        }
+        keyboard_focus = focus_stops[index].kind;
+        keyboard_active = true;
+        revealControl(state, focus_stops[index]);
+    } else if (keyboard_active and current != null) {
+        const hit = focus_stops[current.?];
+        if (event.key == .escape) {
+            keyboard_active = false;
+        } else if (event.key == .@"return" or event.key == .kp_enter or event.key == .space) {
+            activate(state, hit.kind);
+        } else if (hit.kind == .chip and (event.key == .left or event.key == .right or event.key == .home or event.key == .end)) {
+            var first = current.?;
+            var last = first;
+            while (first > 0 and focus_stops[first - 1].kind == .chip) first -= 1;
+            while (last + 1 < focus_count and focus_stops[last + 1].kind == .chip) last += 1;
+            const index = switch (event.key) {
+                .home => first,
+                .end => last,
+                .left => if (current.? == first) last else current.? - 1,
+                else => if (current.? == last) first else current.? + 1,
+            };
+            keyboard_focus = focus_stops[index].kind;
+            revealControl(state, focus_stops[index]);
+        } else return false;
+    } else return false;
+    state.markDirty();
     return true;
 }
 
@@ -957,6 +1121,10 @@ fn scrollBy(state: *AppState, delta: f32) void {
 }
 
 pub fn handleKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
+    // The panel routes here only while its body owns keys. Do not wait for
+    // another paint after a click before accepting the first Tab in a batch.
+    body_keyboard_focused = true;
+    if (handleControlKey(state, event)) return true;
     const mods = event.mod;
     const primary = mods.primary();
     switch (event.key) {
@@ -1067,7 +1235,9 @@ fn stableText(state: *AppState, value: []const u8) []const u8 {
 }
 
 fn snapRect(rect: palette.Rect) palette.Rect {
-    return .{ .x = @round(rect.x), .y = @round(rect.y), .w = @round(rect.w), .h = @round(rect.h) };
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @round(rect.x + rect.w) - x, .h = @round(rect.y + rect.h) - y };
 }
 
 fn queueRect(state: *AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
@@ -1079,11 +1249,7 @@ fn queueRounded(state: *AppState, rect: palette.Rect, color: palette.Color, radi
 }
 
 fn queueShell(state: *AppState, rect: palette.Rect, fill: palette.Color, border: palette.Color, radius: f32, clip: palette.Rect) void {
-    const inset = @max(theme.scaledUi(1.0), 1.0);
-    queueRounded(state, rect, border, radius, clip);
-    if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
-        queueRounded(state, .{ .x = rect.x + inset, .y = rect.y + inset, .w = rect.w - inset * 2.0, .h = rect.h - inset * 2.0 }, fill, @max(radius - inset, 0.0), clip);
-    }
+    state.palette_overlay_batch.panelClipped(state.allocator, snapRect(rect), fill, border, radius, @max(@round(theme.scaledUi(1.0)), 1.0), clip) catch {};
 }
 
 fn queueLabel(state: *AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
@@ -1135,17 +1301,143 @@ fn elideEnd(state: *AppState, value: []const u8, font_size: f32, max_w: f32) []c
     return ellipsis;
 }
 
-/// `value` cut at the start with "…" to fit `max_w` (frame arena).
-fn elideStart(state: *AppState, value: []const u8, font_size: f32, max_w: f32) []const u8 {
+/// Keep the filename intact before spending any width on directories. In very
+/// narrow columns keep its extension and a Unicode-safe stem prefix visible.
+fn elideFilename(allocator: std.mem.Allocator, name: []const u8, font_size: f32, max_w: f32) []const u8 {
+    if (max_w <= 0) return "";
+    if (text_measure.textWidth(.ui, font_size, name) <= max_w) return name;
+    const extension = std.fs.path.extension(name);
+    var end = name.len - extension.len;
+    while (true) {
+        const shown = std.fmt.allocPrint(allocator, "{s}…{s}", .{ name[0..end], extension }) catch return "";
+        if (text_measure.textWidth(.ui, font_size, shown) <= max_w) return shown;
+        if (end == 0) break;
+        end -= 1;
+        while (end > 0 and (name[end] & 0xC0) == 0x80) end -= 1;
+    }
+    return if (text_measure.textWidth(.ui, font_size, "…") <= max_w) "…" else "";
+}
+
+/// Hide only whole directory segments, with one ellipsis and separator.
+fn elideDirectory(allocator: std.mem.Allocator, value: []const u8, font_size: f32, max_w: f32) []const u8 {
     if (max_w <= 0.0) return "";
     if (text_measure.textWidth(.ui, font_size, value) <= max_w) return value;
-    const ellipsis = "…";
-    var start: usize = 0;
-    while (start < value.len) {
-        start += 1;
-        while (start < value.len and (value[start] & 0xC0) == 0x80) start += 1;
-        const candidate = std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s}{s}", .{ ellipsis, value[start..] }) catch return "";
+    const prefix = "…/";
+    if (text_measure.textWidth(.ui, font_size, prefix) > max_w) return "";
+    for (value, 0..) |byte, index| {
+        if (byte != '/' or index + 1 == value.len) continue;
+        const candidate = std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, value[index + 1 ..] }) catch return "";
         if (text_measure.textWidth(.ui, font_size, candidate) <= max_w) return candidate;
     }
-    return ellipsis;
+    return prefix;
+}
+
+test "changes paths elide whole directory segments and preserve unicode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const font: f32 = 13;
+    const path = "packages/desktop/src/ui/";
+    const filename = "chat_panel.zig";
+    const filename_w = text_measure.textWidth(.ui, font, filename);
+    const directory_w = text_measure.textWidth(.ui, font, "…/ui/");
+    try std.testing.expectEqualStrings(filename, elideFilename(allocator, filename, font, filename_w));
+    try std.testing.expectEqualStrings("…/ui/", elideDirectory(allocator, path, font, directory_w + 0.1));
+    const narrow_name = elideFilename(allocator, "日本語の長いファイル名.zig", font, filename_w);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(narrow_name));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_name, ".zig"));
+    try std.testing.expect(text_measure.textWidth(.ui, font, narrow_name) <= filename_w);
+    try std.testing.expectEqualStrings("", elideFilename(allocator, filename, font, 0));
+    try std.testing.expectEqualStrings(path, elideDirectory(allocator, path, font, text_measure.textWidth(.ui, font, path)));
+    const suffix = "…/src/ui/";
+    try std.testing.expectEqualStrings(suffix, elideDirectory(allocator, path, font, text_measure.textWidth(.ui, font, suffix) + 0.1));
+    const unicode_suffix = "…/日本語/";
+    try std.testing.expectEqualStrings(unicode_suffix, elideDirectory(allocator, "packages/日本語/", font, text_measure.textWidth(.ui, font, unicode_suffix) + 0.1));
+    const prefix_w = text_measure.textWidth(.ui, font, "…/");
+    try std.testing.expectEqualStrings("…/", elideDirectory(allocator, path, font, prefix_w));
+    try std.testing.expectEqualStrings("", elideDirectory(allocator, path, font, prefix_w - 1));
+    try std.testing.expectEqualStrings("", elideDirectory(allocator, path, font, 0));
+}
+
+test "changes filters scroll one row reveal keyboard focus and clamp after shrinking" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try @import("../state/storage.zig").Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, @import("../app/config.zig").AppConfig{}, .{ .gl_texture_uploads_enabled = false, .browser_textures_enabled = false });
+    defer {
+        state.workspace_changes.chips = &.{};
+        state.lifecycle.clearDirty();
+        state.deinit();
+        resetHitCache();
+        chip_scroll_x = 0;
+        chip_max_scroll = 0;
+        keyboard_focus = null;
+        keyboard_active = false;
+        body_keyboard_focused = false;
+    }
+    var chips = [_]changes.Chip{
+        .{ .kind = .all, .files = 23 },
+        .{ .kind = .thread, .thread_id = "a", .title = "A long conversation about the UI", .files = 21 },
+        .{ .kind = .thread, .thread_id = "b", .title = "Another long conversation", .files = 2 },
+    };
+    state.workspace_changes.chips = &chips;
+    mouse = null;
+    chip_generation = state.workspace_changes.generation;
+    chip_scroll_x = 9000;
+    chip_max_scroll = 9000;
+    const rect: palette.Rect = .{ .x = 400, .y = 30, .w = 320, .h = 600 };
+    resetHitCache();
+    const bottom = renderChips(&state, rect, 90, rect);
+    try std.testing.expectApproxEqAbs(@as(f32, 90) + theme.scaledUi(4 + CHIP_H_UI + 2), bottom, 0.01);
+    try std.testing.expect(chip_max_scroll > 0);
+    try std.testing.expect(chip_scroll_x <= chip_max_scroll);
+    // Every filter retains one y coordinate; only horizontal clipping varies.
+    var chip_y: ?f32 = null;
+    for (focus_stops[0..focus_count]) |stop| {
+        if (stop.kind != .chip) continue;
+        if (chip_y) |y| try std.testing.expectEqual(y, stop.rect.y) else chip_y = stop.rect.y;
+    }
+    body_keyboard_focused = true;
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .tab }));
+    try std.testing.expect(keyboard_focus.? == .chips_previous);
+    const before_scroll = chip_scroll_x;
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .@"return" }));
+    try std.testing.expect(chip_scroll_x < before_scroll);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(@as(u32, 0), keyboard_focus.?.chip);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .tab, .mod = .{ .shift = true } }));
+    try std.testing.expect(keyboard_focus.? == .chips_previous);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .tab }));
+    try std.testing.expectEqual(@as(u32, 0), keyboard_focus.?.chip);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .end }));
+    try std.testing.expectEqual(@as(u32, 2), keyboard_focus.?.chip);
+    try std.testing.expect(chip_scroll_x > 0);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .home }));
+    try std.testing.expectEqual(@as(f32, 0), chip_scroll_x);
+    try std.testing.expect(handleControlKey(&state, &.{ .key = .end }));
+    try std.testing.expect(chip_scroll_x > 0);
+    try std.testing.expect(!handleControlKey(&state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(!handleControlKey(&state, &.{ .key = .tab, .mod = .{ .ctrl = true } }));
+    // Data shrinking is clamped before painting, not one frame afterwards.
+    state.workspace_changes.chips = chips[0..2];
+    chips[1].title = "One";
+    resetHitCache();
+    _ = renderChips(&state, rect, 90, rect);
+    try std.testing.expectEqual(@as(f32, 0), chip_max_scroll);
+    try std.testing.expectEqual(@as(f32, 0), chip_scroll_x);
+    for (hits[0..hit_count]) |hit| {
+        if (hit.kind != .chip) continue;
+        try std.testing.expect(hit.rect.x >= chip_viewport.x);
+        try std.testing.expect(hit.rect.x + hit.rect.w <= chip_viewport.x + chip_viewport.w);
+    }
+    // The first Tab after a pointer focus change need not wait for a paint.
+    body_keyboard_focused = false;
+    keyboard_focus = null;
+    keyboard_active = false;
+    try std.testing.expect(handleKey(&state, &.{ .key = .tab }));
+    try std.testing.expect(keyboard_active);
 }

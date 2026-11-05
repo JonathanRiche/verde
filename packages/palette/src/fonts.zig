@@ -6,7 +6,7 @@
 //!
 //! | role | primary | fallback chain (in order) |
 //! |---|---|---|
-//! | ui | CalSans-Regular | mono_symbols, symbols, symbols_alt, math, emoji |
+//! | ui | NotoSans-Regular | mono_symbols, symbols, symbols_alt, math, emoji |
 //! | ui_bold, prose_bold | NotoSans-Bold | same as ui |
 //! | prose | NotoSans-Regular | same as ui |
 //! | prose_italic | NotoSans-Italic | same as ui |
@@ -79,7 +79,7 @@ pub const FaceSet = struct {
 
     /// File names of the bundled fonts (`assets/fonts`).
     pub const file_names = .{
-        .ui = "CalSans-Regular.ttf",
+        .ui = "NotoSans-Regular.ttf",
         .bold = "NotoSans-Bold.ttf",
         .prose = "NotoSans-Regular.ttf",
         .italic = "NotoSans-Italic.ttf",

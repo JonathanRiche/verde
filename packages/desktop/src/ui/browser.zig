@@ -10,6 +10,8 @@ const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
 const theme = @import("theme.zig");
+const tooltip = @import("tooltip.zig");
+const text_edit = @import("text_edit.zig");
 const local_servers = @import("../state/local_servers.zig");
 
 // Nerd Font Symbols codicon glyphs. Codepoints match the Microsoft Codicons
@@ -110,6 +112,7 @@ var palette_overflow_menu_rect: palette.Rect = .{};
 const BrowserOverflowAction = union(enum) {
     select_tab: usize,
     duplicate_tab,
+    close_tab,
     toggle_pin,
     maximize_pane,
     toggle_detach,
@@ -131,6 +134,9 @@ const BrowserOverflowHit = struct {
 
 var palette_overflow_hits: [32]BrowserOverflowHit = undefined;
 var palette_overflow_hit_count: usize = 0;
+var overflow_keyboard_action: ?BrowserOverflowAction = null;
+var inspector_keyboard_kind: ?BrowserHitKind = null;
+var context_keyboard_active = false;
 
 /// Address-bar suggestion dropdown geometry; one rect per visible row.
 var palette_suggestion_rect: palette.Rect = .{};
@@ -206,6 +212,9 @@ pub fn paneToolbarActionRowHeight() f32 {
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
     palette_mouse_pos = .{ x, y };
+    context_keyboard_active = false;
+    overflow_keyboard_action = null;
+    inspector_keyboard_kind = null;
     if (browser_history_controller.browserSuggestionsVisible(state)) {
         if (suggestionRowAtPoint(x, y)) |row| browser_history_controller.selectBrowserSuggestion(state, row);
     }
@@ -472,6 +481,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                 if (state.canUseBrowserInspector()) state.toggleBrowserInspector();
             },
             .inspect_mode_menu => {
+                inspector_keyboard_kind = null;
                 blurAddress(state);
                 if (state.canUseBrowserInspector()) {
                     state.browser_controller.inspector_menu_open = !state.browser_controller.inspector_menu_open;
@@ -501,6 +511,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .copy_url => copyCurrentUrl(state),
             .open_external => state.openCurrentBrowserUrlExternally(),
             .overflow => {
+                overflow_keyboard_action = null;
                 state.browser_controller.toolbar_overflow_open = !state.browser_controller.toolbar_overflow_open;
                 state.browser_controller.inspector_menu_open = false;
             },
@@ -563,8 +574,102 @@ pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool
     return true;
 }
 
+pub fn menuOpen(state: *const app_state.AppState) bool {
+    if (!state.isBrowserVisible()) return false;
+    return contextMenuRendered(state) or overflowMenuRendered(state) or inspectorMenuRendered(state);
+}
+
+fn contextMenuRendered(state: *const app_state.AppState) bool {
+    return state.browser_controller.context_menu_open and palette_context_menu_panel_count > 0;
+}
+
+fn overflowMenuRendered(state: *const app_state.AppState) bool {
+    return state.browser_controller.toolbar_overflow_open and palette_overflow_hit_count > 0;
+}
+
+fn inspectorMenuRendered(state: *const app_state.AppState) bool {
+    return state.browser_controller.inspector_menu_open and palette_menu_rect.w > 0 and palette_menu_rect.h > 0;
+}
+
+pub fn closeMenus(state: *app_state.AppState) void {
+    state.dismissBrowserContextMenu();
+    state.browser_controller.toolbar_overflow_open = false;
+    state.browser_controller.inspector_menu_open = false;
+    overflow_keyboard_action = null;
+    inspector_keyboard_kind = null;
+    context_keyboard_active = false;
+}
+
+fn handleChromeMenuKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!state.isBrowserVisible() or (!overflowMenuRendered(state) and !inspectorMenuRendered(state))) return false;
+    defer state.markDirty();
+    if (!event.down) return true;
+    if (event.key == .escape or event.key == .tab) {
+        closeMenus(state);
+        return true;
+    }
+    if (overflowMenuRendered(state)) {
+        var rows: [32]BrowserOverflowHit = undefined;
+        var count: usize = 0;
+        var selected: ?usize = null;
+        for (palette_overflow_hits[0..palette_overflow_hit_count]) |hit| {
+            if (!hit.enabled) continue;
+            if (overflow_keyboard_action) |action| {
+                if (std.meta.eql(action, hit.action)) selected = count;
+            }
+            rows[count] = hit;
+            count += 1;
+        }
+        if (count == 0) return true;
+        switch (event.key) {
+            .up, .down, .home, .end => {
+                const index = switch (event.key) {
+                    .home => 0,
+                    .end => count - 1,
+                    .up => if (selected) |i| (i + count - 1) % count else count - 1,
+                    else => if (selected) |i| (i + 1) % count else 0,
+                };
+                overflow_keyboard_action = rows[index].action;
+            },
+            .@"return", .space => if (selected) |i| {
+                activateOverflowAction(state, rows[i].action);
+                closeMenus(state);
+            },
+            else => {},
+        }
+    } else {
+        const kinds = [_]BrowserHitKind{ .inspect_mode_point, .inspect_mode_draw_box, .inspect_mode_draw_freeform };
+        var selected: ?usize = null;
+        for (kinds, 0..) |kind, i| if (inspector_keyboard_kind == kind) {
+            selected = i;
+        };
+        switch (event.key) {
+            .up, .down, .home, .end => {
+                const index = switch (event.key) {
+                    .home => 0,
+                    .end => kinds.len - 1,
+                    .up => if (selected) |i| (i + kinds.len - 1) % kinds.len else kinds.len - 1,
+                    else => if (selected) |i| (i + 1) % kinds.len else 0,
+                };
+                inspector_keyboard_kind = kinds[index];
+            },
+            .@"return", .space => if (inspector_keyboard_kind) |kind| {
+                if (findHit(kind)) |hit| _ = handlePaletteMouseButton(state, hit.rect.x + hit.rect.w * 0.5, hit.rect.y + hit.rect.h * 0.5, true, 1);
+                closeMenus(state);
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
-    if (state.browser_controller.context_menu_open) return handleBrowserContextMenuKeyDown(state, event);
+    if (!state.isBrowserVisible()) return false;
+    if (contextMenuRendered(state)) {
+        context_keyboard_active = true;
+        return handleBrowserContextMenuKeyDown(state, event);
+    }
+    if (handleChromeMenuKeyDown(state, event)) return true;
     if (!state.browser_controller.address_focused) return false;
     if (!event.down) return true;
 
@@ -599,11 +704,11 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.ev
         },
         .tab => acceptAddressCompletion(state),
         .left => {
-            const target = state.browser_controller.address_cursor -| 1;
+            const target = text_edit.prevBoundary(state.browserState().addressInput(), state.browser_controller.address_cursor);
             moveAddressCursor(state, target, shift);
         },
         .right => {
-            const target = @min(state.browser_controller.address_cursor + 1, address_len);
+            const target = text_edit.nextBoundary(state.browserState().addressInput(), state.browser_controller.address_cursor);
             moveAddressCursor(state, target, shift);
         },
         .home => moveAddressCursor(state, 0, shift),
@@ -647,7 +752,10 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.ev
 fn handleBrowserContextMenuKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down) return true;
     switch (event.key) {
-        .escape => state.dismissBrowserContextMenu(),
+        .escape, .tab => {
+            state.dismissBrowserContextMenu();
+            context_keyboard_active = false;
+        },
         .up => moveBrowserContextMenuSelection(state, -1),
         .down => moveBrowserContextMenuSelection(state, 1),
         .home => selectBrowserContextMenuBoundary(state, false),
@@ -773,7 +881,7 @@ fn moveAddressCursor(state: *app_state.AppState, target: usize, shift: bool) voi
     } else {
         clearAddressSelection(state);
     }
-    state.browser_controller.address_cursor = target;
+    state.browser_controller.address_cursor = utf8PrefixLen(state.browserState().addressInput(), target);
 }
 
 fn copyAddressSelection(state: *app_state.AppState) void {
@@ -1087,10 +1195,13 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
 
     const row_right = dock_rect.x + dock_rect.w - pad_x;
     const close_pane_rect: palette.Rect = .{ .x = row_right - button_size, .y = row_y, .w = button_size, .h = button_size };
-    renderCompactIconButton(state, close_pane_rect, NF_COD_CLOSE, rectHovered(close_pane_rect), false);
-    addPaletteHit(close_pane_rect, .close);
+    // A docked browser already has the side panel close action above it.
+    if (!browserPaneIsDocked(state)) {
+        renderCompactIconButton(state, close_pane_rect, NF_COD_CLOSE, rectHovered(close_pane_rect), false);
+        addPaletteHit(close_pane_rect, .close);
+    }
     const overflow_rect: palette.Rect = .{
-        .x = close_pane_rect.x - right_reserve - gap - button_size,
+        .x = if (browserPaneIsDocked(state)) row_right - button_size else close_pane_rect.x - right_reserve - gap - button_size,
         .y = row_y,
         .w = button_size,
         .h = button_size,
@@ -1109,7 +1220,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             .h = button_size,
         };
         queuePalettePanel(state, tab_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0), hairline());
-        const tab_close_size = theme.scaledUi(18.0);
+        const tab_close_size: f32 = 0.0;
         const tab_close_rect: palette.Rect = .{
             .x = tab_rect.x + tab_rect.w - tab_close_size - theme.scaledUi(3.0),
             .y = tab_rect.y + (tab_rect.h - tab_close_size) * 0.5,
@@ -1123,9 +1234,6 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(10.0) - leading, 1.0),
             .h = theme.scaledUi(18.0),
         }, state.browserTabTitle(0), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0));
-        renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
-        palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = 0, .kind = .close };
-        palette_tab_hit_count += 1;
     } else if (tabs_w >= theme.scaledUi(40.0)) {
         const visible_count = @min(tab_count, palette_tab_hits.len / 2);
         const tab_width = @min(theme.scaledUi(180.0), @max(tabs_w / @as(f32, @floatFromInt(visible_count)), theme.scaledUi(56.0)));
@@ -1246,18 +1354,27 @@ fn renderTabTitle(state: *app_state.AppState, rect: palette.Rect, title: []const
     queuePaletteText(state, rect, ellipsizedTabTitle(&buffer, title, rect.w, font_size), color, font_size, rect);
 }
 
+/// Largest complete UTF-8 prefix within a byte limit (input is valid UTF-8).
+fn utf8PrefixLen(value: []const u8, max_bytes: usize) usize {
+    var end = @min(value.len, max_bytes);
+    while (end > 0 and end < value.len and (value[end] & 0xc0) == 0x80) end -= 1;
+    return end;
+}
+
 /// Truncates `title` with a trailing ellipsis to fit `max_w`, cutting only at
 /// UTF-8 codepoint boundaries.
 fn ellipsizedTabTitle(buffer: []u8, title: []const u8, max_w: f32, font_size: f32) []const u8 {
     const ellipsis = "\u{2026}";
-    const bounded = title[0..@min(title.len, buffer.len - ellipsis.len)];
+    if (buffer.len < ellipsis.len) return "";
+    const bounded = title[0..utf8PrefixLen(title, buffer.len - ellipsis.len)];
     if (bounded.len == title.len and app_state.paletteUiTextPrefixWidth(bounded, font_size, bounded.len) <= max_w) return title;
     const ellipsis_w = app_state.paletteUiTextPrefixWidth(ellipsis, font_size, ellipsis.len);
     var end: usize = 0;
     var fit_end: usize = 0;
     while (end < bounded.len) {
         const cp_len = std.unicode.utf8ByteSequenceLength(bounded[end]) catch 1;
-        const next = @min(end + cp_len, bounded.len);
+        const next = end + cp_len;
+        if (next > bounded.len) break;
         if (app_state.paletteUiTextPrefixWidth(bounded, font_size, next) + ellipsis_w > max_w) break;
         fit_end = next;
         end = next;
@@ -1280,17 +1397,19 @@ fn renderToolbarOverflowMenu(
     external_visible: bool,
     inspector_visible: bool,
 ) void {
-    const row_h = theme.scaledUi(30.0);
-    const pad = theme.scaledUi(6.0);
+    const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
     const menu_w = theme.scaledUi(238.0);
     const max_tab_rows = @min(state.browserTabCount(), @as(usize, 8));
     const hidden_action_rows: usize =
         @as(usize, if (copy_visible) 0 else 1) +
         @as(usize, if (external_visible) 0 else 1) +
         @as(usize, if (inspector_visible) 0 else 1);
-    const action_rows: usize = 9 + hidden_action_rows;
+    const action_rows: usize = 10 + hidden_action_rows;
     const row_count = max_tab_rows + action_rows;
-    const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count));
+    const separator_h = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    const separator_count: usize = if (max_tab_rows > 0) 4 else 3;
+    const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count)) + separator_h * @as(f32, @floatFromInt(separator_count));
     const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
     const max_x = palette_toolbar_rect.x + palette_toolbar_rect.w - menu_w - theme.scaledUi(4.0);
     palette_overflow_menu_rect = .{
@@ -1299,7 +1418,7 @@ fn renderToolbarOverflowMenu(
         .w = menu_w,
         .h = menu_h,
     };
-    queuePalettePanel(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), hairline());
+    palette_overflow_menu_rect = context_menu.queuePanel(state, palette_overflow_menu_rect);
 
     var y = palette_overflow_menu_rect.y + pad;
     for (0..max_tab_rows) |tab_index| {
@@ -1310,6 +1429,10 @@ fn renderToolbarOverflowMenu(
         y += row_h;
     }
 
+    if (max_tab_rows > 0) {
+        context_menu.queueSeparator(state, palette_overflow_menu_rect.x + pad, y, menu_w - pad * 2.0);
+        y += separator_h;
+    }
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Duplicate active tab", .duplicate_tab, state.browserTabCount() > 0);
     y += row_h;
     renderToolbarOverflowRow(
@@ -1320,6 +1443,10 @@ fn renderToolbarOverflowMenu(
         state.browserTabCount() > 0,
     );
     y += row_h;
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Close active tab", .close_tab, state.browserTabCount() > 0);
+    y += row_h;
+    context_menu.queueSeparator(state, palette_overflow_menu_rect.x + pad, y, menu_w - pad * 2.0);
+    y += separator_h;
     const pane_id = state.currentProjectVisibleBrowserPaneId();
     const docked = browserPaneIsDocked(state);
     const maximized = if (pane_id) |id| state.isCurrentProjectWorkspacePaneMaximized(id) else false;
@@ -1332,6 +1459,8 @@ fn renderToolbarOverflowMenu(
     const can_attach = if (pane_id) |id| !docked and state.canAttachBrowserToTab(id) else false;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (docked) "Move to own tab" else "Attach to tab", .tab_placement, docked or can_attach);
     y += row_h;
+    context_menu.queueSeparator(state, palette_overflow_menu_rect.x + pad, y, menu_w - pad * 2.0);
+    y += separator_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Reload page", .reload, true);
     y += row_h;
     if (!copy_visible) {
@@ -1350,6 +1479,8 @@ fn renderToolbarOverflowMenu(
     y += row_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Import cookies\xE2\x80\xA6", .import_cookies, true);
     y += row_h;
+    context_menu.queueSeparator(state, palette_overflow_menu_rect.x + pad, y, menu_w - pad * 2.0);
+    y += separator_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Close browser pane", .close_pane, pane_id != null);
 }
 
@@ -1357,23 +1488,26 @@ fn overflowRowRect(y: f32, row_h: f32, pad: f32, menu_w: f32) palette.Rect {
     return .{ .x = palette_overflow_menu_rect.x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h };
 }
 
-fn renderToolbarOverflowRow(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    label: []const u8,
-    action: BrowserOverflowAction,
-    enabled: bool,
-) void {
-    const hovered = rectHovered(rect);
-    if (hovered and enabled) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
-    }
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-        .w = rect.w - theme.scaledUi(16.0),
-        .h = theme.scaledUi(13.0) * 1.25,
-    }, label, paletteColor(if (enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), rect);
+fn renderToolbarOverflowRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserOverflowAction, enabled: bool) void {
+    const keyboard_focused = if (overflow_keyboard_action) |selected| std.meta.eql(selected, action) else false;
+    const hovered = keyboard_focused or rectHovered(rect);
+    context_menu.queueRowState(state, rect, hovered and enabled, keyboard_focused);
+    const destructive = action == .close_pane or action == .close_tab or action == .clear_history;
+    const text_color = context_menu.actionColor(enabled, destructive);
+    const glyph: []const u8 = switch (action) {
+        .select_tab, .duplicate_tab => "\u{EAAE}",
+        .close_pane, .close_tab => NF_COD_CLOSE,
+        .copy_url => NF_COD_COPY,
+        .reload => NF_COD_REFRESH,
+        .toggle_inspector => NF_COD_INSPECT,
+        .toggle_pin => NF_COD_PINNED,
+        .maximize_pane => "\u{F0616}",
+        .clear_history => "\u{EA81}",
+        .import_cookies => "\u{EB29}",
+        else => NF_COD_LINK_EXTERNAL,
+    };
+    context_menu.queueIcon(state, rect, glyph, text_color, palette_overflow_menu_rect);
+    context_menu.queueLabel(state, rect, label, text_color, theme.scaledUi(context_menu.CHECK_SLOT_UI), 0, palette_overflow_menu_rect);
     if (palette_overflow_hit_count < palette_overflow_hits.len) {
         palette_overflow_hits[palette_overflow_hit_count] = .{ .rect = rect, .action = action, .enabled = enabled };
         palette_overflow_hit_count += 1;
@@ -1406,6 +1540,7 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
     switch (action) {
         .select_tab => |index| state.switchBrowserTab(index),
         .duplicate_tab => state.duplicateBrowserTab(state.activeBrowserTabIndex()),
+        .close_tab => state.closeBrowserTab(state.activeBrowserTabIndex()),
         .toggle_pin => state.toggleBrowserTabPinned(state.activeBrowserTabIndex()),
         .maximize_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
             _ = state.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
@@ -1439,25 +1574,7 @@ fn renderToolbarTooltip(state: *app_state.AppState) void {
         const hit = palette_hits[index];
         if (!rectHovered(hit.rect) or hit.kind == .address or hit.kind == .local_server) continue;
         const label = toolbarTooltipLabel(state, hit.kind);
-        const font_size = theme.scaledUi(11.0);
-        const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
-        const pad_x = theme.scaledUi(7.0);
-        const tooltip_w = text_w + pad_x * 2.0;
-        const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
-        const max_x = palette_toolbar_rect.x + palette_toolbar_rect.w - tooltip_w - theme.scaledUi(4.0);
-        const rect: palette.Rect = .{
-            .x = std.math.clamp(hit.rect.x + hit.rect.w * 0.5 - tooltip_w * 0.5, min_x, @max(min_x, max_x)),
-            .y = palette_toolbar_rect.y + palette_toolbar_rect.h + theme.scaledUi(4.0),
-            .w = tooltip_w,
-            .h = theme.scaledUi(24.0),
-        };
-        queuePalettePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), hairline());
-        queuePaletteText(state, .{
-            .x = rect.x + pad_x,
-            .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
-            .w = rect.w - pad_x * 2.0,
-            .h = font_size * 1.25,
-        }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
+        tooltip.queueAvoiding(state, hit.rect, label, &.{palette_toolbar_rect});
         return;
     }
 }
@@ -1487,44 +1604,31 @@ fn toolbarTooltipLabel(state: *app_state.AppState, kind: BrowserHitKind) []const
 
 fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, inspector_mode: browser_runtime.InspectorMode) void {
     const menu_width = theme.scaledUi(180.0);
-    const row_height = theme.scaledUi(32.0);
-    const pad = theme.scaledUi(8.0);
+    const row_height = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
     palette_menu_rect = .{
         .x = anchor.x + anchor.w - menu_width,
         .y = anchor.y + anchor.h + theme.scaledUi(6.0),
         .w = menu_width,
         .h = row_height * 3.0 + pad * 2.0,
     };
-    queuePalettePanel(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), hairline());
+    palette_menu_rect = context_menu.queuePanel(state, palette_menu_rect);
 
     var y = palette_menu_rect.y + pad;
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Point", inspector_mode == .point, .inspect_mode_point);
     y += row_height;
-    renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Box", inspector_mode == .draw_box, .inspect_mode_draw_box);
+    renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw box", inspector_mode == .draw_box, .inspect_mode_draw_box);
     y += row_height;
-    renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Freeform", inspector_mode == .draw_freeform, .inspect_mode_draw_freeform);
+    renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw freeform", inspector_mode == .draw_freeform, .inspect_mode_draw_freeform);
 }
 
 fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, selected: bool, kind: BrowserHitKind) void {
-    const hovered = rectHovered(rect);
-    if (selected or hovered) {
-        queuePaletteRoundedRect(
-            state,
-            rect,
-            paletteColor(if (selected) theme.wash(theme.accent(), 64) else theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
-            theme.scaledUi(6.0),
-        );
-    }
-
-    const marker = if (selected) "* " else "  ";
-    var row_buf = std.mem.zeroes([64]u8);
-    const row_label = std.fmt.bufPrint(&row_buf, "{s}{s}", .{ marker, label }) catch label;
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(14.0) * 1.25) * 0.5,
-        .w = rect.w - theme.scaledUi(16.0),
-        .h = theme.scaledUi(14.0) * 1.25,
-    }, row_label, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
+    const keyboard_focused = inspector_keyboard_kind == kind;
+    const hovered = keyboard_focused or rectHovered(rect);
+    context_menu.queueRowState(state, rect, hovered, keyboard_focused);
+    const leading = theme.scaledUi(context_menu.CHECK_SLOT_UI);
+    if (selected) context_menu.queueCheck(state, rect, theme.accent(), palette_menu_rect);
+    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, hovered), leading, 0, palette_menu_rect);
     addPaletteHit(rect, kind);
 }
 
@@ -1602,9 +1706,9 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     var open_child_y: f32 = 0.0;
 
     if (parent_index == null and state.browserContextMenuHasLink()) {
-        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open Link", .open_link_current, panel_rect);
+        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open link", .open_link_current, panel_rect);
         row_y += row_height;
-        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open Link in New Tab", .open_link_new_tab, panel_rect);
+        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open link in new tab", .open_link_new_tab, panel_rect);
         row_y += row_height;
         context_menu.queueSeparator(state, panel_rect.x + pad, row_y, row_w);
         row_y += separator_height;
@@ -1619,10 +1723,11 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         }
 
         const row_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height };
+        const keyboard_focused = context_keyboard_active and state.browser_controller.context_menu_selected_index == item.index;
         const highlighted = item.enabled and (state.browser_controller.context_menu_selected_index == item.index or rectHovered(row_rect));
-        if (highlighted) context_menu.queueRowHighlight(state, row_rect);
+        context_menu.queueRowState(state, row_rect, highlighted, keyboard_focused and item.enabled);
         const label_color = context_menu.labelColor(item.enabled, highlighted);
-        const leading_width = if (state.browser_controller.context_menu_is_option) theme.scaledUi(context_menu.CHECK_SLOT_UI) else 0.0;
+        const leading_width = theme.scaledUi(context_menu.CHECK_SLOT_UI);
         const trailing_width = if (item.submenu) theme.scaledUi(context_menu.CHEVRON_SLOT_UI) else 0.0;
         context_menu.queueLabel(state, row_rect, item.label, label_color, leading_width, trailing_width, panel_rect);
         if (state.browser_controller.context_menu_is_option and item.selected) {
@@ -1644,8 +1749,10 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         row_y += separator_height;
         const close_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height };
         const highlighted = state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect);
-        if (highlighted) context_menu.queueRowHighlight(state, close_rect);
-        context_menu.queueLabel(state, close_rect, "Close Pane", context_menu.labelColor(true, highlighted), 0.0, 0.0, panel_rect);
+        context_menu.queueRowState(state, close_rect, highlighted, context_keyboard_active and state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX);
+        const danger = context_menu.actionColor(true, true);
+        context_menu.queueIcon(state, close_rect, NF_COD_CLOSE, danger, panel_rect);
+        context_menu.queueLabel(state, close_rect, "Close pane", danger, theme.scaledUi(context_menu.CHECK_SLOT_UI), 0.0, panel_rect);
         addBrowserContextMenuHit(close_rect, .close_pane);
     }
 
@@ -1669,7 +1776,8 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
 fn renderBrowserContextLinkRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserContextMenuAction, clip: palette.Rect) void {
     const highlighted = rectHovered(rect);
     if (highlighted) context_menu.queueRowHighlight(state, rect);
-    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, highlighted), 0.0, 0.0, clip);
+    context_menu.queueIcon(state, rect, NF_COD_LINK_EXTERNAL, theme.COLOR_WHITE, clip);
+    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, highlighted), theme.scaledUi(context_menu.CHECK_SLOT_UI), 0.0, clip);
     addBrowserContextMenuHit(rect, action);
 }
 
@@ -1799,7 +1907,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     );
 
     if (focused) {
-        const cursor = @min(state.browser_controller.address_cursor, address.len);
+        const cursor = utf8PrefixLen(address, state.browser_controller.address_cursor);
         const prefix_w = app_state.paletteUiTextPrefixWidth(address, font_size, cursor);
         const caret_x = text_rect.x + prefix_w;
         queuePaletteRect(state, .{
@@ -1831,7 +1939,7 @@ fn acceptAddressCompletion(state: *app_state.AppState) void {
     const address = state.browserState().addressInput();
     if (state.browser_controller.address_cursor != address.len) return;
     var buffer: [256]u8 = undefined;
-    const len = @min(completion.len, buffer.len);
+    const len = utf8PrefixLen(completion, buffer.len);
     @memcpy(buffer[0..len], completion[0..len]);
     clearAddressSelection(state);
     insertAddressText(state, buffer[0..len]);
@@ -1914,8 +2022,8 @@ const SelectionRange = struct { start: usize, end: usize };
 /// them in order so callers don't have to worry about direction.
 fn addressSelectionRange(state: *app_state.AppState, address: []const u8) ?SelectionRange {
     const anchor = state.browser_controller.address_selection_anchor orelse return null;
-    const cursor = @min(state.browser_controller.address_cursor, address.len);
-    const a = @min(anchor, address.len);
+    const cursor = utf8PrefixLen(address, state.browser_controller.address_cursor);
+    const a = utf8PrefixLen(address, anchor);
     if (a == cursor) return null;
     return .{ .start = @min(a, cursor), .end = @max(a, cursor) };
 }
@@ -1943,14 +2051,14 @@ fn isWordChar(b: u8) bool {
 
 fn wordBoundsAt(address: []const u8, offset: usize) SelectionRange {
     if (address.len == 0) return .{ .start = 0, .end = 0 };
-    var start = @min(offset, address.len);
-    var end = start;
+    const clicked = if (offset >= address.len) text_edit.prevBoundary(address, address.len) else utf8PrefixLen(address, offset);
+    // Punctuation (including a multi-byte dash) selects the clicked codepoint,
+    // rather than the ASCII word immediately before it or part of its bytes.
+    if (!isWordChar(address[clicked])) return .{ .start = clicked, .end = text_edit.nextBoundary(address, clicked) };
+    var start = clicked;
+    var end = clicked + 1;
     while (start > 0 and isWordChar(address[start - 1])) start -= 1;
     while (end < address.len and isWordChar(address[end])) end += 1;
-    // Empty run (clicked on a non-word boundary) — fall back to selecting the
-    // single byte under the cursor so a double-click still produces a visible
-    // selection.
-    if (start == end and end < address.len) end += 1;
     return .{ .start = start, .end = end };
 }
 
@@ -1979,13 +2087,13 @@ fn focusAddress(state: *app_state.AppState) void {
     state.blurPaletteComposer();
     state.unfocusBrowserPane();
     state.browser_controller.inspector_menu_open = false;
-    state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
+    state.browser_controller.address_cursor = utf8PrefixLen(state.browserState().addressInput(), state.browser_controller.address_cursor);
 }
 
 pub fn blurAddress(state: *app_state.AppState) void {
     state.browser_controller.address_focused = false;
     browser_history_controller.hideBrowserSuggestions(state);
-    state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
+    state.browser_controller.address_cursor = utf8PrefixLen(state.browserState().addressInput(), state.browser_controller.address_cursor);
     state.browser_controller.address_drag_active = false;
     clearAddressSelection(state);
 }
@@ -2029,9 +2137,9 @@ fn insertAddressText(state: *app_state.AppState, text: []const u8) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_controller.address_cursor, current_len);
+    const cursor = utf8PrefixLen(browser_state.addressInput(), state.browser_controller.address_cursor);
     const available = if (buffer.len > current_len) buffer.len - current_len else 0;
-    const insert_len = @min(text.len, available);
+    const insert_len = utf8PrefixLen(text, available);
     if (insert_len == 0) return;
 
     std.mem.copyBackwards(u8, buffer[cursor + insert_len .. current_len + insert_len], buffer[cursor..current_len]);
@@ -2044,21 +2152,25 @@ fn deleteAddressBackward(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_controller.address_cursor, current_len);
+    const cursor = utf8PrefixLen(browser_state.addressInput(), state.browser_controller.address_cursor);
     if (cursor == 0) return;
-    std.mem.copyForwards(u8, buffer[cursor - 1 .. current_len - 1], buffer[cursor..current_len]);
-    buffer[current_len - 1] = 0;
-    state.browser_controller.address_cursor = cursor - 1;
+    const previous = text_edit.prevBoundary(browser_state.addressInput(), cursor);
+    const removed = cursor - previous;
+    std.mem.copyForwards(u8, buffer[previous .. current_len - removed], buffer[cursor..current_len]);
+    buffer[current_len - removed] = 0;
+    state.browser_controller.address_cursor = previous;
 }
 
 fn deleteAddressForward(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_controller.address_cursor, current_len);
+    const cursor = utf8PrefixLen(browser_state.addressInput(), state.browser_controller.address_cursor);
     if (cursor >= current_len) return;
-    std.mem.copyForwards(u8, buffer[cursor .. current_len - 1], buffer[cursor + 1 .. current_len]);
-    buffer[current_len - 1] = 0;
+    const next = text_edit.nextBoundary(browser_state.addressInput(), cursor);
+    const removed = next - cursor;
+    std.mem.copyForwards(u8, buffer[cursor .. current_len - removed], buffer[next..current_len]);
+    buffer[current_len - removed] = 0;
     state.browser_controller.address_cursor = cursor;
 }
 
@@ -2295,7 +2407,7 @@ fn renderLocalServers(
             .y = row.y + (row.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
-        }, server.name());
+        });
 
         const text_x = row.x + pad + icon_size + theme.scaledUi(14.0);
         const text_w = row.x + row.w - pad - text_x;
@@ -2317,39 +2429,39 @@ fn renderLocalServers(
     }, "Select a live local server to open it in this browser tab.", muted, caption_size, clip);
 }
 
-/// Playful codicons for server rows; each server keeps one by name.
-const LOCAL_SERVER_GLYPHS = [_][]const u8{
-    "\u{EB44}", // rocket
-    "\u{EAF2}", // flame
-    "\u{EA79}", // beaker
-    "\u{EB05}", // heart
-    "\u{EB58}", // squirrel
-    "\u{EB68}", // telescope
-    "\u{EBD5}", // compass
-    "\u{EC10}", // sparkle
-    "\u{EC15}", // coffee
-    "\u{EC17}", // game
-    "\u{EC1B}", // music
-    "\u{EBCF}", // wand
-    "\u{EB29}", // package
-    "\u{EA61}", // lightbulb
-};
-
-// Draws a server's glyph on a soft round tile tinted from the active theme.
-fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect, name: []const u8) void {
-    const hash = std.hash.Wyhash.hash(0, name);
-    const tints = [_][4]f32{ theme.accent(), theme.COLOR_YELLOW, theme.COLOR_DIFF_REMOVE, theme.COLOR_DIFF_ADD, theme.COLOR_TEXT_MUTED };
-    const tint = tints[(hash >> 32) % tints.len];
-    const glyph = LOCAL_SERVER_GLYPHS[hash % LOCAL_SERVER_GLYPHS.len];
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.mix(theme.background(), tint, 0.16)), rect.w * 0.5);
-    const glyph_size = rect.w * 0.5;
-    queuePaletteIcon(state, iconRectForButton(rect, glyph_size), glyph, glyph_size, paletteColor(tint));
+// A neutral server tile shares the browser toolbar's icon family.
+fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect) void {
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0));
+    const glyph_size = rect.w * 0.55;
+    queuePaletteIcon(state, iconRectForButton(rect, glyph_size), NF_COD_GLOBE, glyph_size, paletteColor(theme.COLOR_TEXT_MUTED));
 }
 
 fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {
     const raw = browser_state.current_url orelse browser_state.addressInput();
     const url = std.mem.trim(u8, raw, &std.ascii.whitespace);
     return url.len == 0 or std.mem.eql(u8, url, "about:blank");
+}
+
+test "browser tab truncation preserves UTF-8 at em dash and emoji buffer cuts" {
+    const title = "UI fix R3 Stream A — details 🐟";
+    const dash = std.mem.indexOf(u8, title, "—").?;
+    const emoji = std.mem.indexOf(u8, title, "🐟").?;
+    var buffer: [128]u8 = undefined;
+    // A fixed buffer can end inside a codepoint even with ample visual width.
+    for ([_]usize{ dash + 1, dash + 2, emoji + 1, emoji + 2, emoji + 3 }) |cut| {
+        const shown = ellipsizedTabTitle(buffer[0 .. cut + "…".len], title, 10000, 13);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(shown));
+        const prefix_end = if (cut < emoji) dash else emoji;
+        try std.testing.expectEqualSlices(u8, title[0..prefix_end], shown[0 .. shown.len - "…".len]);
+        try std.testing.expect(std.mem.endsWith(u8, shown, "…"));
+    }
+    // Width-based cuts must be safe too, including narrow and tiny buffers.
+    for (0..100) |width| {
+        const shown = ellipsizedTabTitle(&buffer, title, @floatFromInt(width), 13);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(shown));
+    }
+    try std.testing.expectEqualStrings("", ellipsizedTabTitle(buffer[0..2], title, 10000, 13));
+    try std.testing.expectEqualStrings(title, ellipsizedTabTitle(&buffer, title, 10000, 13));
 }
 
 test "browser context-menu keyboard selection filters rows by level and wraps" {
@@ -2451,6 +2563,42 @@ const SuggestionTestFixture = struct {
     }
 };
 
+test "browser address edits preserve UTF-8 boundaries and capacity" {
+    var fixture: SuggestionTestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const state = &fixture.state;
+    const address = state.browserState();
+    browser_history_controller.hideBrowserSuggestions(state);
+    address.setAddress("a—🐟b");
+    state.browser_controller.address_cursor = "a—".len;
+    deleteAddressBackward(state);
+    try std.testing.expectEqualStrings("a🐟b", address.addressInput());
+    try std.testing.expectEqual(@as(usize, 1), state.browser_controller.address_cursor);
+    deleteAddressForward(state);
+    try std.testing.expectEqualStrings("ab", address.addressInput());
+    insertAddressText(state, "—🐟");
+    try std.testing.expectEqualStrings("a—🐟b", address.addressInput());
+    try std.testing.expectEqual(@as(usize, "a—🐟".len), state.browser_controller.address_cursor);
+    // Clicking a non-ASCII character selects its whole encoded codepoint.
+    const word = wordBoundsAt(address.addressInput(), 2);
+    try std.testing.expectEqualStrings("—", address.addressInput()[word.start..word.end]);
+    state.browser_controller.address_selection_anchor = null;
+    state.browser_controller.address_cursor = 1;
+    try std.testing.expect(handlePaletteKeyDown(state, &.{ .key = .right }));
+    try std.testing.expectEqual(@as(usize, "a—".len), state.browser_controller.address_cursor);
+    try std.testing.expect(handlePaletteKeyDown(state, &.{ .key = .left }));
+    try std.testing.expectEqual(@as(usize, 1), state.browser_controller.address_cursor);
+    // A paste near the byte capacity must reject an incomplete codepoint.
+    const buffer = address.addressBuffer();
+    @memset(buffer[0 .. buffer.len - 2], 'a');
+    buffer[buffer.len - 2] = 0;
+    state.browser_controller.address_cursor = buffer.len - 2;
+    insertAddressText(state, "—");
+    try std.testing.expectEqual(buffer.len - 2, address.addressInput().len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(address.addressInput()));
+}
+
 test "Enter in the address bar loads the highlighted suggestion, not the typed text" {
     var fixture: SuggestionTestFixture = undefined;
     try fixture.init();
@@ -2464,4 +2612,38 @@ test "Enter in the address bar loads the highlighted suggestion, not the typed t
     try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
     try std.testing.expect(!state.browser_controller.address_focused);
     try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
+}
+
+test "browser stale menus cannot capture input before paint or after hiding" {
+    var fixture: SuggestionTestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    defer resetPaletteHitCache();
+    const state = &fixture.state;
+    state.browser_controller.address_focused = false;
+    // Restoring browser focus establishes the runtime presentation in this fixture.
+    try std.testing.expect(state.isBrowserVisible());
+    resetPaletteHitCache();
+    state.browser_controller.toolbar_overflow_open = true;
+    state.browser_controller.inspector_menu_open = true;
+    state.browser_controller.context_menu_open = true; // Async backend callback.
+    try std.testing.expect(!menuOpen(state));
+    try std.testing.expect(!handlePaletteKeyDown(state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(!handleChromeMenuKeyDown(state, &.{ .key = .escape }));
+    palette_overflow_hit_count = 1;
+    try std.testing.expect(menuOpen(state));
+    palette_overflow_hit_count = 0;
+    palette_menu_rect = .{ .x = 1, .y = 1, .w = 100, .h = 100 };
+    try std.testing.expect(menuOpen(state));
+    palette_menu_rect = .{};
+    palette_context_menu_panel_count = 1;
+    try std.testing.expect(menuOpen(state));
+    state.browser_controller.background_access = true;
+    try std.testing.expect(!menuOpen(state));
+    try std.testing.expect(!handlePaletteKeyDown(state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(!handleChromeMenuKeyDown(state, &.{ .key = .escape }));
+    // A later hidden-frame reset also invalidates every menu's painted geometry.
+    resetPaletteHitCache();
+    state.browser_controller.background_access = false;
+    try std.testing.expect(!menuOpen(state));
 }

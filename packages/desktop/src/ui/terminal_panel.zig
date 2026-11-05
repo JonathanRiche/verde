@@ -17,7 +17,7 @@ const log = std.log.scoped(.terminal_panel);
 
 const MAX_PANE_HITS = 64;
 const MAX_TAB_HITS = 32;
-const TERMINAL_CONTEXT_MENU_WIDTH: f32 = 180.0;
+const TERMINAL_CONTEXT_MENU_WIDTH: f32 = 220.0;
 const TERMINAL_SCROLLBAR_MIN_THUMB_CSS: f32 = 28.0;
 const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
 const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
@@ -388,6 +388,7 @@ const TerminalHitCache = struct {
     tab_count: usize = 0,
     tabs: [MAX_TAB_HITS]TabHit = [_]TabHit{.{}} ** MAX_TAB_HITS,
     menu_open: bool = false,
+    menu_focus_action: ?TerminalContextMenuAction = null,
     menu_kind: TerminalContextMenuKind = .pane,
     menu_pane_id: u32 = 0,
     menu_tab_index: usize = 0,
@@ -396,7 +397,7 @@ const TerminalHitCache = struct {
     menu_count: usize = 0,
     menu_hits: [14]ContextMenuHit = [_]ContextMenuHit{.{}} ** 14,
     menu_dock_id: u32 = 0,
-    /// Link under the right-click that opened the pane menu ("Copy Link").
+    /// Link under the right-click that opened the pane menu ("Copy link").
     menu_link_len: usize = 0,
     menu_link: [MAX_TERMINAL_LINK_BYTES]u8 = undefined,
     dock_id: u32 = 0,
@@ -430,8 +431,8 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     renderDockAtForDock(state, rect, 0);
 }
 
-pub fn paneHeaderHeight() f32 {
-    return 0.0;
+pub fn paneHeaderHeight(rect: palette.Rect) f32 {
+    return @import("chat_panel.zig").paneHeaderHeight(rect);
 }
 
 pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_id: u32) void {
@@ -455,10 +456,6 @@ pub fn renderDockAtForDockWithin(state: *app_state.AppState, rect: palette.Rect,
     // reflowed back and forth — visible as terminal-pane jitter while typing.
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
-    queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
-    if (state.terminalDockSurfaceAttention(state.project_controller.selected_index, dock_id)) {
-        queueBorder(state, rect, paletteColor(theme.COLOR_YELLOW), 0.0, theme.scaledUi(2.0));
-    }
 
     if (dock.activeTab()) |tab| {
         renderPaneNode(state, dock, tab.root, rect, viewport_clip);
@@ -574,14 +571,77 @@ fn dockConst(state: *const app_state.AppState, dock_id: u32) ?*const terminal.Do
     return state.currentProjectTerminalDock(dock_id);
 }
 
+pub fn menuOpen() bool {
+    // A dock that stopped rendering may retain its request flag until the
+    // next pointer event. Only painted menu rows may capture keyboard input.
+    return hit_cache.menu_open and hit_cache.menu_count > 0;
+}
+
+/// Pending requests also participate in sibling-menu dismissal before paint.
+pub fn menuRequested() bool {
+    return hit_cache.menu_open;
+}
+
+pub fn standaloneMenuOpen() bool {
+    return menuOpen() and hit_cache.menu_dock_id == STANDALONE_DOCK_ID;
+}
+
+pub fn workspaceMenuOpen() bool {
+    return menuOpen() and hit_cache.menu_dock_id != STANDALONE_DOCK_ID;
+}
+
+pub fn closeMenu() void {
+    hit_cache.menu_open = false;
+    hit_cache.menu_focus_action = null;
+}
+
+/// Setup auth input belongs to onboarding. Navigation operates its context
+/// menu; typing/paste dismisses the menu and continues to the setup terminal.
+pub fn handleStandaloneMenuKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!standaloneMenuOpen()) return false;
+    switch (event.key) {
+        .escape, .tab, .up, .down, .home, .end, .@"return", .space => return handlePaletteKeyDown(state, event),
+        else => {
+            closeMenu();
+            return false;
+        },
+    }
+}
+
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
-    // Escape closes an open terminal context menu (the topmost layer)
-    // instead of reaching the TUI underneath.
-    // `menu_count` is set only when the menu was drawn last frame, so a
-    // stale flag for an off-screen dock never swallows Escape.
-    if (hit_cache.menu_open and hit_cache.menu_count > 0 and event.down and event.key == .escape) {
-        hit_cache.menu_open = false;
-        state.markDirty();
+    if (menuOpen()) {
+        defer state.markDirty();
+        if (!event.down) return true;
+        switch (event.key) {
+            .escape, .tab => closeMenu(),
+            .up, .down, .home, .end => {
+                var rows: [14]TerminalContextMenuAction = undefined;
+                var count: usize = 0;
+                var selected: ?usize = null;
+                for (hit_cache.menu_hits[0..hit_cache.menu_count]) |hit| {
+                    if (!hit.enabled) continue;
+                    if (hit_cache.menu_focus_action == hit.action) selected = count;
+                    rows[count] = hit.action;
+                    count += 1;
+                }
+                if (count > 0) {
+                    const index = switch (event.key) {
+                        .home => 0,
+                        .end => count - 1,
+                        .up => if (selected) |i| (i + count - 1) % count else count - 1,
+                        else => if (selected) |i| (i + 1) % count else 0,
+                    };
+                    hit_cache.menu_focus_action = rows[index];
+                }
+            },
+            .@"return", .space => {
+                if (hit_cache.menu_focus_action) |action| {
+                    if (dockMutable(state, hit_cache.menu_dock_id)) |dock| performContextMenuAction(state, dock, action);
+                    closeMenu();
+                }
+            },
+            else => {},
+        }
         return true;
     }
     if (!terminalCopyShortcut(event) or !selection_state.active) return false;
@@ -643,7 +703,10 @@ fn handleMouseButtonInPanes(state: *app_state.AppState, x: f32, y: f32, button: 
     if (button == 1 and !down and pending_link_click.active) return finishPendingLinkClick(state, x, y);
     if (button == 1 and hit_cache.menu_open) {
         if (!down) return true;
-        const dock = dockMutable(state, hit_cache.menu_dock_id) orelse return false;
+        const dock = dockMutable(state, hit_cache.menu_dock_id) orelse {
+            closeMenu();
+            return false;
+        };
         var i: usize = 0;
         while (i < hit_cache.menu_count) : (i += 1) {
             const hit = hit_cache.menu_hits[i];
@@ -817,16 +880,16 @@ fn renderPaneNode(state: *app_state.AppState, dock: anytype, node: anytype, rect
 }
 
 fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: palette.Rect, viewport_clip: palette.Rect) void {
-    // `rect` is the full pane bounds; `grid_rect` is inset horizontally so
+    // `rect` is the full pane bounds; `grid_rect` is inset on all sides so
     // cell output gets breathing room without pulling the focus border or
     // mouse hit envelope inward (the focus border should hug the dock edge
     // for outermost panes, not float at the inset).
     const inset = terminalPaneHorizontalInset();
     const grid_rect = palette.Rect{
         .x = rect.x + inset,
-        .y = rect.y,
+        .y = rect.y + inset,
         .w = @max(rect.w - inset * 2.0, 1.0),
-        .h = rect.h,
+        .h = @max(rect.h - inset * 2.0, 1.0),
     };
     appendPaneHit(pane_id, grid_rect);
     // A failed resize must be visible in diagnostics: the session's cell
@@ -852,7 +915,6 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
             runtime_log.diagnostic("terminal size reassert failed pane={d} err={s}", .{ pane_id, @errorName(err) });
         };
     }
-    const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_controller.focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;
         queueRect(state, rect, paletteColor(theme.background()));
@@ -864,7 +926,13 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
     }
     dock.markPaneRendered(pane_id);
-    if (focused) queueBorder(state, rect, paletteColor(theme.accent()), 0.0, theme.scaledUi(1.0));
+    // Workspace panes own the outer focus/status frame. Internal terminal
+    // splits retain an indicator without duplicating that frame.
+    if (dock.activePaneConst()) |active| {
+        if (active.id == pane_id and state.terminal_controller.focused and !std.meta.eql(rect, viewport_clip)) {
+            queueRect(state, .{ .x = rect.x, .y = rect.y, .w = @max(@round(theme.scaledUi(1.0)), 1.0), .h = rect.h }, paletteColor(theme.accent()));
+        }
+    }
 }
 
 fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32, viewport_clip: palette.Rect, scroll_row: usize) void {
@@ -1311,7 +1379,8 @@ fn renderTerminalScrollbar(state: *app_state.AppState, pane_rect: palette.Rect, 
     const thumb_y = track.y + (track.h - thumb_h) * (offset_f / scrollable_f);
 
     queueRounded(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(2.0));
-    queueRounded(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 220)), theme.scaledUi(2.0));
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(track, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    queueRounded(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(if (hovered) theme.COLOR_TEXT_SUBTLE else theme.borderMuted(), if (hovered) 220 else 128)), theme.scaledUi(2.0));
 }
 
 fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palette.Rect) void {
@@ -1354,7 +1423,7 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         count += 1;
         if (hit_cache.menu_kind == .pane and hit_cache.menu_link_len > 0) {
             actions[count] = .copy_link;
-            labels[count] = "Copy Link";
+            labels[count] = "Copy link";
             enabled[count] = true;
             count += 1;
         }
@@ -1368,11 +1437,11 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         // Copy only (above).
     } else if (hit_cache.menu_kind == .tab) {
         actions[count] = .rename_tab;
-        labels[count] = "Rename Tab";
+        labels[count] = "Rename tab";
         enabled[count] = true;
         count += 1;
         actions[count] = .close_tab;
-        labels[count] = "Close Tab";
+        labels[count] = "Close tab";
         enabled[count] = dock.tabs.items.len > 1;
         count += 1;
     } else {
@@ -1386,35 +1455,35 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         }
         if (hit_cache.menu_link_len > 0) {
             actions[count] = .copy_link;
-            labels[count] = "Copy Link";
+            labels[count] = "Copy link";
             enabled[count] = true;
             count += 1;
         }
         actions[count] = .zoom_pane;
         labels[count] = if (workspace_pane_id) |pane_id|
-            if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane"
+            if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom pane" else "Zoom pane"
         else
-            "Zoom Pane";
+            "Zoom pane";
         enabled[count] = if (workspace_pane_id) |pane_id| state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id) else false;
         count += 1;
         actions[count] = .split_up;
-        labels[count] = "Split Above";
+        labels[count] = "Split above";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_down;
-        labels[count] = "Split Below";
+        labels[count] = "Split below";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_left;
-        labels[count] = "Split Left";
+        labels[count] = "Split left";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_right;
-        labels[count] = "Split Right";
+        labels[count] = "Split right";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .close_pane;
-        labels[count] = "Close Pane";
+        labels[count] = "Close pane";
         enabled[count] = has_workspace_pane;
         count += 1;
     }
@@ -1422,7 +1491,12 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     const menu_w = theme.scaledUi(TERMINAL_CONTEXT_MENU_WIDTH);
     const pad = theme.scaledUi(context_menu.PAD_UI);
     const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
-    const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(count));
+    const separator_h = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    var separator_count: usize = 0;
+    for (0..count) |index| {
+        if (terminalMenuStartsGroup(actions[0..count], index)) separator_count += 1;
+    }
+    const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(count)) + separator_h * @as(f32, @floatFromInt(separator_count));
     var menu_x = hit_cache.menu_anchor.x;
     var menu_y = hit_cache.menu_anchor.y;
     if (menu_x + menu_w > dock_rect.x + dock_rect.w) menu_x = dock_rect.x + dock_rect.w - menu_w - theme.scaledUi(4.0);
@@ -1436,13 +1510,37 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     var i: usize = 0;
     var y = hit_cache.menu_panel.y + pad;
     while (i < count) : (i += 1) {
+        if (terminalMenuStartsGroup(actions[0..count], i)) {
+            context_menu.queueSeparator(state, hit_cache.menu_panel.x + pad, y, hit_cache.menu_panel.w - pad * 2.0);
+            y += separator_h;
+        }
         const row = palette.Rect{ .x = hit_cache.menu_panel.x + pad, .y = y, .w = hit_cache.menu_panel.w - pad * 2.0, .h = row_h };
         hit_cache.menu_hits[i] = .{ .action = actions[i], .rect = row, .enabled = enabled[i] };
-        const hovered = mouse_ok and enabled[i] and rectContains(row, mx, my);
-        if (hovered) context_menu.queueRowHighlight(state, row);
-        context_menu.queueLabel(state, row, labels[i], context_menu.labelColor(enabled[i], hovered), 0.0, 0.0, hit_cache.menu_panel);
+        const keyboard_focused = hit_cache.menu_focus_action == actions[i];
+        const hovered = keyboard_focused or (mouse_ok and enabled[i] and rectContains(row, mx, my));
+        context_menu.queueRowState(state, row, hovered, keyboard_focused);
+        const text_color = context_menu.actionColor(enabled[i], actions[i] == .close_pane or actions[i] == .close_tab);
+        const glyph: []const u8 = switch (actions[i]) {
+            .copy_selection, .copy_link => "\u{EBCC}",
+            .close_pane, .close_tab => "\u{EA76}",
+            .zoom_pane => "\u{F0616}",
+            .split_up, .split_down => "\u{EB57}",
+            .split_left, .split_right => "\u{EB56}",
+            .rename_tab => "\u{EA73}",
+            else => "\u{EA85}",
+        };
+        context_menu.queueIcon(state, row, glyph, text_color, hit_cache.menu_panel);
+        context_menu.queueLabel(state, row, labels[i], text_color, theme.scaledUi(context_menu.CHECK_SLOT_UI), 0.0, hit_cache.menu_panel);
         y += row_h;
     }
+}
+
+fn terminalMenuStartsGroup(actions: []const TerminalContextMenuAction, index: usize) bool {
+    if (index == 0) return false;
+    return switch (actions[index]) {
+        .zoom_pane, .split_up, .close_pane, .close_tab => true,
+        else => false,
+    };
 }
 
 fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: TerminalContextMenuAction) void {
@@ -1989,7 +2087,7 @@ fn viewportSelectionRange(start: TerminalCellCoord, end: TerminalCellCoord, scro
 }
 
 /// Opens the pane menu and remembers the link under the pointer, if any,
-/// for its "Copy Link" row.
+/// for its "Copy link" row.
 fn openPaneContextMenu(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32) void {
     openContextMenu(.pane, 0, target.pane_id, x, y);
     hit_cache.menu_link_len = 0;
@@ -2013,6 +2111,7 @@ fn copyMenuLinkToClipboard(state: *app_state.AppState) void {
 
 fn openContextMenu(kind: TerminalContextMenuKind, tab_index: usize, pane_id: u32, x: f32, y: f32) void {
     hit_cache.menu_open = true;
+    hit_cache.menu_focus_action = null;
     hit_cache.menu_link_len = 0;
     hit_cache.menu_kind = kind;
     hit_cache.menu_dock_id = hit_cache.dock_id;
@@ -2128,11 +2227,14 @@ fn graphemesForCell(cell: ghostty_vt.Cell, graphemes: []const []const u21, index
 
 fn cellText(raw_cell: ghostty_vt.Cell, graphemes: []const u21, buffer: []u8) ?[]const u8 {
     if (!raw_cell.hasText()) return null;
+    const first_len = std.unicode.utf8CodepointSequenceLength(raw_cell.codepoint()) catch return null;
+    if (first_len > buffer.len) return null;
     var index: usize = 0;
     index += std.unicode.utf8Encode(raw_cell.codepoint(), buffer[index..]) catch return null;
     if (raw_cell.hasGrapheme()) {
         for (graphemes) |cp| {
-            if (index >= buffer.len) break;
+            const cp_len = std.unicode.utf8CodepointSequenceLength(cp) catch break;
+            if (cp_len > buffer.len - index) break;
             index += std.unicode.utf8Encode(cp, buffer[index..]) catch break;
         }
     }
@@ -2261,12 +2363,10 @@ fn terminalRenderCellSize(base: u32, font_scale: f32) f32 {
     return @max(@round(@as(f32, @floatFromInt(base)) * font_scale), 1.0);
 }
 
-/// Breathing room on the left/right edges of the dock so terminal output
-/// doesn't sit flush against the pane border. Applied once at the dock
-/// level — splits divide the inset region without adding more padding
-/// between sibling panes.
+/// Breathing room around each terminal grid. Rendering, PTY sizing, hit
+/// testing and selection all use the same inset rect.
 fn terminalPaneHorizontalInset() f32 {
-    return theme.scaledUi(6.0);
+    return theme.scaledUi(12.0);
 }
 
 fn intersectRect(a: palette.Rect, b: palette.Rect) ?palette.Rect {
@@ -3055,6 +3155,22 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
     };
 }
 
+test "terminal cell text truncation preserves UTF-8 at buffer capacity" {
+    const cell = ghostty_vt.Cell{ .content_tag = .codepoint_grapheme, .content = .{ .codepoint = .{ .data = '—' } } };
+    var buffer: [9]u8 = undefined;
+    const graphemes = [_]u21{ '🐟', 0x0301 };
+    for (0..buffer.len + 1) |capacity| {
+        const text = cellText(cell, &graphemes, buffer[0..capacity]);
+        if (capacity < "—".len) {
+            try std.testing.expect(text == null);
+            continue;
+        }
+        const expected = if (capacity < "—🐟".len) "—" else if (capacity < "—🐟́".len) "—🐟" else "—🐟́";
+        try std.testing.expectEqualStrings(expected, text.?);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text.?));
+    }
+}
+
 test "box drawing mappings preserve tee directions and line styles" {
     try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light, .left = .light }, boxLinesForCodepoint(0x2534).?); // ┴
     try std.testing.expectEqual(BoxLines{ .right = .light, .down = .light, .left = .light }, boxLinesForCodepoint(0x252c).?); // ┬
@@ -3135,4 +3251,63 @@ test "selection rows are absolute so scrolling moves the highlight with its text
     // Fully scrolled out.
     try std.testing.expect(viewportSelectionRange(start, end, 20, 10) == null);
     try std.testing.expect(viewportSelectionRange(start, end, 0, 10) == null);
+}
+
+test "terminal pane menu keys skip disabled rows and never reach terminal input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try @import("../state/storage.zig").Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try app_state.AppState.init(allocator, &storage, @import("../app/config.zig").AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    const previous_hits = hit_cache;
+    defer {
+        hit_cache = previous_hits;
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    hit_cache.menu_open = true;
+    hit_cache.menu_count = 0;
+    hit_cache.menu_dock_id = 999999; // An off-screen/closed dock.
+    try std.testing.expect(!menuOpen());
+    try std.testing.expect(!workspaceMenuOpen());
+    try std.testing.expect(!handlePaletteKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(!handlePaletteKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(!handleMouseButtonInPanes(&state, 1, 1, 1, true, 1));
+    try std.testing.expect(!menuRequested());
+    hit_cache.menu_open = true;
+    hit_cache.menu_dock_id = STANDALONE_DOCK_ID;
+    hit_cache.menu_count = 1;
+    try std.testing.expect(standaloneMenuOpen());
+    try std.testing.expect(!workspaceMenuOpen());
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(!standaloneMenuOpen());
+    hit_cache.menu_open = true;
+    try std.testing.expect(!handleStandaloneMenuKeyDown(&state, &.{ .key = .character, .codepoint = 'a' }));
+    try std.testing.expect(!menuRequested()); // The auth character may proceed to onboarding.
+    hit_cache.menu_open = true;
+    try std.testing.expect(!handleStandaloneMenuKeyDown(&state, &.{ .key = .v, .mod = .{ .ctrl = true } }));
+    try std.testing.expect(!menuRequested()); // Paste shortcuts may proceed too.
+    hit_cache.menu_open = true;
+    hit_cache.menu_dock_id = 1;
+    hit_cache.menu_count = 3;
+    hit_cache.menu_focus_action = null;
+    hit_cache.menu_hits[0] = .{ .action = .copy_selection, .enabled = true };
+    hit_cache.menu_hits[1] = .{ .action = .copy_link, .enabled = false };
+    hit_cache.menu_hits[2] = .{ .action = .close_pane, .enabled = true };
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .down }));
+    try std.testing.expectEqual(TerminalContextMenuAction.copy_selection, hit_cache.menu_focus_action.?);
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .down }));
+    try std.testing.expectEqual(TerminalContextMenuAction.close_pane, hit_cache.menu_focus_action.?);
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .down }));
+    try std.testing.expectEqual(TerminalContextMenuAction.copy_selection, hit_cache.menu_focus_action.?);
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
+    try std.testing.expect(handlePaletteKeyDown(&state, &.{ .key = .escape }));
+    try std.testing.expect(!menuOpen());
+    try std.testing.expect(!handlePaletteKeyDown(&state, &.{ .key = .character, .codepoint = 'x' }));
 }

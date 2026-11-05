@@ -24,6 +24,11 @@ const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
+const context_menu = @import("context_menu.zig");
+const tooltip = @import("tooltip.zig");
+const sidebar = @import("sidebar.zig");
+const ui_layout = @import("layout.zig");
+const command_palette = @import("command_palette.zig");
 const theme = @import("theme.zig");
 const workspace_identity = @import("workspace_identity.zig");
 
@@ -37,9 +42,11 @@ const WORKSPACE_HEADER_CONTROL_GAP_CSS: f32 = 6.0;
 /// Total composer footprint: the framed editor plus the directory strip
 /// under it (toolbar_height 32 + toolbar_gap 10 in the composer config).
 const COMPOSER_HEIGHT: f32 = 262.0;
-/// Floor keeps ~2 lines of prompt text visible above the inner toolbar even
-/// in short panes, after the 42px directory strip is taken out.
+/// Floor of the growth cap: keeps ~2 lines of prompt text visible above the
+/// inner toolbar even in short panes, after the 42px directory strip.
 const COMPOSER_MIN_HEIGHT: f32 = 176.0;
+/// Lines an empty prompt box shows; it grows with its text up to the cap.
+const COMPOSER_EMPTY_LINES: f32 = 2.0;
 /// Compact read-only strip used instead of the prompt box on subagent panes.
 const SUBAGENT_COMPOSER_HEIGHT: f32 = 72.0;
 const SUBAGENT_COMPOSER_MIN_HEIGHT: f32 = 60.0;
@@ -77,6 +84,9 @@ const BANG_MODE_BANNER_HEIGHT: f32 = 54.0;
 const APPROVAL_CARD_HEIGHT: f32 = 164.0;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
+/// Pane-header Commit / Open dropdowns: the same layer as the pane "…"
+/// context menu (`workspace_panes.PANE_CONTEXT_MENU_Z`), above toasts.
+const HEADER_MENU_Z: i32 = 180;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 13.0;
 /// Provider logo slot in the model pill.
@@ -102,6 +112,10 @@ const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = app_state.PALETTE_COMPOSER_FONT_SIZE;
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 18;
+/// Advance of one cell in fixed-cell text (`queueFixedText*`). Wrapping must
+/// use the same cell the renderer draws with, or long tool output paints past
+/// its card's inner edge.
+const FIXED_TEXT_CELL_EM: f32 = 0.55;
 // Once the visible tail is ready, cold history advances one row per frame.
 // Markdown rows are indivisible, so the row cap is the reliable bound across
 // machines; the elapsed budget prevents cheap grouped rows from accumulating.
@@ -422,6 +436,81 @@ var git_menu_pane_id: ?app_state.WorkspacePaneId = null;
 fn closeGitMenu() void {
     git_menu_open = false;
     git_menu_pane_id = null;
+    header_menu_keyboard_index = null;
+}
+
+/// Keyboard-highlighted row in whichever header dropdown is open (the Open
+/// menu or the git menu); null until an arrow key moves it.
+var header_menu_keyboard_index: ?usize = null;
+
+/// True while a pane-header dropdown (folder/Open menu or git menu) is open.
+pub fn headerMenuOpen(state: *const app_state.AppState) bool {
+    return git_menu_open or state.workspace_header_open_menu_open;
+}
+
+/// Closes the pane-header dropdowns (folder/Open menu and git menu).
+pub fn closeHeaderMenus(state: *app_state.AppState) void {
+    const was_open = headerMenuOpen(state);
+    closeGitMenu();
+    state.workspace_header_open_menu_open = false;
+    state.workspace_header_open_menu_pane_id = null;
+    header_menu_keyboard_index = null;
+    if (was_open) state.markDirty();
+}
+
+/// Keys for an open pane-header dropdown. The open menu owns the keys:
+/// Escape/Tab close it, Up/Down/Home/End move the highlight across enabled
+/// rows, Enter/Space run the highlighted row like a click. Returns true when
+/// consumed (always, while a header menu is open).
+pub fn handleHeaderMenuKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!headerMenuOpen(state)) return false;
+    defer state.markDirty();
+    if (!event.down) return true;
+    if (event.key == .escape or event.key == .tab) {
+        closeHeaderMenus(state);
+        return true;
+    }
+    const RowRef = struct { rect: palette.Rect, enabled: bool };
+    var rows: [8]RowRef = undefined;
+    var count: usize = 0;
+    if (gitMenuHit()) |hit| {
+        for (0..hit.git_menu_row_count) |i| {
+            rows[count] = .{ .rect = hit.git_menu_row_rects[i], .enabled = hit.git_menu_row_enabled[i] };
+            count += 1;
+        }
+    } else if (workspaceHeaderMenuHit(state)) |hit| {
+        for (0..hit.menu_row_count) |i| {
+            rows[count] = .{ .rect = hit.menu_row_rects[i], .enabled = hit.menu_row_enabled[i] };
+            count += 1;
+        }
+    }
+    if (count == 0) return true;
+    switch (event.key) {
+        .up, .down, .home, .end => {
+            var index: usize = switch (event.key) {
+                .home => 0,
+                .end => count - 1,
+                .up => if (header_menu_keyboard_index) |i| (@min(i, count - 1) + count - 1) % count else count - 1,
+                else => if (header_menu_keyboard_index) |i| (@min(i, count - 1) + 1) % count else 0,
+            };
+            // Skip disabled rows in the direction of travel.
+            const step_back = event.key == .up or event.key == .end;
+            var tries: usize = 0;
+            while (!rows[index].enabled and tries < count) : (tries += 1) {
+                index = if (step_back) (index + count - 1) % count else (index + 1) % count;
+            }
+            if (rows[index].enabled) header_menu_keyboard_index = index;
+        },
+        .@"return", .space => if (header_menu_keyboard_index) |i| {
+            if (i < count and rows[i].enabled) {
+                const r = rows[i].rect;
+                _ = handleWorkspaceHeaderPaletteMouseButton(state, r.x + r.w * 0.5, r.y + r.h * 0.5, true);
+            }
+            closeHeaderMenus(state);
+        },
+        else => {},
+    }
+    return true;
 }
 
 fn gitMenuHit() ?*WorkspaceHeaderHitCache {
@@ -594,10 +683,17 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
 
     // ~30% shorter than the original (0.14 / 54 / 82) clamp: scale each bound by 0.7.
     const header_height = theme.clampf(rect.h * 0.098, theme.scaledUi(38.0), theme.scaledUi(TOP_BAR_HEIGHT));
+    // A3: the prompt box hugs its content: an empty composer shows
+    // COMPOSER_EMPTY_LINES lines and grows line by line up to the old fixed
+    // size (32% of the pane, clamped), after which the text scrolls inside it.
+    const composer_cap = theme.clampf(rect.h * 0.32, theme.scaledUi(COMPOSER_MIN_HEIGHT), theme.scaledUi(COMPOSER_HEIGHT));
     const composer_height = if (subagent_view)
         theme.clampf(rect.h * 0.12, theme.scaledUi(SUBAGENT_COMPOSER_MIN_HEIGHT), theme.scaledUi(SUBAGENT_COMPOSER_HEIGHT))
+    else if (live_composer)
+        @min(state.composer_controller.composer.preferredHeight(COMPOSER_EMPTY_LINES, composerFollowupHintReserve(state)), composer_cap)
     else
-        theme.clampf(rect.h * 0.32, theme.scaledUi(COMPOSER_MIN_HEIGHT), theme.scaledUi(COMPOSER_HEIGHT));
+        // Inactive panes show only the draft's first line.
+        @min(state.composer_controller.composer.minimumHeight(COMPOSER_EMPTY_LINES), composer_cap);
     // Lifted off the panel edge so the toolbar pills (and the popovers that
     // open above them) never sit flush against the bottom of the window.
     const bottom_margin = theme.clampf(rect.h * 0.028, theme.scaledUi(14.0), theme.scaledUi(22.0));
@@ -609,6 +705,14 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         0.0;
 
     const header = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_height };
+    // The git / update card stack floats over this pane's top right (the
+    // transcript runs under it); header tooltips stay off that band. It
+    // depends only on last frame's card rects.
+    const card_reserve = ui_layout.topCardReserve(state, rect);
+    pane_top_card_band = if (card_reserve > 0.0)
+        .{ .x = rect.x, .y = rect.y + header_height, .w = rect.w, .h = @min(card_reserve, rect.h * 0.5) }
+    else
+        .{};
 
     const composer_bottom = if (terminal_height > 0.0)
         rect.y + rect.h - terminal_height - terminal_gap
@@ -706,6 +810,9 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     // Agents the turn waits on, pinned just above the background commands.
     var agents_bar: AgentsBar = undefined;
     const show_agents_bar = !blocked_by_quick and !subagent_view and agentsBarFor(state, live_composer, &agents_bar);
+    // A1: while this pane's agents banner shows a live wait, it owns the
+    // turn's timer and running state; the transcript below goes quiet.
+    agents_bar_owns_turn_status = show_agents_bar and agents_bar.mode == .working;
     const agents_bar_reserve = if (show_agents_bar)
         theme.scaledUi(AGENTS_BAR_HEIGHT_CSS) + theme.scaledUi(8.0)
     else
@@ -1237,11 +1344,12 @@ pub fn agentActivityForPane(state: *app_state.AppState, pane_id: app_state.Works
 
 /// Accent for an agent summary: attention reads yellow, failures danger,
 /// live work accent.
+/// Sidebar status roles: waiting for input = warning, running, failed, done.
 pub fn agentActivityColor(activity: AgentActivity) [4]f32 {
-    if (activity.attention > 0) return theme.COLOR_YELLOW;
-    if (activity.active > 0) return theme.accent();
-    if (activity.failed > 0) return theme.danger();
-    return theme.success();
+    if (activity.attention > 0) return theme.warning();
+    if (activity.active > 0) return theme.statusRunning();
+    if (activity.failed > 0) return theme.statusFailed();
+    return theme.statusSuccess();
 }
 
 /// Short sidebar status for a working chat that is waiting on agents
@@ -1304,6 +1412,15 @@ fn agentBarMemory(thread_key: u64, now_ms: i64) *AgentBarMemory {
 }
 
 const AgentBarMode = enum { hidden, working, all_done };
+
+/// Set per pane render (layout pass, before the transcript and header): the
+/// band under the pane header covered by the git / update card stack, or an
+/// empty rect. Transcript content starts below it.
+var pane_top_card_band: palette.Rect = .{};
+
+/// Set per pane render (layout pass, before the transcript): the agents
+/// banner is showing a live wait, so the running tool group shows counts only.
+var agents_bar_owns_turn_status: bool = false;
 
 /// Advances the thread's bar memory with this frame's activity and decides
 /// what the bar shows. The bar hides on dismissal until the spawn signature
@@ -1456,13 +1573,14 @@ fn agentsBarFor(state: *app_state.AppState, live_composer: bool, out: *AgentsBar
 
 fn agentsBarHeadline(buf: []u8, bar: *const AgentsBar) []const u8 {
     const activity = bar.activity;
-    if (bar.mode == .all_done) {
-        if (bar.done_failed > 0) return std.fmt.bufPrint(buf, "{d} agent{s} finished \u{00B7} {d} failed", .{ bar.done_total, if (bar.done_total == 1) "" else "s", bar.done_failed }) catch "Agents finished";
-        if (bar.done_total <= 1) return "\u{2713} Agent done";
-        return std.fmt.bufPrint(buf, "\u{2713} All {d} agents done", .{bar.done_total}) catch "Agents done";
-    }
     const elapsed = bar.elapsed();
     const sep: []const u8 = if (elapsed.len > 0) " \u{00B7} " else "";
+    if (bar.mode == .all_done) {
+        // The leading status mark is the check; the words carry no glyph.
+        if (bar.done_failed > 0) return std.fmt.bufPrint(buf, "{d} agent{s} finished \u{00B7} {d} failed{s}{s}", .{ bar.done_total, if (bar.done_total == 1) "" else "s", bar.done_failed, sep, elapsed }) catch "Agents finished";
+        if (bar.done_total <= 1) return std.fmt.bufPrint(buf, "Agent done{s}{s}", .{ sep, elapsed }) catch "Agent done";
+        return std.fmt.bufPrint(buf, "All {d} agents done{s}{s}", .{ bar.done_total, sep, elapsed }) catch "Agents done";
+    }
     if (activity.attention > 0) {
         return std.fmt.bufPrint(buf, "{d} agent{s} need{s} input{s}{s}", .{ activity.attention, if (activity.attention == 1) "" else "s", if (activity.attention == 1) "s" else "", sep, elapsed }) catch "Agent needs input";
     }
@@ -1481,7 +1599,7 @@ fn renderAgentsBar(state: *app_state.AppState, rect: palette.Rect, bar: *const A
     const mouse_y = state.transcript_controller.palette_mouse_y;
     const done = bar.mode == .all_done;
     const tone = if (done)
-        (if (bar.done_failed > 0) theme.danger() else theme.success())
+        (if (bar.done_failed > 0) theme.statusFailed() else theme.statusSuccess())
     else
         agentActivityColor(bar.activity);
     queuePanel(
@@ -1494,11 +1612,16 @@ fn renderAgentsBar(state: *app_state.AppState, rect: palette.Rect, bar: *const A
     );
     const pad = theme.scaledUi(12.0);
     const cy = rect.y + rect.h * 0.5;
-    const dot_status: linked_chats.Status = if (done)
-        (if (bar.done_failed > 0) .failed else .completed)
-    else
-        bar.activity.urgent;
-    queueLinkedChatStatusDot(state, rect.x + pad, cy, dot_status, rect);
+    // Shared status marks: check / cross once every agent settled, the
+    // waiting mark while this turn waits on its agents, else the most urgent
+    // agent's own mark (an approval wait is a waiting dot too).
+    if (done) {
+        queueLinkedChatStatusDot(state, rect.x + pad, cy, if (bar.done_failed > 0) .failed else .completed, rect);
+    } else if (bar.activity.attention == 0 and bar.activity.waiting()) {
+        queueWaitingStatusMark(state, rect.x + pad, cy, rect);
+    } else {
+        queueLinkedChatStatusDot(state, rect.x + pad, cy, bar.activity.urgent, rect);
+    }
 
     // Right controls, laid out right to left: dismiss, then View.
     const control = theme.scaledUi(24.0);
@@ -1534,7 +1657,8 @@ fn renderAgentsBar(state: *app_state.AppState, rect: palette.Rect, bar: *const A
     const headline = truncateUiLabel(&headline_trunc, headline_raw, @max(controls_left - text_x, 0.0), headline_font);
     const headline_w = chromeLabelWidth(headline_font, headline);
     queueChromeLabel(state, .{ .x = text_x, .y = cy - headline_font * 0.7, .w = headline_w, .h = headline_font * 1.4 }, headline, paletteColor(theme.COLOR_WHITE), headline_font, rect);
-    if (done) return;
+    // Settled agents keep their chips (check / cross marks), mirroring the
+    // waiting banner, so the done state still names who finished.
 
     // Agent chips fill what is left; overflow collapses into "+N".
     const chip_font = theme.scaledUi(12.0);
@@ -1692,9 +1816,47 @@ fn renderLinkedChatsEmpty(state: *app_state.AppState, rect: palette.Rect, title:
     const body_font = theme.scaledUi(12.0);
     const y = rect.y + @max(rect.h * 0.3, pad);
     queueChromeLabel(state, .{ .x = rect.x + pad, .y = y, .w = width, .h = title_font * 1.4 }, title, paletteColor(theme.COLOR_WHITE), title_font, rect);
-    var line_buf: [256]u8 = undefined;
-    const line = truncateUiLabel(&line_buf, body, width, body_font);
-    queueChromeLabel(state, .{ .x = rect.x + pad, .y = y + title_font * 1.4 + theme.scaledUi(6.0), .w = width, .h = body_font * 1.4 }, line, paletteColor(theme.COLOR_TEXT_MUTED), body_font, rect);
+    // The body wraps (measured, at word boundaries) instead of ellipsizing
+    // mid-sentence in a narrow side panel; only an overlong last line clips.
+    var lines: [4][]const u8 = undefined;
+    const line_count = wrapUiWords(body, width, body_font, &lines);
+    var line_y = y + title_font * 1.4 + theme.scaledUi(6.0);
+    for (lines[0..line_count], 0..) |raw_line, index| {
+        var line_buf: [256]u8 = undefined;
+        const line = if (index + 1 == line_count) truncateUiLabel(&line_buf, raw_line, width, body_font) else raw_line;
+        queueChromeLabel(state, .{ .x = rect.x + pad, .y = line_y, .w = width, .h = body_font * 1.4 }, line, paletteColor(theme.COLOR_TEXT_MUTED), body_font, rect);
+        line_y += body_font * 1.45;
+    }
+}
+
+/// Greedy word wrap of `text` into at most `out.len` lines no wider than
+/// `max_w` in the `.ui` face. Text past the last line is appended to it (the
+/// caller ellipsizes). Returns the line count.
+fn wrapUiWords(text: []const u8, max_w: f32, font_size: f32, out: [][]const u8) usize {
+    const trimmed = std.mem.trim(u8, text, " ");
+    if (trimmed.len == 0 or out.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < trimmed.len and count < out.len) {
+        if (count + 1 == out.len) {
+            out[count] = trimmed[start..];
+            return count + 1;
+        }
+        var end = start;
+        var last_fit = start;
+        while (end < trimmed.len) {
+            const next_space = std.mem.indexOfScalarPos(u8, trimmed, end + 1, ' ') orelse trimmed.len;
+            if (chromeLabelWidth(font_size, trimmed[start..next_space]) > max_w and last_fit > start) break;
+            last_fit = next_space;
+            end = next_space;
+            if (next_space >= trimmed.len) break;
+        }
+        out[count] = trimmed[start..last_fit];
+        count += 1;
+        start = last_fit;
+        while (start < trimmed.len and trimmed[start] == ' ') start += 1;
+    }
+    return count;
 }
 
 /// Registers the pane's thread as a wanted parent (so polling starts) and
@@ -1754,14 +1916,15 @@ fn appendSidebarSubagent(state: *app_state.AppState, rows: *std.ArrayList(Sideba
     rows.append(state.allocator, row) catch {};
 }
 
-/// Live work is accent-colored (and pulses); settled work drops to grey so
-/// running and done rows never share a hue.
+/// Shared status roles, as the sidebar uses them: running never shares a hue
+/// with done, and a state also reads by its mark's shape (see
+/// `queueLinkedChatStatusDot`), never by colour alone.
 fn linkedChatStatusColor(status: linked_chats.Status) [4]f32 {
     return switch (status) {
-        .running => theme.accent(),
-        .waiting_approval, .blocked => theme.COLOR_YELLOW,
-        .completed => theme.COLOR_TEXT_SUBTLE,
-        .failed, .aborted, .interrupted => theme.danger(),
+        .running => theme.statusRunning(),
+        .waiting_approval, .blocked => theme.warning(),
+        .completed => theme.statusSuccess(),
+        .failed, .aborted, .interrupted => theme.statusFailed(),
         .idle, .unknown => theme.COLOR_TEXT_SUBTLE,
     };
 }
@@ -1771,23 +1934,29 @@ fn linkedChatStatusColor(status: linked_chats.Status) [4]f32 {
 fn linkedChatStatusPulse(state: *app_state.AppState, status: linked_chats.Status) f32 {
     if (!status.isActive() or state.app_config.reduced_motion.status_pulse) return 1.0;
     state.sidebar_pulse_animating = true;
-    return theme.activityPulse(profiler.nowNs());
+    // Same floor as the sidebar's `attentionPulse`: the breathing dot never
+    // fades out entirely.
+    return 0.35 + 0.65 * theme.activityPulse(profiler.nowNs());
 }
 
-/// Status pip for a linked chat or subagent row: a breathing dot with a soft
-/// expanding halo while active, a flat dot once settled.
+/// Status mark for a linked chat, subagent, banner or pill: the sidebar's
+/// own `queueStatusMark` set, so a state looks the same on every surface —
+/// ring = running, pulsing dot = waiting (approval / blocked), check = done,
+/// cross = failed, plain dot = idle. Centred at (`x` + 4px, `cy`).
 fn queueLinkedChatStatusDot(state: *app_state.AppState, x: f32, cy: f32, status: linked_chats.Status, clip: palette.Rect) void {
-    const color = linkedChatStatusColor(status);
-    const r = theme.scaledUi(4.0);
-    const cx = x + r;
-    if (status.isActive()) {
-        const pulse = linkedChatStatusPulse(state, status);
-        const halo_r = r * (1.4 + 0.8 * pulse);
-        queueRoundedClipped(state, .{ .x = cx - halo_r, .y = cy - halo_r, .w = halo_r * 2.0, .h = halo_r * 2.0 }, paletteColor(theme.withAlpha(color, @intFromFloat(20.0 + (1.0 - pulse) * 50.0))), halo_r, clip);
-        queueRoundedClipped(state, .{ .x = cx - r, .y = cy - r, .w = r * 2.0, .h = r * 2.0 }, paletteColor(theme.withAlpha(color, @intFromFloat(140.0 + pulse * 115.0))), r, clip);
-        return;
-    }
-    queueRoundedClipped(state, .{ .x = cx - r, .y = cy - r, .w = r * 2.0, .h = r * 2.0 }, paletteColor(color), r, clip);
+    const kind: sidebar.StatusMark = switch (status) {
+        .running => .working,
+        .completed => .check,
+        .failed, .aborted, .interrupted => .cross,
+        .waiting_approval, .blocked, .idle, .unknown => .dot,
+    };
+    sidebar.queueStatusMark(state, kind, x + theme.scaledUi(4.0), cy, linkedChatStatusColor(status), linkedChatStatusPulse(state, status), clip);
+}
+
+/// The parent turn itself waiting on its agents: the sidebar's waiting mark,
+/// a pulsing dot in `theme.warning()`.
+fn queueWaitingStatusMark(state: *app_state.AppState, x: f32, cy: f32, clip: palette.Rect) void {
+    sidebar.queueStatusMark(state, .dot, x + theme.scaledUi(4.0), cy, theme.warning(), linkedChatStatusPulse(state, .waiting_approval), clip);
 }
 
 /// Meta-line color: active rows read in their (pulsing) status color, failures
@@ -1799,7 +1968,7 @@ fn linkedChatMetaColor(state: *app_state.AppState, status: linked_chats.Status) 
             break :blk theme.withAlpha(linkedChatStatusColor(status), @intFromFloat(170.0 + pulse * 85.0));
         },
         .failed, .aborted, .interrupted => linkedChatStatusColor(status),
-        else => theme.COLOR_TEXT_SUBTLE,
+        else => theme.COLOR_TEXT_MUTED,
     };
 }
 
@@ -1820,15 +1989,21 @@ fn linkedChatAgeLabel(buf: []u8, updated_at_ms: i64) []const u8 {
 /// Measured single-line truncation for `.ui`-role labels: one shaping pass
 /// yields per-glyph advances, so no character widths are guessed.
 fn truncateUiLabel(buf: []u8, text: []const u8, max_w: f32, font_size: f32) []const u8 {
+    return truncateRoleLabel(buf, text, max_w, font_size, .ui);
+}
+
+/// `truncateUiLabel` for any font role (untyped `queueText` draws in
+/// `.prose_bold`), so truncation measures the face that actually draws.
+fn truncateRoleLabel(buf: []u8, text: []const u8, max_w: f32, font_size: f32, role: palette.FontRole) []const u8 {
     if (max_w <= 0.0 or text.len == 0) return "";
     const ellipsis = "...";
     var advances: [512]f32 = undefined;
     const measured = text[0..@min(text.len, advances.len)];
-    text_measure.textGlyphAdvances(.ui, measured, font_size, advances[0..measured.len]);
+    text_measure.textGlyphAdvances(role, measured, font_size, advances[0..measured.len]);
     var total: f32 = 0.0;
     for (advances[0..measured.len]) |advance| total += advance;
     if (measured.len == text.len and total <= max_w) return text;
-    const ellipsis_w = chromeLabelWidth(font_size, ellipsis);
+    const ellipsis_w = if (role == .ui) chromeLabelWidth(font_size, ellipsis) else text_measure.textWidth(role, font_size, ellipsis);
     const budget = max_w - ellipsis_w;
     if (budget <= 0.0) return "";
     var used: f32 = 0.0;
@@ -1904,7 +2079,7 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
     var controls_left = if (embedded) header.x + header.w - pad + theme.scaledUi(4.0) + control_gap else chevron_rect.x;
     if (parent.hasFinished()) {
         const label = "Clear done";
-        const label_font = theme.scaledUi(11.0);
+        const label_font = theme.scaledUi(12.0);
         const pill_w = chromeLabelWidth(label_font, label) + theme.scaledUi(16.0);
         const pill = snapRect(.{
             .x = controls_left - control_gap - pill_w,
@@ -1957,7 +2132,7 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
     for (entries, 0..) |*entry, index| {
         if (parent_count > 0 and (index == 0 or index == parent_count)) {
             const label = if (index == 0) (if (parent_count == 1) "Parent chat" else "Parent chats") else "Child chats";
-            queueChromeLabel(state, .{ .x = list.x + pad, .y = y + theme.scaledUi(2.0), .w = list.w - pad * 2.0, .h = section_h }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), list_clip);
+            queueChromeLabel(state, .{ .x = list.x + pad, .y = y + theme.scaledUi(2.0), .w = list.w - pad * 2.0, .h = section_h }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), list_clip);
             y += section_h;
         }
         defer y += row_h;
@@ -1972,8 +2147,8 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
     }
     if (layout.subagents.items.len > 0) {
         var label_buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(&label_buf, "{s} Subagents", .{runtime.providerLabel(state.currentThread().provider)}) catch "Subagents";
-        queueChromeLabel(state, .{ .x = list.x + pad, .y = y + theme.scaledUi(2.0), .w = list.w - pad * 2.0, .h = section_h }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), list_clip);
+        const label = std.fmt.bufPrint(&label_buf, "{s} subagents", .{runtime.providerLabel(state.currentThread().provider)}) catch "Subagents";
+        queueChromeLabel(state, .{ .x = list.x + pad, .y = y + theme.scaledUi(2.0), .w = list.w - pad * 2.0, .h = section_h }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), list_clip);
         y += section_h;
         for (layout.subagents.items) |agent| {
             defer y += row_h;
@@ -1993,7 +2168,7 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
             const age = linkedChatAgeLabel(&age_buf, agent.updated_at_ms);
             var meta_buf: [64]u8 = undefined;
             const meta = if (age.len > 0) std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s}", .{ agent.status.label(), age }) catch agent.status.label() else agent.status.label();
-            queueChromeLabel(state, .{ .x = text_x, .y = y + theme.scaledUi(24.0), .w = text_w, .h = theme.scaledUi(16.0) }, meta, paletteColor(linkedChatMetaColor(state, agent.status)), theme.scaledUi(11.0), list_clip);
+            queueChromeLabel(state, .{ .x = text_x, .y = y + theme.scaledUi(24.0), .w = text_w, .h = theme.scaledUi(16.0) }, meta, paletteColor(linkedChatMetaColor(state, agent.status)), theme.scaledUi(12.0), list_clip);
             var index_buf: [32]u8 = undefined;
             const index_text = std.fmt.bufPrint(&index_buf, "{d}", .{agent.message_index}) catch continue;
             const visible = intersectRect(row, list_clip);
@@ -2002,13 +2177,14 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
     }
 }
 
-/// Bounded, UTF-8-safe prefix of a child's one-line summary for the row meta.
-fn linkedChatSummarySnippet(summary: []const u8) []const u8 {
+/// Bounded, UTF-8-safe prefix of a child's one-line summary for the row
+/// meta, as plain text: agents often lead with markdown ("**Overall Score:**"),
+/// which must not leak literal asterisks into a compact row.
+fn linkedChatSummarySnippet(buf: []u8, summary: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, summary, " \t\r\n");
-    if (trimmed.len <= 300) return trimmed;
-    var end: usize = 300;
-    while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
-    return trimmed[0..end];
+    var end: usize = @min(trimmed.len, 300);
+    while (end > 0 and end < trimmed.len and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    return chat_markdown.plainPreviewLine(buf, trimmed[0..end]);
 }
 
 fn renderLinkedChatRow(
@@ -2059,13 +2235,15 @@ fn renderLinkedChatRow(
         .h = title_font * 1.4,
     }, title, paletteColor(if (!entry.is_parent and entry.status.isFinished()) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE), title_font, clip);
 
-    const meta_font = theme.scaledUi(11.0);
+    // 12px floor: the preview is the row's latest outcome, meant to be read.
+    const meta_font = theme.scaledUi(12.0);
     var age_buf: [16]u8 = undefined;
     const age = linkedChatAgeLabel(&age_buf, entry.updated_at_ms);
     var meta_buf: [512]u8 = undefined;
     // Children append their last result (or blocker) so the drawer doubles
     // as an orchestration overview: task (title), state, and latest outcome.
-    const summary = linkedChatSummarySnippet(entry.summary);
+    var summary_buf: [320]u8 = undefined;
+    const summary = linkedChatSummarySnippet(&summary_buf, entry.summary);
     const meta_raw = if (entry.is_parent)
         (if (std.meta.stringToEnum(app_state.Provider, entry.provider)) |provider| runtime.providerLabel(provider) else entry.provider)
     else if (age.len > 0 and summary.len > 0)
@@ -2139,7 +2317,7 @@ fn renderLinkedChatsRail(state: *app_state.AppState, rect: palette.Rect, parent:
     queueRounded(state, badge, paletteColor(theme.withAlpha(badge_color, 56)), badge_d * 0.5);
     var count_buf: [8]u8 = undefined;
     const count = std.fmt.bufPrint(&count_buf, "{d}", .{@min(entries.len + parent.subagent_count, 99)}) catch "9";
-    queueCenteredChromeLabel(state, badge, count, paletteColor(badge_color), theme.scaledUi(10.0), rect);
+    queueCenteredChromeLabel(state, badge, count, paletteColor(badge_color), theme.scaledUi(11.0), rect);
     appendLinkedChatHit(pane_id, rect, .toggle, parent.workspace_id, parent.parent_thread_id, "", "");
 }
 
@@ -2160,6 +2338,7 @@ fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f3
 
 pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
+    header_menu_keyboard_index = null;
     if (state.project_controller.projects.items.len == 0) return false;
 
     if (gitMenuHit()) |menu_hit| {
@@ -2318,6 +2497,7 @@ pub fn workspaceHeaderWantsPointerAt(state: *const app_state.AppState, x: f32, y
 
 pub fn handleFileSearchPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
+    if (!composerAutocompleteVisible(state)) return false;
     if (!state.hasActiveFileSearch()) return false;
     if (file_search_hits.row_count == 0) return false;
     if (!rectContains(file_search_hits.panel_rect, x, y)) return false;
@@ -2334,6 +2514,7 @@ pub fn handleFileSearchPaletteMouseButton(state: *app_state.AppState, x: f32, y:
 
 pub fn handleSlashCommandPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
+    if (!composerAutocompleteVisible(state)) return false;
     if (!state.slashCommandPickerActive()) return false;
     if (slash_picker_hits.row_count == 0) return false;
     if (!rectContains(slash_picker_hits.panel_rect, x, y)) return false;
@@ -2606,6 +2787,7 @@ fn transcriptSelectableBodyKind(
         return if (batch.count == 1) .markdown else null;
     }
     if (role == .system) {
+        if (isTranscriptStatusNotice(role, author)) return null;
         if (isSlashCommandResultMessage(author, body)) return .markdown;
         if (shouldRenderPaletteCommandRow(author, body) or
             isDiffSummaryMessage(author, body) or
@@ -2618,8 +2800,15 @@ fn transcriptSelectableBodyKind(
         }
         return .plain;
     }
-    if (role == .assistant and !muted_body and !assistant_plain_layout) return .markdown;
+    if (!muted_body and transcriptBodyUsesMarkdown(role, assistant_plain_layout)) return .markdown;
     return .plain;
+}
+
+/// Replies and prompts (typed or agent-sent) share one markdown renderer, so
+/// `**bold**` and `` `code` `` in a prompt render instead of showing literally.
+/// Height, paint, selection and copy all branch on this.
+fn transcriptBodyUsesMarkdown(role: app_state.ChatRole, assistant_plain_layout: bool) bool {
+    return (role == .assistant or role == .user) and !assistant_plain_layout;
 }
 
 fn transcriptSelectableBodyRect(
@@ -3451,39 +3640,8 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
 }
 
 fn truncateWorkspaceTitle(buf: []u8, title: []const u8, max_width: f32, font_size: f32) []const u8 {
-    const gw = font_size * 0.52;
-    if (max_width <= 0.0 or buf.len == 0) return "";
-    var total: f32 = 0;
-    var i: usize = 0;
-    while (i < title.len) {
-        const seq = std.unicode.utf8ByteSequenceLength(title[i]) catch return title;
-        const end = @min(i + seq, title.len);
-        total += gw * @max(1.0, @as(f32, @floatFromInt(end - i)));
-        i = end;
-    }
-    if (total <= max_width) {
-        const n = @min(title.len, buf.len);
-        @memcpy(buf[0..n], title[0..n]);
-        return buf[0..n];
-    }
-    const ellipsis = "...";
-    const ellipsis_w = @as(f32, @floatFromInt(ellipsis.len)) * gw;
-    if (ellipsis_w > max_width) return "";
-    i = 0;
-    total = 0;
-    while (i < title.len) {
-        const seq = std.unicode.utf8ByteSequenceLength(title[i]) catch break;
-        const end = @min(i + seq, title.len);
-        const adv = gw * @max(1.0, @as(f32, @floatFromInt(end - i)));
-        if (total + adv + ellipsis_w > max_width) break;
-        total += adv;
-        i = end;
-    }
-    const prefix_len = i;
-    if (prefix_len + ellipsis.len > buf.len) return title;
-    @memcpy(buf[0..prefix_len], title[0..prefix_len]);
-    @memcpy(buf[prefix_len..][0..ellipsis.len], ellipsis);
-    return buf[0 .. prefix_len + ellipsis.len];
+    // The header title is untyped `queueText`, which draws in `.prose_bold`.
+    return truncateRoleLabel(buf, title, max_width, font_size, .prose_bold);
 }
 
 fn queueWorkspaceHeaderFolderIcon(state: *app_state.AppState, x: f32, center_y: f32, color: palette.Color) void {
@@ -3576,15 +3734,16 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(if (subagent) theme.accent() else theme.borderMuted()));
 
     const padding_x = theme.scaledUi(28.0);
-    const title_src: []const u8 = if (thread.committed)
-        if (thread.title.len > 0) thread.title else "New chat"
+    // Older daemons and clients store the placeholder as "New Chat"; show it
+    // in sentence case like the rest of the UI.
+    const title_src: []const u8 = if (thread.committed and thread.title.len > 0 and !std.mem.eql(u8, thread.title, "New Chat"))
+        thread.title
     else
         "New chat";
 
     const button_h = theme.scaledUi(30.0);
     const button_gap = theme.scaledUi(WORKSPACE_HEADER_CONTROL_GAP_CSS);
     const title_gap = theme.scaledUi(16.0);
-    const label_font = theme.scaledUi(14.0);
     const title_font = theme.scaledUi(18.0);
 
     const open_folder = state.defaultOpenShowsFolderIcon();
@@ -3664,6 +3823,21 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             header_hit.git_chevron_rect = git_chevron_rect;
         }
     }
+    // Provider update chip (`[logo Update Grok 1.0.77 | ×]`, drawn by the
+    // layout's toast pass): left of the git button in the focused pane's
+    // header when the title keeps its minimum width; otherwise the update
+    // shows as a floating card.
+    if (paneOwnsActiveChatState(state, pane_id)) {
+        const update_w = ui_layout.headerUpdateChipWidth(state);
+        if (update_w > 0.0) {
+            const chip_h = theme.scaledUi(ui_layout.HEADER_UPDATE_CHIP_H_UI);
+            const chip_x = title_limit_x - button_gap - update_w;
+            if (chip_x - title_x - title_gap >= theme.scaledUi(160.0)) {
+                ui_layout.setHeaderUpdateSlot(snapRect(.{ .x = chip_x, .y = rect.y + @max((rect.h - chip_h) * 0.5, theme.scaledUi(4.0)), .w = update_w, .h = chip_h }));
+                title_limit_x = chip_x;
+            }
+        }
+    }
     const title_max_w = @max(title_limit_x - title_x - title_gap, theme.scaledUi(96.0));
 
     var title_buf: [256]u8 = undefined;
@@ -3714,12 +3888,21 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         queueRect(state, .{ .x = git_chevron_rect.x, .y = whole.y + theme.scaledUi(6.0), .w = theme.scaledUi(1.0), .h = git_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)));
 
         var gx = git_main_rect.x + git_pad_x;
-        queueIconText(state, .{
-            .x = gx,
-            .y = git_main_rect.y + (git_h - git_icon_size) * 0.5,
-            .w = git_icon_size,
-            .h = git_icon_size,
-        }, git_icon, paletteColor(if (git_view.busy_label != null) theme.COLOR_TEXT_MUTED else theme.accent()), git_icon_size, rect);
+        if (git_view.busy_label != null) {
+            // Busy ("Writing message…", "Committing…"): the git toast's
+            // eight-dot spinner, so every surface showing this state matches.
+            drawGitCommitSpinner(state, .{ .x = gx, .y = git_main_rect.y + (git_h - git_icon_size) * 0.5, .w = git_icon_size, .h = git_icon_size }, theme.COLOR_TEXT_MUTED, rect);
+        } else {
+            // Accent only when this chat has something to commit or push;
+            // the zero-files state stays neutral like the label.
+            const idle = if (git_view.button) |button| button.kind == .commit and button.files == 0 else false;
+            queueIconText(state, .{
+                .x = gx,
+                .y = git_main_rect.y + (git_h - git_icon_size) * 0.5,
+                .w = git_icon_size,
+                .h = git_icon_size,
+            }, git_icon, paletteColor(if (idle) theme.COLOR_TEXT_MUTED else theme.accent()), git_icon_size, rect);
+        }
         gx += git_icon_size + git_inner_gap;
         const label_w = chromeLabelWidth(git_font, git_label);
         const label_color = if (git_view.busy_label != null) theme.COLOR_TEXT_MUTED else if (main_hover) theme.COLOR_WHITE else theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.25);
@@ -3727,9 +3910,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         gx += label_w + git_inner_gap;
         if (git_badge.len > 0) {
             const badge_rect = snapRect(.{ .x = gx, .y = git_main_rect.y + (git_h - git_badge_h) * 0.5, .w = git_badge_w, .h = git_badge_h });
-            const tone = if (git_attention) theme.COLOR_YELLOW else theme.COLOR_TEXT_MUTED;
-            queueRounded(state, badge_rect, paletteColor(theme.wash(tone, if (git_attention) 48 else 36)), git_badge_h * 0.5);
-            queueCenteredChromeLabel(state, badge_rect, git_badge, paletteColor(if (git_attention) theme.COLOR_YELLOW else theme.COLOR_WHITE), git_badge_font, rect);
+            // Readable count badge: on-accent text on a solid accent pill when
+            // the changes want attention, else primary text on surface-2.
+            const badge_fill = if (git_attention) theme.accent() else theme.COLOR_PANEL_MUTED;
+            const badge_text = if (git_attention) theme.foregroundOn(badge_fill) else theme.COLOR_WHITE;
+            queueRounded(state, badge_rect, paletteColor(badge_fill), git_badge_h * 0.5);
+            queueCenteredChromeLabel(state, badge_rect, git_badge, paletteColor(badge_text), git_badge_font, rect);
         }
         const git_chevron_size = theme.scaledUi(11.0);
         queueIconText(state, .{
@@ -3780,6 +3966,31 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         .h = chevron_size,
     }, NF_COD_CHEVRON_DOWN, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
 
+    // Delayed tooltips for the icon-only header controls (not while one of
+    // their menus is open, so the tip never covers the rows).
+    if (mouse_ok and !headerMenuOpen(state)) {
+        // Every header tip steers clear of its own header row.
+        // ...and off the git / update card stack below it (A1).
+        const header_avoid = [_]palette.Rect{ rect, pane_top_card_band };
+        const header_row: []const palette.Rect = if (pane_top_card_band.w > 0.0) header_avoid[0..] else header_avoid[0..1];
+        tooltip.queueAvoiding(state, open_main_rect, state.defaultOpenTooltip(), header_row);
+        tooltip.queueAvoiding(state, chevron_rect, "Open with\u{2026}", header_row);
+        if (git_chevron_rect.w > 0.0) tooltip.queueAvoiding(state, git_chevron_rect, "Git actions", header_row);
+        // The main part's count needs words: whose files it counts.
+        if (git_main_rect.w > 0.0 and git_view.busy_label == null) {
+            if (git_view.button) |button| {
+                var tip_buf: [160]u8 = undefined;
+                if (gitHeaderTooltip(&tip_buf, button)) |tip| tooltip.queueAvoiding(state, git_main_rect, tip, header_row);
+            }
+        }
+    }
+
+    // Header dropdowns and key tips float above toasts (z 132) and every
+    // pane surface, at the pane context menu's layer; tooltips sit higher
+    // still (tooltip.zig).
+    const previous_z = state.palette_overlay_batch.setZIndex(HEADER_MENU_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
     const pane_focused = if (pane_id) |id| state.isCurrentProjectWorkspacePaneFocused(id) else true;
     if (state.ctrl_shortcut_hints_visible and state.shift_shortcut_hints_visible and pane_focused) {
         if (state.command_controller.keyboard_config) |config| {
@@ -3789,7 +4000,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     }
 
     if (git_menu_open and paneIdEqual(git_menu_pane_id, pane_id) and git_chevron_rect.w > 0.0) {
-        renderGitMenu(state, header_hit, rect, git_chevron_rect, git_view.menu, label_font);
+        renderGitMenu(state, header_hit, rect, git_chevron_rect, git_view.menu);
     }
 
     if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
@@ -3833,47 +4044,41 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         count += 1;
     }
 
+    // Shared context-menu chrome (panel, row height, 13px `.ui` labels,
+    // hover fill) so header dropdowns match the pane "..." menu.
     const menu_w = theme.scaledUi(250.0);
-    const menu_pad = theme.scaledUi(8.0);
-    const menu_row_h = theme.scaledUi(34.0);
+    const menu_pad = theme.scaledUi(context_menu.PAD_UI);
+    const menu_row_h = headerMenuRowHeight();
     const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(count)) * menu_row_h;
     const menu_x = @max(rect.x + theme.scaledUi(12.0), chevron_rect.x + chevron_rect.w - menu_w);
     const menu_y = chevron_rect.y + chevron_rect.h + theme.scaledUi(6.0);
-    header_hit.menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
-
+    header_hit.menu_panel_rect = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
     const menu_clip = header_hit.menu_panel_rect;
-    queueRounded(state, header_hit.menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
-    queueBorder(state, header_hit.menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
     header_hit.menu_row_count = count;
     var ri: usize = 0;
-    var ry = menu_y + menu_pad;
+    var ry = menu_clip.y + menu_pad;
     while (ri < count) : (ri += 1) {
         header_hit.menu_row_kind[ri] = kinds[ri];
         header_hit.menu_row_enabled[ri] = enabled[ri];
 
         const rr = palette.Rect{
-            .x = menu_x + theme.scaledUi(4.0),
+            .x = menu_clip.x + menu_pad,
             .y = ry,
-            .w = menu_w - theme.scaledUi(8.0),
+            .w = menu_clip.w - menu_pad * 2.0,
             .h = menu_row_h,
         };
         header_hit.menu_row_rects[ri] = rr;
 
         const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
-        if (row_hover) {
-            queueRounded(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
-        }
+        const row_keyboard = header_menu_keyboard_index != null and header_menu_keyboard_index.? == ri and enabled[ri];
+        if (row_hover or row_keyboard) context_menu.queueRowHighlight(state, rr);
 
-        const row_icon_x = rr.x + theme.scaledUi(12.0);
+        const row_icon_slot = theme.scaledUi(HEADER_MENU_ICON_SLOT_UI);
+        const row_icon_x = rr.x + theme.scaledUi(context_menu.LABEL_INSET_UI);
         const row_icon_cy = rr.y + menu_row_h * 0.5;
-        const row_text_x = row_icon_x + theme.scaledUi(18.0) + theme.scaledUi(10.0);
-        const row_col = paletteColor(if (!enabled[ri])
-            theme.COLOR_TEXT_SUBTLE
-        else if (row_hover)
-            theme.COLOR_WHITE
-        else
-            theme.COLOR_TEXT_MUTED);
+        const row_rgba = context_menu.labelColor(enabled[ri], row_hover or row_keyboard);
+        const row_col = paletteColor(row_rgba);
 
         const editor_target: ?app_state.ProjectEditorTarget = switch (kinds[ri]) {
             .folder => null,
@@ -3882,13 +4087,14 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             .vscode => .vscode,
             .zed => .zed,
         };
+        const icon_size = theme.scaledUi(16.0);
         if (editor_target) |target| {
             // Editor logos are monochrome masks tinted like the folder glyph
             // so they never read as AI-provider brand marks.
             if (state.editorLogoTextureForTarget(target)) |cached| {
-                const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_size, icon_size);
                 queueTintedImage(state, .{
-                    .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                    .x = row_icon_x + (icon_size - scaled[0]) * 0.5,
                     .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
                     .w = scaled[0],
                     .h = scaled[1],
@@ -3898,26 +4104,59 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             queueWorkspaceHeaderFolderIcon(state, row_icon_x, row_icon_cy, row_col);
         }
 
-        queueFixedTextLine(state, .{
-            .x = row_text_x,
-            .y = rr.y + (menu_row_h - label_font * 1.25) * 0.5,
-            .w = rr.w - (row_text_x - rr.x) - theme.scaledUi(8.0),
-            .h = label_font * 1.25,
-        }, stableText(state, labels[ri]), row_col, label_font, menu_clip);
+        context_menu.queueLabel(state, rr, labels[ri], row_rgba, row_icon_slot, 0.0, menu_clip);
 
         ry += menu_row_h;
     }
 }
 
+/// Leading room for a header-menu row icon (folder, editor logo, git glyph).
+const HEADER_MENU_ICON_SLOT_UI: f32 = 26.0;
+
+/// Header dropdown rows follow the shared context-menu row height, never
+/// below 32 logical px.
+fn headerMenuRowHeight() f32 {
+    return theme.scaledUi(@max(context_menu.ROW_HEIGHT_UI, 32.0));
+}
+
 /// The git split button's menu: Commit…, Commit & push, and Push / Pull &
 /// push when they apply. Rows are disabled while a git action runs.
+/// Tooltip for the header git button's count, worded as the counterpart of
+/// the Changes panel's Commit tip ("Commit workspace changes · N files total.
+/// The chat header counts files changed by that chat."). The badge counts
+/// only files this chat owns (what the quick commit takes); shared and
+/// unclear files are left out. Push counts unpushed commits.
+fn gitHeaderTooltip(buf: []u8, button: git_changes.HeaderButton) ?[]const u8 {
+    switch (button.kind) {
+        .push => return std.fmt.bufPrint(buf, "Push {d} commit{s} not pushed yet", .{ button.ahead, if (button.ahead == 1) "" else "s" }) catch null,
+        .commit, .commit_and_push => {
+            if (button.files == 0) return "Nothing from this chat to commit yet. The Changes panel lists every workspace change.";
+            const left_out: []const u8 = if (button.attention) "; shared or unclear files are left out" else "";
+            return std.fmt.bufPrint(buf, "Commit this chat's changes \u{00B7} {d} file{s}{s}. The Changes panel lists every workspace change.", .{ button.files, if (button.files == 1) "" else "s", left_out }) catch null;
+        },
+    }
+}
+
+test "git header tooltip explains whose files the count covers" {
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Commit this chat's changes \u{00B7} 3 files. The Changes panel lists every workspace change.",
+        gitHeaderTooltip(&buf, .{ .kind = .commit_and_push, .files = 3 }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Commit this chat's changes \u{00B7} 1 file; shared or unclear files are left out. The Changes panel lists every workspace change.",
+        gitHeaderTooltip(&buf, .{ .kind = .commit, .files = 1, .attention = true }).?,
+    );
+    try std.testing.expectEqualStrings("Push 2 commits not pushed yet", gitHeaderTooltip(&buf, .{ .kind = .push, .ahead = 2 }).?);
+    try std.testing.expectEqualStrings("Nothing from this chat to commit yet. The Changes panel lists every workspace change.", gitHeaderTooltip(&buf, .{ .kind = .commit, .files = 0, .attention = true }).?);
+}
+
 fn renderGitMenu(
     state: *app_state.AppState,
     header_hit: *WorkspaceHeaderHitCache,
     rect: palette.Rect,
     anchor: palette.Rect,
     menu: git_changes.HeaderMenu,
-    label_font: f32,
 ) void {
     var kinds: [4]GitMenuRow = undefined;
     var enabled: [4]bool = undefined;
@@ -3943,31 +4182,25 @@ fn renderGitMenu(
     const my = state.transcript_controller.palette_mouse_y;
     const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
     const menu_w = theme.scaledUi(220.0);
-    const menu_pad = theme.scaledUi(6.0);
-    const menu_row_h = theme.scaledUi(32.0);
+    const menu_pad = theme.scaledUi(context_menu.PAD_UI);
+    const menu_row_h = headerMenuRowHeight();
     const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(count)) * menu_row_h;
     const menu_x = @max(rect.x + theme.scaledUi(12.0), anchor.x + anchor.w - menu_w);
     const menu_y = anchor.y + anchor.h + theme.scaledUi(6.0);
-    header_hit.git_menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    header_hit.git_menu_panel_rect = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
     const menu_clip = header_hit.git_menu_panel_rect;
-    queueRounded(state, menu_clip, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
-    queueBorder(state, menu_clip, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
 
     header_hit.git_menu_row_count = count;
-    var ry = menu_y + menu_pad;
+    var ry = menu_clip.y + menu_pad;
     for (0..count) |ri| {
         header_hit.git_menu_row_kind[ri] = kinds[ri];
         header_hit.git_menu_row_enabled[ri] = enabled[ri];
-        const rr = palette.Rect{ .x = menu_x + theme.scaledUi(4.0), .y = ry, .w = menu_w - theme.scaledUi(8.0), .h = menu_row_h };
+        const rr = palette.Rect{ .x = menu_clip.x + menu_pad, .y = ry, .w = menu_clip.w - menu_pad * 2.0, .h = menu_row_h };
         header_hit.git_menu_row_rects[ri] = rr;
         const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
-        if (row_hover) queueRounded(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(7.0));
-        const row_col = paletteColor(if (!enabled[ri])
-            theme.COLOR_TEXT_SUBTLE
-        else if (row_hover)
-            theme.COLOR_WHITE
-        else
-            theme.COLOR_TEXT_MUTED);
+        const row_keyboard = header_menu_keyboard_index != null and header_menu_keyboard_index.? == ri and enabled[ri];
+        if (row_hover or row_keyboard) context_menu.queueRowHighlight(state, rr);
+        const row_rgba = context_menu.labelColor(enabled[ri], row_hover or row_keyboard);
         const icon: []const u8 = switch (kinds[ri]) {
             .commit => NF_COD_GIT_COMMIT,
             .commit_and_push => NF_COD_CLOUD_UPLOAD,
@@ -3981,15 +4214,9 @@ fn renderGitMenu(
             .pull_push => "Pull & push",
         };
         const icon_size = theme.scaledUi(15.0);
-        const icon_x = rr.x + theme.scaledUi(10.0);
-        queueIconText(state, .{ .x = icon_x, .y = rr.y + (menu_row_h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, row_col, icon_size, menu_clip);
-        const text_x = icon_x + icon_size + theme.scaledUi(10.0);
-        queueFixedTextLine(state, .{
-            .x = text_x,
-            .y = rr.y + (menu_row_h - label_font * 1.25) * 0.5,
-            .w = rr.w - (text_x - rr.x) - theme.scaledUi(8.0),
-            .h = label_font * 1.25,
-        }, label, row_col, label_font, menu_clip);
+        const icon_x = rr.x + theme.scaledUi(context_menu.LABEL_INSET_UI);
+        queueIconText(state, .{ .x = icon_x, .y = rr.y + (menu_row_h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, paletteColor(row_rgba), icon_size, menu_clip);
+        context_menu.queueLabel(state, rr, label, row_rgba, theme.scaledUi(HEADER_MENU_ICON_SLOT_UI), 0.0, menu_clip);
         ry += menu_row_h;
     }
 }
@@ -3997,16 +4224,17 @@ fn renderGitMenu(
 // Workspace header Ctrl+Shift hint beside the focused pane's Open control.
 fn renderWorkspaceHeaderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, clip: palette.Rect, label: []const u8) void {
     if (label.len == 0) return;
-    const size = theme.scaledUi(15.0);
-    const tip_rect: palette.Rect = .{
-        .x = target.x - size + theme.scaledUi(2.5),
-        .y = target.y + (target.h - size) * 0.5,
-        .w = size,
-        .h = size,
-    };
-    queuePanel(state, tip_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
-    const font_size = theme.scaledUi(9.5);
+    const font_size = theme.scaledUi(KEY_TIP_FONT);
     const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    const size = theme.scaledUi(KEY_TIP_SIZE);
+    const tip_w = keyTipWidth(text_w);
+    const tip_rect = snapRect(.{
+        .x = target.x - tip_w + theme.scaledUi(2.5),
+        .y = target.y + (target.h - size) * 0.5,
+        .w = tip_w,
+        .h = size,
+    });
+    queuePanel(state, tip_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), @max(@round(theme.scaledUi(1.0)), 1.0));
     queueText(state, .{
         .x = tip_rect.x + @max((tip_rect.w - text_w) * 0.5, 0.0),
         .y = tip_rect.y + (tip_rect.h - font_size * 1.25) * 0.5,
@@ -4533,10 +4761,34 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, lane:
     if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
     if (active_geometry) logTranscriptStreamSettled(thread, has_pending_stream, content_height, max_scroll, scroll_y, saved_scroll, follow_tail, column.h);
 
-    var content_y = renderCommittedTranscript(state, thread, column, scroll_y, clip);
+    // A1: while the turn's status is pinned, the top of the viewport is a
+    // reserved strip: content is clipped below it, so the pill never sits on
+    // (or fades) a line of text. Whether the pill shows is only known after
+    // the pending pass, so the strip follows the previous frame's result.
+    const strip_key = @intFromPtr(thread);
+    const strip_h = if (has_pending_stream and stickyStripActive(strip_key)) @round(theme.scaledUi(STICKY_TURN_STRIP_CSS)) else 0.0;
+    const content_clip: palette.Rect = .{ .x = clip.x, .y = clip.y + strip_h, .w = clip.w, .h = @max(clip.h - strip_h, 0.0) };
+    // Rows record their click targets (card toggles, "Show more", subagent
+    // open, copy buttons, task actions) at full row size; clip the ones this
+    // pass adds to the painted content so a click in the strip (or past the
+    // viewport) never reaches a row hidden under it.
+    const hit_marks = StateHitMarks.take(state);
+    var content_y = renderCommittedTranscript(state, thread, column, scroll_y, content_clip);
 
-    content_y = renderPendingSlashCommand(state, column, content_y, clip);
-    renderPendingTranscriptStream(state, thread, column, content_y, clip, thread.messages.items.len);
+    content_y = renderPendingSlashCommand(state, column, content_y, content_clip);
+    const pinned_status_shown = renderPendingTranscriptStream(state, thread, column, content_y, content_clip, clip, thread.messages.items.len);
+    hit_marks.clipSince(state, content_clip);
+    setStickyStripActive(strip_key, pinned_status_shown);
+    // A line cut by the pinned strip's edge fades
+    // out over 12px instead of showing as a sliver of half-glyphs.
+    if (strip_h > 0.0) renderTranscriptTopFade(state, content_clip);
+    if (strip_h > 0.0) {
+        const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+        queueRectClipped(state, .{ .x = column.x, .y = @round(content_clip.y) - stroke, .w = column.w, .h = stroke }, paletteColor(theme.borderMuted()), clip);
+    }
+    // Content continues below the viewport: fade it out above the composer
+    // so a clipped card reads as "more below", not as cut off.
+    if (max_scroll > 1.0 and scroll_y < max_scroll - 1.0) renderTranscriptBottomFade(state, clip);
 
     if (max_scroll > 1.0) {
         const track = snapRect(palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(12.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h });
@@ -4544,16 +4796,18 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, lane:
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll);
         const thumb_rect = snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h });
         queueRounded(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 160)), theme.scaledUi(2.0));
-        queueRounded(state, thumb_rect, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 210)), theme.scaledUi(2.0));
+        const thumb_hovered = (transcript_scrollbar_drag_active and transcript_scrollbar_drag_pane_id == pane_id) or
+            rectContains(expandedScrollbarHit(thumb_rect), state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+        queueRounded(state, thumb_rect, paletteColor(theme.scrollbarThumb(thumb_hovered)), theme.scaledUi(2.0));
         transcript_scrollbar_track = track;
         transcript_scrollbar_thumb = thumb_rect;
         transcript_scrollbar_max_scroll = max_scroll;
-        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
+        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = content_clip, .scroll_y = scroll_y, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
     } else {
         transcript_scrollbar_track = .{};
         transcript_scrollbar_thumb = .{};
         transcript_scrollbar_max_scroll = 0.0;
-        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y });
+        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = content_clip, .scroll_y = scroll_y });
     }
     const visible_region_ready = thread.transcript_layout_visible_ready and
         (thread.transcript_layout_valid or
@@ -5225,7 +5479,7 @@ fn renderCommittedTranscript(
         } else if (commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end)) {
             const last = thread.messages.items[item.group_end - 1];
             const batch_start = transcriptBatchStart(state);
-            renderToolCallGroup(state, thread.messages.items, item.message_index, item.group_end, 0, column, content_y, item_height, clip, thread.backgroundCommandIsRunning(last.body), null);
+            renderToolCallGroup(state, thread.messages.items, item.message_index, item.group_end, 0, column, content_y, item_height, clip, thread.backgroundCommandIsRunning(last.body), null, null, false);
             multiplyTranscriptBatchOpacity(
                 state,
                 batch_start,
@@ -5263,7 +5517,7 @@ fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, c
             state,
             bubble,
             paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)),
-            paletteColor(theme.withAlpha(theme.COLOR_GREEN, border_alpha)),
+            paletteColor(theme.withAlpha(theme.statusRunning(), border_alpha)),
             transcriptBubbleCornerRadius(),
             clip,
         );
@@ -5285,13 +5539,13 @@ fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, c
             .y = status_cy - status_dia,
             .w = status_dia * 2.0,
             .h = status_dia * 2.0,
-        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(35.0 + pulse * 55.0))), status_dia, clip);
+        }, paletteColor(theme.withAlpha(theme.statusRunning(), @intFromFloat(35.0 + pulse * 55.0))), status_dia, clip);
         queueRoundedClipped(state, .{
             .x = status_cx - status_dia * 0.5,
             .y = status_cy - status_dia * 0.5,
             .w = status_dia,
             .h = status_dia,
-        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(180.0 + pulse * 60.0))), status_dia * 0.5, clip);
+        }, paletteColor(theme.withAlpha(theme.statusRunning(), @intFromFloat(180.0 + pulse * 60.0))), status_dia * 0.5, clip);
 
         const text_x = bubble.x + pad_x + status_dia * 2.0 + theme.scaledUi(12.0);
         const right_w = theme.scaledUi(96.0);
@@ -5337,7 +5591,7 @@ fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, c
             .y = rail.y,
             .w = @min(segment_w, rail.w),
             .h = rail.h,
-        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 220)), rail_h * 0.5, clip);
+        }, paletteColor(theme.withAlpha(theme.statusRunning(), 220)), rail_h * 0.5, clip);
     }
     return content_y + height + theme.scaledUi(12.0);
 }
@@ -5374,7 +5628,7 @@ fn renderPendingSlashCommandDots(state: *app_state.AppState, rect: palette.Rect,
         const local = @mod(phase + offset, 1.0);
         const wave = 0.5 + 0.5 * std.math.sin(local * std.math.tau);
         const alpha: u8 = @intFromFloat(85.0 + wave * 155.0);
-        queueRoundedClipped(state, .{ .x = x, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, alpha)), dot * 0.5, clip);
+        queueRoundedClipped(state, .{ .x = x, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(theme.statusRunning(), alpha)), dot * 0.5, clip);
         x += dot + gap;
     }
 }
@@ -5519,6 +5773,7 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     const variant_hash = transcriptLayoutVariantHash(state);
     const base = thread.messages.items.len;
     var total: f32 = 0;
+    var folded = false;
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = &send_state.pending_events.items[pi];
@@ -5532,15 +5787,19 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
             pi + 1;
         if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             total += pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base, column_width, send_state.started_at_ms, variant_hash) + theme.scaledUi(12.0);
+            folded = pendingStreamFoldsIntoGroup(send_state.pending_events.items, pi, group_end, send_state.streamRevealedText().len);
             pi = group_end;
             continue;
         }
+        folded = pendingStreamFoldsIntoRow(send_state.pending_events.items, pi, send_state.streamRevealedText().len);
         const msg_idx = base + pi;
         total += pendingSingleRowHeight(state, event, send_state.started_at_ms, msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
         pi += 1;
     }
-    const stream_msg_idx = base + send_state.pending_events.items.len;
-    total += pendingStreamBodyHeight(state, send_state, stream_msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
+    if (!folded) {
+        const stream_msg_idx = base + send_state.pending_events.items.len;
+        total += pendingStreamBodyHeight(state, send_state, stream_msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
+    }
     if (selectedProjectId(state)) |project_id| {
         var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
         const agent_count = collectTurnAgentsLocked(state, project_id, thread, false, &agents);
@@ -5549,16 +5808,36 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     return total;
 }
 
-fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, content_y: f32, clip: palette.Rect, base_message_index: usize) void {
+/// Returns true when the turn's status was pinned into the reserved strip at
+/// the top of `strip_clip` (its header is scrolled out of `clip`).
+fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, content_y: f32, clip: palette.Rect, strip_clip: palette.Rect, base_message_index: usize) bool {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
+    if (send_state.status != .pending) return false;
 
     var y = content_y;
     const now_ms = unixTimestampMs();
     const variant_hash = transcriptLayoutVariantHash(state);
     const pending_count = send_state.pending_events.items.len;
+
+    var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
+    const agent_count = if (selectedProjectId(state)) |project_id| collectTurnAgentsLocked(state, project_id, thread, true, &agents) else 0;
+    const activity = AgentActivity.summarize(agents[0..agent_count]);
+    // Silent provider plus running agents: the turn is waiting, not writing.
+    const waiting_on_agents = activity.waiting() and streamQuietLocked(send_state, monotonicMs());
+    const thinking = thinkingLabelShown(send_state.thinking, send_state.thinking_cleared_at_ms, monotonicMs());
+    const stream_text: []const u8 = send_state.streamRevealedText();
+    // A2: while the tail tool group runs and no reply text has streamed, the
+    // group header carries the verb + timer and the Working card is dropped
+    // (mirrors `transcriptPendingStreamHeight`).
+    const lead: ToolGroupLead = .{
+        .text = pendingTurnVerb(send_state.local_command, thinking),
+        .color = if (activity.attention > 0) agentActivityColor(activity) else theme.statusRunning(),
+    };
+    var folded = false;
+    var folded_group_y: f32 = y;
+
     var pi: usize = 0;
     while (pi < pending_count) {
         const event = &send_state.pending_events.items[pi];
@@ -5573,6 +5852,8 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             const item_h = pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w, send_state.started_at_ms, variant_hash);
             const entrance_opacity = pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion.chat);
+            folded = pendingStreamFoldsIntoGroup(send_state.pending_events.items, pi, group_end, stream_text.len);
+            folded_group_y = y;
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 const batch_start = transcriptBatchStart(state);
                 renderToolCallGroup(
@@ -5586,7 +5867,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
                     item_h,
                     clip,
                     group_end == pending_count,
-                    send_state.started_at_ms,
+                    // A1: the banner owns the timer and running mark.
+                    if (agents_bar_owns_turn_status) null else send_state.started_at_ms,
+                    if (folded and !waiting_on_agents and !agents_bar_owns_turn_status) lead else null,
+                    agents_bar_owns_turn_status,
                 );
                 multiplyTranscriptBatchOpacity(
                     state,
@@ -5601,11 +5885,22 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         const msg_idx = base_message_index + pi;
         const item_h = pendingSingleRowHeight(state, event, send_state.started_at_ms, msg_idx, column.w, variant_hash);
         const batch_start = transcriptBatchStart(state);
+        // A4: a lone running tool row at the tail folds the Working card the
+        // same way a running group does.
+        const row_folds = pendingStreamFoldsIntoRow(send_state.pending_events.items, pi, stream_text.len);
+        folded = row_folds;
+        if (row_folds) folded_group_y = y;
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
+            var row_lead_buf: [80]u8 = undefined;
+            var row_elapsed_buf: [32]u8 = undefined;
+            const row_lead: ToolGroupLead = .{
+                .text = std.fmt.bufPrint(&row_lead_buf, "{s} \u{00B7} {s}", .{ lead.text, formatElapsedDuration(&row_elapsed_buf, send_state.started_at_ms) }) catch lead.text,
+                .color = lead.color,
+            };
             const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status, event.tool_call_kind, null);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status, event.tool_call_kind, null, if (row_folds and !waiting_on_agents) row_lead else null);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -5618,6 +5913,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         } else if (event.role == .system and isGitCommitMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderGitCommitCard(state, thread.local_thread_id, column, y, item_h, event.body, clip);
+            }
+        } else if (isTranscriptStatusNotice(event.role, event.author)) {
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderTranscriptStatusNotice(state, column, y, item_h, event.author, event.body, clip);
             }
         } else {
             const role_label: []const u8 = switch (event.role) {
@@ -5650,48 +5949,72 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         pi += 1;
     }
 
-    var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
-    const agent_count = if (selectedProjectId(state)) |project_id| collectTurnAgentsLocked(state, project_id, thread, true, &agents) else 0;
-    const activity = AgentActivity.summarize(agents[0..agent_count]);
-    // Silent provider plus running agents: the turn is waiting, not writing.
-    const waiting_on_agents = activity.waiting() and streamQuietLocked(send_state, monotonicMs());
-
     var status_buf: [64]u8 = undefined;
     const working_label = if (send_state.local_command)
         formatPendingCommandLabel(&status_buf, send_state.started_at_ms)
-    else if (waiting_on_agents)
-        formatPendingWaitingLabel(&status_buf, send_state.started_at_ms, activity.active)
     else
-        formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, thinkingLabelShown(send_state.thinking, send_state.thinking_cleared_at_ms, monotonicMs()));
-    const stream_text: []const u8 = send_state.streamRevealedText();
-    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = false; // item 4: stream renders as markdown in place
-    const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
-    const assistant_h = pendingStreamBodyHeight(state, send_state, stream_msg_idx, column.w, variant_hash);
-    if (y + assistant_h >= column.y and y <= column.y + column.h) {
-        appendPendingRowHit(.{
-            .send_state = send_state,
-            .column = column,
-            .turn_started_at_ms = send_state.started_at_ms,
-            .pending_index = null,
-            .message_index = stream_msg_idx,
-            .y = y,
-            .height = assistant_h,
-        });
-        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
+        // A1: a wait on agents is told once, by the agents banner above the
+        // composer; the turn's own label stays "Working".
+        formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, thinking);
+    var header_y = folded_group_y;
+    if (folded) {
+        renderTurnFinishLines(state, column, y, clip, agents[0..agent_count]);
+    } else {
+        const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+        const stream_plain = false; // item 4: stream renders as markdown in place
+        const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
+        const assistant_h = pendingStreamBodyHeight(state, send_state, stream_msg_idx, column.w, variant_hash);
+        if (y + assistant_h >= column.y and y <= column.y + column.h) {
+            appendPendingRowHit(.{
+                .send_state = send_state,
+                .column = column,
+                .turn_started_at_ms = send_state.started_at_ms,
+                .pending_index = null,
+                .message_index = stream_msg_idx,
+                .y = y,
+                .height = assistant_h,
+            });
+            renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
+        }
+        renderTurnFinishLines(state, column, y + assistant_h + theme.scaledUi(12.0), clip, agents[0..agent_count]);
+        header_y = y;
     }
-    renderTurnFinishLines(state, column, y + assistant_h + theme.scaledUi(12.0), clip, agents[0..agent_count]);
-    // The working label rides on the stream bubble's header; once that has
-    // scrolled out of view, keep it pinned to the viewport's top edge.
-    const header_visible = y + theme.scaledUi(STICKY_TURN_HEADER_CSS) >= clip.y and y <= clip.y + clip.h;
-    if (!send_state.local_command and !header_visible) renderStickyTurnStatus(state, clip, working_label, activity, waiting_on_agents);
+    // The working label rides on the stream bubble's header (or the folded
+    // group's header); once that has scrolled out of view, keep it pinned to
+    // the viewport's top edge.
+    const header_visible = header_y + theme.scaledUi(STICKY_TURN_HEADER_CSS) >= clip.y and header_y <= clip.y + clip.h;
+    if (send_state.local_command or header_visible) return false;
+    renderStickyTurnStatus(state, strip_clip, working_label, activity);
+    return true;
 }
 
-/// Label for a pending turn whose provider is idle while agents run.
-fn formatPendingWaitingLabel(buf: []u8, started_at_ms: i64, active: usize) []const u8 {
-    var elapsed_buf: [32]u8 = undefined;
-    const elapsed = formatElapsedDuration(&elapsed_buf, started_at_ms);
-    return std.fmt.bufPrint(buf, "Waiting on {d} agent{s} - {s}", .{ active, if (active == 1) "" else "s", elapsed }) catch "Waiting on agents";
+/// A2: true when the pending group [start, end) is the turn's running tail
+/// and no reply text has streamed yet, so its header stands in for the
+/// separate "Working / Waiting for streamed output..." card. Height and paint
+/// passes both call this so they agree.
+fn pendingStreamFoldsIntoGroup(entries: anytype, start: usize, end: usize, stream_text_len: usize) bool {
+    if (stream_text_len > 0 or end != entries.len) return false;
+    return toolCallGroupRunningCount(entries, start, end, true) > 0;
+}
+
+/// A4: true when the single (ungrouped) pending event at `index` is the
+/// turn's running tail tool row and no reply text has streamed, so the row's
+/// header carries the verb + timer instead of a separate Working card. Must
+/// stay in step with the paint pass's `renderCommandEventRow` running flag.
+fn pendingStreamFoldsIntoRow(entries: anytype, index: usize, stream_text_len: usize) bool {
+    if (stream_text_len > 0 or index + 1 != entries.len) return false;
+    const entry = entries[index];
+    if (entry.role != .system or !shouldRenderPaletteCommandRow(entry.author, entry.body)) return false;
+    if (toolCallEntryStatus(entry)) |status| return status == .pending or status == .in_progress;
+    return true;
+}
+
+/// Verb of the live turn without its timer ("Working", "Thinking",
+/// "Running command"), led into a folded group header. A wait on agents is
+/// never led here: the agents banner is its single in-pane source (A1).
+fn pendingTurnVerb(local_command: bool, thinking: bool) []const u8 {
+    if (local_command) return "Running command";
+    return if (thinking) "Thinking" else "Working";
 }
 
 // Finish lines: one quiet row per agent that settled during this turn, under
@@ -5736,9 +6059,6 @@ fn renderTurnFinishLines(state: *app_state.AppState, column: palette.Rect, top: 
     for (finished[first..count]) |*agent| {
         defer y += line_h;
         if (y + line_h < clip.y or y > clip.y + clip.h) continue;
-        const ok = agent.status == .completed;
-        const tone = if (ok) theme.success() else theme.danger();
-        const glyph: []const u8 = if (ok) "\u{2713}" else "\u{2715}";
         const verb: []const u8 = switch (agent.status) {
             .completed => "finished",
             .failed => "failed",
@@ -5746,7 +6066,8 @@ fn renderTurnFinishLines(state: *app_state.AppState, column: palette.Rect, top: 
             else => "interrupted",
         };
         const x = column.x + theme.scaledUi(6.0);
-        queueChromeLabel(state, .{ .x = x, .y = y + (line_h - font * 1.4) * 0.5, .w = icon_w, .h = font * 1.4 }, glyph, paletteColor(tone), font, clip);
+        // The settled agent's shared mark (check / cross, sidebar colours).
+        queueLinkedChatStatusDot(state, x, y + line_h * 0.5, agent.status, clip);
         var age_buf: [16]u8 = undefined;
         const age = linkedChatAgeLabel(&age_buf, agent.updated_at_ms);
         var line_buf: [320]u8 = undefined;
@@ -5761,12 +6082,145 @@ fn renderTurnFinishLines(state: *app_state.AppState, column: palette.Rect, top: 
     }
 }
 
-// Sticky turn status: a small pill at the top of the transcript viewport
-// that repeats the stream header ("Working - 1:01", "Waiting on 2 agents -
-// 1:01") while the header itself is scrolled out of view.
-const STICKY_TURN_HEADER_CSS: f32 = 22.0;
+const TRANSCRIPT_BOTTOM_FADE_CSS: f32 = 24.0;
+const TRANSCRIPT_BOTTOM_FADE_STEPS: usize = 6;
 
-fn renderStickyTurnStatus(state: *app_state.AppState, clip: palette.Rect, label: []const u8, activity: AgentActivity, waiting_on_agents: bool) void {
+/// Mirror of `renderTranscriptBottomFade` along the top of `clip`: opaque pane
+/// background at the edge, clear 12px below it.
+fn renderTranscriptTopFade(state: *app_state.AppState, clip: palette.Rect) void {
+    const fade_h = @min(theme.scaledUi(TRANSCRIPT_TOP_FADE_CSS), clip.h * 0.25);
+    if (fade_h <= 1.0) return;
+    const steps: f32 = @floatFromInt(TRANSCRIPT_BOTTOM_FADE_STEPS);
+    for (0..TRANSCRIPT_BOTTOM_FADE_STEPS) |step| {
+        const index: f32 = @floatFromInt(step);
+        const y0 = @round(clip.y + fade_h * index / steps);
+        const y1 = @round(clip.y + fade_h * (index + 1.0) / steps);
+        if (y1 <= y0) continue;
+        const t = 1.0 - index / steps;
+        const alpha: u8 = @intFromFloat(t * t * 245.0);
+        queueRectClipped(state, .{ .x = clip.x, .y = y0, .w = clip.w, .h = y1 - y0 }, paletteColor(theme.withAlpha(theme.background(), alpha)), clip);
+    }
+}
+
+const TRANSCRIPT_TOP_FADE_CSS: f32 = 12.0;
+
+/// Stepped fade from transparent to the pane background along the viewport's
+/// bottom edge (Palette has no gradient primitive; thin strips read smooth).
+fn renderTranscriptBottomFade(state: *app_state.AppState, clip: palette.Rect) void {
+    const fade_h = @min(theme.scaledUi(TRANSCRIPT_BOTTOM_FADE_CSS), clip.h * 0.25);
+    if (fade_h <= 1.0) return;
+    const top = clip.y + clip.h - fade_h;
+    const steps: f32 = @floatFromInt(TRANSCRIPT_BOTTOM_FADE_STEPS);
+    for (0..TRANSCRIPT_BOTTOM_FADE_STEPS) |step| {
+        const index: f32 = @floatFromInt(step);
+        const y0 = @round(top + fade_h * index / steps);
+        const y1 = @round(top + fade_h * (index + 1.0) / steps);
+        if (y1 <= y0) continue;
+        const t = (index + 1.0) / steps;
+        const alpha: u8 = @intFromFloat(t * t * 235.0);
+        queueRectClipped(state, .{ .x = clip.x, .y = y0, .w = clip.w, .h = y1 - y0 }, paletteColor(theme.withAlpha(theme.background(), alpha)), clip);
+    }
+}
+
+// Sticky turn status: a small pill at the top of the transcript viewport
+// that repeats the stream header ("Working · 1:01") while the header itself
+// is scrolled out of view.
+const STICKY_TURN_HEADER_CSS: f32 = 22.0;
+/// Reserved strip the pinned pill docks in: 8px above and below a 26px pill.
+const STICKY_TURN_STRIP_CSS: f32 = 42.0;
+
+/// Lengths of AppState's per-frame transcript hit lists at a point in the
+/// paint, so hits a pass appended can be clipped to what it actually showed.
+const StateHitMarks = struct {
+    card_toggles: usize,
+    code_copies: usize,
+    task_actions: usize,
+
+    fn take(state: *const app_state.AppState) StateHitMarks {
+        return .{
+            .card_toggles = state.card_toggle_hits.items.len,
+            .code_copies = state.code_copy_buttons.items.len,
+            .task_actions = state.background_task_action_hits.items.len,
+        };
+    }
+
+    fn clipSince(self: StateHitMarks, state: *app_state.AppState, bounds: palette.Rect) void {
+        clipHitRectsSince(&state.card_toggle_hits, self.card_toggles, bounds);
+        clipHitRectsSince(&state.code_copy_buttons, self.code_copies, bounds);
+        clipHitRectsSince(&state.background_task_action_hits, self.task_actions, bounds);
+    }
+};
+
+/// Intersects the `rect` of every hit at or after `start` with `bounds`,
+/// dropping hits left with no area. Earlier hits and order are untouched.
+fn clipHitRectsSince(list: anytype, start: usize, bounds: palette.Rect) void {
+    if (start >= list.items.len) return;
+    var write = start;
+    for (list.items[start..]) |hit| {
+        var clipped = hit;
+        clipped.rect = intersectRect(hit.rect, bounds);
+        if (clipped.rect.w <= 0.0 or clipped.rect.h <= 0.0) continue;
+        list.items[write] = clipped;
+        write += 1;
+    }
+    list.shrinkRetainingCapacity(write);
+}
+
+test "transcript hits are clipped to the content below the pinned-status strip" {
+    const Hit = struct { rect: palette.Rect, key: u32 };
+    var hits: std.ArrayList(Hit) = .empty;
+    defer hits.deinit(std.testing.allocator);
+    // A hit from an earlier pass stays as recorded.
+    try hits.append(std.testing.allocator, .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 30 }, .key = 1 });
+    const start = hits.items.len;
+    // Tool-group header wholly inside the 42px strip: dropped.
+    try hits.append(std.testing.allocator, .{ .rect = .{ .x = 10, .y = 105, .w = 300, .h = 30 }, .key = 2 });
+    // Header straddling the strip's bottom edge: only its visible part counts.
+    try hits.append(std.testing.allocator, .{ .rect = .{ .x = 10, .y = 130, .w = 300, .h = 30 }, .key = 3 });
+    // Fully visible row: unchanged.
+    try hits.append(std.testing.allocator, .{ .rect = .{ .x = 10, .y = 200, .w = 300, .h = 30 }, .key = 4 });
+    const content: palette.Rect = .{ .x = 0, .y = 142, .w = 400, .h = 300 }; // clip.y 100 + 42px strip
+    clipHitRectsSince(&hits, start, content);
+    try std.testing.expectEqual(@as(usize, 3), hits.items.len);
+    try std.testing.expectEqual(@as(u32, 1), hits.items[0].key);
+    try std.testing.expectEqual(@as(f32, 0), hits.items[0].rect.y);
+    try std.testing.expectEqual(@as(u32, 3), hits.items[1].key);
+    try std.testing.expectEqual(@as(f32, 142), hits.items[1].rect.y);
+    try std.testing.expectEqual(@as(f32, 18), hits.items[1].rect.h);
+    try std.testing.expectEqual(@as(u32, 4), hits.items[2].key);
+}
+
+/// Threads whose pinned status showed last frame (see A1 in
+/// `renderTranscriptContent`). Keyed by thread address; a handful of panes
+/// can stream at once, and a full table just forgets the oldest key.
+var sticky_strip_keys: [8]usize = [_]usize{0} ** 8;
+
+fn stickyStripActive(key: usize) bool {
+    for (sticky_strip_keys) |entry| {
+        if (entry == key) return true;
+    }
+    return false;
+}
+
+fn setStickyStripActive(key: usize, active: bool) void {
+    for (&sticky_strip_keys) |*entry| {
+        if (entry.* == key) {
+            if (!active) entry.* = 0;
+            return;
+        }
+    }
+    if (!active) return;
+    for (&sticky_strip_keys) |*entry| {
+        if (entry.* == 0) {
+            entry.* = key;
+            return;
+        }
+    }
+    std.mem.copyForwards(usize, sticky_strip_keys[0 .. sticky_strip_keys.len - 1], sticky_strip_keys[1..]);
+    sticky_strip_keys[sticky_strip_keys.len - 1] = key;
+}
+
+fn renderStickyTurnStatus(state: *app_state.AppState, clip: palette.Rect, label: []const u8, activity: AgentActivity) void {
     const font = theme.scaledUi(12.0);
     const pad_x = theme.scaledUi(12.0);
     const dot_slot = theme.scaledUi(16.0);
@@ -5775,8 +6229,23 @@ fn renderStickyTurnStatus(state: *app_state.AppState, clip: palette.Rect, label:
     const w = @min(pad_x * 2.0 + dot_slot + text_w, clip.w - theme.scaledUi(16.0));
     if (w <= dot_slot + pad_x * 2.0) return;
     const pill = snapRect(.{ .x = clip.x + (clip.w - w) * 0.5, .y = clip.y + theme.scaledUi(8.0), .w = w, .h = h });
-    const tone = if (waiting_on_agents or activity.attention > 0) agentActivityColor(activity) else theme.accent();
-    queuePanel(state, pill, paletteColor(theme.mix(theme.background(), tone, 0.10)), paletteColor(theme.withAlpha(tone, 120)), h * 0.5, @max(theme.scaledUi(1.0), 1.0));
+    const tone = if (activity.attention > 0) agentActivityColor(activity) else theme.statusRunning();
+    // Soft drop shadow (two stacked scrims, as context menus use) so the
+    // pinned pill lifts off the transcript text it floats over.
+    const shadow_layers = [_]struct { spread: f32, drop: f32, alpha: f32 }{
+        .{ .spread = 5.0, .drop = 4.0, .alpha = 0.14 },
+        .{ .spread = 2.0, .drop = 1.5, .alpha = 0.20 },
+    };
+    for (shadow_layers) |layer| {
+        const spread = theme.scaledUi(layer.spread);
+        queueRoundedClipped(state, snapRect(.{
+            .x = pill.x - spread,
+            .y = pill.y - spread + theme.scaledUi(layer.drop),
+            .w = pill.w + spread * 2.0,
+            .h = pill.h + spread * 2.0,
+        }), paletteColor(theme.scrim(layer.alpha)), h * 0.5 + spread, clip);
+    }
+    queuePanel(state, pill, paletteColor(theme.mix(theme.background(), tone, 0.10)), paletteColor(theme.withAlpha(tone, 120)), h * 0.5, @max(@round(theme.scaledUi(1.0)), 1.0));
     const status: linked_chats.Status = if (activity.attention > 0) .waiting_approval else .running;
     queueLinkedChatStatusDot(state, pill.x + pad_x - theme.scaledUi(2.0), pill.y + h * 0.5, status, pill);
     var trunc_buf: [96]u8 = undefined;
@@ -5815,15 +6284,15 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64, thinking: bool) []co
     // Reasoning liveness swaps the verb, keeping the elapsed timer in place.
     const verb: []const u8 = if (thinking) "Thinking" else "Working";
     if (hours > 0) {
-        return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}:{d:0>2}", .{ verb, hours, minutes, seconds }) catch "Working - 0:00";
+        return std.fmt.bufPrint(buf, "{s} \u{00B7} {d}:{d:0>2}:{d:0>2}", .{ verb, hours, minutes, seconds }) catch "Working \u{00B7} 0:00";
     }
-    return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}", .{ verb, minutes, seconds }) catch "Working - 0:00";
+    return std.fmt.bufPrint(buf, "{s} \u{00B7} {d}:{d:0>2}", .{ verb, minutes, seconds }) catch "Working \u{00B7} 0:00";
 }
 
 fn formatPendingCommandLabel(buf: []u8, started_at_ms: i64) []const u8 {
     const elapsed_ms = @max(unixTimestampMs() - @max(started_at_ms, 0), 0);
     const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
-    return std.fmt.bufPrint(buf, "Running command - {d}:{d:0>2}", .{ total_seconds / 60, total_seconds % 60 }) catch "Running command";
+    return std.fmt.bufPrint(buf, "Running command \u{00B7} {d}:{d:0>2}", .{ total_seconds / 60, total_seconds % 60 }) catch "Running command";
 }
 
 fn isCommandSystemEvent(author: []const u8) bool {
@@ -5961,6 +6430,44 @@ test "tool call groups stop before user-required system events" {
     try std.testing.expect(toolCallGroupFailed(entries[0..], 3, 4));
     try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
     try std.testing.expectEqual(@as(usize, 1), toolCallGroupRunningCount(entries[0..], 0, 2, true));
+}
+
+test "tool rows pick a glyph per kind" {
+    try std.testing.expectEqualStrings(NF_COD_TERMINAL, toolRowGlyph(.execute, "Ran command", "ls"));
+    try std.testing.expectEqualStrings(NF_COD_FILE, toolRowGlyph(.read, "Read", "src/main.zig"));
+    try std.testing.expectEqualStrings(NF_COD_EDIT, toolRowGlyph(null, "Edit", "src/main.zig"));
+    try std.testing.expectEqualStrings(NF_COD_SEARCH, toolRowGlyph(null, "Grep", "pattern"));
+    try std.testing.expectEqualStrings(NF_COD_GLOBE, toolRowGlyph(.fetch, "WebFetch", "https://example.com"));
+    try std.testing.expectEqualStrings(NF_COD_TERMINAL, toolRowGlyph(null, "Ran command", "zig build"));
+    try std.testing.expectEqualStrings(NF_COD_TOOLS, toolRowGlyph(.mcp, "verde.list_panes", "Input:\n{}"));
+}
+
+test "interruption notices render as status, not message cards" {
+    try std.testing.expect(isTranscriptStatusNotice(.system, "Conversation interrupted"));
+    try std.testing.expect(isTranscriptStatusNotice(.system, "Command cancelled"));
+    try std.testing.expect(!isTranscriptStatusNotice(.assistant, "Conversation interrupted"));
+    try std.testing.expect(!isTranscriptStatusNotice(.system, "Ran command"));
+    try std.testing.expect(transcriptSelectableBodyKind(.system, "Conversation interrupted", "Tell the model what to do differently.", false, false) == null);
+}
+
+test "a lone running tail tool row folds the Working card" {
+    const Event = struct {
+        role: app_state.ChatRole = .system,
+        author: []const u8,
+        body: []const u8,
+        tool_call_status: ?provider_types.ToolCallStatus = null,
+    };
+    const running = [_]Event{
+        .{ .role = .assistant, .author = "Claude", .body = "Checking." },
+        .{ .author = "Ran command", .body = "zig build", .tool_call_status = .in_progress },
+    };
+    try std.testing.expect(pendingStreamFoldsIntoRow(running[0..], 1, 0));
+    // Streamed reply text owns the running surface again.
+    try std.testing.expect(!pendingStreamFoldsIntoRow(running[0..], 1, 12));
+    // Only the tail row folds; prose never does.
+    try std.testing.expect(!pendingStreamFoldsIntoRow(running[0..], 0, 0));
+    const finished = [_]Event{.{ .author = "Ran command", .body = "zig build", .tool_call_status = .completed }};
+    try std.testing.expect(!pendingStreamFoldsIntoRow(finished[0..], 0, 0));
 }
 
 test "subagent rows group separately from ordinary tool calls" {
@@ -6305,6 +6812,7 @@ fn renderPinnedBackgroundCommands(
             null,
             null,
             row.task_index,
+            null,
         );
         if (pending) thread.send_state.mutex.unlock();
         appendBackgroundTaskPinHit(pane_id, card_rect);
@@ -6435,6 +6943,49 @@ fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const
     return original_author;
 }
 
+/// Codicon for a tool row's kind, so a read, an edit and a search are
+/// distinguishable at a glance. Rows without a structured kind (older saves,
+/// providers that only name the tool) fall back to the tool's display name.
+fn toolRowGlyph(kind: ?provider_types.ToolCallKind, author_raw: []const u8, body_raw: []const u8) []const u8 {
+    if (chat_types.looksLikeSubagentCard(author_raw, kind, body_raw)) return NF_COD_HUBOT;
+    if (kind) |value| switch (value) {
+        .execute => return NF_COD_TERMINAL,
+        .read => return NF_COD_FILE,
+        .edit, .move => return NF_COD_EDIT,
+        .delete => return NF_COD_TRASH,
+        .search => return NF_COD_SEARCH,
+        .fetch => return NF_COD_GLOBE,
+        .think => return NF_COD_LIGHTBULB,
+        .subagent => return NF_COD_HUBOT,
+        .mcp, .other => {},
+    };
+    const author = std.mem.trim(u8, author_raw, "\n\r\t ");
+    if (isCommandSystemEvent(author) or std.ascii.eqlIgnoreCase(author, "Shell") or std.ascii.eqlIgnoreCase(author, "Bash")) return NF_COD_TERMINAL;
+    const by_name = [_]struct { name: []const u8, glyph: []const u8 }{
+        .{ .name = "Read", .glyph = NF_COD_FILE },
+        .{ .name = "Read File", .glyph = NF_COD_FILE },
+        .{ .name = "LS", .glyph = NF_COD_FILE },
+        .{ .name = "List", .glyph = NF_COD_FILE },
+        .{ .name = "Edit", .glyph = NF_COD_EDIT },
+        .{ .name = "Write", .glyph = NF_COD_EDIT },
+        .{ .name = "Move", .glyph = NF_COD_EDIT },
+        .{ .name = "Delete", .glyph = NF_COD_TRASH },
+        .{ .name = "Grep", .glyph = NF_COD_SEARCH },
+        .{ .name = "Glob", .glyph = NF_COD_SEARCH },
+        .{ .name = "Search", .glyph = NF_COD_SEARCH },
+        .{ .name = "Web Search", .glyph = NF_COD_GLOBE },
+        .{ .name = "WebFetch", .glyph = NF_COD_GLOBE },
+        .{ .name = "Fetch", .glyph = NF_COD_GLOBE },
+        .{ .name = "Think", .glyph = NF_COD_LIGHTBULB },
+        .{ .name = "Thinking", .glyph = NF_COD_LIGHTBULB },
+    };
+    for (by_name) |entry| {
+        if (std.ascii.eqlIgnoreCase(author, entry.name)) return entry.glyph;
+    }
+    if (isCommandLikeShellBody(body_raw)) return NF_COD_TERMINAL;
+    return NF_COD_TOOLS;
+}
+
 fn transcriptCommandEventHeight(
     state: ?*app_state.AppState,
     message_index: ?usize,
@@ -6461,7 +7012,7 @@ fn transcriptCommandEventHeight(
 
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const inner_w = @max(column_width - pad_x * 2.0, theme.scaledUi(80.0));
-    const chars_per_line = @max(@as(usize, @intFromFloat(inner_w / (font_size * 0.52))), 1);
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_w / (font_size * FIXED_TEXT_CELL_EM))), 1);
     const line_count = wrappedLineCount(body, chars_per_line);
     const show_all = blk: {
         const app = state orelse break :blk false;
@@ -6594,6 +7145,8 @@ const CHILD_ROW_PAD_BOTTOM: f32 = 9.0;
 /// height minus 42) so text selection keeps working on the reply.
 const CHILD_ROW_BODY_TOP: f32 = 34.0;
 const CHILD_ROW_BODY_INSET_Y: f32 = 42.0;
+/// Width before a child card's status word that holds its status mark.
+const CHILD_ROW_STATUS_MARK_SLOT: f32 = 18.0;
 const CHILD_ROW_TITLE_FONT: f32 = 14.0;
 const CHILD_ROW_META_FONT: f32 = 12.0;
 const CHILD_ROW_PREVIEW_FONT: f32 = 12.5;
@@ -7065,6 +7618,7 @@ fn transcriptMessageHeightStream(
         return childNotificationBatchHeight(state, message_index, batch, column_width, streaming);
     }
     if (parentSteerBody(role, body_raw)) |inner| return transcriptMessageHeightStream(state, message_index, inner, role, column_width, message_author, assistant_plain_layout, streaming);
+    if (isTranscriptStatusNotice(role, message_author)) return theme.scaledUi(TRANSCRIPT_NOTICE_H_CSS);
     if (role == .system and isSlashCommandResultMessage(message_author, body_raw)) {
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
     }
@@ -7090,7 +7644,7 @@ fn transcriptMessageHeightStream(
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
     const body_inner_width = @max(body_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
-    if (role == .assistant and !assistant_plain_layout) {
+    if (transcriptBodyUsesMarkdown(role, assistant_plain_layout)) {
         if (!streaming) {
             if (state) |app| {
                 if (message_index) |index| {
@@ -7113,7 +7667,7 @@ fn transcriptMessageHeightStream(
             chat_markdown.buildBodyViewStreaming(std.heap.page_allocator, body)
         else
             chat_markdown.buildBodyView(std.heap.page_allocator, body)) catch {
-            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * FIXED_TEXT_CELL_EM))), 1);
             const line_count = wrappedLineCount(body, chars_per_line);
             return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
         };
@@ -7133,7 +7687,7 @@ fn transcriptMessageHeightStream(
         }
     }
     var plain_view = chat_markdown.buildPlainBodyView(std.heap.page_allocator, body) catch {
-        const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+        const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * FIXED_TEXT_CELL_EM))), 1);
         const line_count = wrappedLineCount(body, chars_per_line);
         return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
     };
@@ -7155,16 +7709,12 @@ fn queueRoundedShellClipped(
     radius: f32,
     clip: palette.Rect,
 ) void {
-    const inset = @max(theme.scaledUi(1.0), 1.0);
-    queueRoundedClipped(state, bounds, border_color, radius, clip);
-    if (bounds.w > inset * 2.0 and bounds.h > inset * 2.0) {
-        queueRoundedClipped(state, .{
-            .x = bounds.x + inset,
-            .y = bounds.y + inset,
-            .w = bounds.w - inset * 2.0,
-            .h = bounds.h - inset * 2.0,
-        }, fill_color, @max(radius - inset, 0.0), clip);
-    }
+    // One panel command: fill and hairline composite in a single SDF pass.
+    // (Drawing the border colour as a full rounded rect under an inset fill
+    // let translucent fills show the border hue through, so a 25% accent
+    // wash rendered as a solid accent block.)
+    const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+    state.palette_overlay_batch.panelClipped(state.allocator, bounds, fill_color, border_color, radius, stroke, clip) catch {};
 }
 
 fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
@@ -7183,7 +7733,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status, message.tool_call_kind, null);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status, message.tool_call_kind, null, null);
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -7206,6 +7756,10 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         renderWorkspaceSetupCard(state, column, y, height, message, clip, message_index);
         return;
     }
+    if (isTranscriptStatusNotice(message.role, message.author)) {
+        renderTranscriptStatusNotice(state, column, y, height, message.author, message.body, clip);
+        return;
+    }
     if (message.role == .system) {
         if (utils.providerFailureActionProvider(message.body)) |provider| {
             renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip, message_index);
@@ -7221,10 +7775,54 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
     renderTranscriptImages(state, column, y, height, message, clip);
 }
 
+/// App-state notices the transcript records between turns ("Conversation
+/// interrupted", "Command cancelled"). They are status, not content, so they
+/// render as a centered divider notice instead of a message card.
+const TRANSCRIPT_STATUS_NOTICE_AUTHORS = [_][]const u8{ "Conversation interrupted", "Command cancelled" };
+const TRANSCRIPT_NOTICE_H_CSS: f32 = 34.0;
+const TRANSCRIPT_NOTICE_FONT_CSS: f32 = 13.0;
+
+fn isTranscriptStatusNotice(role: app_state.ChatRole, author: []const u8) bool {
+    if (role != .system) return false;
+    for (TRANSCRIPT_STATUS_NOTICE_AUTHORS) |notice| {
+        if (std.mem.eql(u8, author, notice)) return true;
+    }
+    return false;
+}
+
+// Region: status notice — a muted one-line label ("Conversation interrupted ·
+// Tell the model what to do differently.") centred between two hairlines.
+fn renderTranscriptStatusNotice(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, author: []const u8, body_raw: []const u8, clip: palette.Rect) void {
+    const font = theme.scaledUi(TRANSCRIPT_NOTICE_FONT_CSS);
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    var label_buf: [256]u8 = undefined;
+    const raw = if (body.len > 0)
+        std.fmt.bufPrint(&label_buf, "{s} \u{00B7} {s}", .{ author, firstTextLine(body) }) catch author
+    else
+        author;
+    const gap = theme.scaledUi(12.0);
+    const min_line = theme.scaledUi(24.0);
+    const max_label_w = @max(column.w - (min_line + gap) * 2.0, theme.scaledUi(40.0));
+    var trunc_buf: [288]u8 = undefined;
+    const label = truncateUiLabel(&trunc_buf, raw, max_label_w, font);
+    const label_w = @min(chromeLabelWidth(font, label), max_label_w);
+    const cy = y + height * 0.5;
+    const label_x = column.x + (column.w - label_w) * 0.5;
+    const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+    const line_y = @round(cy);
+    const line_color = paletteColor(theme.borderMuted());
+    const left_w = label_x - gap - column.x;
+    if (left_w > 0.0) queueRectClipped(state, .{ .x = @round(column.x), .y = line_y, .w = @round(left_w), .h = stroke }, line_color, clip);
+    const right_x = label_x + label_w + gap;
+    const right_w = column.x + column.w - right_x;
+    if (right_w > 0.0) queueRectClipped(state, .{ .x = @round(right_x), .y = line_y, .w = @round(right_w), .h = stroke }, line_color, clip);
+    queueChromeLabel(state, .{ .x = label_x, .y = cy - font * 0.7, .w = label_w + theme.scaledUi(2.0), .h = font * 1.4 }, label, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
+}
+
 fn providerFailureActionHeight(body_raw: []const u8, column_width: f32) f32 {
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const inner_width = @max(column_width - theme.scaledUi(32.0), theme.scaledUi(80.0));
-    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * 0.52))), 1);
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * FIXED_TEXT_CELL_EM))), 1);
     const display_body = utils.providerFailureActionBody(body_raw);
     const line_count = wrappedLineCount(std.mem.trim(u8, display_body, "\n\r\t "), chars_per_line);
     const body_height = @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
@@ -7279,7 +7877,7 @@ fn renderProviderFailureActionCard(
 
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const inner_width = @max(bubble.w - pad * 2.0, theme.scaledUi(80.0));
-    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * 0.52))), 1);
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * FIXED_TEXT_CELL_EM))), 1);
     const body = std.mem.trim(u8, utils.providerFailureActionBody(body_raw), "\n\r\t ");
     const line_count = wrappedLineCount(body, chars_per_line);
     const body_height = @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
@@ -7439,28 +8037,24 @@ fn renderTranscriptImagesFromParts(
                 transcript_image_hit_count += 1;
             }
         }
-        queueRoundedShellClipped(
-            state,
-            frame,
-            paletteColor(theme.background()),
-            paletteColor(theme.COLOR_PANEL_MUTED),
-            theme.scaledUi(9.0),
-            clip,
-        );
+        // Inside a user bubble the frame takes the bubble's own (slightly
+        // sunk) fill, never the pane colour, which read as a dark hole.
+        const frame_fill = if (role == .user) theme.userBubbleInsetFill() else theme.background();
         if (state.ensureImageTexture(image.path)) |cached| {
             const inset = theme.scaledUi(6.0);
-            const image_rect = palette.Rect{ .x = frame.x + inset, .y = frame.y + inset, .w = frame.w - inset * 2.0, .h = frame.h - inset * 2.0 };
-            const dims = runtime.scaledImageSize(cached.width, cached.height, image_rect.w, image_rect.h);
-            const image_clip = intersectClipRect(clip, frame) orelse frame;
+            const slot = palette.Rect{ .x = frame.x + inset, .y = frame.y + inset, .w = frame.w - inset * 2.0, .h = frame.h - inset * 2.0 };
+            const dims = runtime.scaledImageSize(cached.width, cached.height, slot.w, slot.h);
+            // The frame hugs the image's aspect ratio (no letterbox band),
+            // pinned to the slot's top-left; the slot height stays fixed so
+            // the measured block height is unchanged.
+            const hug = snapRect(.{ .x = frame.x, .y = frame.y, .w = dims[0] + inset * 2.0, .h = dims[1] + inset * 2.0 });
+            queueRoundedShellClipped(state, hug, paletteColor(frame_fill), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(9.0), clip);
+            const image_clip = intersectClipRect(clip, hug) orelse hug;
             if (image_clip.w > 0.0 and image_clip.h > 0.0) {
-                queueImage(state, .{
-                    .x = image_rect.x + (image_rect.w - dims[0]) * 0.5,
-                    .y = image_rect.y + (image_rect.h - dims[1]) * 0.5,
-                    .w = dims[0],
-                    .h = dims[1],
-                }, cached, image_clip);
+                queueImage(state, .{ .x = hug.x + inset, .y = hug.y + inset, .w = dims[0], .h = dims[1] }, cached, image_clip);
             }
         } else {
+            queueRoundedShellClipped(state, frame, paletteColor(frame_fill), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(9.0), clip);
             queueText(state, .{ .x = frame.x + pad, .y = frame.y + pad, .w = frame.w - pad * 2.0, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
         }
         image_y += thumb_h + gap;
@@ -7594,7 +8188,8 @@ fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f
     const data = parseUsageSummary(body_raw);
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
     const rr = transcriptBubbleCornerRadius();
-    queueRoundedShellClipped(state, bubble, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 150)), rr, clip);
+    // Neutral info card: usage is not a warning or an action.
+    queueRoundedShellClipped(state, bubble, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), rr, clip);
 
     const pad = theme.scaledUi(16.0);
     const gap = theme.scaledUi(12.0);
@@ -7754,7 +8349,7 @@ fn slashCommandResultHeight(state: ?*app_state.AppState, message_index: ?usize, 
             }
         }
         var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
-            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * FIXED_TEXT_CELL_EM))), 1);
             const line_count = wrappedLineCount(body, chars_per_line);
             break :blk @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
         };
@@ -7809,13 +8404,14 @@ fn renderSlashCommandResultCard(
     }, "Slash command output", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
 
     const pill = palette.Rect{ .x = bubble.x + bubble.w - pad - pill_w, .y = bubble.y + pad + theme.scaledUi(8.0), .w = pill_w, .h = theme.scaledUi(24.0) };
-    queueRoundedClipped(state, pill, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), pill.h * 0.5, clip);
+    // Settled state in the success hue (the accent is Working in Omarchy).
+    queueRoundedClipped(state, pill, paletteColor(theme.withAlpha(theme.statusSuccess(), 48)), pill.h * 0.5, clip);
     queueChromeLabel(state, .{
         .x = pill.x + theme.scaledUi(10.0),
         .y = pill.y + theme.scaledUi(4.0),
         .w = pill.w - theme.scaledUi(20.0),
         .h = theme.scaledUi(16.0),
-    }, "completed", paletteColor(theme.COLOR_GREEN), theme.scaledUi(11.5), clip);
+    }, "completed", paletteColor(theme.statusSuccess()), theme.scaledUi(11.5), clip);
 
     queueRectClipped(state, .{ .x = bubble.x + pad, .y = bubble.y + pad + header_h - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)), clip);
 
@@ -9022,7 +9618,34 @@ fn renderDiffLayoutToggle(
     layout: DiffLayout,
     clip: palette.Rect,
 ) void {
-    const segments = diff_render.renderLayoutToggle(state, rect, layout, clip, diffMouse(state));
+    // Region: Stacked | Split, drawn as the shared segmented control (joined
+    // track, tinted selected segment with an accent hairline) so it matches
+    // the same choice in Settings.
+    const track = snapRect(rect);
+    const left_w = @round(track.w * 0.5);
+    const segments = [2]palette.Rect{
+        .{ .x = track.x, .y = track.y, .w = left_w, .h = track.h },
+        .{ .x = track.x + left_w, .y = track.y, .w = track.w - left_w, .h = track.h },
+    };
+    const selected_index: usize = if (layout == .split) 1 else 0;
+    const radius = theme.scaledUi(6.0);
+    const base = theme.segmentedTrackFill();
+    queueRoundedShellClipped(state, track, paletteColor(base), paletteColor(theme.segmentedTrackBorder(base)), radius, clip);
+    const mouse = diffMouse(state);
+    const labels = [2][]const u8{ "Stacked", "Split" };
+    for (segments, 0..) |segment, index| {
+        const hovered = if (mouse) |point| rectContains(segment, point.x, point.y) else false;
+        if (hovered and index != selected_index) {
+            const inset = theme.scaledUi(2.0);
+            queueRoundedClipped(state, .{ .x = segment.x + inset, .y = segment.y + inset, .w = segment.w - inset * 2.0, .h = segment.h - inset * 2.0 }, paletteColor(theme.segmentedHoverFill()), radius - inset, clip);
+        }
+    }
+    queueRoundedShellClipped(state, segments[selected_index], paletteColor(theme.segmentedSelectedFill(base)), paletteColor(theme.segmentedSelectedBorder(base)), radius, clip);
+    for (segments, labels, 0..) |segment, label, index| {
+        const hovered = if (mouse) |point| rectContains(segment, point.x, point.y) else false;
+        const color = if (index == selected_index or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+        queueCenteredChromeLabel(state, segment, label, paletteColor(color), theme.scaledUi(12.0), clip);
+    }
     if (diff_layout_hit_count + 2 <= diff_layout_hits.len) {
         diff_layout_hits[diff_layout_hit_count] = .{ .rect = segments[0], .split = false };
         diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = segments[1], .split = true };
@@ -9103,6 +9726,10 @@ fn renderToolCallGroup(
     clip: palette.Rect,
     fallback_running: bool,
     started_at_ms: ?i64,
+    lead: ?ToolGroupLead,
+    /// The agents banner carries the live state: show counts only, with a
+    /// quiet neutral dot instead of the running ring.
+    status_owned_elsewhere: bool,
 ) void {
     const failed_count = toolCallGroupFailureCount(entries, start, end);
     const failed = failed_count > 0;
@@ -9118,9 +9745,10 @@ fn renderToolCallGroup(
         state,
         bubble,
         paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 235)),
-        // A failed child is identified by the status dot and its own row; the
-        // group shell stays neutral so one failure does not tint every call.
-        paletteColor(if (running and !failed) theme.COLOR_GREEN else theme.borderMuted()),
+        // The shell stays neutral in every state: running is carried by the
+        // accent status dot, a failure by the danger dot and "failed" count,
+        // so the focused composer remains the only accent-outlined box.
+        paletteColor(theme.borderMuted()),
         transcriptBubbleCornerRadius(),
         clip,
     );
@@ -9134,83 +9762,53 @@ fn renderToolCallGroup(
         .w = status_dia,
         .h = status_dia,
     };
-    const normal_status_color = if (running) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED;
-    const partial_failure = failed_count > 0 and failed_count < count;
-    const status_color = if (failed and !partial_failure) theme.COLOR_DIFF_REMOVE else normal_status_color;
-    queueRoundedClipped(state, status_rect, paletteColor(status_color), status_dia * 0.5, clip);
-    if (partial_failure) {
-        const center: palette.draw.Vec2 = .{ .x = status_rect.x + status_rect.w * 0.5, .y = status_rect.y + status_rect.h * 0.5 };
-        const radius = status_dia * 0.5;
-        const failed_ratio = @as(f32, @floatFromInt(failed_count)) / @as(f32, @floatFromInt(count));
-        const sweep = std.math.tau * failed_ratio;
-        const segment_angle = std.math.tau / 24.0;
-        var angle: f32 = -std.math.pi / 2.0;
-        const end_angle = angle + sweep;
-        while (angle < end_angle) {
-            const next_angle = @min(angle + segment_angle, end_angle);
-            queueTriangleClipped(
-                state,
-                center,
-                .{ .x = center.x + std.math.cos(angle) * radius, .y = center.y + std.math.sin(angle) * radius },
-                .{ .x = center.x + std.math.cos(next_angle) * radius, .y = center.y + std.math.sin(next_angle) * radius },
-                paletteColor(theme.COLOR_DIFF_REMOVE),
-                clip,
-            );
-            angle = next_angle;
-        }
-    }
+    // Shared status marks (sidebar set): failed (any child) = cross, running
+    // = ring, done = check. A finished tool call is neutral (`statusDone`):
+    // green is kept for chat-level completion, not every call in a transcript.
+    const status_color = if (failed)
+        theme.statusFailed()
+    else if (running)
+        theme.statusRunning()
+    else
+        theme.statusDone();
+    const quiet_running = running and status_owned_elsewhere and !failed;
+    const status_kind: sidebar.StatusMark = if (failed) .cross else if (quiet_running) .dot else if (running) .working else .check;
+    sidebar.queueStatusMark(state, status_kind, status_rect.x + status_rect.w * 0.5, status_rect.y + status_rect.h * 0.5, if (quiet_running) theme.statusDone() else status_color, if (running and !quiet_running) linkedChatStatusPulse(state, .running) else 1.0, clip);
 
-    var summary_buf: [128]u8 = undefined;
+    var summary_buf: [192]u8 = undefined;
+    var summary_len: usize = 0;
     const subagent = isSubagentTimelineEntry(entries[start]);
     const noun = if (subagent)
         (if (count == 1) "subagent" else "subagents")
     else if (count == 1) "tool call" else "tool calls";
-    const summary = if (running) blk: {
-        if (started_at_ms == null) {
-            if (failed_count > 0) {
-                break :blk std.fmt.bufPrint(
-                    &summary_buf,
-                    "{d} {s}  ·  {d} completed  ·  {d} failed  ·  {d} running",
-                    .{ count, noun, completed_count, failed_count, running_count },
-                ) catch "Tool calls running";
-            }
-            break :blk std.fmt.bufPrint(
-                &summary_buf,
-                "{d} {s}  ·  {d} completed  ·  {d} running",
-                .{ count, noun, completed_count, running_count },
-            ) catch "Tool calls running";
+    // A folded live turn leads with its verb ("Working", "Thinking", ...) so
+    // the group header is the only running surface.
+    const lead_text: []const u8 = if (running) (if (lead) |value| value.text else "") else "";
+    if (lead_text.len > 0) appendSummaryPart(&summary_buf, &summary_len, "{s}  \u{00B7}  ", .{lead_text});
+    appendSummaryPart(&summary_buf, &summary_len, "{d} {s}  \u{00B7}  {d} completed", .{ count, noun, completed_count });
+    if (failed_count > 0) appendSummaryPart(&summary_buf, &summary_len, "  \u{00B7}  {d} failed", .{failed_count});
+    if (running) appendSummaryPart(&summary_buf, &summary_len, "  \u{00B7}  {d} running", .{running_count});
+    if (running) {
+        if (started_at_ms) |started| {
+            var elapsed_buf: [32]u8 = undefined;
+            appendSummaryPart(&summary_buf, &summary_len, "  \u{00B7}  {s}", .{formatElapsedDuration(&elapsed_buf, started)});
         }
-        var elapsed_buf: [32]u8 = undefined;
-        const elapsed = formatElapsedDuration(&elapsed_buf, started_at_ms.?);
-        if (failed_count > 0) {
-            break :blk std.fmt.bufPrint(
-                &summary_buf,
-                "{d} {s}  ·  {d} completed  ·  {d} failed  ·  {d} running  ·  {s}",
-                .{ count, noun, completed_count, failed_count, running_count, elapsed },
-            ) catch "Tool calls running";
-        }
-        break :blk std.fmt.bufPrint(
-            &summary_buf,
-            "{d} {s}  ·  {d} completed  ·  {d} running  ·  {s}",
-            .{ count, noun, completed_count, running_count, elapsed },
-        ) catch "Tool calls running";
-    } else if (failed_count > 0)
-        std.fmt.bufPrint(
-            &summary_buf,
-            "{d} {s}  ·  {d} completed  ·  {d} failed",
-            .{ count, noun, completed_count, failed_count },
-        ) catch "Tool calls completed with failures"
-    else
-        std.fmt.bufPrint(&summary_buf, "{d} {s}  ·  {d} completed", .{ count, noun, completed_count }) catch "Tool calls completed";
+    }
+    const summary = summary_buf[0..summary_len];
+    const lead_len = @min(lead_text.len, summary.len);
+    const lead_color = if (lead) |value| value.color else theme.statusRunning();
 
     const chev_w = theme.scaledUi(22.0);
     const text_x = bubble.x + pad_x + status_dia + theme.scaledUi(11.0);
-    queueFixedTextLine(state, .{
+    const summary_font = theme.scaledUi(14.0);
+    const summary_rect: palette.Rect = .{
         .x = text_x,
         .y = bubble.y + theme.scaledUi(14.0),
         .w = @max(bubble.w - (text_x - bubble.x) - pad_x - chev_w, theme.scaledUi(40.0)),
         .h = theme.scaledUi(20.0),
-    }, summary, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    };
+    const summary_clip = intersectClipRect(clip, summary_rect);
+    queueToolGroupSummary(state, summary_rect, summary, lead_len, lead_color, failed_count, summary_font, summary_clip);
     queueCardChevron(state, bubble.x + bubble.w - pad_x - chev_w * 0.5, bubble.y + header_h * 0.5, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
     state.recordCardToggleHit(.{
         .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
@@ -9249,6 +9847,7 @@ fn renderToolCallGroup(
             toolCallEntryStatus(entry),
             if (@hasField(@TypeOf(entry), "tool_call_kind")) entry.tool_call_kind else null,
             null,
+            null,
         );
         child_y += child_h + theme.scaledUi(8.0);
     }
@@ -9277,6 +9876,7 @@ fn renderCommandEventRow(
     tool_call_status: ?provider_types.ToolCallStatus,
     tool_call_kind: ?provider_types.ToolCallKind,
     live_task_index: ?usize,
+    lead: ?ToolGroupLead,
 ) void {
     // Command transcript card, including controls for tracked background tasks.
     // A child agent's streamed transcript belongs to its own pane.
@@ -9298,7 +9898,10 @@ fn renderCommandEventRow(
         state,
         bubble,
         paletteColor(fill_color),
-        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (stopped) theme.COLOR_YELLOW else resting_border),
+        // The shell stays neutral even when the call failed or stopped: the
+        // status dot and the danger-coloured label carry the state, so a
+        // command's output never reads as error chrome.
+        paletteColor(resting_border),
         rr,
         clip,
     );
@@ -9314,30 +9917,27 @@ fn renderCommandEventRow(
     const expanded = state.isCardExpandedDefault(key, default_expanded);
 
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
-    const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
+    // A folded live turn (see `pendingStreamFoldsIntoRow`) swaps the action
+    // label for its verb + timer, so this row is the turn's only running
+    // surface.
+    const row_lead: ?ToolGroupLead = if (is_running) lead else null;
+    const label = if (row_lead) |value| value.text else paletteCommandRowDisplayAuthor(original_author, body_raw);
 
     const status_dia = theme.scaledUi(8.0);
     const status_cx = bubble.x + pad_x + status_dia * 0.5;
     const status_cy = bubble.y + pad_y + line_h * 0.5;
-    const status_color: [4]f32 = blk: {
-        if (failed) break :blk theme.COLOR_DIFF_REMOVE;
-        if (stopped) break :blk theme.COLOR_YELLOW;
-        if (is_running) {
-            const t_ns: i128 = profiler.nowNs();
-            const period_ns: i128 = 1_400_000_000;
-            const phase = @as(f32, @floatFromInt(@mod(t_ns, period_ns))) / @as(f32, @floatFromInt(period_ns));
-            const sin_t = std.math.sin(phase * std.math.tau);
-            const alpha = 0.45 + 0.55 * (sin_t * 0.5 + 0.5);
-            break :blk theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(alpha * 255.0));
-        }
-        break :blk theme.COLOR_GREEN;
-    };
-    queueRoundedClipped(state, .{
-        .x = status_cx - status_dia * 0.5,
-        .y = status_cy - status_dia * 0.5,
-        .w = status_dia,
-        .h = status_dia,
-    }, paletteColor(status_color), status_dia * 0.5, clip);
+    // Shared status marks (sidebar set): failed = cross, stopped = warning
+    // dot, running = ring with a breathing dot, finished = neutral check.
+    const status_kind: sidebar.StatusMark = if (failed) .cross else if (stopped) .dot else if (is_running) .working else .check;
+    const status_color: [4]f32 = if (failed)
+        theme.statusFailed()
+    else if (stopped)
+        theme.warning()
+    else if (is_running)
+        theme.statusRunning()
+    else
+        theme.statusDone();
+    sidebar.queueStatusMark(state, status_kind, status_cx, status_cy, status_color, if (is_running) linkedChatStatusPulse(state, .running) else 1.0, clip);
 
     const copy_w = theme.scaledUi(56.0);
     const copy_h = theme.scaledUi(26.0);
@@ -9396,7 +9996,6 @@ fn renderCommandEventRow(
     });
     const leftmost_action_x = if (show_open) open_rect.x else if (show_output) output_rect.x else if (local_bang) retry_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
     const text_right = leftmost_action_x - copy_gap;
-    const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
     const header_text_clip = intersectClipRect(clip, .{
         .x = text_x,
         .y = bubble.y,
@@ -9483,55 +10082,58 @@ fn renderCommandEventRow(
         }
     }
 
+    // Header anatomy shared by every provider: a kind glyph (icon font), the
+    // action label, a "·" separator, then the command in the mono face.
     const mono_w = font_size * 0.55;
     const text_y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5;
-    const icon_text = if (grouped) "$" else ">_";
-    const icon_w = @as(f32, @floatFromInt(icon_text.len)) * mono_w;
+    const icon_size = theme.scaledUi(14.0);
+    const icon_w = theme.scaledUi(16.0);
     const gap = theme.scaledUi(7.0);
+    if (text_x + icon_w <= text_right) {
+        const glyph = toolRowGlyph(tool_call_kind, original_author, body_raw);
+        const origin = text_measure.centeredGlyphOrigin(.icon, glyph, icon_size, text_x + icon_w * 0.5, status_cy);
+        queueIconText(state, .{ .x = origin.x, .y = origin.y, .w = icon_size * 1.5, .h = icon_size * 1.5 }, glyph, text_color, icon_size, header_text_clip);
+    }
     const label_x = text_x + icon_w + gap;
-    const label_w = @as(f32, @floatFromInt(label.len)) * mono_w;
+    const label_w = text_measure.textWidth(.prose_bold, font_size, label);
     const separator_gap = theme.scaledUi(8.0);
-    const separator = "-";
-    const separator_w = @as(f32, @floatFromInt(separator.len)) * mono_w;
+    const separator = "\u{00B7}";
+    const separator_w = text_measure.textWidth(.prose_bold, font_size, separator);
     const separator_x = label_x + label_w + separator_gap;
     const body_x = separator_x + separator_w + separator_gap;
     const body_w = @max(text_right - body_x, 0.0);
-
-    queueFixedTextLine(state, snapRect(.{
-        .x = text_x,
-        .y = text_y,
-        .w = @min(icon_w, text_w),
-        .h = font_size * 1.25,
-    }), icon_text, text_color, font_size, header_text_clip);
 
     if (label_x < text_right) {
         queueFixedTextLine(state, snapRect(.{
             .x = label_x,
             .y = text_y,
-            .w = @min(label_w, @max(text_right - label_x, 0.0)),
+            .w = @min(label_w + theme.scaledUi(2.0), @max(text_right - label_x, 0.0)),
             .h = font_size * 1.25,
-        }), label, text_color, font_size, header_text_clip);
+        }), label, if (row_lead) |value| paletteColor(value.color) else text_color, font_size, header_text_clip);
     }
 
     if (body_w > mono_w * 3.0 and body.len > 0) {
         queueFixedTextLine(state, snapRect(.{
             .x = separator_x,
             .y = text_y,
-            .w = @min(separator_w, @max(text_right - separator_x, 0.0)),
+            .w = @min(separator_w + theme.scaledUi(2.0), @max(text_right - separator_x, 0.0)),
             .h = font_size * 1.25,
         }), separator, text_color, font_size, header_text_clip);
 
-        const owned_preview = commandRowPreviewAlloc(state.allocator, body) catch null;
+        // Structured tool bodies (MCP etc.) summarize as "<tool> · <key arg>";
+        // the raw JSON stays in the expanded body only.
+        const owned_preview = (toolRowSummaryAlloc(state.allocator, body) catch null) orelse
+            (commandRowPreviewAlloc(state.allocator, body) catch null);
         defer if (owned_preview) |preview| state.allocator.free(preview);
         const preview = owned_preview orelse firstTextLine(body);
         const display_body = truncateMonoToWidth(state.allocator, preview, body_w, font_size);
         defer if (display_body.allocated) state.allocator.free(display_body.text);
-        queueFixedTextLine(state, snapRect(.{
+        queueRoleTextLine(state, snapRect(.{
             .x = body_x,
             .y = text_y,
             .w = body_w,
             .h = font_size * 1.25,
-        }), display_body.text, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, header_text_clip);
+        }), display_body.text, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, .mono, header_text_clip);
     }
 
     if (subagent_row) {
@@ -9585,30 +10187,45 @@ fn renderCommandEventRow(
             .w = @max(bubble.w - pad_x * 2.0, theme.scaledUi(40.0)),
             .h = @max(bubble.h - header_h - pad_y, theme.scaledUi(1.0)),
         };
-        const chars_per_line = @max(@as(usize, @intFromFloat(inner.w / (font_size * 0.52))), 1);
+        const chars_per_line = @max(@as(usize, @intFromFloat(inner.w / (font_size * FIXED_TEXT_CELL_EM))), 1);
         const line_count = wrappedLineCount(body, chars_per_line);
         const output_key = toolOutputKey(message_index);
         const show_all = state.isCardExpanded(output_key);
         const visible_lines = if (show_all) line_count else @min(line_count, TOOL_OUTPUT_COLLAPSED_LINES);
         const body_h = @as(f32, @floatFromInt(visible_lines)) * line_h;
-        renderWrappedBody(state, .{ .x = inner.x, .y = inner.y, .w = inner.w, .h = body_h }, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
+        renderWrappedMonoBody(state, .{ .x = inner.x, .y = inner.y, .w = inner.w, .h = body_h }, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, intersectRect(clip, bubble));
         if (!show_all and line_count > visible_lines) {
+            // "Show more" is a real ghost button (Copy's resting/hover fills,
+            // a disclosure chevron, pointer cursor via the card-toggle hit).
             const more_label = "Show more";
             const more_font = theme.scaledUi(12.0);
-            const more_pad_x = theme.scaledUi(6.0);
-            const more_w = @as(f32, @floatFromInt(more_label.len)) * more_font * 0.55 + more_pad_x * 2.0;
-            const more_rect = palette.Rect{
+            const more_pad_x = theme.scaledUi(9.0);
+            const more_chev = theme.scaledUi(11.0);
+            const more_gap = theme.scaledUi(5.0);
+            const more_label_w = chromeLabelWidth(more_font, more_label);
+            const more_w = more_pad_x * 2.0 + more_label_w + more_gap + more_chev;
+            const more_rect = snapRect(.{
                 .x = inner.x + inner.w - more_w,
-                .y = inner.y + body_h,
+                .y = inner.y + body_h + theme.scaledUi(1.0),
                 .w = more_w,
-                .h = theme.scaledUi(26.0),
-            };
-            queueFixedTextLine(state, .{
+                .h = theme.scaledUi(24.0),
+            });
+            const more_hovered = rectContains(more_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+            const more_bg = if (more_hovered)
+                theme.withAlpha(theme.raise(theme.COLOR_PANEL_ALT, 0.08), 210)
+            else
+                theme.withAlpha(theme.COLOR_PANEL_MUTED, 86);
+            const more_fg = paletteColor(if (more_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+            queueRoundedClipped(state, more_rect, paletteColor(more_bg), theme.scaledUi(5.0), clip);
+            const more_label_h = more_font * 1.4;
+            queueChromeLabel(state, .{
                 .x = more_rect.x + more_pad_x,
-                .y = more_rect.y,
-                .w = more_rect.w - more_pad_x * 2.0,
-                .h = more_rect.h,
-            }, more_label, paletteColor(theme.COLOR_GREEN), more_font, clip);
+                .y = more_rect.y + (more_rect.h - more_label_h) * 0.5,
+                .w = more_label_w + theme.scaledUi(2.0),
+                .h = more_label_h,
+            }, more_label, more_fg, more_font, clip);
+            const chev_origin = text_measure.centeredGlyphOrigin(.icon, NF_COD_CHEVRON_DOWN, more_chev, more_rect.x + more_pad_x + more_label_w + more_gap + more_chev * 0.5, more_rect.y + more_rect.h * 0.5);
+            queueIconText(state, .{ .x = chev_origin.x, .y = chev_origin.y, .w = more_chev * 1.5, .h = more_chev * 1.5 }, NF_COD_CHEVRON_DOWN, more_fg, more_chev, clip);
             state.recordCardToggleHit(.{ .rect = more_rect, .key = output_key, .kind = .tool_output, .message_index = message_index });
         }
     }
@@ -9628,29 +10245,61 @@ fn intersectClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
     };
 }
 
-/// Right-pointing triangle when collapsed, down-pointing when expanded.
-/// Clipped so rows scrolled out of the transcript never bleed into other panes.
-fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool, color: palette.Color, clip: palette.Rect) void {
-    const half = theme.scaledUi(4.0);
-    if (expanded) {
-        queueTriangleClipped(
-            state,
-            .{ .x = cx - half, .y = cy - half * 0.5 },
-            .{ .x = cx + half, .y = cy - half * 0.5 },
-            .{ .x = cx, .y = cy + half * 0.7 },
-            color,
-            clip,
-        );
-    } else {
-        queueTriangleClipped(
-            state,
-            .{ .x = cx - half * 0.5, .y = cy - half },
-            .{ .x = cx + half * 0.7, .y = cy },
-            .{ .x = cx - half * 0.5, .y = cy + half },
-            color,
-            clip,
-        );
+/// Live-turn verb folded into a running tool group's header (A2), drawn in
+/// the running status colour ahead of the counts.
+const ToolGroupLead = struct {
+    text: []const u8,
+    color: [4]f32,
+};
+
+fn appendSummaryPart(buf: []u8, len: *usize, comptime fmt: []const u8, args: anytype) void {
+    const written = std.fmt.bufPrint(buf[len.*..], fmt, args) catch return;
+    len.* += written.len;
+}
+
+/// Tool-group summary line. The leading `lead_len` bytes (a folded turn verb)
+/// draw in `lead_color`; the "N failed" segment is drawn in danger so a
+/// failure reads in words as well as by the status dot; the rest stays
+/// muted. Untyped text draws in the prose-bold face, so segments are
+/// measured with that role.
+fn queueToolGroupSummary(state: *app_state.AppState, rect: palette.Rect, summary: []const u8, lead_len: usize, lead_color: [4]f32, failed_count: usize, font_size: f32, clip: ?palette.Rect) void {
+    const muted = paletteColor(theme.COLOR_TEXT_MUTED);
+    var x = rect.x;
+    if (lead_len > 0) {
+        queueFixedTextLine(state, rect, summary[0..lead_len], paletteColor(lead_color), font_size, clip);
+        x += text_measure.textWidth(.prose_bold, font_size, summary[0..lead_len]);
     }
+    const rest = summary[lead_len..];
+    const rest_rect: palette.Rect = .{ .x = x, .y = rect.y, .w = @max(rect.x + rect.w - x, 1.0), .h = rect.h };
+    var failed_buf: [32]u8 = undefined;
+    const failed_text = if (failed_count > 0) std.fmt.bufPrint(&failed_buf, "{d} failed", .{failed_count}) catch "" else "";
+    const start_byte = if (failed_text.len > 0) std.mem.indexOf(u8, rest, failed_text) else null;
+    const start = start_byte orelse {
+        queueFixedTextLine(state, rest_rect, rest, muted, font_size, clip);
+        return;
+    };
+    const end = start + failed_text.len;
+    const prefix_w = text_measure.textWidth(.prose_bold, font_size, rest[0..start]);
+    const failed_w = text_measure.textWidth(.prose_bold, font_size, failed_text);
+    if (start > 0) queueFixedTextLine(state, rest_rect, rest[0..start], muted, font_size, clip);
+    queueFixedTextLine(state, .{ .x = rest_rect.x + prefix_w, .y = rect.y, .w = @max(rest_rect.w - prefix_w, 1.0), .h = rect.h }, failed_text, paletteColor(theme.statusFailed()), font_size, clip);
+    if (end < rest.len) {
+        const offset = prefix_w + failed_w;
+        queueFixedTextLine(state, .{ .x = rest_rect.x + offset, .y = rect.y, .w = @max(rest_rect.w - offset, 1.0), .h = rect.h }, rest[end..], muted, font_size, clip);
+    }
+}
+
+/// Codicon disclosure chevron (right when collapsed, down when expanded):
+/// the same glyph family and size settings selects and menus use, centred on
+/// its ink. Clipped so rows scrolled out of the transcript never bleed into
+/// other panes.
+pub const DISCLOSURE_CHEVRON_SIZE_UI: f32 = 14.0;
+
+fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool, color: palette.Color, clip: palette.Rect) void {
+    const size = theme.scaledUi(DISCLOSURE_CHEVRON_SIZE_UI);
+    const glyph = if (expanded) NF_COD_CHEVRON_DOWN else NF_COD_CHEVRON_RIGHT;
+    const origin = text_measure.centeredGlyphOrigin(.icon, glyph, size, cx, cy);
+    queueIconText(state, .{ .x = origin.x, .y = origin.y, .w = size * 1.5, .h = size * 1.5 }, glyph, color, size, clip);
 }
 
 // Orchestration summary row: one compact, clickable line standing in for a
@@ -9730,14 +10379,24 @@ fn renderChildNotificationCard(
     const status = notification.status.label();
     const status_w = @min(chromeLabelWidth(meta_font, status), identity_rect.w);
     const status_x = identity_rect.x + identity_rect.w - status_w;
+    // Status reads by shape too: the shared check / ring / cross mark (see
+    // `queueLinkedChatStatusDot`) leads the status word.
+    const mark_slot = theme.scaledUi(CHILD_ROW_STATUS_MARK_SLOT);
     const provider_w = chromeLabelWidth(meta_font, identity.provider);
-    const provider_x = status_x - gap - provider_w;
+    const provider_x = status_x - mark_slot - gap - provider_w;
     const show_provider = identity.provider.len > 0 and provider_x - gap - header.x >= theme.scaledUi(120.0);
-    const title_w = @max((if (show_provider) provider_x else status_x) - gap - header.x, 0.0);
+    const title_w = @max((if (show_provider) provider_x else status_x - mark_slot) - gap - header.x, 0.0);
     var title_buf: [512]u8 = undefined;
     const title = truncateUiLabel(&title_buf, identity.title, title_w, title_font);
-    queueChromeLabel(state, .{ .x = header.x, .y = header.y, .w = title_w, .h = header.h }, title, paletteColor(if (hover) theme.COLOR_GREEN else theme.COLOR_WHITE), title_font, row_clip);
+    // Hover is a neutral tint behind the identity row (the pointer cursor
+    // marks it as a link); the title stays primary text in every state.
+    if (hover) {
+        const tint_pad = theme.scaledUi(6.0);
+        queueRoundedClipped(state, .{ .x = identity_rect.x - tint_pad, .y = identity_rect.y, .w = identity_rect.w + tint_pad * 2.0, .h = identity_rect.h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 12)), theme.scaledUi(6.0), row_clip);
+    }
+    queueChromeLabel(state, .{ .x = header.x, .y = header.y, .w = title_w, .h = header.h }, title, paletteColor(theme.COLOR_WHITE), title_font, row_clip);
     if (show_provider) queueChromeLabel(state, .{ .x = provider_x, .y = header.y, .w = provider_w, .h = header.h }, identity.provider, paletteColor(theme.COLOR_TEXT_MUTED), meta_font, row_clip);
+    queueLinkedChatStatusDot(state, status_x - mark_slot + theme.scaledUi(2.0), header.y + header.h * 0.5, notification.status, row_clip);
     queueChromeLabel(state, .{ .x = status_x, .y = header.y, .w = status_w, .h = header.h }, status, paletteColor(linkedChatStatusColor(notification.status)), meta_font, row_clip);
     const identity_visible = intersectRect(identity_rect, row_clip);
     if (identity_visible.w > 0.0 and identity_visible.h > 0.0 and state.project_controller.projects.items.len > 0) {
@@ -9831,49 +10490,44 @@ fn renderTranscriptBubbleFromParts(
     // Replies sit on the panel surface so they lift off the pane background;
     // the user's own turns carry a light accent wash with an accent edge.
     // Messages another agent sent keep the user's side but drop the accent
-    // wash, so only prompts the human typed read as "You".
+    // wash, so only prompts the human typed read as "You". A mid-turn steer
+    // is the user's words too, so it takes the same user surface (never the
+    // warning tint, which maps to red in many themes); other system notes are
+    // neutral info cards.
     const human_user = role == .user and std.mem.eql(u8, role_label, "You");
-    const bg = switch (role) {
-        .user => if (human_user) theme.wash(theme.accent(), 64) else theme.withAlpha(theme.COLOR_PANEL, 250),
-        .assistant => theme.withAlpha(theme.COLOR_PANEL, 250),
-        .system => theme.wash(theme.COLOR_YELLOW, 54),
+    const steering = isSteeringAuthor(role, role_label);
+    const user_surface = human_user or steering;
+    const bg = if (user_surface)
+        theme.userBubbleFill()
+    else switch (role) {
+        .user, .assistant => theme.withAlpha(theme.COLOR_PANEL, 250),
+        .system => theme.COLOR_PANEL_ALT,
     };
     const rr = transcriptBubbleCornerRadius();
-    const activity = if (active) theme.activityPulse(profiler.nowNs()) else 0.0;
-    const border_color = if (active)
-        theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(92.0 + activity * 88.0))
+    // A live reply keeps a neutral edge; its pulsing dot and label carry the
+    // accent so the focused composer stays the only accent-outlined box.
+    const border_color = if (user_surface)
+        theme.userBubbleBorder()
     else if (role == .user)
         theme.border()
     else
         theme.borderMuted();
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border_color), rr, clip);
+    const display_label = if (steering) "Steering" else role_label;
 
     var label_x = bubble.x + theme.scaledUi(14.0);
     if (active) {
-        const core_d = theme.scaledUi(5.5);
-        const halo_d = core_d + theme.scaledUi(5.0) * activity;
-        const center_x = label_x + halo_d * 0.5;
-        const center_y = bubble.y + theme.scaledUi(19.0);
-        queueRoundedClipped(state, .{
-            .x = center_x - halo_d * 0.5,
-            .y = center_y - halo_d * 0.5,
-            .w = halo_d,
-            .h = halo_d,
-        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(28.0 + activity * 48.0))), halo_d * 0.5, clip);
-        queueRoundedClipped(state, .{
-            .x = center_x - core_d * 0.5,
-            .y = center_y - core_d * 0.5,
-            .w = core_d,
-            .h = core_d,
-        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(180.0 + activity * 75.0))), core_d * 0.5, clip);
-        label_x += halo_d + theme.scaledUi(6.0);
+        // The live turn's mark is the shared running ring (sidebar set).
+        const mark_w = theme.scaledUi(12.0);
+        sidebar.queueStatusMark(state, .working, label_x + mark_w * 0.5, bubble.y + theme.scaledUi(19.0), theme.statusRunning(), linkedChatStatusPulse(state, .running), clip);
+        label_x += mark_w + theme.scaledUi(6.0);
     }
     queueText(state, snapRect(.{
         .x = label_x,
         .y = bubble.y + theme.scaledUi(9.0),
         .w = @max(bubble.x + bubble.w - theme.scaledUi(14.0) - label_x, theme.scaledUi(20.0)),
         .h = theme.scaledUi(20.0),
-    }), role_label, paletteColor(if (active) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    }), display_label, paletteColor(if (active) theme.statusRunning() else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
         .y = bubble.y + theme.scaledUi(34.0),
@@ -9882,8 +10536,11 @@ fn renderTranscriptBubbleFromParts(
     };
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
     last_body_tail = null;
-    if (role == .assistant and !muted_body and !assistant_plain_layout) {
-        renderMarkdownBody(state, message_index, body_rect, body_text, clip, streaming);
+    // Text never paints past the card: an unbreakable token wider than the
+    // body (a long path or URL) is cut at the card's inner edge instead.
+    const body_clip = intersectRect(clip, .{ .x = bubble.x + theme.scaledUi(4.0), .y = bubble.y, .w = @max(bubble.w - theme.scaledUi(8.0), 0.0), .h = bubble.h });
+    if (!muted_body and transcriptBodyUsesMarkdown(role, assistant_plain_layout)) {
+        renderMarkdownBodyWithOptions(state, message_index, body_rect, body_text, body_clip, streaming, if (user_surface) userBubbleMarkdownOptions() else transcriptMarkdownOptions());
     } else {
         renderPlainSelectableBody(
             state,
@@ -9891,11 +10548,17 @@ fn renderTranscriptBubbleFromParts(
             body_rect,
             body_text,
             if (muted_body) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE,
-            clip,
+            body_clip,
             streaming,
         );
     }
     if (active) renderStreamCaret(state, last_body_tail, clip);
+}
+
+/// Mid-turn steers the user sent ("Steering current turn", or the
+/// provider-specific "Steering · …" pin labels) render as user turns.
+fn isSteeringAuthor(role: app_state.ChatRole, author: []const u8) bool {
+    return role == .system and std.mem.startsWith(u8, author, "Steering");
 }
 
 /// End of the last prose line drawn by the most recent body render (fresh
@@ -9923,7 +10586,7 @@ fn renderStreamCaret(state: *app_state.AppState, tail: ?chat_markdown.TextTail, 
         .w = theme.scaledUi(2.0),
         .h = caret_h,
     };
-    queueRoundedClipped(state, caret, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 220)), caret.w * 0.5, clip);
+    queueRoundedClipped(state, caret, paletteColor(theme.withAlpha(theme.statusRunning(), 220)), caret.w * 0.5, clip);
 }
 
 fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
@@ -9957,6 +10620,17 @@ fn transcriptPlainTextOptions(color: [4]f32) chat_markdown.RenderOptions {
 }
 
 fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect, streaming: bool) void {
+    renderMarkdownBodyWithOptions(state, message_index, rect, body, clip, streaming, transcriptMarkdownOptions());
+}
+
+/// Markdown body on a user bubble: code blocks take the bubble-derived fill.
+fn userBubbleMarkdownOptions() chat_markdown.RenderOptions {
+    var options = transcriptMarkdownOptions();
+    options.code_background = theme.userBubbleCodeFill();
+    return options;
+}
+
+fn renderMarkdownBodyWithOptions(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect, streaming: bool, options: chat_markdown.RenderOptions) void {
     if (body.len == 0) return;
     // Committed messages cache per message index; the streaming reply keeps
     // one slot rebuilt per delta (item 4) so animation frames replay geometry.
@@ -9965,7 +10639,7 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
     else
         state.transcriptMarkdownBodyEntry(message_index, body);
     if (cached) |entry| {
-        renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptMarkdownOptions(), true);
+        renderSelectableBodyEntry(state, message_index, rect, entry, clip, options, true);
         return;
     }
 
@@ -9977,7 +10651,7 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
         return;
     };
     defer view.deinit(state.allocator);
-    renderMarkdownBodyView(state, message_index, rect, view, clip);
+    renderSelectableBodyView(state, message_index, rect, view, clip, options, true);
 }
 
 fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect: palette.Rect, view: chat_markdown.BodyView, clip: palette.Rect) void {
@@ -10234,6 +10908,7 @@ fn transcriptBodyRenderStyleHash(kind: chat_types.TranscriptBodyKind, options: c
     hashOptionalFloat(&hasher, options.glyph_width);
     hashOptionalFloat(&hasher, options.code_font_size);
     if (options.text_color) |color| hasher.update(std.mem.asBytes(&color));
+    if (options.code_background) |color| hasher.update(std.mem.asBytes(&color));
     return hasher.final();
 }
 
@@ -10297,6 +10972,87 @@ fn firstTextLine(text: []const u8) []const u8 {
     return text;
 }
 
+const TOOL_BODY_SECTIONS = [_][]const u8{ "Tool:\n", "Input:\n", "Output:\n", "Error:\n", "Locations:\n", "Transcript:\n" };
+
+/// One "Label:\n<value>" section of a structured tool body; sections are
+/// separated by a blank line before the next known label.
+fn toolBodySection(body: []const u8, header: []const u8) ?[]const u8 {
+    const start = blk: {
+        if (std.mem.startsWith(u8, body, header)) break :blk header.len;
+        var probe: [32]u8 = undefined;
+        if (header.len + 2 > probe.len) return null;
+        @memcpy(probe[0..2], "\n\n");
+        @memcpy(probe[2 .. 2 + header.len], header);
+        const at = std.mem.indexOf(u8, body, probe[0 .. 2 + header.len]) orelse return null;
+        break :blk at + 2 + header.len;
+    };
+    var end = body.len;
+    for (TOOL_BODY_SECTIONS) |next| {
+        var search = start;
+        while (std.mem.indexOfPos(u8, body, search, "\n\n")) |gap| {
+            if (std.mem.startsWith(u8, body[gap + 2 ..], next)) {
+                end = @min(end, gap);
+                break;
+            }
+            search = gap + 1;
+        }
+    }
+    return std.mem.trim(u8, body[start..end], " \t\r\n");
+}
+
+/// Input fields that best say what a tool call acts on, most telling first.
+const TOOL_SUMMARY_KEYS = [_][]const u8{ "command", "cmd", "path", "file_path", "filePath", "file", "query", "pattern", "url", "title", "name", "description", "prompt", "message", "reason", "text" };
+
+/// "<tool> · <key argument>" for structured tool bodies (`Tool:` / `Input:`
+/// sections); null when the body is not structured so callers fall back to
+/// the plain preview. Never returns the raw JSON object.
+fn toolRowSummaryAlloc(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    const tool = toolBodySection(body, "Tool:\n");
+    const input = toolBodySection(body, "Input:\n");
+    if (tool == null and input == null) return null;
+    var argument: []const u8 = "";
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*value| value.deinit();
+    if (input) |raw| {
+        if (std.json.parseFromSlice(std.json.Value, allocator, raw, .{})) |value| {
+            parsed = value;
+            if (value.value == .object) {
+                for (TOOL_SUMMARY_KEYS) |key| {
+                    const field = value.value.object.get(key) orelse continue;
+                    if (field != .string) continue;
+                    const text = std.mem.trim(u8, firstTextLine(std.mem.trim(u8, field.string, " \t\r\n")), " \t");
+                    if (text.len == 0) continue;
+                    argument = text;
+                    break;
+                }
+            }
+        } else |_| {
+            // Not JSON (a bare command or path): its first line is the argument.
+            argument = std.mem.trim(u8, firstTextLine(raw), " \t");
+            if (argument.len > 0 and (argument[0] == '{' or argument[0] == '[')) argument = "";
+        }
+    }
+    const name = if (tool) |value| std.mem.trim(u8, firstTextLine(value), " \t") else "";
+    if (name.len == 0 and argument.len == 0) return null;
+    if (name.len == 0) return try allocator.dupe(u8, argument);
+    if (argument.len == 0) return try allocator.dupe(u8, name);
+    return try std.fmt.allocPrint(allocator, "{s} \u{00B7} {s}", .{ name, argument });
+}
+
+test "structured tool rows summarize as tool and key argument, never raw JSON" {
+    const allocator = std.testing.allocator;
+    const mcp = (try toolRowSummaryAlloc(allocator, "Tool:\nverde.report_chat_blocked\n\nInput:\n{\n  \"turn_id\": \"t-1\",\n  \"reason\": \"Need a decision\\nmore\"\n}")).?;
+    defer allocator.free(mcp);
+    try std.testing.expectEqualStrings("verde.report_chat_blocked \u{00B7} Need a decision", mcp);
+    const path = (try toolRowSummaryAlloc(allocator, "Tool:\nRead\n\nInput:\n{\"file_path\":\"src/main.zig\",\"limit\":20}\n\nOutput:\nok")).?;
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("Read \u{00B7} src/main.zig", path);
+    const bare = (try toolRowSummaryAlloc(allocator, "Tool:\nverde.list_panes\n\nInput:\n{}")).?;
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("verde.list_panes", bare);
+    try std.testing.expect((try toolRowSummaryAlloc(allocator, "git status --short")) == null);
+}
+
 fn commandRowPreviewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var preview: std.ArrayList(u8) = .empty;
     errdefer preview.deinit(allocator);
@@ -10351,8 +11107,18 @@ fn wrappedLineCount(body: []const u8, chars_per_line: usize) usize {
 }
 
 fn renderWrappedBody(state: *app_state.AppState, rect: palette.Rect, body: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
+    renderWrappedBodyRole(state, rect, body, color, font_size, null, clip);
+}
+
+/// Tool output and command bodies: the same fixed-cell wrap, drawn in the
+/// mono face so commands read as code.
+fn renderWrappedMonoBody(state: *app_state.AppState, rect: palette.Rect, body: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
+    renderWrappedBodyRole(state, rect, body, color, font_size, .mono, clip);
+}
+
+fn renderWrappedBodyRole(state: *app_state.AppState, rect: palette.Rect, body: []const u8, color: palette.Color, font_size: f32, role: ?palette.FontRole, clip: palette.Rect) void {
     if (body.len == 0) return;
-    const char_w = font_size * 0.52;
+    const char_w = font_size * FIXED_TEXT_CELL_EM;
     const line_h = font_size * 1.28;
     const chars_per_line = @max(@as(usize, @intFromFloat(rect.w / char_w)), 1);
     var y = rect.y;
@@ -10364,7 +11130,7 @@ fn renderWrappedBody(state: *app_state.AppState, rect: palette.Rect, body: []con
         const line_end = i;
         if (line_end == chunk_start) {
             if (y + line_h >= clip.y and y <= clip.y + clip.h) {
-                queueFixedTextLine(state, .{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }, " ", color, font_size, clip);
+                queueRoleTextLine(state, .{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }, " ", color, font_size, role, clip);
             }
             y += line_h;
         } else {
@@ -10373,7 +11139,7 @@ fn renderWrappedBody(state: *app_state.AppState, rect: palette.Rect, body: []con
                 const chunk_len = @min(remaining, chars_per_line);
                 const chunk = body[chunk_start .. chunk_start + chunk_len];
                 if (y + line_h >= clip.y and y <= clip.y + clip.h) {
-                    queueFixedTextLine(state, .{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }, chunk, color, font_size, clip);
+                    queueRoleTextLine(state, .{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }, chunk, color, font_size, role, clip);
                 }
                 y += line_h;
                 chunk_start += chunk_len;
@@ -10439,8 +11205,8 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.syncComposerToolbarOverlayHitRects();
 }
 
-/// While the turn waits on agents, the empty prompt says so and that a
-/// follow-up can still be queued. Runs after `syncPaletteComposerControls`,
+/// While the turn waits on agents, the empty prompt says a follow-up can
+/// still be queued (the banner names the wait). Runs after `syncPaletteComposerControls`,
 /// which sets the default placeholder every frame.
 fn syncAgentsWaitingPlaceholder(state: *app_state.AppState) void {
     const thread = state.currentThread();
@@ -10449,9 +11215,8 @@ fn syncAgentsWaitingPlaceholder(state: *app_state.AppState) void {
     const project_id = selectedProjectId(state) orelse return;
     const activity = agentActivityForThread(state, project_id, thread);
     if (!activity.waiting()) return;
-    var buf: [96]u8 = undefined;
-    const placeholder = std.fmt.bufPrint(&buf, "Waiting on {d} agent{s}\u{2026} type to queue a follow-up", .{ activity.active, if (activity.active == 1) "" else "s" }) catch return;
-    state.composer_controller.composer.setPlaceholder(state.allocator, placeholder) catch {};
+    // Neutral: the agents banner above already says what the turn waits on.
+    state.composer_controller.composer.setPlaceholder(state.allocator, "Type to queue a follow-up") catch {};
 }
 
 /// Renders the unfocused split-pane prompt preview without touching the shared live composer widget.
@@ -10511,7 +11276,7 @@ fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect)
 
     // The live composer consolidates reasoning/speed/access into one run
     // pill; the read-only preview mirrors that with the same summary text
-    // and the same embedded state glyphs (brain gauge / bolt / lock).
+    // and the same embedded state glyphs (bulb gauge / bolt / lock).
     // Measure the joined label (it spans up to three settings and includes
     // multibyte separators) instead of guessing from byte count.
     var summary_buf: [192]u8 = undefined;
@@ -10555,7 +11320,7 @@ const INACTIVE_RUN_PILL_ICON_CELL_CSS: f32 = 24.0;
 const INACTIVE_RUN_PILL_ICON_SIZE_CSS: f32 = 18.0;
 
 // Renders the inactive preview's run pill: summary text broken around glyph
-// cells so brain/bolt/lock land beside the segment each one describes,
+// cells so bulb/bolt/lock land beside the segment each one describes,
 // matching the live run pill's walk (including the half-space nudge that
 // centers each glyph over the word gap).
 fn renderInactiveComposerRunPill(state: *app_state.AppState, pill: palette.Rect, label: []const u8, slots: []const InactiveRunSlot) void {
@@ -10586,9 +11351,8 @@ fn renderInactiveComposerRunPill(state: *app_state.AppState, pill: palette.Rect,
         if (x + gap_shift + cell_w > label_right) break;
         const cell = palette.Rect{ .x = x + gap_shift, .y = pill.y, .w = cell_w, .h = pill.h };
         switch (slot.kind) {
-            // The brain inks its full em; draw it smaller so the three glyphs
-            // read as the same visual weight (matches the live pill).
-            .reasoning => drawThinkingIcon(state, composerIconRectInCell(cell, icon_size * 0.85), icon_color),
+            // Same codicon family and size as the lock (matches the live pill).
+            .reasoning => drawThinkingIcon(state, composerIconRectInCell(cell, icon_size), icon_color),
             .speed => if (state.currentThread().fast_mode == .on)
                 drawBoltIcon(state, composerIconRectInCell(cell, icon_size), icon_color)
             else
@@ -10604,7 +11368,7 @@ fn renderInactiveComposerRunPill(state: *app_state.AppState, pill: palette.Rect,
 }
 
 fn inactiveComposerPillWidth(label: []const u8, has_icon: bool) f32 {
-    const text_w = @as(f32, @floatFromInt(label.len)) * theme.scaledUi(12.5) * 0.54;
+    const text_w = chromeLabelWidth(theme.scaledUi(12.5), label);
     return theme.clampf(text_w + theme.scaledUi(if (has_icon) 50.0 else 26.0), theme.scaledUi(if (has_icon) 92.0 else 76.0), theme.scaledUi(180.0));
 }
 
@@ -10661,7 +11425,9 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
     };
     if (state.currentThread().isSendPendingForUi()) {
         const pulse = theme.activityPulse(profiler.nowNs());
-        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, @intFromFloat(188.0 + pulse * 67.0))), size * 0.5);
+        // Stop is danger in every theme (warning maps to red, orange or
+        // amber depending on the palette).
+        queueRounded(state, button, paletteColor(theme.withAlpha(theme.danger(), @intFromFloat(188.0 + pulse * 67.0))), size * 0.5);
         const stop_side = size * (0.29 + pulse * 0.06);
         const stop = palette.Rect{
             .x = button.x + (size - stop_side) * 0.5,
@@ -10669,7 +11435,7 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
             .w = stop_side,
             .h = stop_side,
         };
-        queueRounded(state, stop, paletteColor(theme.withAlpha(theme.background(), 230)), theme.scaledUi(2.0));
+        queueRounded(state, stop, paletteColor(theme.withAlpha(theme.foregroundOn(theme.danger()), 230)), theme.scaledUi(2.0));
     } else {
         // This preview is read-only; keep the send affordance disabled so it
         // does not imply that clicks/keystrokes will be handled by this pane.
@@ -10711,8 +11477,23 @@ fn drawInactiveComposerSendArrow(state: *app_state.AppState, button: palette.Rec
     );
 }
 
+/// The "/" and "@" autocomplete popovers follow the draft, so closing them
+/// would clear what the user typed. Instead they are only shown (and
+/// hit-tested) while the composer has focus and no other menu or composer
+/// picker is open; the draft is left untouched and they reappear on refocus.
+fn composerAutocompleteVisible(state: *app_state.AppState) bool {
+    if (!state.composer_controller.focused) return false;
+    if (headerMenuOpen(state) or state.sidebar_context_menu_open) return false;
+    const composer = &state.composer_controller;
+    return !(composer.model_picker.isOpen() or
+        composer.directory_picker.isOpen() or
+        composer.runtime_picker.isOpen() or
+        composer.run_config_open);
+}
+
 fn renderComposerFileSearchResults(state: *app_state.AppState) void {
     file_search_hits = .{};
+    if (!composerAutocompleteVisible(state)) return;
     if (!state.hasActiveFileSearch()) return;
 
     const composer = state.composer_controller.composer.bounds();
@@ -10722,38 +11503,38 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
     const row_height = theme.scaledUi(42.0);
     const max_rows: usize = @min(results.len, file_search_hits.row_rects.len);
     const visible_rows: usize = if (results.len == 0) 1 else @max(@as(usize, 1), @min(max_rows, 6));
-    const pad = theme.scaledUi(8.0);
-    const gap = theme.scaledUi(8.0);
-    const panel_w = @min(composer.w, theme.scaledUi(720.0));
-    const panel_h = pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows));
-    const panel = palette.Rect{
-        .x = composer.x,
-        .y = @max(theme.scaledUi(8.0), composer.y - gap - panel_h),
-        .w = panel_w,
-        .h = panel_h,
-    };
+    const pad = theme.scaledUi(COMPOSER_POPOVER_PAD_UI);
+    const panel = composerPopoverRect(composer, pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows)));
     file_search_hits.panel_rect = panel;
 
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FILE_SEARCH_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    queueRoundedShellClipped(
-        state,
-        panel,
-        paletteColor(theme.withAlpha(theme.background(), 250)),
-        paletteColor(theme.COLOR_PANEL_MUTED),
-        theme.scaledUi(12.0),
-        panel,
-    );
+    queueComposerPopoverChrome(state, panel);
 
     if (results.len == 0) {
-        const message = if (state.fileSearchIsScanning()) "Indexing workspace files..." else "No matching files";
+        // Empty state reads as a menu row (icon + label, vertically centred)
+        // so the one-row popover is clearly attached to the "@" being typed.
+        // "@" alone has no query yet; invite typing instead of reporting a miss.
+        const query = state.file_search_controller.last_query orelse "";
+        const message = if (state.fileSearchIsScanning())
+            "Indexing workspace files\u{2026}"
+        else if (query.len == 0)
+            "Type to search files\u{2026}"
+        else
+            "No matching files";
+        const row = palette.Rect{ .x = panel.x + pad, .y = panel.y + pad, .w = panel.w - pad * 2.0, .h = row_height };
+        const icon_size = theme.scaledUi(15.0);
+        const icon_x = row.x + theme.scaledUi(12.0);
+        queueIconText(state, .{ .x = icon_x, .y = row.y + (row.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, NF_COD_SEARCH, paletteColor(theme.COLOR_TEXT_SUBTLE), icon_size, panel);
+        const font = theme.scaledUi(14.0);
+        const text_x = icon_x + icon_size + theme.scaledUi(12.0);
         queueText(state, .{
-            .x = panel.x + theme.scaledUi(14.0),
-            .y = panel.y + pad + theme.scaledUi(9.0),
-            .w = panel.w - theme.scaledUi(28.0),
-            .h = row_height,
-        }, message, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), panel);
+            .x = text_x,
+            .y = row.y + (row.h - font * 1.3) * 0.5,
+            .w = row.x + row.w - text_x - theme.scaledUi(12.0),
+            .h = font * 1.3,
+        }, message, paletteColor(theme.COLOR_TEXT_MUTED), font, panel);
         return;
     }
 
@@ -10781,8 +11562,8 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
         file_search_hits.row_count = visible_index + 1;
 
         const hovered = mouse_ok and rectContains(row, mx, my);
-        if (result_index == selected_index or hovered) {
-            queueRounded(state, row, paletteColor(if (result_index == selected_index) theme.withAlpha(theme.selection(), 230) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 230)), theme.scaledUi(8.0));
+        if (command_palette.rowHighlightFill(result_index == selected_index, hovered)) |fill| {
+            queueRounded(state, row, paletteColor(fill), theme.scaledUi(7.0));
         }
 
         const result = results[result_index];
@@ -10813,6 +11594,7 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
 
 fn renderComposerSlashCommands(state: *app_state.AppState) void {
     slash_picker_hits = .{};
+    if (!composerAutocompleteVisible(state)) return;
     if (!state.slashCommandPickerActive()) return;
 
     const total = state.slashCommandPickerRowCount();
@@ -10821,31 +11603,27 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
     const composer = state.composer_controller.composer.bounds();
     if (composer.w <= theme.scaledUi(160.0)) return;
 
-    const row_height = theme.scaledUi(46.0);
+    // A3: a second line only when the usage adds arguments beyond the name.
+    // One row height for the whole list (two-line if any row needs it) keeps
+    // scrolling and hit rects uniform; single-line rows centre their text.
+    var any_usage = false;
+    for (0..total) |index| {
+        const candidate = state.slashCommandPickerRow(index) orelse continue;
+        if (slashUsageAddsArgs(candidate.name, candidate.usage)) {
+            any_usage = true;
+            break;
+        }
+    }
+    const row_height = theme.scaledUi(if (any_usage) 46.0 else 34.0);
     const visible_rows: usize = @min(total, slash_picker_hits.row_rects.len - 1, 7);
-    const pad = theme.scaledUi(8.0);
-    const gap = theme.scaledUi(8.0);
-    const panel_w = @min(composer.w, theme.scaledUi(760.0));
-    const panel_h = pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows));
-    const panel = palette.Rect{
-        .x = composer.x,
-        .y = @max(theme.scaledUi(8.0), composer.y - gap - panel_h),
-        .w = panel_w,
-        .h = panel_h,
-    };
+    const pad = theme.scaledUi(COMPOSER_POPOVER_PAD_UI);
+    const panel = composerPopoverRect(composer, pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows)));
     slash_picker_hits.panel_rect = panel;
 
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FILE_SEARCH_Z + 1);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    queueRoundedShellClipped(
-        state,
-        panel,
-        paletteColor(theme.withAlpha(theme.background(), 252)),
-        paletteColor(theme.COLOR_PANEL_MUTED),
-        theme.scaledUi(12.0),
-        panel,
-    );
+    queueComposerPopoverChrome(state, panel);
 
     const selected = state.slashCommandPickerSelectedIndex();
     const first_index = if (selected >= visible_rows) selected + 1 - visible_rows else 0;
@@ -10872,30 +11650,12 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
         slash_picker_hits.row_count = visible_index + 1;
 
         const hovered = mouse_ok and rectContains(row, mx, my);
-        if (row_index == selected or hovered) {
-            queueRounded(state, row, paletteColor(if (row_index == selected) theme.withAlpha(theme.selection(), 230) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 230)), theme.scaledUi(8.0));
+        if (command_palette.rowHighlightFill(row_index == selected, hovered)) |fill| {
+            queueRounded(state, row, paletteColor(fill), theme.scaledUi(7.0));
         }
 
         const text_color = paletteColor(if (data.disabled) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE);
         const meta_color = paletteColor(theme.COLOR_TEXT_MUTED);
-        queueChromeLabel(state, .{
-            .x = row.x + theme.scaledUi(12.0),
-            .y = row.y + theme.scaledUi(6.0),
-            .w = theme.scaledUi(140.0),
-            .h = theme.scaledUi(18.0),
-        }, data.name, text_color, theme.scaledUi(14.5), row);
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(156.0),
-            .y = row.y + theme.scaledUi(7.0),
-            .w = @max(row.w - theme.scaledUi(250.0), theme.scaledUi(80.0)),
-            .h = theme.scaledUi(18.0),
-        }, data.summary, text_color, theme.scaledUi(13.0), row);
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(12.0),
-            .y = row.y + theme.scaledUi(25.0),
-            .w = row.w - theme.scaledUi(120.0),
-            .h = theme.scaledUi(16.0),
-        }, data.usage, meta_color, theme.scaledUi(11.5), row);
         // Session-scoped commands are only greyed out until the first turn
         // creates a provider thread; say so instead of a blanket "Unavailable".
         const badge = if (!data.disabled)
@@ -10904,13 +11664,96 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
             "Needs thread"
         else
             "Unavailable";
+        // Fixed columns: name | description (ellipsized) | right-aligned
+        // provider badge. The badge column is reserved first so the
+        // description can never run underneath it.
+        const inset = theme.scaledUi(12.0);
+        const col_gap = theme.scaledUi(16.0);
+        const meta_font = theme.scaledUi(11.5);
+        const badge_w = @min(@max(text_measure.textWidth(.prose_bold, meta_font, badge) + theme.scaledUi(2.0), theme.scaledUi(SLASH_MENU_BADGE_MIN_W_UI)), row.w * 0.3);
+        const badge_x = row.x + row.w - inset - badge_w;
+        const name_w = theme.scaledUi(SLASH_MENU_NAME_W_UI);
+        const name_font = theme.scaledUi(14.5);
+        const show_usage = slashUsageAddsArgs(data.name, data.usage);
+        // First-line top: fixed for two-line rows, centred otherwise.
+        const line_top = if (show_usage) row.y + theme.scaledUi(6.0) else row.y + (row.h - theme.scaledUi(18.0)) * 0.5;
+        var name_buf: [160]u8 = undefined;
+        queueChromeLabel(state, .{
+            .x = row.x + inset,
+            .y = line_top,
+            .w = name_w,
+            .h = theme.scaledUi(18.0),
+        }, truncateUiLabel(&name_buf, data.name, name_w, name_font), text_color, name_font, row);
+        const desc_x = row.x + inset + name_w + col_gap;
+        const desc_w = badge_x - col_gap - desc_x;
+        if (desc_w > theme.scaledUi(24.0)) {
+            const desc_font = theme.scaledUi(13.0);
+            var desc_buf: [520]u8 = undefined;
+            queueText(state, .{
+                .x = desc_x,
+                .y = line_top + theme.scaledUi(1.0),
+                .w = desc_w,
+                .h = theme.scaledUi(18.0),
+            }, truncateRoleLabel(&desc_buf, data.summary, desc_w, desc_font, .prose_bold), text_color, desc_font, row);
+        }
+        if (show_usage) {
+            const usage_w = badge_x - col_gap - (row.x + inset);
+            var usage_buf: [520]u8 = undefined;
+            queueText(state, .{
+                .x = row.x + inset,
+                .y = row.y + theme.scaledUi(25.0),
+                .w = @max(usage_w, theme.scaledUi(1.0)),
+                .h = theme.scaledUi(16.0),
+            }, truncateRoleLabel(&usage_buf, data.usage, usage_w, meta_font, .prose_bold), meta_color, meta_font, row);
+        }
+        var badge_buf: [160]u8 = undefined;
+        const badge_text = truncateRoleLabel(&badge_buf, badge, badge_w, meta_font, .prose_bold);
+        const badge_text_w = text_measure.textWidth(.prose_bold, meta_font, badge_text);
         queueText(state, .{
-            .x = row.x + row.w - theme.scaledUi(104.0),
-            .y = row.y + theme.scaledUi(16.0),
-            .w = theme.scaledUi(92.0),
-            .h = theme.scaledUi(16.0),
-        }, badge, meta_color, theme.scaledUi(11.5), row);
+            .x = row.x + row.w - inset - badge_text_w,
+            .y = row.y + (row.h - meta_font * 1.3) * 0.5,
+            .w = badge_text_w + theme.scaledUi(2.0),
+            .h = meta_font * 1.3,
+        }, badge_text, meta_color, meta_font, row);
     }
+}
+
+/// True when a slash command's usage line says more than its name (it lists
+/// arguments, e.g. "/stack start|stop"); "/handoff" under "/handoff" is noise.
+fn slashUsageAddsArgs(name: []const u8, usage_raw: []const u8) bool {
+    const usage = std.mem.trim(u8, usage_raw, " \t\r\n");
+    if (usage.len == 0) return false;
+    return !std.mem.eql(u8, usage, std.mem.trim(u8, name, " \t\r\n"));
+}
+
+test "slash menu rows show a usage line only when it adds arguments" {
+    try std.testing.expect(!slashUsageAddsArgs("/handoff", "/handoff"));
+    try std.testing.expect(!slashUsageAddsArgs("/usage", " /usage "));
+    try std.testing.expect(!slashUsageAddsArgs("/usage", ""));
+    try std.testing.expect(slashUsageAddsArgs("/stack", "/stack start|stop|restart|status"));
+    try std.testing.expect(slashUsageAddsArgs("/compact", "/compact [instructions]"));
+}
+
+/// Composer "/" and "@" popovers share one geometry and chrome: exactly the
+/// composer's left edge and width, `COMPOSER_POPOVER_GAP_UI` above it, and the
+/// shared menu panel (opaque elevated surface, hairline border, soft shadow)
+/// so a short list never reads as a hole in the transcript.
+const COMPOSER_POPOVER_GAP_UI: f32 = 8.0;
+const COMPOSER_POPOVER_PAD_UI: f32 = 8.0;
+const SLASH_MENU_NAME_W_UI: f32 = 140.0;
+const SLASH_MENU_BADGE_MIN_W_UI: f32 = 72.0;
+
+fn composerPopoverRect(composer: palette.Rect, content_h: f32) palette.Rect {
+    return .{
+        .x = composer.x,
+        .y = @max(theme.scaledUi(8.0), composer.y - theme.scaledUi(COMPOSER_POPOVER_GAP_UI) - content_h),
+        .w = composer.w,
+        .h = content_h,
+    };
+}
+
+fn queueComposerPopoverChrome(state: *app_state.AppState, panel: palette.Rect) void {
+    _ = context_menu.queuePanel(state, panel);
 }
 
 fn renderComposerDraftImage(state: *app_state.AppState) void {
@@ -11161,27 +12004,42 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
 
 /// While a reply is streaming, show the provider's queue/steer shortcuts once
 /// the user has typed a non-empty draft.
-fn renderComposerFollowupHint(state: *app_state.AppState) void {
-    if (!state.hasPendingStream()) return;
-    const hint = state.pendingFollowupHint() orelse return;
+/// Text-area height reserved under a growing prompt for the queue/steer hint
+/// (`renderComposerFollowupHint`), so the hint never sits on the last line.
+fn composerFollowupHintReserve(state: *app_state.AppState) f32 {
+    if (!composerFollowupHintVisible(state)) return 0.0;
+    return theme.scaledUi(14.0) * 1.4 + theme.scaledUi(7.0) * 0.5;
+}
+
+fn composerFollowupHintVisible(state: *app_state.AppState) bool {
+    if (!state.hasPendingStream()) return false;
+    if (state.pendingFollowupHint() == null) return false;
     const draft = state.composer_controller.composer.text();
-    if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) return;
+    return std.mem.trim(u8, draft, &std.ascii.whitespace).len > 0;
+}
+
+fn renderComposerFollowupHint(state: *app_state.AppState) void {
+    if (!composerFollowupHintVisible(state)) return;
+    const hint = state.pendingFollowupHint() orelse return;
 
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FOLLOWUP_HINT_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
     const tr = state.composer_controller.composer.textRect();
     const clip: palette.Rect = .{ .x = tr.x, .y = tr.y, .w = tr.w, .h = tr.h };
+    // Readable helper text: the regular UI face at 14 (renders >= 12px) in
+    // the muted tier, which theme.zig holds to >= 6:1 on panel surfaces.
     const pad = theme.scaledUi(7.0);
-    const font = theme.scaledUi(13.0);
-    const est_w = @as(f32, @floatFromInt(hint.len)) * font * 0.52;
+    const font = theme.scaledUi(14.0);
+    const label_h = font * 1.4;
+    const est_w = chromeLabelWidth(font, hint) + theme.scaledUi(2.0);
     const max_w = @max(tr.w - pad * 2.0, theme.scaledUi(1.0));
     const label_w = @min(est_w, max_w);
-    queueText(state, .{
+    queueChromeLabel(state, .{
         .x = tr.x + tr.w - label_w - pad,
-        .y = tr.y + tr.h - font - pad,
+        .y = tr.y + tr.h - label_h - pad * 0.5,
         .w = label_w,
-        .h = font,
+        .h = label_h,
     }, hint, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
 }
 
@@ -11205,8 +12063,8 @@ fn pendingFollowupPinLabel(
 /// Renders the pinned follow-up card above the composer. Mirrors the AMP TUI:
 /// the queued/steered prompt stays pinned ("waiting to send") for every provider
 /// until it is dispatched as the next turn (or accepted inline by the provider, which
-/// removes the pin and shows it in the transcript instead). Reuses the amber tint
-/// of the transcript steering bubble (`COLOR_YELLOW`) for visual continuity.
+/// removes the pin and shows it in the transcript instead). It is the user's own
+/// words, so it uses the user-bubble surface, matching the transcript steer.
 fn renderPendingFollowupPin(
     state: *app_state.AppState,
     rect: palette.Rect,
@@ -11220,10 +12078,10 @@ fn renderPendingFollowupPin(
     queuePanel(
         state,
         rect,
-        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 54)),
-        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 150)),
+        paletteColor(theme.userBubbleFill()),
+        paletteColor(theme.userBubbleBorder()),
         radius,
-        @max(theme.scaledUi(1.0), 1.0),
+        @max(@round(theme.scaledUi(1.0)), 1.0),
     );
 
     const pad_x = theme.scaledUi(14.0);
@@ -11236,7 +12094,7 @@ fn renderPendingFollowupPin(
     // narrow cards so it never collides with the status label on the left.
     const note = "Double-click to edit";
     const note_font = theme.scaledUi(11.0);
-    const note_w = @as(f32, @floatFromInt(note.len)) * note_font * 0.52;
+    const note_w = text_measure.textWidth(.prose_bold, note_font, note);
     const label_room = if (rect.w >= theme.scaledUi(360.0)) inner_w - note_w - theme.scaledUi(10.0) else inner_w;
 
     queueText(state, .{
@@ -11244,7 +12102,7 @@ fn renderPendingFollowupPin(
         .y = rect.y + theme.scaledUi(8.0),
         .w = @max(label_room, theme.scaledUi(1.0)),
         .h = label_font + theme.scaledUi(2.0),
-    }, label, paletteColor(theme.raise(theme.COLOR_YELLOW, 0.18)), label_font, rect);
+    }, label, paletteColor(theme.COLOR_TEXT_MUTED), label_font, rect);
 
     if (rect.w >= theme.scaledUi(360.0)) {
         queueText(state, .{
@@ -11270,20 +12128,24 @@ fn renderPendingFollowupPin(
     }, prompt, paletteColor(theme.COLOR_WHITE), body_font, rect);
 }
 
-// Vertical nudge from the pill's geometric center to the label text's optical
-// midline. The run labels are lowercase-heavy ("Full access"), so their ink
-// mass sits below center — negative drops the glyphs onto it. Measured from
-// screenshots at 1.667x display scale: glyph ink centered ~3px above the
-// cap-band midline at +1.0, so -1.0 (a ~3.3px swing) lands brain/lock on it.
-const RUN_PILL_ICON_OPTICAL_LIFT: f32 = -1.0;
+/// Noto Sans cap height (em). Run-pill glyphs center on the label's cap band.
+const COMPOSER_LABEL_CAP_HEIGHT_EM: f32 = 0.714;
 
-// Centers a square glyph box of `size` inside a reserved run-pill label cell;
-// the cell's spare width splits evenly into the word-side and separator-side
-// gaps, and the box is lifted to the label text's optical midline.
+// Square glyph box of `size` inside a reserved run-pill label cell: the
+// cell's spare width splits evenly into the word-side and separator-side
+// gaps, and the box is centered on the label's cap-band midline (baseline
+// minus half the cap height), measured from the label's real font ascent.
+// `queueComposerIcon` then centers each glyph's ink in the box, so glyphs
+// from different icon faces (Codicon bulb, Nerd Font lock) share one line.
 fn composerIconRectInCell(cell: palette.Rect, size: f32) palette.Rect {
+    const label_font = theme.scaledUi(app_state.PALETTE_COMPOSER_TOOLBAR_FONT_SIZE);
+    // The toolbar label's line box (estimated metrics: 1.25 em) is centered
+    // in the pill, which the cell spans vertically.
+    const line_top = cell.y + @max((cell.h - label_font * 1.25) * 0.5, 0.0);
+    const cap_mid = line_top + text_measure.fontAscent(.ui, label_font) - label_font * COMPOSER_LABEL_CAP_HEIGHT_EM * 0.5;
     return snapIconRectOrigin(.{
         .x = cell.x + @max((cell.w - size) * 0.5, 0.0),
-        .y = cell.y + (cell.h - size) * 0.5 - theme.scaledUi(RUN_PILL_ICON_OPTICAL_LIFT),
+        .y = cap_mid - size * 0.5,
         .w = size,
         .h = size,
     });
@@ -11403,12 +12265,12 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         if (state.currentComposerShowsReasoningSegment() and slot_index < slots.count) {
             const cell = slots.rects[slot_index];
             slot_index += 1;
-            // The brain glyph inks its full em square while the bolt/lock
-            // carry ~7-12% built-in side bearings; draw it smaller so the
-            // three glyphs read as the same visual weight.
-            drawThinkingIcon(state, composerIconRectInCell(cell, icon_size * 0.85), icon_color);
+            // A codicon like the lock, so both share stroke weight and size.
+            drawThinkingIcon(state, composerIconRectInCell(cell, icon_size), icon_color);
         }
-        if (state.currentComposerShowsFastToggle() and slot_index < slots.count) {
+        // Speed only appears when Fast is on (`composerRunSummaryParts`
+        // omits the default tier), so its glyph is always the bolt.
+        if (state.currentComposerShowsFastToggle() and state.currentThread().fast_mode == .on and slot_index < slots.count) {
             const cell = slots.rects[slot_index];
             slot_index += 1;
             const fast_icon_rect = composerIconRectInCell(cell, icon_size);
@@ -11511,19 +12373,29 @@ fn renderStopButtonAgentsTooltip(state: *app_state.AppState) void {
     queueText(state, .{ .x = rect.x + pad_x, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = text_w, .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
 }
 
+/// Ctrl/Ctrl+Shift key tips match the sidebar's (`renderSidebarShortcutKeyTip`):
+/// an 18px box with an 11px label, widening for labels that need it.
+const KEY_TIP_SIZE: f32 = 18.0;
+const KEY_TIP_FONT: f32 = 11.0;
+
+fn keyTipWidth(text_w: f32) f32 {
+    return @max(theme.scaledUi(KEY_TIP_SIZE), text_w + theme.scaledUi(8.0));
+}
+
 fn renderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, label: []const u8) void {
     if (label.len == 0) return;
-    const size = theme.scaledUi(15.0);
-    const inset = theme.scaledUi(4.0);
-    const rect: palette.Rect = .{
-        .x = target.x + target.w - size - inset,
-        .y = target.y - size - theme.scaledUi(3.0),
-        .w = size,
-        .h = size,
-    };
-    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
-    const font_size = theme.scaledUi(9.5);
+    const font_size = theme.scaledUi(KEY_TIP_FONT);
     const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    const size = theme.scaledUi(KEY_TIP_SIZE);
+    const tip_w = keyTipWidth(text_w);
+    const inset = theme.scaledUi(4.0);
+    const rect = snapRect(.{
+        .x = target.x + target.w - tip_w - inset,
+        .y = target.y - size - theme.scaledUi(3.0),
+        .w = tip_w,
+        .h = size,
+    });
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), @max(@round(theme.scaledUi(1.0)), 1.0));
     queueText(state, .{
         .x = rect.x + @max((rect.w - text_w) * 0.5, 0.0),
         .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
@@ -11566,9 +12438,22 @@ const NF_COD_CLOUD_UPLOAD = "\u{EAC3}";
 const NF_COD_SYNC = "\u{EA77}";
 const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
+const NF_COD_SEARCH = "\u{EA6D}";
 const NF_COD_CLOSE = "\u{EA76}";
+const NF_COD_CHECK = "\u{EAB2}";
 const NF_COD_LINK_EXTERNAL = "\u{EB14}";
-const NF_MD_BRAIN = "\u{F09D1}"; // brain — reasoning/thinking level on the run pill
+const NF_COD_TERMINAL = "\u{EA85}"; // shell rows (matches the sidebar's terminal glyph)
+// Tool-row kind glyphs (see `toolRowGlyph`).
+const NF_COD_FILE = "\u{EA7B}";
+const NF_COD_EDIT = "\u{EA73}";
+const NF_COD_TRASH = "\u{EA81}";
+const NF_COD_GLOBE = "\u{EB01}";
+const NF_COD_TOOLS = "\u{EB6D}";
+const NF_COD_HUBOT = "\u{EB08}";
+// Reasoning level on the run pill: Codicon `lightbulb-empty`, stroked like the
+// lock beside it. (U+EA61 `lightbulb` resolves to Symbols Nerd Font first,
+// whose copy is a filled bulb; U+EC40 exists only in Codicon.)
+const NF_COD_LIGHTBULB = "\u{EC40}";
 
 /// Renders a single codicon glyph centered inside `rect` using the icon font.
 /// SDL_ttf rasterizes the glyph with proper antialiasing at the requested
@@ -11576,11 +12461,14 @@ const NF_MD_BRAIN = "\u{F09D1}"; // brain — reasoning/thinking level on the ru
 /// glyph (renderer pixel space) for partial-fill effects.
 fn queueComposerIcon(state: *app_state.AppState, rect: palette.Rect, glyph: []const u8, color: palette.Color, clip: ?palette.Rect) void {
     // Glyph cell rendered slightly under the full rect height to leave the
-    // codicon's drawn extent visually balanced with adjacent label text.
+    // codicon's drawn extent visually balanced with adjacent label text. The
+    // ink (not the font's line box, which differs between icon faces) is
+    // centered in `rect`.
     const font_size = rect.h * 0.96;
+    const origin = text_measure.centeredGlyphOrigin(.icon, glyph, font_size, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
     state.palette_overlay_batch.roleText(
         state.allocator,
-        snapRect(rect),
+        .{ .x = origin.x, .y = origin.y, .w = font_size * 1.5, .h = font_size * 1.5 },
         stableText(state, glyph),
         color,
         font_size,
@@ -11605,27 +12493,27 @@ fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette
     queueComposerIcon(state, rect, glyph, color, null);
 }
 
-/// Faint fraction of the brain silhouette that stays visible above the fill,
-/// keeping the glyph's outline readable at low reasoning levels.
+/// Faint fraction of the reasoning glyph that stays visible above the fill,
+/// keeping its outline readable at low reasoning levels.
 const THINKING_ICON_EMPTY_ALPHA: f32 = 0.32;
 
 fn drawThinkingIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    // Reasoning gauge: the brain fills bottom-up with the selected level — a
+    // Reasoning gauge: the bulb fills bottom-up with the selected level — a
     // faint full silhouette underneath, and the bright glyph clipped to the
     // bottom `ratio` of the box on top, so Low shows a sliver and the top
-    // level a solid brain.
+    // level a fully lit bulb.
     const ratio = std.math.clamp(state.currentComposerReasoningFillRatio(), 0.0, 1.0);
     if (ratio >= 1.0) {
-        queueComposerIcon(state, rect, NF_MD_BRAIN, color, null);
+        queueComposerIcon(state, rect, NF_COD_LIGHTBULB, color, null);
         return;
     }
     var faint = color;
     faint.a *= THINKING_ICON_EMPTY_ALPHA;
-    queueComposerIcon(state, rect, NF_MD_BRAIN, faint, null);
+    queueComposerIcon(state, rect, NF_COD_LIGHTBULB, faint, null);
     if (ratio <= 0.0) return;
     const snapped = snapRect(rect);
     const fill_h = @round(snapped.h * ratio);
-    queueComposerIcon(state, rect, NF_MD_BRAIN, color, .{
+    queueComposerIcon(state, rect, NF_COD_LIGHTBULB, color, .{
         .x = snapped.x,
         .y = snapped.y + snapped.h - fill_h,
         .w = snapped.w,
@@ -11710,14 +12598,20 @@ fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, 
 }
 
 fn queueFixedText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
-    state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * 0.55, font_size * 1.25, true) catch {};
+    state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * FIXED_TEXT_CELL_EM, font_size * 1.25, true) catch {};
 }
 
 fn queueFixedTextLine(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
-    state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * 0.55, font_size * 1.25, false) catch {};
+    state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * FIXED_TEXT_CELL_EM, font_size * 1.25, false) catch {};
 }
 
-/// Chrome label rendered through the `.ui` font role (CalSans-Regular). Use
+/// Single fixed-cell line in an explicit face (`.mono` for commands and tool
+/// output); null keeps the default prose face of `queueFixedTextLine`.
+fn queueRoleTextLine(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, role: ?palette.FontRole, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.fixedRoleText(state.allocator, rect, stableText(state, value), color, font_size, role, null, clip, .{}, font_size * FIXED_TEXT_CELL_EM, font_size * 1.25, false) catch {};
+}
+
+/// Chrome label rendered through the `.ui` font role (Noto Sans Regular). Use
 /// this for workspace header buttons / sidebar labels so they share the same
 /// typeface as the composer prompt and selector pills.
 fn queueChromeLabel(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
@@ -12041,7 +12935,7 @@ const CursorBenchFixture = struct {
             .clip = self.column,
             .scroll_y = scroll_y,
         });
-        renderPendingTranscriptStream(state, thread, self.column, self.column.y - scroll_y, self.column, thread.messages.items.len);
+        _ = renderPendingTranscriptStream(state, thread, self.column, self.column.y - scroll_y, self.column, self.column, thread.messages.items.len);
     }
 
     fn deinit(self: *CursorBenchFixture, allocator: std.mem.Allocator) void {
@@ -12291,4 +13185,36 @@ test "pointer hits skip layout rows that outlived their messages" {
     const group: chat_types.TranscriptLayoutItem = .{ .message_index = 0, .group_end = 3, .top = -80.0, .height = 80.0 };
     try std.testing.expect(!layoutItemInRange(group, 2));
     try std.testing.expect(layoutItemInRange(group, 3));
+}
+
+test "steering notes render as user turns, other system notes stay neutral" {
+    try std.testing.expect(isSteeringAuthor(.system, "Steering current turn"));
+    try std.testing.expect(isSteeringAuthor(.system, "Steering \u{00B7} waiting for Claude to accept"));
+    try std.testing.expect(!isSteeringAuthor(.system, "Usage"));
+    try std.testing.expect(!isSteeringAuthor(.system, "Parent agent \u{00B7} steering"));
+    try std.testing.expect(!isSteeringAuthor(.user, "Steering current turn"));
+}
+
+test "empty-state body wraps at word boundaries within the measured width" {
+    text_measure.clear();
+    const body = "Chats this conversation delegates to, or is delegated from, appear here.";
+    const font_size: f32 = 12.0;
+    const max_w = chromeLabelWidth(font_size, "Chats this conversation delegates");
+    var lines: [4][]const u8 = undefined;
+    const count = wrapUiWords(body, max_w, font_size, &lines);
+    try std.testing.expect(count >= 2);
+    for (lines[0 .. count - 1]) |line| {
+        try std.testing.expect(chromeLabelWidth(font_size, line) <= max_w);
+        try std.testing.expect(line.len > 0 and line[0] != ' ' and line[line.len - 1] != ' ');
+    }
+    // Every word survives the wrap, in order.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (lines[0..count], 0..) |line, i| {
+        if (i > 0) try joined.append(std.testing.allocator, ' ');
+        try joined.appendSlice(std.testing.allocator, line);
+    }
+    try std.testing.expectEqualStrings(body, joined.items);
+    // A wide column keeps it on one line.
+    try std.testing.expectEqual(@as(usize, 1), wrapUiWords(body, 10_000.0, font_size, &lines));
 }

@@ -903,6 +903,9 @@ fn parseDelimitedInline(
     start: usize,
 ) Allocator.Error!?InlineParseResult {
     const marker = source[start];
+    // CommonMark: `_` runs flanked by alphanumerics never open emphasis, so
+    // snake_case identifiers (`settings_modal`, `chat_markdown`) stay literal.
+    if (marker == '_' and underscoreRunIsIntraword(source, start)) return null;
     const run = countRun(source, start);
     const delimiter_length: usize = if (run >= 2) 2 else 1;
     const end_opt = findClosingDelimiter(source, start + delimiter_length, marker, delimiter_length);
@@ -964,9 +967,28 @@ fn findClosingDelimiter(source: []const u8, start: usize, marker: u8, length: us
                 break;
             }
         }
-        if (matches) return index;
+        if (matches) {
+            // An `_` closer followed by an alphanumeric is intraword
+            // (`_a_b`), so it cannot close; skip its whole run.
+            if (marker == '_') {
+                const run_end = index + countRun(source, index);
+                if (run_end < source.len and std.ascii.isAlphanumeric(source[run_end])) {
+                    index = run_end - 1;
+                    continue;
+                }
+            }
+            return index;
+        }
     }
     return null;
+}
+
+/// True when the `_` run containing `start` follows an alphanumeric byte, i.e.
+/// it sits inside a word and must not open emphasis.
+fn underscoreRunIsIntraword(source: []const u8, start: usize) bool {
+    var run_start = start;
+    while (run_start > 0 and source[run_start - 1] == '_') run_start -= 1;
+    return run_start > 0 and std.ascii.isAlphanumeric(source[run_start - 1]);
 }
 
 /// Like `parseInlines` but with `streaming_mode_active` forced off — used for
@@ -977,4 +999,27 @@ fn parseInlineChildren(allocator: Allocator, source: []const u8) Allocator.Error
     streaming_mode_active = false;
     defer streaming_mode_active = prev;
     return parseInlines(allocator, source);
+}
+
+fn testEmphasisCount(source: []const u8) !usize {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const document = try (Parser{}).parse(arena.allocator(), source);
+    var count: usize = 0;
+    for (document.blocks) |block| switch (block) {
+        .paragraph => |paragraph| for (paragraph.inlines) |item| switch (item) {
+            .emphasis, .strong => count += 1,
+            else => {},
+        },
+        else => {},
+    };
+    return count;
+}
+
+test "intraword underscores never open or close emphasis" {
+    try std.testing.expectEqual(@as(usize, 0), try testEmphasisCount("settings_modal.zig's private chat_markdown helper"));
+    try std.testing.expectEqual(@as(usize, 0), try testEmphasisCount("foo__bar__baz and a_b_c"));
+    try std.testing.expectEqual(@as(usize, 1), try testEmphasisCount("an _emphasized_ word"));
+    try std.testing.expectEqual(@as(usize, 1), try testEmphasisCount("__strong__ text"));
+    try std.testing.expectEqual(@as(usize, 1), try testEmphasisCount("snake_case *star*emphasis"));
 }

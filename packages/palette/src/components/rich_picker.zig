@@ -18,6 +18,88 @@ const text_layout = @import("../text_layout.zig");
 pub const ItemTextFn = *const fn (context: ?*anyopaque, index: usize) []const u8;
 pub const ItemBoolFn = *const fn (context: ?*anyopaque, index: usize) bool;
 
+const ELLIPSIS = "\u{2026}";
+/// Caret width the embedded text input draws (`text_input.zig`).
+const SEARCH_CARET_W: f32 = 1.5;
+
+/// Trailing action (favorite star) colour: muted at rest, so a column of
+/// stars never competes with the labels or the current row's check; accent
+/// only for an active (favorited) star on the hovered / keyboard-focused row.
+/// Favorites stay recognizable at rest by their filled glyph.
+fn actionIconColor(style: anytype, active: bool, emphasized: bool) draw.Color {
+    return if (active and emphasized) style.accent_color else style.description_color;
+}
+
+fn colorOver(top: draw.Color, bottom: draw.Color) draw.Color {
+    const a = top.a;
+    return .{ .r = top.r * a + bottom.r * (1.0 - a), .g = top.g * a + bottom.g * (1.0 - a), .b = top.b * a + bottom.b * (1.0 - a), .a = 1.0 };
+}
+
+fn channelLuminance(c: f32) f32 {
+    return if (c <= 0.03928) c / 12.92 else std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
+}
+
+fn luminance(color: draw.Color) f32 {
+    return 0.2126 * channelLuminance(color.r) + 0.7152 * channelLuminance(color.g) + 0.0722 * channelLuminance(color.b);
+}
+
+fn contrastRatio(a: draw.Color, b: draw.Color) f32 {
+    const la = luminance(a);
+    const lb = luminance(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+/// `color` mixed toward `strong` until it reaches 4.5:1 on `backing`.
+fn readableColor(color: draw.Color, strong: draw.Color, backing: draw.Color) draw.Color {
+    var result = colorOver(color, backing);
+    const target = colorOver(strong, backing);
+    var amount: f32 = 0.0;
+    while (contrastRatio(result, backing) < 4.5 and amount < 1.0) {
+        amount = @min(amount + 0.1, 1.0);
+        const base = colorOver(color, backing);
+        result = .{
+            .r = base.r + (target.r - base.r) * amount,
+            .g = base.g + (target.g - base.g) * amount,
+            .b = base.b + (target.b - base.b) * amount,
+            .a = 1.0,
+        };
+    }
+    return result;
+}
+
+/// A label cut to fit `max_w`: `prefix` is a subslice of the input (so it
+/// stays valid for the batch) and `ellipsis` says whether "…" follows it.
+const FittedText = struct { prefix: []const u8, ellipsis: bool, prefix_w: f32 };
+
+/// Measures `text` and, when it overflows `max_w`, keeps the longest
+/// codepoint-aligned prefix that leaves room for a trailing ellipsis, so
+/// long titles read "Verde Cloud · Internal…" instead of being hard-clipped.
+fn fitText(metrics_value: text_layout.FontMetrics, text: []const u8, max_w: f32) FittedText {
+    const full_w = metrics_value.measureSlice(text);
+    if (full_w <= max_w + 0.5) return .{ .prefix = text, .ellipsis = false, .prefix_w = full_w };
+    const room = max_w - metrics_value.measureSlice(ELLIPSIS);
+    var width: f32 = 0.0;
+    var end: usize = 0;
+    while (end < text.len) {
+        const advance = metrics_value.nextAdvance(text, end);
+        if (advance.byte_len == 0 or width + advance.width > room) break;
+        width += advance.width;
+        end += advance.byte_len;
+    }
+    // End on a word boundary ("isn't on this…", not "isn't on this mac…")
+    // unless that would drop more than half the fitted text.
+    if (std.mem.lastIndexOfScalar(u8, text[0..end], ' ')) |space| {
+        if (space * 2 >= end and end < text.len and text[end] != ' ') end = space;
+    }
+    // Drop trailing spaces / separators so it never reads "Cloud ·…".
+    while (end > 0 and (text[end - 1] == ' ' or text[end - 1] == ',' or text[end - 1] == '-')) end -= 1;
+    if (end >= 2 and std.mem.endsWith(u8, text[0..end], "\u{00B7}")) {
+        end -= "\u{00B7}".len;
+        while (end > 0 and text[end - 1] == ' ') end -= 1;
+    }
+    return .{ .prefix = text[0..end], .ellipsis = true, .prefix_w = metrics_value.measureSlice(text[0..end]) };
+}
+
 pub const RowLeadingRenderFn = *const fn (
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -90,6 +172,9 @@ pub const RichPickerConfig = struct {
     item_label: ?ItemTextFn = null,
     item_description: ?ItemTextFn = null,
     item_badge: ?ItemTextFn = null,
+    /// True when an item's badge names an action ("Set up") rather than a
+    /// status ("Connected"): it draws as a small outlined button.
+    item_badge_action: ?ItemBoolFn = null,
     /// Optional trailing row action. Hosts commonly use this for pin/favorite
     /// toggles; activating it emits `.action` without selecting or closing.
     item_action_icon: []const u8 = "",
@@ -248,14 +333,17 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         const search_underline = config.search_style == .underline;
         const SearchInput = text_input_component.TextInput(.{
             .height = config.search_height,
-            .padding_x = if (search_underline) 4.0 else 10.0,
+            // Boxed fields inset text 12px (more than the 8px corner), like
+            // the composers; the underline style already sits past its icon.
+            .padding_x = if (search_underline) 4.0 else 12.0,
             .padding_y = 6.0,
             .background_color = if (search_underline) transparent else config.search_background_color,
             .border_color = if (search_underline) transparent else config.search_border_color,
             .corner_radius = if (search_underline) 0.0 else 8.0,
             .border_width = 1.0,
             .text_color = config.text_color,
-            .placeholder_text = config.search_placeholder,
+            // Drawn by `renderSearch`, offset past the caret (see there).
+            .placeholder_text = "",
             .font_size = config.font_size,
             .font_role = config.font_role,
             .font_id = config.font_id,
@@ -299,6 +387,11 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         /// a copy so the filter survives item-index churn across refreshes.
         active_group_label: std.ArrayList(u8) = .empty,
         hovered_rail: ?usize = null,
+        /// Item whose trailing action (favorite star) is under the pointer.
+        hovered_action: ?usize = null,
+        /// The highlight was last moved by the keyboard (arrows), not the
+        /// pointer; keyboard focus reveals a row's star.
+        keyboard_highlight: bool = false,
         /// Keyboard focus within the rail. Null keeps arrow navigation in the
         /// model rows; otherwise the value is the rail entry index (including
         /// the leading "all groups" entry at zero).
@@ -517,17 +610,11 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             defer batch.restoreZIndex(previous_z);
 
             const rect = self.pickerRect();
-            const inset = @max(config.border_width, 1.0);
             const corner = self.scaled(config.corner_radius);
-            try batch.roundedRectClipped(allocator, rect, self.style.border_color, corner, rect);
-            if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
-                try batch.roundedRectClipped(allocator, .{
-                    .x = rect.x + inset,
-                    .y = rect.y + inset,
-                    .w = rect.w - inset * 2.0,
-                    .h = rect.h - inset * 2.0,
-                }, self.style.background_color, @max(corner - inset, 0.0), rect);
-            }
+            try self.renderElevation(allocator, batch, rect, corner);
+            // Fill and 1px border as one panel command (one anti-aliased
+            // edge), like the app's menus.
+            try batch.panel(allocator, rect, self.style.background_color, self.style.border_color, corner, @max(@round(self.scaled(@max(config.border_width, 1.0))), 1.0));
 
             if (self.railActive()) {
                 // The viewport (and so the rail) may have shrunk since the last scroll.
@@ -537,12 +624,13 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             if (self.searchActive()) try self.renderSearch(allocator, batch);
 
             const body = self.bodyRect();
+            const badge_column_w = self.badgeColumnWidth();
             for (self.rows.items) |row| {
                 const row_rect = self.rowRect(row);
                 if (row_rect.y + row_rect.h < body.y or row_rect.y > body.y + body.h) continue;
                 switch (row.kind) {
                     .header => try self.renderHeaderRow(allocator, batch, row, row_rect, body),
-                    .item => try self.renderItemRow(allocator, batch, row, row_rect, body),
+                    .item => try self.renderItemRow(allocator, batch, row, row_rect, body, badge_column_w),
                 }
             }
             if (self.rows.items.len == 0) try self.renderEmptyState(allocator, batch, body);
@@ -1069,6 +1157,8 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             self.open = false;
             self.dragging_scrollbar = false;
             self.hovered_rail = null;
+            self.hovered_action = null;
+            self.keyboard_highlight = false;
             self.focused_rail = null;
             self.search.focused = false;
             self.clearSearch(allocator) catch {};
@@ -1202,6 +1292,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         }
 
         fn moveHighlight(self: *Component, delta: i32) void {
+            self.keyboard_highlight = true;
             if (self.rows.items.len == 0) return;
             const count = @as(i32, @intCast(self.rows.items.len));
             var index: i32 = blk: {
@@ -1297,12 +1388,16 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 if (try self.search.handleInput(allocator, .{ .mouse_drag = point })) return true;
             }
             if (self.rowAtPoint(point)) |row_index| {
-                if (self.rows.items[row_index].kind == .item and self.highlighted != row_index) {
+                const row = self.rows.items[row_index];
+                self.hovered_action = if (row.kind == .item and self.itemActionRect(self.rowRect(row)).contains(point)) row.item else null;
+                self.keyboard_highlight = false;
+                if (row.kind == .item and self.highlighted != row_index) {
                     self.highlighted = row_index;
                     self.emitHighlight(row_index);
                 }
                 return true;
             }
+            self.hovered_action = null;
             return self.pickerRect().contains(point);
         }
 
@@ -1327,8 +1422,55 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             return text_layout.FontMetrics.fixed(size, self.scaled(config.glyph_width), size * 1.3);
         }
 
-        fn derivedMetrics(_: *const Component, font_size: f32) text_layout.FontMetrics {
+        /// Metrics for a secondary size (descriptions, badges, chips). Reuses
+        /// the host's advance callback when it has one, so fitted text and
+        /// trailing ellipses land where the glyphs really end; the fixed
+        /// 0.55em estimate overshot and left "…" floating past the text.
+        fn derivedMetrics(self: *const Component, font_size: f32) text_layout.FontMetrics {
+            if (self.font_metrics) |base| {
+                if (base.advance != null) {
+                    var derived = base;
+                    derived.font_size = font_size;
+                    derived.line_height = font_size * 1.3;
+                    if (base.fixed_advance) |advance| derived.fixed_advance = advance * font_size / @max(base.font_size, 1.0);
+                    derived.ascent = null;
+                    derived.descent = null;
+                    derived.baseline = null;
+                    return derived;
+                }
+            }
             return text_layout.FontMetrics.fixed(font_size, font_size * 0.55, font_size * 1.3);
+        }
+
+        /// Menu elevation: the same layered drop shadow as the app's context
+        /// menus (`context_menu.queuePanel`), lighter on light backgrounds,
+        /// so a picker reads as a layer above the transcript text under it.
+        fn renderElevation(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, corner: f32) !void {
+            const Shadow = struct { spread: f32, drop: f32, alpha: f32 };
+            const dark = [_]Shadow{ .{ .spread = 6.0, .drop = 6.0, .alpha = 0.10 }, .{ .spread = 2.0, .drop = 2.0, .alpha = 0.16 } };
+            const light = [_]Shadow{.{ .spread = 0.0, .drop = 2.0, .alpha = 0.06 }};
+            const layers: []const Shadow = if (luminance(self.style.background_color) > 0.5) &light else &dark;
+            for (layers) |layer| {
+                const spread = self.scaled(layer.spread);
+                try batch.roundedRect(allocator, .{
+                    .x = rect.x - spread,
+                    .y = rect.y - spread + self.scaled(layer.drop),
+                    .w = rect.w + spread * 2.0,
+                    .h = rect.h + spread * 2.0,
+                }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = layer.alpha }, corner + spread);
+            }
+        }
+
+        /// Badge and shortcut-chip text never drops below 11px.
+        fn badgeFontSize(self: *const Component) f32 {
+            return self.scaled(@max(config.badge_font_size, 11.0));
+        }
+
+        /// Badge / chip label colour with at least 4.5:1 contrast on `fill`
+        /// composited over the picker background.
+        fn badgeTextColor(self: *const Component, fill: ?draw.Color) draw.Color {
+            const backing = if (fill) |color| colorOver(color, self.style.background_color) else self.style.background_color;
+            return readableColor(self.style.badge_text_color, self.style.text_color, backing);
         }
 
         // Renders the left group rail: the "all" entry plus one icon per
@@ -1445,6 +1587,24 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             self.search.setBounds(self.searchInputRect());
             self.search.z_index = self.z_index + 1;
             try self.search.render(allocator, batch);
+            // Placeholder one caret width plus 3px in from where typed text
+            // starts, so the idle caret never sits on its first letter (same
+            // as the shared composer). The input's own placeholder is off.
+            if (self.search.buffer.items.len == 0 and config.search_placeholder.len > 0) {
+                const text_rect = self.search.textRect();
+                const placeholder_metrics = self.metrics();
+                const x = text_rect.x + SEARCH_CARET_W + self.scaled(3.0);
+                const previous_z = batch.setZIndex(self.search.z_index);
+                defer batch.restoreZIndex(previous_z);
+                try batch.roleText(allocator, .{
+                    .x = x,
+                    // Same baseline as typed text (the input draws it at the
+                    // top of its text rect).
+                    .y = text_rect.y,
+                    .w = @max(text_rect.x + text_rect.w - x, 0.0),
+                    .h = placeholder_metrics.line_height,
+                }, config.search_placeholder, self.style.description_color, placeholder_metrics.font_size, config.font_role, config.font_id, text_rect);
+            }
             if (search_underline) {
                 // The rule sits inside the search gap, separating query from
                 // results like the reference design.
@@ -1469,19 +1629,36 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             }, label, self.style.header_color, header_metrics.font_size, config.font_role, config.font_id, clip);
         }
 
-        fn renderItemRow(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, row: Row, row_rect: draw.Rect, clip: draw.Rect) !void {
+        /// Width of the shared badge column: the widest badge pill among the
+        /// item rows, so every badged row's label ends at the same x and
+        /// ellipsizes before the column ("Verde Cloud · Internal…  Connected")
+        /// instead of each pill floating at its own width. Rows without a
+        /// badge keep the full label width.
+        fn badgeColumnWidth(self: *const Component) f32 {
+            if (config.item_badge == null) return 0.0;
+            const badge_metrics = self.derivedMetrics(self.badgeFontSize());
+            var widest: f32 = 0.0;
+            for (self.rows.items) |row| {
+                if (row.kind != .item) continue;
+                const badge = itemText(config.item_badge, self.callbacks.context, row.item);
+                if (badge.len == 0) continue;
+                widest = @max(widest, badge_metrics.measureSlice(badge));
+            }
+            if (widest <= 0.0) return 0.0;
+            return widest + self.scaled(config.badge_padding_x) * 2.0;
+        }
+
+        fn renderItemRow(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, row: Row, row_rect: draw.Rect, clip: draw.Rect, badge_column_w: f32) !void {
             const context = self.callbacks.context;
             const row_corner = @min(9.0, @max(4.0, row_rect.h * 0.24));
             const is_selected = self.selected_item != null and self.selected_item.? == row.item;
             const is_highlighted = self.highlighted != null and
                 self.rows.items[self.highlighted.?].kind == .item and
                 self.rows.items[self.highlighted.?].item == row.item;
-            // Hover/keyboard highlight wins over the (often subtler) selected
-            // fill so keyboard navigation stays visible on the selected row.
+            // Only hover / keyboard highlight fills a row; the current choice
+            // is marked by its check alone, like every other picker and menu.
             if (is_highlighted) {
                 try batch.roundedRectClipped(allocator, row_rect, self.style.highlighted_color, row_corner, clip);
-            } else if (is_selected) {
-                try batch.roundedRectClipped(allocator, row_rect, self.style.selected_color, row_corner, clip);
             }
 
             var x = row_rect.x + self.scaled(config.row_padding_x);
@@ -1506,13 +1683,25 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 const active = if (config.item_action_active) |callback| callback(context, row.item) else false;
                 const icon = if (active and config.item_action_active_icon.len > 0) config.item_action_active_icon else config.item_action_icon;
                 const action_rect = self.itemActionRect(row_rect);
+                const action_hovered = self.hovered_action != null and self.hovered_action.? == row.item;
+                // The whole 32px target shows on hover as a filled square,
+                // like the other icon buttons, not just the glyph.
+                if (action_hovered) {
+                    try batch.roundedRectClipped(allocator, action_rect, self.style.border_color, self.scaled(7.0), clip);
+                }
                 const action_w = icon_metrics.measureSlice(icon);
-                try batch.roleText(allocator, .{
+                // Star rule: shown while the pointer is over its own 32px
+                // target or the row has keyboard focus; favorites keep their
+                // filled star on other rows. The current row shows its check
+                // alone otherwise. The target always stays clickable.
+                const keyboard_row = is_highlighted and self.keyboard_highlight;
+                const action_emphasized = action_hovered or keyboard_row;
+                if (action_emphasized or (active and !is_selected)) try batch.roleText(allocator, .{
                     .x = action_rect.x + @max((action_rect.w - action_w) * 0.5, 0.0),
                     .y = action_rect.y + @max((action_rect.h - icon_metrics.line_height) * 0.5, 0.0),
                     .w = action_w,
                     .h = icon_metrics.line_height,
-                }, icon, if (active) self.style.accent_color else self.style.description_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, clip);
+                }, icon, actionIconColor(self.style, active, action_emphasized), icon_metrics.font_size, config.icon_font_role, config.icon_font_id, clip);
                 trailing_right = action_rect.x - self.scaled(config.icon_gap);
             }
             if (shortcut_chip_labels.len > 0 and row.ordinal < shortcut_chip_labels.len) {
@@ -1529,27 +1718,40 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 }, config.check_icon, self.style.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, clip);
                 trailing_right = check_x - self.scaled(config.icon_gap);
             }
-            const badge = itemText(config.item_badge, context, row.item);
+            // Tags ("Default", "Connected", "Sign in") are quiet meta text in
+            // a shared column, never a filled chip; the current row carries
+            // its check alone, so its tag is omitted.
+            const badge = if (is_selected) "" else itemText(config.item_badge, context, row.item);
             if (badge.len > 0) {
-                const badge_metrics = self.derivedMetrics(self.scaled(config.badge_font_size));
+                const badge_metrics = self.derivedMetrics(self.badgeFontSize());
                 const badge_text_w = badge_metrics.measureSlice(badge);
                 const badge_pad = self.scaled(config.badge_padding_x);
                 const badge_h = badge_metrics.line_height + self.scaled(4.0);
                 const badge_w = badge_text_w + badge_pad * 2.0;
+                // Right-aligned in the shared column; the label stops at the
+                // column's left edge below.
+                const column_w = @max(badge_column_w, badge_w);
                 const badge_rect: draw.Rect = .{
                     .x = trailing_right - badge_w,
                     .y = row_rect.y + (row_rect.h - badge_h) * 0.5,
                     .w = badge_w,
                     .h = badge_h,
                 };
-                try batch.roundedRectClipped(allocator, badge_rect, self.style.badge_background_color, badge_h * 0.5, clip);
+                // Action badges ("Set up") read as a small secondary button:
+                // a hairline outline and primary text; statuses stay plain.
+                const badge_action = if (config.item_badge_action) |callback| callback(context, row.item) else false;
+                if (badge_action) {
+                    const outline: draw.Rect = .{ .x = badge_rect.x, .y = badge_rect.y - self.scaled(2.0), .w = badge_rect.w, .h = badge_rect.h + self.scaled(4.0) };
+                    try batch.panel(allocator, outline, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 }, self.style.border_color, self.scaled(6.0), @max(@round(self.scaled(1.0)), 1.0));
+                }
                 try batch.roleText(allocator, .{
                     .x = badge_rect.x + badge_pad,
                     .y = badge_rect.y + @max((badge_rect.h - badge_metrics.line_height) * 0.5, 0.0),
                     .w = badge_text_w,
                     .h = badge_metrics.line_height,
-                }, badge, self.style.badge_text_color, badge_metrics.font_size, config.font_role, config.font_id, clip);
-                trailing_right = badge_rect.x - self.scaled(config.icon_gap);
+                }, badge, if (badge_action) self.style.text_color else readableColor(self.style.description_color, self.style.text_color, self.style.background_color), badge_metrics.font_size, config.font_role, config.font_id, clip);
+                // At least 12px between the label and the badge column.
+                trailing_right = trailing_right - column_w - @max(self.scaled(config.icon_gap), self.scaled(12.0));
             }
 
             const label = itemText(config.item_label, context, row.item);
@@ -1571,20 +1773,17 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 @max(label_w - check_w - self.scaled(config.icon_gap), 0.0)
             else
                 label_w;
-            try batch.roleText(allocator, .{
+            const label_color = if (config.item_muted != null and config.item_muted.?(context, row.item)) self.style.description_color else self.style.text_color;
+            const label_clip_rect: draw.Rect = .{ .x = x, .y = clip.y, .w = label_area_w, .h = clip.h };
+            const fitted_label = try self.renderFittedText(allocator, batch, label_metrics, label, .{
                 .x = x,
                 .y = top,
                 .w = label_area_w,
                 .h = label_metrics.line_height,
-            }, label, if (config.item_muted != null and config.item_muted.?(context, row.item)) self.style.description_color else self.style.text_color, label_metrics.font_size, config.font_role, config.font_id, .{
-                .x = x,
-                .y = clip.y,
-                .w = label_area_w,
-                .h = clip.h,
-            });
+            }, label_color, label_clip_rect);
             if (inline_check) {
                 try batch.roleText(allocator, .{
-                    .x = x + @min(label_metrics.measureSlice(label), label_area_w) + self.scaled(config.icon_gap),
+                    .x = x + @min(fitted_label, label_area_w) + self.scaled(config.icon_gap),
                     .y = top + (label_metrics.line_height - icon_metrics.line_height) * 0.5,
                     .w = check_w,
                     .h = icon_metrics.line_height,
@@ -1605,18 +1804,31 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                     });
                     description_x += icon_size + self.scaled(6.0);
                 }
-                try batch.roleText(allocator, .{
+                _ = try self.renderFittedText(allocator, batch, description_metrics, description, .{
                     .x = description_x,
                     .y = description_y,
                     .w = @max(trailing_right - description_x, 0.0),
                     .h = description_metrics.line_height,
-                }, description, self.style.description_color, description_metrics.font_size, config.font_role, config.font_id, label_clip);
+                }, self.style.description_color, label_clip);
             }
+        }
+
+        /// Draws `text` inside `rect`, ending in "…" when it would overflow.
+        /// Returns the drawn width (prefix plus ellipsis).
+        fn renderFittedText(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, metrics_value: text_layout.FontMetrics, text: []const u8, rect: draw.Rect, color: draw.Color, clip: draw.Rect) !f32 {
+            _ = self;
+            const fitted = fitText(metrics_value, text, rect.w);
+            try batch.roleText(allocator, rect, fitted.prefix, color, metrics_value.font_size, config.font_role, config.font_id, clip);
+            if (!fitted.ellipsis) return fitted.prefix_w;
+            const ellipsis_w = metrics_value.measureSlice(ELLIPSIS);
+            try batch.roleText(allocator, .{ .x = rect.x + fitted.prefix_w, .y = rect.y, .w = ellipsis_w, .h = rect.h }, ELLIPSIS, color, metrics_value.font_size, config.font_role, config.font_id, clip);
+            return fitted.prefix_w + ellipsis_w;
         }
 
         fn itemActionRect(self: *const Component, row_rect: draw.Rect) draw.Rect {
             if (config.item_action_icon.len == 0) return .{ .x = row_rect.x + row_rect.w, .y = row_rect.y, .w = 0.0, .h = 0.0 };
-            const size = self.scaled(26.0);
+            // A 32px icon button for the favorite star.
+            const size = @min(self.scaled(32.0), row_rect.h);
             return .{
                 .x = row_rect.x + row_rect.w - self.scaled(config.row_padding_x) - size,
                 .y = row_rect.y + (row_rect.h - size) * 0.5,
@@ -1628,7 +1840,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         // Renders one "Ctrl+n" shortcut chip (outlined pill) at the row's
         // trailing edge and returns the new trailing-right x.
         fn renderShortcutChip(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, label: []const u8, row_rect: draw.Rect, trailing_right: f32, clip: draw.Rect) !f32 {
-            const chip_metrics = self.derivedMetrics(self.scaled(config.badge_font_size));
+            const chip_metrics = self.derivedMetrics(self.badgeFontSize());
             const text_w = chip_metrics.measureSlice(label);
             const pad = self.scaled(config.badge_padding_x);
             const chip_h = chip_metrics.line_height + self.scaled(6.0);
@@ -1644,8 +1856,8 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 .y = chip_rect.y + @max((chip_rect.h - chip_metrics.line_height) * 0.5, 0.0),
                 .w = text_w,
                 .h = chip_metrics.line_height,
-            }, label, self.style.badge_text_color, chip_metrics.font_size, config.font_role, config.font_id, clip);
-            return chip_rect.x - self.scaled(config.icon_gap);
+            }, label, self.badgeTextColor(null), chip_metrics.font_size, config.font_role, config.font_id, clip);
+            return chip_rect.x - @max(self.scaled(config.icon_gap), self.scaled(12.0));
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
@@ -1915,4 +2127,20 @@ test "rich picker scrolling rail keeps every group reachable" {
     try std.testing.expectEqual(picker.railAddIndex(), picker.focused_rail);
     const add_rect = picker.railItemRect(picker.railAddIndex().?);
     try std.testing.expect(add_rect.y >= rail.y and add_rect.y + add_rect.h <= rail.y + rail.h + 0.01);
+}
+
+test "rich picker labels end in an ellipsis instead of clipping" {
+    const metrics_value = text_layout.FontMetrics.fixed(10.0, 10.0, 13.0);
+    const short = fitText(metrics_value, "Local", 100.0);
+    try std.testing.expect(!short.ellipsis);
+    try std.testing.expectEqualStrings("Local", short.prefix);
+    // 10px per glyph; 60px leaves 50px for text after the ellipsis.
+    const long = fitText(metrics_value, "Verde Cloud", 60.0);
+    try std.testing.expect(long.ellipsis);
+    try std.testing.expectEqualStrings("Verde", long.prefix);
+    try std.testing.expect(long.prefix_w + metrics_value.measureSlice(ELLIPSIS) <= 60.0);
+    // Cuts land on a word boundary, never mid-word.
+    const subtitle = fitText(metrics_value, "isn't on this machine", 150.0);
+    try std.testing.expect(subtitle.ellipsis);
+    try std.testing.expectEqualStrings("isn't on this", subtitle.prefix);
 }

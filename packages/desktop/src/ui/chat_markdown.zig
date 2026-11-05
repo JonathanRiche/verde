@@ -96,6 +96,10 @@ pub const RenderOptions = struct {
     bold_italic_font: ?*anyopaque = null,
     code_font: ?*anyopaque = null,
     code_font_size: ?f32 = null,
+    /// Fenced code block fill; null uses `theme.md.code_bg`. User bubbles pass
+    /// a fill derived from their tinted surface so code never draws as a dark
+    /// hole in them.
+    code_background: ?[4]f32 = null,
 };
 
 pub const CodeCopyButtonSink = struct {
@@ -390,6 +394,76 @@ const FlattenContext = struct {
 const FontSpec = struct {
     size: ?f32 = null,
 };
+
+/// Plain one-line preview of a markdown snippet for compact rows (linked
+/// chats, release notes): newlines fold to spaces, a leading heading/list/quote
+/// marker is dropped, and inline syntax (`**`/`__` emphasis, code backticks,
+/// `*word*` emphasis, `[label](url)` links kept as their label) is removed.
+/// Snake_case and spaced asterisks stay as written. Truncates at `buf.len`.
+pub fn plainPreviewLine(buf: []u8, source: []const u8) []const u8 {
+    var line = std.mem.trim(u8, source, " \t\r\n");
+    while (line.len > 0 and line[0] == '#') line = line[1..];
+    if (line.len >= 2 and (line[0] == '-' or line[0] == '*' or line[0] == '+' or line[0] == '>') and line[1] == ' ') line = line[2..];
+    const stripped = stripInlineMarkdown(buf, std.mem.trimStart(u8, line, " "));
+    for (buf[0..stripped.len]) |*byte| {
+        if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
+    }
+    return stripped;
+}
+
+/// Copies `line` into `buf` without inline markdown syntax; see
+/// `plainPreviewLine`.
+pub fn stripInlineMarkdown(buf: []u8, line: []const u8) []const u8 {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < line.len and len < buf.len) {
+        const c = line[i];
+        // `__` inside a word (`foo__bar`) is literal, as in CommonMark.
+        const intraword_underscore = c == '_' and i > 0 and std.ascii.isAlphanumeric(line[i - 1]) and
+            i + 2 < line.len and std.ascii.isAlphanumeric(line[i + 2]);
+        if ((c == '*' or c == '_') and !intraword_underscore and i + 1 < line.len and line[i + 1] == c) {
+            i += 2;
+            continue;
+        }
+        if (c == '`') {
+            i += 1;
+            continue;
+        }
+        if (c == '*') {
+            const prev_space = i == 0 or line[i - 1] == ' ';
+            const next_space = i + 1 >= line.len or line[i + 1] == ' ';
+            if (!(prev_space and next_space)) {
+                i += 1;
+                continue;
+            }
+        }
+        if (c == '[') {
+            if (std.mem.indexOfScalarPos(u8, line, i + 1, ']')) |close| {
+                if (close + 1 < line.len and line[close + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, line, close + 2, ')')) |paren| {
+                        const label = stripInlineMarkdown(buf[len..], line[i + 1 .. close]);
+                        len += label.len;
+                        i = paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        buf[len] = c;
+        len += 1;
+        i += 1;
+    }
+    return buf[0..len];
+}
+
+test "plain preview line strips inline markdown" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Overall Score: 6.9/10", plainPreviewLine(&buf, "**Overall Score:** 6.9/10"));
+    try std.testing.expectEqualStrings("Done: see docs and run zig build", plainPreviewLine(&buf, "## Done: see [docs](https://x.y) and run `zig build`"));
+    try std.testing.expectEqualStrings("snake_case stays, 2 * 3 too", plainPreviewLine(&buf, "- snake_case stays, 2 * 3 too"));
+    try std.testing.expectEqualStrings("one two", plainPreviewLine(&buf, "one\ntwo"));
+    try std.testing.expectEqualStrings("call foo__bar, not bold", plainPreviewLine(&buf, "call foo__bar, not __bold__"));
+}
 
 /// Parses markdown into a reusable body view with flattened text, rule, and code blocks.
 pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
@@ -1373,7 +1447,7 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
     queuePaletteRoundedShell(
         context,
         rect,
-        paletteColor(theme.md.code_bg),
+        paletteColor(options.code_background orelse theme.md.code_bg),
         paletteColor(theme.md.code_border),
         codeBlockRounding(options),
     );
@@ -3359,7 +3433,7 @@ fn renderSelectablePaletteCodeBlock(
     queuePaletteRoundedShell(
         context,
         rect,
-        paletteColor(theme.md.code_bg),
+        paletteColor(options.code_background orelse theme.md.code_bg),
         paletteColor(theme.md.code_border),
         codeBlockRounding(options),
     );
@@ -3696,8 +3770,8 @@ fn isInlineWhitespace(byte: u8) bool {
 }
 
 /// Map a markdown block + inline style to the Palette FontRole that should
-/// render it. Chat headings stay on the default UI face (CalSans) so they read
-/// as part of the same design language as the surrounding chrome. Body prose
+/// render it. Chat headings stay on the default UI face (Noto Sans, the same
+/// family as body prose) so they match the surrounding chrome. Body prose
 /// drops to NotoSans-Regular; strong/italic emphasis selects the matching Noto
 /// weight; inline code switches to mono.
 fn markdownFontRole(block_style: TextStyle, inline_style: InlineStyle) palette.FontRole {

@@ -440,6 +440,18 @@ pub fn segmentedSelectedBorder(base: [4]f32) [4]f32 {
     return mix(base, accent(), 0.62);
 }
 
+/// Fenced code inside a user bubble: the bubble's own fill, nudged toward the
+/// text colour so the block still reads as a separate surface (never the
+/// assistant cards' near-pane `md.code_bg`, which reads as a dark hole).
+pub fn userBubbleCodeFill() [4]f32 {
+    return mix(userBubbleFill(), current_colors.text, 0.06);
+}
+
+/// Image attachment frame inside a user bubble: the bubble fill, slightly sunk.
+pub fn userBubbleInsetFill() [4]f32 {
+    return sink(userBubbleFill(), 0.04);
+}
+
 /// Opaque surface of the user's own transcript turns: a light accent wash
 /// over the panel. Text on it uses the theme text colour (never accent).
 pub fn userBubbleFill() [4]f32 {
@@ -1431,6 +1443,23 @@ test "readable text tiers clear the contrast floors on Omarchy-derived palettes"
         ensureReadableTextTiers(&tiers);
         try std.testing.expect(contrastRatio(tiers.text_subtle, tiers.panel_alt) >= 4.5);
         try std.testing.expect(contrastRatio(tiers.text, userBubbleFillFor(tiers)) >= 4.5);
+    }
+}
+
+test "user bubble code and image fills stay readable and distinct in every built-in theme" {
+    const saved = current_colors;
+    defer current_colors = saved;
+    for ([_]ThemeColors{ verde_dark_colors, verde_light_colors, verde_legacy_colors }) |palette_colors| {
+        current_colors = palette_colors;
+        const bubble = userBubbleFill();
+        const code = userBubbleCodeFill();
+        // Code text (primary and muted tiers) keeps 4.5:1 on the code fill.
+        try std.testing.expect(contrastRatio(current_colors.text, code) >= 4.5);
+        try std.testing.expect(contrastRatio(current_colors.text_muted, code) >= 4.5);
+        // A visible but quiet step from the bubble, never the pane colour.
+        try std.testing.expect(contrastRatio(code, bubble) > 1.02);
+        try std.testing.expect(!std.meta.eql(code, current_colors.background));
+        try std.testing.expect(!std.meta.eql(userBubbleInsetFill(), current_colors.background));
     }
 }
 

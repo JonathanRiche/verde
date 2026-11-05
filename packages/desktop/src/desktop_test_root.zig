@@ -84,6 +84,7 @@ test {
     if (@import("builtin").os.tag == .linux) _ = @import("live_voice/audio_pipewire.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("ui/diff_render.zig");
+    _ = @import("ui/side_panel.zig");
     _ = @import("ui/side_panel_changes.zig");
     _ = @import("ui/handoff_sheet.zig");
     _ = @import("state/handoff_controller.zig");
@@ -94,7 +95,9 @@ test {
     _ = @import("ui/workspace_identity.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/chat_panel.zig");
+    _ = @import("ui/context_menu.zig");
     _ = @import("ui/terminal_panel.zig");
+    _ = @import("ui/tooltip.zig");
     _ = @import("ui/workspace_panes.zig");
     _ = @import("ui/host.zig");
     _ = @import("loop_wakeup");

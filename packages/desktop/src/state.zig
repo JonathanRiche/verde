@@ -38,6 +38,7 @@ const session_protocol = headless.session_protocol;
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
+const companion_ui = @import("ui/companion.zig");
 const utils = @import("utils.zig");
 const browser_pane = @import("state/browser_pane.zig");
 const workspace_layout = @import("state/workspace_layout.zig");
@@ -2497,7 +2498,7 @@ pub const PaletteModalTextFocus = enum {
 /// the transcript's bubble body text keys off it (`chat_panel.zig`) so the
 /// prompt box and the chat thread always read at the same size.
 pub const PALETTE_COMPOSER_FONT_SIZE: f32 = 18.0;
-const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
+pub const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
@@ -2517,11 +2518,11 @@ fn paletteComposerStyle() PaletteComposerPrompt.Style {
         .send_color = paletteColor(theme.COLOR_GREEN),
         .send_hover_color = paletteColor(theme.raise(theme.COLOR_GREEN, 0.08)),
         .send_foreground_color = paletteColor(theme.foregroundOn(theme.COLOR_GREEN)),
-        .stop_button_color = paletteColor(theme.COLOR_YELLOW),
-        .stop_button_hover_color = paletteColor(theme.raise(theme.COLOR_YELLOW, 0.08)),
-        .stop_foreground_color = paletteColor(theme.foregroundOn(theme.COLOR_YELLOW)),
+        .stop_button_color = paletteColor(theme.danger()),
+        .stop_button_hover_color = paletteColor(theme.raise(theme.danger(), 0.08)),
+        .stop_foreground_color = paletteColor(theme.foregroundOn(theme.danger())),
         .text_color = paletteColor(theme.COLOR_WHITE),
-        .placeholder_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 220)),
+        .placeholder_color = paletteColor(theme.COLOR_TEXT_SUBTLE),
         .icon_color = paletteColor(theme.COLOR_TEXT_MUTED),
         .cursor_color = paletteColor(theme.COLOR_WHITE),
         .selection_color = paletteColor(theme.withAlpha(theme.selection(), 140)),
@@ -2548,17 +2549,19 @@ fn companionComposerStyle() CompanionComposerPrompt.Style {
         .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
         .focus_border_color = paletteColor(chrome.accent),
         .focus_border_width = @max(@round(COMPANION_COMPOSER_FOCUS_BORDER_WIDTH * scale), 1.0) / scale,
-        .control_background_color = paletteColor(theme.withAlpha(chrome.controls, 0)),
-        .control_hover_color = paletteColor(theme.withAlpha(chrome.controls, 70)),
+        // The model pill is the companion's only model control: a filled
+        // chip like the chat composer's, not bare text.
+        .control_background_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)),
+        .control_hover_color = paletteColor(theme.withAlpha(theme.raise(theme.COLOR_PANEL_ALT, 0.08), 210)),
         .separator_color = paletteColor(chrome.hairline),
         .send_color = paletteColor(chrome.accent),
         .send_hover_color = paletteColor(chrome.accent_hi),
         .send_foreground_color = paletteColor(chrome.accent_fg),
-        .stop_button_color = paletteColor(chrome.warning),
-        .stop_button_hover_color = paletteColor(theme.raise(chrome.warning, 0.08)),
-        .stop_foreground_color = paletteColor(chrome.warning_fg),
+        .stop_button_color = paletteColor(chrome.danger),
+        .stop_button_hover_color = paletteColor(theme.raise(chrome.danger, 0.08)),
+        .stop_foreground_color = paletteColor(theme.foregroundOn(chrome.danger)),
         .text_color = paletteColor(chrome.text),
-        .placeholder_color = paletteColor(theme.withAlpha(chrome.text_subtle, 220)),
+        .placeholder_color = paletteColor(chrome.text_subtle),
         .icon_color = paletteColor(chrome.text_muted),
         .cursor_color = paletteColor(chrome.text),
         .selection_color = paletteColor(chrome.selection),
@@ -2628,7 +2631,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .focus_border_color = paletteColor(theme.default_colors.accent),
     .focus_border_width = 1.5,
     // Force the bold pill labels (GPT-5.5, Medium, Fast, Full access) onto the
-    // .ui role too so they share CalSans-Regular with the placeholder and the
+    // .ui role too so they share the regular UI face with the placeholder and the
     // workspace header buttons. The default `.ui_bold` falls through to the
     // renderer's heavy NotoSans-Bold, which reads as a different typeface.
     .bold_font_role = .ui,
@@ -2642,8 +2645,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .send_color = paletteColor(theme.default_colors.accent),
     .send_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.accent, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .send_foreground_color = paletteColor(theme.default_colors.background),
-    .stop_button_color = paletteColor(theme.default_colors.warning),
-    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.warning, 0.08, theme.default_colors.background, theme.default_colors.text)),
+    .stop_button_color = paletteColor(theme.default_colors.diff_remove),
+    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.diff_remove, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .stop_foreground_color = paletteColor(theme.default_colors.background),
     .text_color = paletteColor(theme.default_colors.text),
     .icon_color = paletteColor(theme.default_colors.text_muted),
@@ -2651,7 +2654,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .selection_color = paletteColor(theme.withAlpha(theme.default_colors.selection, 140)),
     .scrollbar_track_color = paletteColor(theme.withAlpha(theme.default_colors.panel_muted, 110)),
     .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.default_colors.text_muted, 200)),
-    .placeholder_color = paletteColor(theme.withAlpha(theme.default_colors.text_subtle, 220)),
+    .placeholder_color = paletteColor(theme.default_colors.text_subtle),
     .font_size = PALETTE_COMPOSER_FONT_SIZE,
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
@@ -2674,14 +2677,16 @@ const COMPANION_COMPOSER_FOCUS_BORDER_WIDTH: f32 = 1.5;
 /// compact steering geometry from its sidecar footer. Border, focus ring and
 /// corner radius match the chat composer so the two frames read alike.
 pub const CompanionComposerPrompt = palette.composerPrompt(.{
-    .padding_x = 11.0,
+    // ≥12px text inset (Muse r9): the first letter and caret clear the
+    // 18px corner instead of sitting on the border.
+    .padding_x = 14.0,
     .padding_y = 9.0,
     .toolbar_height = 32.0,
     .toolbar_gap = 6.0,
     .control_gap = 6.0,
-    .pill_padding_x = 8.0,
+    .pill_padding_x = 10.0,
     .pill_icon_gap = 6.0,
-    .pill_chevron_gap = 0.0,
+    .pill_chevron_gap = 6.0,
     .model_min_width = 126.0,
     .model_max_width = 220.0,
     .corner_radius = 18.0,
@@ -2702,23 +2707,24 @@ pub const CompanionComposerPrompt = palette.composerPrompt(.{
     .send_color = paletteColor(theme.default_colors.accent),
     .send_hover_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_hi),
     .send_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_fg),
-    .stop_button_color = paletteColor(theme.default_colors.warning),
-    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.warning, 0.08, theme.default_colors.background, theme.default_colors.text)),
-    .stop_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).warning_fg),
+    .stop_button_color = paletteColor(theme.default_colors.diff_remove),
+    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.diff_remove, 0.08, theme.default_colors.background, theme.default_colors.text)),
+    .stop_foreground_color = paletteColor(theme.default_colors.background),
     .text_color = paletteColor(theme.default_colors.text),
     .icon_color = paletteColor(theme.default_colors.text_muted),
     .cursor_color = paletteColor(theme.default_colors.text),
     .selection_color = paletteColor(theme.companionChromeFor(theme.default_colors).selection),
     .scrollbar_track_color = paletteColor(theme.withAlpha(theme.default_colors.border_muted, 110)),
     .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.default_colors.text_muted, 200)),
-    .placeholder_color = paletteColor(theme.withAlpha(theme.default_colors.text_subtle, 220)),
+    .placeholder_color = paletteColor(theme.default_colors.text_subtle),
     .font_size = PALETTE_COMPOSER_FONT_SIZE,
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Steer the run…",
     .model_icon = "",
     .model_label = "Workspace · verde",
-    .chevron_icon = "",
+    // Same stroked disclosure chevron as the chat composer's pills.
+    .chevron_icon = "\u{EAB6}",
     .send_icon = "↑",
     .stop_icon = "■",
     .z_index = 120,
@@ -2727,7 +2733,7 @@ pub const CompanionComposerPrompt = palette.composerPrompt(.{
 // CSS-unit width of the composer model picker popover; the component scales it
 // (and every other geometry token) by `setUiScale` for HiDPI displays.
 /// Width reserved per host-drawn state glyph embedded in the run pill's
-/// summary, beside the segment it describes (brain / bolt / lock, ~22px
+/// summary, beside the segment it describes (bulb / bolt / lock, ~22px
 /// drawn, centered). The ~8px spare splits into the word-side and
 /// separator-side gaps, so widening this spaces the glyph away from both
 /// neighbors; mirrors the sizing convention of `pill_overlay_icon_reserve`.
@@ -4214,6 +4220,13 @@ fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u
     return runtimePickerStatusDescription(runtimePickerStatus(snapshot));
 }
 
+/// Setup rows' "Set up" badge is a button (it opens the setup card), not a
+/// status chip; the picker draws it with the action style.
+fn paletteRuntimePickerBadgeIsAction(context: ?*anyopaque, index: usize) bool {
+    const state = appStateFromContext(context) orelse return false;
+    return runtimePickerSetupRow(state, index) != null;
+}
+
 fn paletteRuntimePickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "";
     const state = appStateFromContext(context) orelse return "";
@@ -4248,6 +4261,7 @@ pub const PaletteRuntimePicker = palette.richPicker(.{
     .item_label = paletteRuntimePickerLabel,
     .item_description = paletteRuntimePickerDescription,
     .item_badge = paletteRuntimePickerBadge,
+    .item_badge_action = paletteRuntimePickerBadgeIsAction,
     .check_icon = "\u{EAB2}",
     .check_inline = true,
     .placement = .above,
@@ -10676,7 +10690,7 @@ pub const AppState = struct {
         }
     }
 
-    /// 0..1 gauge for the run pill's brain glyph: position of the selected
+    /// 0..1 gauge for the run pill's reasoning (bulb) glyph: position of the selected
     /// reasoning level within the provider's ordered level list.
     /// (index+1)/count so the lowest level keeps a visible sliver instead of
     /// an empty silhouette; single-level (or unknown) lists read as full.
@@ -14336,7 +14350,7 @@ pub const AppState = struct {
         const companion_scale = theme.displayScaleFactor();
         self.companion_composer.setUiScale(companion_scale);
         self.companion_composer.setFontMetrics(paletteComposerTextFontMetrics(12.5 * companion_scale));
-        self.companion_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(10.5 * companion_scale));
+        self.companion_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(12.0 * companion_scale));
         self.companion_composer.setIconFontMetrics(paletteEstimatedFontMetrics(12.0 * companion_scale));
         self.companion_composer.setBounds(rect);
         self.companion_composer.setExternalModelMenu(true);
@@ -14344,7 +14358,8 @@ pub const AppState = struct {
         self.companion_composer.setShowReasoningToggle(false);
         self.companion_composer.setShowFastToggle(false);
         self.companion_composer.setShowAccessToggle(false);
-        self.companion_composer.setModelLabel(self.allocator, self.companion_controller.identity.brain.slice()) catch {};
+        var model_buf: [128]u8 = undefined;
+        self.companion_composer.setModelLabel(self.allocator, companion_ui.modelLabel(self, &model_buf)) catch {};
         const pending = if (thread) |value| value.isSendPendingForUi() else false;
         self.companion_composer.setSendState(if (!rename and pending) .stop else .send);
         var placeholder_buffer: [128]u8 = undefined;
@@ -15054,8 +15069,8 @@ pub const AppState = struct {
             log.warn("failed to sync palette composer run summary label: {s}", .{@errorName(err)});
         };
         // Host-drawn state glyphs sit inside the run pill label after the
-        // word each one describes — brain after the reasoning segment,
-        // bolt/circle after speed, lock after access (drawn in
+        // word each one describes — bulb gauge after the reasoning segment,
+        // bolt after a Fast speed segment, lock after access (drawn in
         // chat_panel.renderComposerToolbarIcons).
         var run_slots: [3]palette.ComposerPromptIconSlot = undefined;
         var run_slot_count: usize = 0;
@@ -15100,7 +15115,9 @@ pub const AppState = struct {
             result.reasoning_offset = writer.buffered().len;
             wrote_any = true;
         }
-        if (self.currentComposerShowsFastToggle()) {
+        // Speed is summarized only when it differs from the default: a
+        // "Default" segment with a hollow ring told the user nothing.
+        if (self.currentComposerShowsFastToggle() and self.currentThread().fast_mode == .on) {
             if (wrote_any) writer.writeAll(" · ") catch {};
             writer.writeAll(self.currentComposerFastLabel()) catch {};
             result.fast_offset = writer.buffered().len;
@@ -16332,6 +16349,7 @@ pub const AppState = struct {
         self.syncRunConfigSteppers();
         self.composer_controller.run_config_open = true;
         self.composer_controller.run_config_focused_row = 0;
+        self.composer_controller.run_config_focus_visible = false;
         _ = self.layoutRunConfigPopover();
         self.composer_controller.composer.focused = false;
         self.composer_controller.focused = false;
@@ -16650,6 +16668,7 @@ pub const AppState = struct {
             return true;
         }
         if (self.composer_controller.run_config_focused_row >= count) self.composer_controller.run_config_focused_row = count - 1;
+        self.composer_controller.run_config_focus_visible = true;
         switch (key.code) {
             .up => {
                 self.composer_controller.run_config_focused_row = (self.composer_controller.run_config_focused_row + count - 1) % count;
@@ -16785,6 +16804,7 @@ pub const AppState = struct {
             const stepper = &self.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])];
             if (stepper.handleInput(.{ .mouse_down = point })) {
                 self.composer_controller.run_config_focused_row = index;
+                self.composer_controller.run_config_focus_visible = false;
                 self.noteInteraction();
                 return true;
             }

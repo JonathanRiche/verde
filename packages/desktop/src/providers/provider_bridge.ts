@@ -50,6 +50,21 @@ function claudeTextDeltaFromStreamEvent(message) {
   return typeof event.delta.text === "string" && event.delta.text.length > 0 ? event.delta.text : null;
 }
 
+// True when a top-level stream event opens a new text content block. A turn
+// can carry several text blocks back to back (around thinking or hidden
+// tool use); their deltas must not run together ("fixed:The blank").
+function claudeTextBlockStarts(message) {
+  if (message?.type !== "stream_event" || message.parent_tool_use_id) return false;
+  const event = message.event;
+  return event?.type === "content_block_start" && event.content_block?.type === "text";
+}
+
+// Separator to put before a new text block so it starts its own paragraph.
+function claudeTextBlockSeparator(emitted) {
+  if (!emitted || emitted.endsWith("\n\n")) return "";
+  return emitted.endsWith("\n") ? "\n" : "\n\n";
+}
+
 // Same shape, but for a child agent's partial text. The parent's own dedupe
 // (`claudeUnstreamedText`) never sees these, so they stay ephemeral.
 function claudeChildTextDeltaFromStreamEvent(message) {
@@ -1393,6 +1408,8 @@ async function handleClaudeSendPrompt(sdk, request) {
     let sessionId = request.thread_id ?? null;
     let reply = "";
     let streamedText = "";
+    let emittedText = "";
+    let pendingBlockSeparator = "";
     const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [], taskToolUseIds: new Map(), liveBackgroundTasks: [], resumedSubagentIds: new Set() };
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
@@ -1401,11 +1418,15 @@ async function handleClaudeSendPrompt(sdk, request) {
       if (signedOutFailure) throw new Error(signedOutFailure);
       if (message?.type === "stream_event") {
         if (emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState)) continue;
+        if (claudeTextBlockStarts(message)) pendingBlockSeparator = claudeTextBlockSeparator(emittedText);
         const streamedDelta = claudeTextDeltaFromStreamEvent(message);
         if (streamedDelta) {
+          const text = pendingBlockSeparator + streamedDelta;
+          pendingBlockSeparator = "";
           streamedText += streamedDelta;
-          reply += streamedDelta;
-          write({ type: "delta", text: streamedDelta });
+          emittedText += text;
+          reply += text;
+          write({ type: "delta", text });
         }
         continue;
       }
@@ -1446,8 +1467,10 @@ async function handleClaudeSendPrompt(sdk, request) {
         const unstreamed = claudeUnstreamedText(delta, streamedText);
         streamedText = "";
         if (unstreamed) {
-          reply += unstreamed;
-          write({ type: "delta", text: unstreamed });
+          const text = claudeTextBlockSeparator(emittedText) + unstreamed;
+          emittedText += text;
+          reply += text;
+          write({ type: "delta", text });
         }
       }
     }
