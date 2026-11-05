@@ -293,6 +293,24 @@ pub const ANTIGRAVITY_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Max", .value = .max },
 };
 
+/// agy's base model for a folded id: `gemini-3.8-flash-high` ->
+/// `gemini-3.8-flash`. Ids without a tier suffix are returned unchanged.
+pub fn antigravityBaseModelRef(ref: []const u8) []const u8 {
+    for ([_][]const u8{ "low", "medium", "high", "xhigh", "max" }) |tier| {
+        if (ref.len > tier.len + 1 and std.mem.endsWith(u8, ref, tier) and ref[ref.len - tier.len - 1] == '-') {
+            return ref[0 .. ref.len - tier.len - 1];
+        }
+    }
+    return ref;
+}
+
+test "antigravityBaseModelRef strips agy's folded thinking tier" {
+    try std.testing.expectEqualStrings("gemini-3.8-flash", antigravityBaseModelRef("gemini-3.8-flash-high"));
+    try std.testing.expectEqualStrings("gemini-3.8-flash", antigravityBaseModelRef("gemini-3.8-flash"));
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", antigravityBaseModelRef("claude-sonnet-4-6"));
+    try std.testing.expectEqualStrings("default", antigravityBaseModelRef("default"));
+}
+
 /// True when an agy model row offers `effort`: its catalog tiers, else agy's
 /// usual low/medium/high.
 pub fn antigravityEffortSupported(values: ?[]const [:0]const u8, effort: ReasoningEffort) bool {

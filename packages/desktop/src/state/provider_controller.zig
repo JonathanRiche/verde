@@ -2179,7 +2179,9 @@ pub fn fxModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption
 /// keeps agy's usual low/medium/high tiers.
 pub fn antigravityModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
     const ref: []const u8 = model_ref orelse return null;
-    return findModelOptionByValue(self.antigravityModelOptionsSnapshot(), ref);
+    const options = self.antigravityModelOptionsSnapshot();
+    if (findModelOptionByValue(options, ref)) |option| return option;
+    return findModelOptionByValue(options, provider_models.antigravityBaseModelRef(ref));
 }
 
 pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
@@ -2210,6 +2212,15 @@ pub fn knownModelLabel(provider: Provider, live: []const ModelOption, ref: []con
     };
     if (findModelOptionByValue(live, ref)) |option| return option.label;
     if (findModelOptionByValue(builtin_options, ref)) |option| return option.label;
+    if (provider == .antigravity) {
+        // Threads from before the separate reasoning menu stored agy's folded
+        // id (`gemini-3.8-flash-high`); show the base model's name.
+        const agy_base = provider_models.antigravityBaseModelRef(ref);
+        if (agy_base.len == ref.len) return null;
+        if (findModelOptionByValue(live, agy_base)) |option| return option.label;
+        if (findModelOptionByValue(builtin_options, agy_base)) |option| return option.label;
+        return null;
+    }
     if (provider != .claude) return null;
     const base = claudeModelBaseRef(ref);
     if (base.len == ref.len) return null;
