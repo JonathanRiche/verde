@@ -5246,7 +5246,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     });
     try writeMcpTypedTool(&s, "list_linked_chats", "List chats delegated by a parent conversation and their current status.", &CHAT_LINKS_MCP_INPUTS);
     try writeMcpTypedTool(&s, "clear_linked_chats", "Unlink a specific linked chat (link_id from list_linked_chats), or every finished link when link_id is omitted: it leaves the panel and stops notifying the parent. Does not cancel work or delete the chat; delegating to it again relinks it.", &CHAT_LINKS_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Task-capable clients receive an asynchronous task handle; subscribe through subscriptions/listen for completion and input-needed notifications. Set parent_thread_id for automatic Verde parent delivery. Legacy clients can read tail_chat_turn.", &CHAT_SEND_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Task-capable clients receive an asynchronous task handle; subscribe through subscriptions/listen for completion and input-needed notifications. Set parent_thread_id for automatic Verde parent delivery. Legacy clients can read tail_chat_turn. When the thread already has a running turn, the prompt is queued (status \"queued\") and starts as the next turn, with the returned turn_id, once that turn ends.", &CHAT_SEND_MCP_INPUTS);
     try writeMcpTypedTool(&s, "queue_chat_followup", "Steer a running chat pane daemon-direct. Reuse steer_id after an ambiguous response; idle or unsupported panes return invalid_state.", &CHAT_FOLLOWUP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "tail_chat_turn", "Read streamed events and status. Accepted steering is kind=steer with steer_id, message_id, title, body, and images; terminal status follows durable commit.", &CHAT_TAIL_MCP_INPUTS);
     try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
@@ -7115,6 +7115,11 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
         jsonBool(result.object.get("created") orelse .null) orelse false
     else
         false;
+    // The thread was busy: the daemon starts this turn when it is idle.
+    const queued = if (result == .object)
+        jsonBool(result.object.get("queued") orelse .null) orelse false
+    else
+        false;
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -7128,7 +7133,7 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
         .workspace_id = send.workspace_id,
         .local_thread_id = send.local_thread_id,
         .created = created,
-        .status = "accepted",
+        .status = if (queued) "queued" else "accepted",
     });
     try s.endObject();
     return try writer.toOwnedSlice();

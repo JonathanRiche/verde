@@ -11093,7 +11093,7 @@ fn runChatOrchestrationScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         .workspace = .{ .workspace_id = "orch", .label = "Orchestration", .path = pref },
     });
     if (!workspace.response.isOk()) return error.OrchestrationWorkspace;
-    for ([_][]const u8{ "parent", "child", "blocked-child", "approval-child", "cancel-child", "live-child", "restart-child", "busy-parent", "busy-child", "image-child", "other-parent" }) |id| {
+    for ([_][]const u8{ "parent", "child", "blocked-child", "approval-child", "cancel-child", "live-child", "restart-child", "busy-parent", "busy-child", "image-child", "other-parent", "queued-parent" }) |id| {
         var thread = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, headless.store.ThreadUpsertRequest{
             .mutation = .{ .request_key = id, .client_id = client_id },
             .workspace_id = "orch",
@@ -11196,6 +11196,63 @@ fn runChatOrchestrationScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         const row = (try conn.row("select delivered from chat_deliveries where task_id='busy-child-turn'", .{})).?;
         defer row.deinit();
         if (row.int(0) != 1) return error.OrchestrationSteerNotDurable;
+    }
+    // A child's send_chat_message to a thread with a running turn must not
+    // start a second provider turn beside it: it queues and starts as the
+    // next turn, so the transcript commits in the order it happened.
+    var queued_parent = try client.call("chat.turn.start", .{ .turn_id = "queued-parent-turn", .workspace_id = "orch", .local_thread_id = "queued-parent", .project_path = pref, .thread_title = "queued-parent", .provider = "claude", .harness = "local_cli", .prompt = "slow steer target" });
+    if (!queued_parent.response.isOk()) return error.OrchestrationQueuedParentStart;
+    const queued_send = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 4, .method = "tools/call", .params = .{
+        ._meta = meta,
+        .name = "send_chat_message",
+        .arguments = .{ .workspace_id = "orch", .local_thread_id = "queued-parent", .project_path = pref, .turn_id = "queued-agent-turn", .prompt = "update from a child chat" },
+    } }, .{});
+    const queued_reply = (try cli_main.handleMcpHttpRequest(arena, io, queued_send, context)).?;
+    {
+        // The task exists while the prompt waits, so the sender can track it.
+        const queued_task = jsonObjectField((try std.json.parseFromSlice(std.json.Value, arena, queued_reply, .{})).value, "result") orelse {
+            std.debug.print("queued send reply: {s}\n", .{queued_reply});
+            return error.OrchestrationAgentPromptNotQueued;
+        };
+        if (!std.mem.eql(u8, jsonObjectField(queued_task, "taskId").?.string, "queued-agent-turn")) return error.OrchestrationQueuedTaskId;
+        if (!std.mem.eql(u8, jsonObjectField(queued_task, "status").?.string, "working")) {
+            std.debug.print("queued task: {s}\n", .{queued_reply});
+            return error.OrchestrationQueuedTaskStatus;
+        }
+    }
+    {
+        var early = try client.call("chat.turn.tail", .{ .turn_id = "queued-agent-turn" });
+        if (early.response.isOk()) return error.OrchestrationAgentPromptRanInParallel;
+    }
+    try waitChatTurnTerminal(io, &client, "queued-parent-turn", true);
+    const queued_deadline = platform_runtime.unixTimestampMs() + 10000;
+    while (true) {
+        var tail = try client.call("chat.turn.tail", .{ .turn_id = "queued-agent-turn" });
+        if (tail.response.isOk()) break;
+        if (platform_runtime.unixTimestampMs() >= queued_deadline) return error.OrchestrationQueuedPromptNeverStarted;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try waitChatTurnTerminal(io, &client, "queued-agent-turn", true);
+    {
+        const row = (try conn.row("select (select finished_at_ms from chat_turns where turn_id='queued-parent-turn'), (select started_at_ms from chat_turns where turn_id='queued-agent-turn')", .{})) orelse return error.OrchestrationQueuedLedgerMissing;
+        defer row.deinit();
+        if (row.int(1) < row.int(0)) return error.OrchestrationQueuedTurnsOverlapped;
+    }
+    {
+        // The queued prompt's row follows every row of the turn it waited for.
+        var message_rows = try conn.rows("select m.body from messages m join threads t on t.id=m.thread_id where t.local_thread_id='queued-parent' order by m.sort_index", .{});
+        defer message_rows.deinit();
+        var seen_queued_prompt = false;
+        var row_count: usize = 0;
+        while (message_rows.next()) |row| : (row_count += 1) {
+            const body = row.text(0);
+            if (std.mem.eql(u8, body, "update from a child chat")) {
+                if (row_count < 2) return error.OrchestrationQueuedPromptOrder;
+                seen_queued_prompt = true;
+            } else if (seen_queued_prompt and std.mem.eql(u8, body, "slow steer target")) return error.OrchestrationQueuedPromptOrder;
+        }
+        if (message_rows.err) |err| return err;
+        if (!seen_queued_prompt) return error.OrchestrationQueuedPromptMissing;
     }
     var clear = try client.call("chat.links.clear", .{ .workspace_id = "orch", .parent_thread_id = "parent", .completed_only = true });
     if (!clear.response.isOk()) return error.OrchestrationClear;

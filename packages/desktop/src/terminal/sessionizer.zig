@@ -2519,6 +2519,13 @@ pub const Daemon = struct {
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
+    /// Agent-sent prompts (MCP send_chat_message) that arrived while their
+    /// thread already had a turn, in arrival order. Each starts as the next
+    /// turn once the thread is idle (see dispatchQueuedAgentPrompts). Guarded
+    /// by lockDaemon. In memory only: after a daemon restart the durable task
+    /// created at admission reports `interrupted` (chat_links.recoverTasks),
+    /// while chat.turn.tail for the never-started turn id is not_found.
+    queued_agent_prompts: std.ArrayList(QueuedAgentPrompt) = .empty,
     /// Staged chat attachments awaiting a claiming turn. Guarded by lockDaemon;
     /// per-record `busy` flags keep file I/O outside the lock.
     chat_attachments: std.ArrayList(*StagedChatAttachment) = .empty,
@@ -2648,6 +2655,8 @@ pub const Daemon = struct {
         self.sessions.deinit(self.allocator);
         for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
         self.chat_turns.deinit(self.allocator);
+        for (self.queued_agent_prompts.items) |queued| queued.turn.deinit(self.allocator);
+        self.queued_agent_prompts.deinit(self.allocator);
         for (self.chat_attachments.items) |record| record.destroy(self.allocator);
         self.chat_attachments.deinit(self.allocator);
         self.registry_jobs.deinit(self.allocator);
@@ -7882,6 +7891,9 @@ pub const Daemon = struct {
             turn.deinit(self.allocator);
             return response;
         }
+        // Every check an idle start makes has passed; the turn is valid.
+        const queued_delivery = jsonBool(params.object.get("queued_delivery") orelse .null) orelse false;
+        if (try self.queueAgentTurnIfThreadBusy(id_value, turn, queued_delivery)) |response| return response;
         if (turn.task_owner) |owner| {
             lockDaemon(self);
             const task_service = self.store_service;
@@ -7939,6 +7951,77 @@ pub const Daemon = struct {
         turn_launched = true;
         self.mutex.unlock();
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
+    }
+
+    /// A prompt another agent sends (send_chat_message, e.g. a child writing
+    /// to its parent) must not start a second provider process on a thread
+    /// whose session is already running: both would resume the same provider
+    /// session and the transcript would commit out of order. Hold it until
+    /// the thread is idle, behind any prompt queued earlier, then start it as
+    /// its own turn with the same id. The caller already validated `turn`
+    /// the way an idle start would; this also refuses a missing or archived
+    /// thread now, and records the task (and parent link) at once so
+    /// chat.tasks.get and parent delivery see it while it waits.
+    /// Returns null, leaving `turn` with the caller, when it may start now;
+    /// otherwise the response, having taken ownership of `turn`.
+    /// Caller holds workspace_lifecycle_mutex, so this never dispatches; the
+    /// scheduler thread picks up the due entry.
+    fn queueAgentTurnIfThreadBusy(self: *Daemon, id_value: std.json.Value, turn: *ChatTurn, queued_delivery: bool) !?[]u8 {
+        const owner = turn.task_owner orelse return null;
+        // The queued start itself, and attachment sends (never from MCP).
+        if (queued_delivery or turn.owned_image_paths.len != 0 or turn.owned_images.len != 0) return null;
+        var duplicate = false;
+        const service = blk: {
+            lockDaemon(self);
+            defer self.mutex.unlock();
+            if (!threadTurnBusyLocked(self, turn.workspace_id, turn.local_thread_id) and
+                !queuedAgentPromptForThreadLocked(self, turn.workspace_id, turn.local_thread_id)) return null;
+            duplicate = queuedAgentPromptIndexLocked(self, turn.turn_id) != null;
+            const svc = self.store_service orelse return null;
+            _ = svc.in_flight.fetchAdd(1, .monotonic);
+            break :blk svc;
+        };
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        if (duplicate) {
+            const response = try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false, .queued = true });
+            turn.deinit(self.allocator);
+            return response;
+        }
+        const Refusal = struct { code: []const u8, message: []const u8 };
+        const refusal: ?Refusal = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            const conn = service.store.conn;
+            var thread_row = (try conn.row(
+                "select t.archived from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+                .{ turn.workspace_id, turn.local_thread_id },
+            )) orelse break :blk .{ .code = headless.protocol.ERR_RESOURCE_NOT_FOUND, .message = "chat thread not found" };
+            defer thread_row.deinit();
+            if (thread_row.int(0) != 0) break :blk .{ .code = headless.protocol.ERR_INVALID_STATE, .message = "chat thread is archived; unarchive it before sending" };
+            if (turn.parent_thread_id) |parent| {
+                const parent_workspace = (try chat_links.resolveParentWorkspace(conn, self.allocator, turn.workspace_id, parent)) orelse
+                    break :blk .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "parent thread not found" };
+                defer self.allocator.free(parent_workspace);
+                try chat_links.linkAcross(conn, self.allocator, parent_workspace, parent, turn.workspace_id, turn.local_thread_id);
+            }
+            try chat_links.createTask(conn, turn.turn_id, turn.workspace_id, turn.local_thread_id, owner, turn.started_at_ms);
+            if (turn.parent_thread_id) |parent| try chat_links.setOrigin(conn, turn.turn_id, parent);
+            break :blk null;
+        };
+        if (refusal) |refused| {
+            const response = try errorResponseAlloc(self.allocator, id_value, refused.code, refused.message);
+            turn.deinit(self.allocator);
+            return response;
+        }
+        const response = try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false, .queued = true });
+        errdefer self.allocator.free(response);
+        log.info("chat turn queued behind running thread turn turn_id={s} thread={s}", .{ turn.turn_id, turn.local_thread_id });
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        // Due now: if the thread went idle meanwhile, the next scheduler
+        // tick starts it; otherwise the running turn's commit does.
+        try self.queued_agent_prompts.append(self.allocator, .{ .turn = turn, .retry_at_ms = nowMs() });
+        return response;
     }
 
     fn chatTurnListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -15390,6 +15473,8 @@ fn schedulerThread(context: *SessionizerServerContext) void {
             } else |err| log.warn("scheduled tasks deferred: {s}", .{@errorName(err)});
             next_tick_ms = nowMs() + schedules.TICK_MS;
         }
+        // Queued agent prompts due now: newly queued or backing off.
+        if (queuedAgentPromptsDue(daemon)) dispatchParentDeliveries(daemon);
         sleepMs(250);
     }
 }
@@ -15838,6 +15923,11 @@ fn brainLabelAlloc(arena: std.mem.Allocator, provider: []const u8, model: ?[]con
 fn threadTurnBusy(daemon: *Daemon, workspace_id: []const u8, thread_id: []const u8) bool {
     lockDaemon(daemon);
     defer daemon.mutex.unlock();
+    return threadTurnBusyLocked(daemon, workspace_id, thread_id);
+}
+
+/// Caller holds lockDaemon.
+fn threadTurnBusyLocked(daemon: *Daemon, workspace_id: []const u8, thread_id: []const u8) bool {
     for (daemon.chat_turns.items) |turn| {
         if (!std.mem.eql(u8, turn.workspace_id, workspace_id) or !std.mem.eql(u8, turn.local_thread_id, thread_id) or turn.consumed) continue;
         lockTurn(turn);
@@ -19915,6 +20005,9 @@ fn publishChatTurnDurable(daemon: *Daemon, turn: *ChatTurn, worker_done: bool) v
     if (turn.committed_store_revision != null) {
         turn.mutex.unlock();
         daemon.signalTurnEventWaiters();
+        // An answer-ready commit dispatched while the worker still drained
+        // the provider; the thread only becomes idle now.
+        if (worker_done) dispatchParentDeliveries(daemon);
         return;
     }
     turn.finished_at_ms = turn.finished_at_ms orelse nowMs();
@@ -20130,6 +20223,204 @@ fn dispatchParentDeliveriesOnce(daemon: *Daemon) !void {
             },
         }
     }
+    try dispatchQueuedAgentPrompts(daemon, arena, svc);
+}
+
+/// An agent-sent prompt held by queueAgentTurnIfThreadBusy.
+const QueuedAgentPrompt = struct {
+    /// Validated at admission but never launched: the queued start builds a
+    /// fresh turn from the thread's current settings under the same id. This
+    /// one becomes the failed record when the prompt cannot start.
+    turn: *ChatTurn,
+    transient_failures: u8 = 0,
+    /// Next attempt the scheduler thread triggers; 0 waits for a commit.
+    retry_at_ms: i64 = 0,
+
+    fn forThread(self: QueuedAgentPrompt, workspace_id: []const u8, local_thread_id: []const u8) bool {
+        return std.mem.eql(u8, self.turn.workspace_id, workspace_id) and std.mem.eql(u8, self.turn.local_thread_id, local_thread_id);
+    }
+};
+
+/// Transient start failures (store busy, provider spawn errors) before a
+/// queued prompt is reported failed. Backoff doubles from one second.
+const queued_agent_prompt_max_attempts: u8 = 5;
+
+fn queuedAgentPromptBackoffMs(failures: u8) i64 {
+    const shift: u6 = @intCast(@min(failures -| 1, 4));
+    return @as(i64, 1000) << shift;
+}
+
+/// Caller holds lockDaemon.
+fn queuedAgentPromptForThreadLocked(daemon: *Daemon, workspace_id: []const u8, local_thread_id: []const u8) bool {
+    for (daemon.queued_agent_prompts.items) |queued| if (queued.forThread(workspace_id, local_thread_id)) return true;
+    return false;
+}
+
+/// Caller holds lockDaemon.
+fn queuedAgentPromptIndexLocked(daemon: *Daemon, turn_id: []const u8) ?usize {
+    for (daemon.queued_agent_prompts.items, 0..) |queued, index| if (std.mem.eql(u8, queued.turn.turn_id, turn_id)) return index;
+    return null;
+}
+
+/// True when the scheduler thread should dispatch for a due retry.
+fn queuedAgentPromptsDue(daemon: *Daemon) bool {
+    const now = nowMs();
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    for (daemon.queued_agent_prompts.items) |queued| if (queued.retry_at_ms != 0 and queued.retry_at_ms <= now) return true;
+    return false;
+}
+
+fn takeQueuedAgentPrompt(daemon: *Daemon, turn_id: []const u8) ?*ChatTurn {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    const index = queuedAgentPromptIndexLocked(daemon, turn_id) orelse return null;
+    return daemon.queued_agent_prompts.orderedRemove(index).turn;
+}
+
+fn setQueuedAgentPromptRetry(daemon: *Daemon, turn_id: []const u8, retry_at_ms: i64) void {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    const index = queuedAgentPromptIndexLocked(daemon, turn_id) orelse return;
+    daemon.queued_agent_prompts.items[index].retry_at_ms = retry_at_ms;
+}
+
+/// Counts a transient failure and schedules the retry. True once the
+/// attempts are spent and the prompt should be reported failed.
+fn noteQueuedAgentPromptTransientFailure(daemon: *Daemon, turn_id: []const u8, now: i64) bool {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    const index = queuedAgentPromptIndexLocked(daemon, turn_id) orelse return false;
+    const queued = &daemon.queued_agent_prompts.items[index];
+    queued.transient_failures +|= 1;
+    if (queued.transient_failures >= queued_agent_prompt_max_attempts) return true;
+    queued.retry_at_ms = now + queuedAgentPromptBackoffMs(queued.transient_failures);
+    return false;
+}
+
+/// Reports a queued prompt that will never start: its task fails (so
+/// chat.tasks.get and the sender's parent notification carry the reason)
+/// and its turn id tails as failed instead of not_found.
+fn failQueuedAgentPrompt(daemon: *Daemon, svc: *StoreService, turn_id: []const u8, reason: []const u8) void {
+    const allocator = daemon.allocator;
+    const turn = takeQueuedAgentPrompt(daemon, turn_id) orelse return;
+    log.warn("queued agent prompt failed turn_id={s}: {s}", .{ turn_id, reason });
+    {
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        turn.status = .failed;
+        if (turn.error_message) |old| allocator.free(old);
+        turn.error_message = allocator.dupe(u8, reason) catch null;
+        turn.appendStringEvent(allocator, "failed", "message", turn.error_message orelse "queued prompt could not start");
+        turn.finished_at_ms = nowMs();
+        turn.worker_done = true;
+    }
+    {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        const result = std.json.Stringify.valueAlloc(allocator, .{ .content = .{.{ .type = "text", .text = reason }}, .isError = true }, .{}) catch null;
+        defer if (result) |value| allocator.free(value);
+        chat_links.updateTask(svc.store.conn, turn_id, "failed", reason, null, result, nowMs()) catch |err|
+            log.warn("queued agent prompt task update failed turn_id={s}: {s}", .{ turn_id, @errorName(err) });
+    }
+    {
+        lockDaemon(daemon);
+        defer daemon.mutex.unlock();
+        if (daemon.findChatTurn(turn.turn_id) != null) {
+            turn.deinit(allocator);
+        } else daemon.chat_turns.append(allocator, turn) catch turn.deinit(allocator);
+    }
+    // The task update queued a parent delivery; run another pass for it.
+    daemon.delivery_requested.store(true, .release);
+    daemon.signalTurnEventWaiters();
+}
+
+/// Starts the oldest queued agent prompt of each idle thread as its own turn,
+/// with the thread's current provider session. Later prompts for that thread
+/// wait for the next dispatch, which follows the started turn's commit.
+/// Transient start failures retry with backoff (scheduler thread); a definite
+/// refusal or spent retries fail the prompt visibly. Runs only inside
+/// dispatchParentDeliveries, so it is the sole remover.
+fn dispatchQueuedAgentPrompts(daemon: *Daemon, arena: std.mem.Allocator, svc: *StoreService) !void {
+    const ThreadKey = struct { workspace_id: []const u8, local_thread_id: []const u8 };
+    const Next = struct { turn_id: []const u8, key: ThreadKey, prompt: []const u8, task_owner: []const u8, parent_thread_id: ?[]const u8 };
+    var visited: std.ArrayList(ThreadKey) = .empty;
+    var index: usize = 0;
+    const now = nowMs();
+    while (true) {
+        const next: Next = blk: {
+            lockDaemon(daemon);
+            defer daemon.mutex.unlock();
+            while (index < daemon.queued_agent_prompts.items.len) : (index += 1) {
+                const queued = &daemon.queued_agent_prompts.items[index];
+                const seen = for (visited.items) |prior| {
+                    if (queued.forThread(prior.workspace_id, prior.local_thread_id)) break true;
+                } else false;
+                if (seen) {
+                    // Behind its thread's head: the head's start, failure,
+                    // or retry brings this one up, not the scheduler.
+                    if (queued.retry_at_ms <= now) queued.retry_at_ms = 0;
+                    continue;
+                }
+                const turn = queued.turn;
+                const key: ThreadKey = .{ .workspace_id = try arena.dupe(u8, turn.workspace_id), .local_thread_id = try arena.dupe(u8, turn.local_thread_id) };
+                // Backing off: later prompts for this thread stay behind it.
+                if (queued.retry_at_ms > now) {
+                    try visited.append(arena, key);
+                    continue;
+                }
+                break :blk .{
+                    .turn_id = try arena.dupe(u8, turn.turn_id),
+                    .key = key,
+                    .prompt = try arena.dupe(u8, turn.request.prompt),
+                    .task_owner = try arena.dupe(u8, turn.task_owner orelse "verde"),
+                    .parent_thread_id = if (turn.parent_thread_id) |value| try arena.dupe(u8, value) else null,
+                };
+            }
+            return;
+        };
+        if (threadTurnBusy(daemon, next.key.workspace_id, next.key.local_thread_id)) {
+            setQueuedAgentPromptRetry(daemon, next.turn_id, 0);
+            try visited.append(arena, next.key);
+            index += 1;
+            continue;
+        }
+        var refusal: ?[]const u8 = null;
+        var permanent = false;
+        const outcome = deliverThreadPromptWithOptions(daemon, arena, svc, next.key.workspace_id, next.key.local_thread_id, next.turn_id, next.prompt, null, .{
+            // The agent asked for this turn explicitly; it only waited.
+            .honor_stop = false,
+            .steer = false,
+            .task_owner = next.task_owner,
+            .parent_thread_id = next.parent_thread_id,
+            .refusal = &refusal,
+            .permanent = &permanent,
+        }) catch |err| blk: {
+            refusal = @errorName(err);
+            break :blk .deferred;
+        };
+        switch (outcome) {
+            .started, .already_started, .steered => {
+                try visited.append(arena, next.key);
+                if (takeQueuedAgentPrompt(daemon, next.turn_id)) |turn| turn.deinit(daemon.allocator);
+            },
+            .deferred => if (threadTurnBusy(daemon, next.key.workspace_id, next.key.local_thread_id)) {
+                setQueuedAgentPromptRetry(daemon, next.turn_id, 0);
+                try visited.append(arena, next.key);
+                index += 1;
+            } else if (permanent) {
+                // Removed at `index`; the thread's next prompt may still start.
+                failQueuedAgentPrompt(daemon, svc, next.turn_id, refusal orelse "the chat cannot start a turn");
+            } else if (noteQueuedAgentPromptTransientFailure(daemon, next.turn_id, now)) {
+                const reason = try std.fmt.allocPrint(arena, "the chat could not start a turn after {d} attempts: {s}", .{ queued_agent_prompt_max_attempts, refusal orelse "start deferred" });
+                failQueuedAgentPrompt(daemon, svc, next.turn_id, reason);
+            } else {
+                log.info("queued agent prompt retry scheduled turn_id={s}: {s}", .{ next.turn_id, refusal orelse "start deferred" });
+                try visited.append(arena, next.key);
+                index += 1;
+            },
+        }
+    }
 }
 
 /// Batches stay small enough to read and to fit one provider prompt.
@@ -20206,6 +20497,14 @@ const ThreadPromptOptions = struct {
     /// Automatic continuations respect a user's explicit stop. A scheduled
     /// task is the user's own standing request, so it starts regardless.
     honor_stop: bool = true,
+    /// False defers instead of steering into a running turn.
+    steer: bool = true,
+    /// Agent-sent prompts keep their task owner and parent link.
+    task_owner: ?[]const u8 = null,
+    parent_thread_id: ?[]const u8 = null,
+    /// Set true when a deferral is a definite refusal that no retry can
+    /// change (thread or workspace gone, archived, invalid request).
+    permanent: ?*bool = null,
     /// Receives (in the arena) why the daemon refused to start the turn.
     refusal: ?*?[]const u8 = null,
 };
@@ -20244,6 +20543,7 @@ fn deliverThreadPromptWithOptions(
         }
     }
     if ((stopped and options.honor_stop) or finishing) return .deferred;
+    if (running_id != null and !options.steer) return .deferred;
     var response: []u8 = undefined;
     if (running_id) |turn_id| {
         const raw = try std.json.Stringify.valueAlloc(arena, .{ .turn_id = turn_id, .steer_id = identity, .prompt = prompt }, .{});
@@ -20262,13 +20562,25 @@ fn deliverThreadPromptWithOptions(
                 row.deinit();
                 return .already_started;
             }
-            settings = loadThreadGetResult(arena, &svc.store, .{ .workspace_id = workspace_id, .local_thread_id = local_thread_id, .message_limit = 0 }) catch return .deferred;
-            var workspace_row = (try svc.store.conn.row("select path from workspaces where workspace_id=?", .{workspace_id})) orelse return .deferred;
+            settings = loadThreadGetResult(arena, &svc.store, .{ .workspace_id = workspace_id, .local_thread_id = local_thread_id, .message_limit = 0 }) catch |err| {
+                if (options.permanent) |permanent| permanent.* = std.mem.eql(u8, @errorName(err), "ResourceNotFound");
+                if (options.refusal) |refusal| refusal.* = if (std.mem.eql(u8, @errorName(err), "ResourceNotFound")) "chat thread not found" else @errorName(err);
+                return .deferred;
+            };
+            var workspace_row = (try svc.store.conn.row("select path from workspaces where workspace_id=?", .{workspace_id})) orelse {
+                if (options.permanent) |permanent| permanent.* = true;
+                if (options.refusal) |refusal| refusal.* = "workspace not found";
+                return .deferred;
+            };
             defer workspace_row.deinit();
             path = try arena.dupe(u8, workspace_row.text(0));
         }
         const thread = settings.thread;
-        if (thread.archived) return .deferred;
+        if (thread.archived) {
+            if (options.permanent) |permanent| permanent.* = true;
+            if (options.refusal) |refusal| refusal.* = "chat thread is archived";
+            return .deferred;
+        }
         const raw = try std.json.Stringify.valueAlloc(arena, .{
             .turn_id = identity,
             .workspace_id = workspace_id,
@@ -20288,6 +20600,9 @@ fn deliverThreadPromptWithOptions(
             .fast_mode = if (thread.fast_mode) |v| std.mem.eql(u8, v, "on") else false,
             .repository_id = thread.repository_id,
             .repository_cwd = thread.repository_cwd,
+            .task_owner = options.task_owner,
+            .parent_thread_id = options.parent_thread_id,
+            .queued_delivery = options.task_owner != null,
         }, .{});
         var parsed = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
         if (thread.repository_id != null) {
@@ -20305,14 +20620,30 @@ fn deliverThreadPromptWithOptions(
     defer daemon.allocator.free(response);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
     if (parsed.value != .object or parsed.value.object.contains("error") or !parsed.value.object.contains("result")) {
-        if (options.refusal) |refusal| if (parsed.value == .object) {
+        if (parsed.value == .object) {
             if (parsed.value.object.get("error")) |err_value| if (err_value == .object) {
-                if (jsonString(err_value.object.get("message") orelse .null)) |message| refusal.* = try arena.dupe(u8, message);
+                const code = jsonString(err_value.object.get("code") orelse .null) orelse "";
+                const message = jsonString(err_value.object.get("message") orelse .null) orelse "";
+                if (options.refusal) |refusal| if (message.len != 0) {
+                    refusal.* = try arena.dupe(u8, message);
+                };
+                if (options.permanent) |permanent| permanent.* = threadPromptRefusalIsPermanent(code, message);
             };
-        };
+        }
         return .deferred;
     }
     return if (running_id) |turn_id| .{ .steered = turn_id } else .started;
+}
+
+/// A start refusal that retrying cannot fix. Store pressure and a daemon
+/// preparing shutdown pass; everything else (invalid params or
+/// route, missing provider, archived workspace, consumed id) does not.
+fn threadPromptRefusalIsPermanent(code: []const u8, message: []const u8) bool {
+    if (std.mem.eql(u8, code, headless.protocol.ERR_STORE_BUSY) or
+        std.mem.eql(u8, code, headless.protocol.ERR_STORE_UNAVAILABLE)) return false;
+    if (std.mem.eql(u8, code, headless.protocol.ERR_INVALID_STATE) and
+        std.mem.startsWith(u8, message, "daemon is preparing shutdown")) return false;
+    return true;
 }
 
 fn daemonStoreIsOpen(daemon: *Daemon) bool {
@@ -21276,6 +21607,180 @@ fn appendTestChatTurn(
     owned_image_paths = null;
     owns_turn = false;
     return turn;
+}
+
+test "agent prompt on a busy thread queues instead of starting a second provider turn" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.initWithPrefPath(allocator, root);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "queue-workspace", .client_id = "queue-test" },
+            .workspace = .{ .workspace_id = "queue-ws", .label = "Queue", .path = root },
+        });
+        for ([_][]const u8{ "local-thread", "child-thread" }) |thread_id| {
+            _ = try service.store.upsertThread(.{
+                .mutation = .{ .request_key = thread_id, .client_id = "queue-test" },
+                .workspace_id = "queue-ws",
+                .thread = .{ .local_thread_id = thread_id, .title = "Queue", .provider = "claude", .harness = "local_cli" },
+            });
+        }
+    }
+    // The orchestrator's own turn is still running on the thread.
+    const running = try appendTestChatTurn(&daemon, allocator, "gui-running", "queue-ws", root, "Queue", "orchestrate", .running, 10);
+
+    const Start = struct {
+        fn run(d: *Daemon, path: []const u8, turn_id: []const u8, thread_id: []const u8) !std.json.Parsed(std.json.Value) {
+            const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+                .turn_id = turn_id,
+                .task_owner = "mcp",
+                .parent_thread_id = "child-thread",
+                .workspace_id = "queue-ws",
+                .local_thread_id = thread_id,
+                .project_path = path,
+                .thread_title = "Queue",
+                .prompt = "status from a child chat",
+                .provider = "claude",
+                .model_ref = "claude:sonnet",
+            }, .{});
+            defer std.testing.allocator.free(raw);
+            const params = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+            defer params.deinit();
+            const response = try d.chatTurnStartResponse(.{ .integer = 1 }, params.value);
+            defer std.testing.allocator.free(response);
+            return std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{ .allocate = .alloc_always });
+        }
+        fn taskStatus(d: *Daemon, task_id: []const u8) ![]const u8 {
+            const service = d.store_service.?;
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            var row = (try service.store.conn.row("select status from chat_tasks where task_id=?", .{task_id})) orelse return "missing";
+            defer row.deinit();
+            if (std.mem.eql(u8, row.text(0), "running")) return "running";
+            if (std.mem.eql(u8, row.text(0), "failed")) return "failed";
+            return "other";
+        }
+    };
+
+    // Two child messages arrive mid-turn; a retry of the first stays one entry.
+    for ([_][]const u8{ "cli-turn-1", "cli-turn-2", "cli-turn-1" }) |turn_id| {
+        const queued = try Start.run(&daemon, root, turn_id, "local-thread");
+        defer queued.deinit();
+        const result = queued.value.object.get("result").?.object;
+        try std.testing.expectEqualStrings(turn_id, jsonString(result.get("turn_id").?).?);
+        try std.testing.expect(jsonBool(result.get("queued").?).?);
+        try std.testing.expect(!jsonBool(result.get("created").?).?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), daemon.queued_agent_prompts.items.len);
+    try std.testing.expectEqualStrings("cli-turn-1", daemon.queued_agent_prompts.items[0].turn.turn_id);
+    try std.testing.expectEqualStrings("cli-turn-2", daemon.queued_agent_prompts.items[1].turn.turn_id);
+    // The task exists while it waits, so the sender can track it.
+    try std.testing.expectEqualStrings("running", try Start.taskStatus(&daemon, "cli-turn-1"));
+    // Newly queued prompts are due for the scheduler's next pass.
+    try std.testing.expect(queuedAgentPromptsDue(&daemon));
+
+    // A dispatch while the turn still runs keeps both waiting for its commit.
+    dispatchParentDeliveries(&daemon);
+    try std.testing.expectEqual(@as(usize, 2), daemon.queued_agent_prompts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    try std.testing.expect(!queuedAgentPromptsDue(&daemon));
+
+    // A busy thread that is missing from the store refuses synchronously,
+    // exactly as an idle start would, instead of reporting "queued".
+    _ = try appendTestChatTurn(&daemon, allocator, "ghost-running", "queue-ws", root, "Ghost", "orchestrate", .running, 11);
+    {
+        lockDaemon(&daemon);
+        defer daemon.mutex.unlock();
+        const ghost = daemon.chat_turns.items[daemon.chat_turns.items.len - 1];
+        allocator.free(ghost.local_thread_id);
+        ghost.local_thread_id = try allocator.dupe(u8, "ghost-thread");
+    }
+    {
+        const refused = try Start.run(&daemon, root, "cli-turn-ghost", "ghost-thread");
+        defer refused.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_RESOURCE_NOT_FOUND, jsonString(refused.value.object.get("error").?.object.get("code").?).?);
+    }
+
+    // The turn ends, but the thread was archived meanwhile: the queued
+    // prompts cannot start. Each fails visibly instead of vanishing.
+    {
+        lockTurn(running);
+        defer running.mutex.unlock();
+        running.status = .completed;
+        running.worker_done = true;
+    }
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        // The sender's chat is archived too, so the failure notification
+        // stays queued for it instead of starting a provider turn here.
+        try service.store.conn.exec("update threads set archived=1 where local_thread_id in ('local-thread','child-thread')", .{});
+    }
+    dispatchParentDeliveries(&daemon);
+    try std.testing.expectEqual(@as(usize, 0), daemon.queued_agent_prompts.items.len);
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var notified = (try service.store.conn.row("select count(*) from chat_deliveries where task_id in ('cli-turn-1','cli-turn-2') and status='failed'", .{})).?;
+        defer notified.deinit();
+        try std.testing.expect(notified.int(0) >= 1);
+    }
+    for ([_][]const u8{ "cli-turn-1", "cli-turn-2" }) |turn_id| {
+        const failed = daemon.findChatTurn(turn_id) orelse return error.TestExpectedFailedTurn;
+        try std.testing.expectEqual(ChatTurnStatus.failed, failed.status);
+        try std.testing.expectEqualStrings("chat thread is archived", failed.error_message.?);
+        try std.testing.expectEqualStrings("failed", try Start.taskStatus(&daemon, turn_id));
+    }
+
+    // Archived (and now idle) threads refuse new agent sends synchronously.
+    _ = try appendTestChatTurn(&daemon, allocator, "late-running", "queue-ws", root, "Queue", "orchestrate", .running, 12);
+    {
+        const refused = try Start.run(&daemon, root, "cli-turn-3", "local-thread");
+        defer refused.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, jsonString(refused.value.object.get("error").?.object.get("code").?).?);
+    }
+    try std.testing.expectEqualStrings("missing", try Start.taskStatus(&daemon, "cli-turn-3"));
+}
+
+test "queued agent prompt start refusals retry only transient errors" {
+    try std.testing.expect(!threadPromptRefusalIsPermanent(headless.protocol.ERR_STORE_BUSY, "store is busy"));
+    try std.testing.expect(!threadPromptRefusalIsPermanent(headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"));
+    try std.testing.expect(!threadPromptRefusalIsPermanent(headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations"));
+    try std.testing.expect(threadPromptRefusalIsPermanent(headless.protocol.ERR_INVALID_STATE, "turn id is already consumed; retry with a new turn id"));
+    try std.testing.expect(threadPromptRefusalIsPermanent(headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"));
+    try std.testing.expect(threadPromptRefusalIsPermanent(headless.protocol.ERR_WORKSPACE_ARCHIVED, "workspace is archived"));
+    try std.testing.expectEqual(@as(i64, 1000), queuedAgentPromptBackoffMs(1));
+    try std.testing.expectEqual(@as(i64, 2000), queuedAgentPromptBackoffMs(2));
+    try std.testing.expectEqual(@as(i64, 16000), queuedAgentPromptBackoffMs(9));
+
+    // Spent attempts report the prompt failed; earlier ones schedule a retry.
+    var daemon = Daemon.init(std.testing.allocator);
+    defer daemon.deinit();
+    const turn = try appendTestChatTurn(&daemon, std.testing.allocator, "retry-turn", "retry-ws", "/tmp/retry", "Retry", "hello", .running, 1);
+    _ = daemon.chat_turns.pop();
+    try daemon.queued_agent_prompts.append(std.testing.allocator, .{ .turn = turn });
+    var attempt: u8 = 1;
+    while (attempt < queued_agent_prompt_max_attempts) : (attempt += 1) {
+        try std.testing.expect(!noteQueuedAgentPromptTransientFailure(&daemon, "retry-turn", 100));
+        try std.testing.expectEqual(100 + queuedAgentPromptBackoffMs(attempt), daemon.queued_agent_prompts.items[0].retry_at_ms);
+    }
+    try std.testing.expect(noteQueuedAgentPromptTransientFailure(&daemon, "retry-turn", 100));
 }
 
 test "Codex daemon steering uses provider identities and deduplicates ambiguous retry" {

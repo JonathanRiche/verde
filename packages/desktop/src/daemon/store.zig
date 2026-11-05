@@ -2718,6 +2718,23 @@ pub const Store = struct {
         store_revision: i64,
     ) !void {
         const offset: i64 = @intCast(message_offset);
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Stored position of every identified row the tail replaces, so the
+        // rows it does not carry can be put back where they were.
+        var stored_positions: std.StringHashMapUnmanaged(i64) = .empty;
+        {
+            var rows = try self.conn.rows(
+                "select message_id, sort_index from messages where thread_id = ?1 and sort_index >= ?2 and message_id is not null",
+                .{ thread_row_id, offset },
+            );
+            defer rows.deinit();
+            while (rows.next()) |row| try stored_positions.put(arena, try arena.dupe(u8, row.text(0)), row.int(1));
+            if (rows.err) |err| return err;
+        }
+
         try self.conn.execNoArgs(
             \\delete from snapshot_message_positions;
             \\delete from snapshot_message_restore_positions;
@@ -2734,6 +2751,28 @@ pub const Store = struct {
             \\    )
             \\)
         , .{ thread_row_id, offset });
+
+        // Daemon-owned rows the GUI has not observed yet (another client's
+        // turn, or one committed while the GUI followed a different turn).
+        const Uncarried = struct { row_id: i64, original: i64 };
+        var uncarried: std.ArrayList(Uncarried) = .empty;
+        {
+            var carried_ids: std.StringHashMapUnmanaged(void) = .empty;
+            for (messages) |message| if (message.message_id.len != 0) try carried_ids.put(arena, message.message_id, {});
+            var rows = try self.conn.rows(
+                \\select position.message_row_id, position.original_sort_index, m.message_id
+                \\from snapshot_message_positions position
+                \\join messages m on m.id = position.message_row_id
+                \\order by position.original_sort_index
+            , .{});
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                if (carried_ids.contains(row.text(2))) continue;
+                try uncarried.append(arena, .{ .row_id = row.int(0), .original = row.int(1) });
+            }
+            if (rows.err) |err| return err;
+        }
+
         try self.conn.execNoArgs(
             \\update messages
             \\set sort_index = -id
@@ -2744,34 +2783,44 @@ pub const Store = struct {
             .{ thread_row_id, offset },
         );
 
-        for (messages, 0..) |message, message_index| {
-            const sort_index = offset + @as(i64, @intCast(message_index));
-            try self.insertMessage(thread_row_id, sort_index, message);
-            if (message.message_id.len != 0) try self.insertMessageKey(thread_row_id, sort_index, message, store_revision);
+        // Merge, keeping the snapshot's own order: an uncarried row goes back
+        // before the first carried row that was stored after it, so a stale
+        // GUI view cannot push older daemon rows below newer ones. Rows the
+        // snapshot adds after its last stored row are newer than anything
+        // stored, so uncarried rows precede them. Without any stored carried
+        // row there is no anchor; uncarried rows follow the snapshot.
+        var last_stored_carried: ?usize = null;
+        for (messages, 0..) |message, index| {
+            if (message.message_id.len != 0 and stored_positions.contains(message.message_id)) last_stored_carried = index;
         }
-
-        const next_sort_row = (try self.conn.row(
-            "select coalesce(max(sort_index) + 1, 0) from messages where thread_id = ?1 and sort_index >= 0",
-            .{thread_row_id},
-        )) orelse return error.StoreCorrupt;
-        const next_sort = next_sort_row.int(0);
-        next_sort_row.deinit();
-        try self.conn.exec(
-            \\insert into snapshot_message_restore_positions (message_row_id, sort_index)
-            \\select position.message_row_id,
-            \\       ?1 + row_number() over (order by position.original_sort_index) - 1
-            \\from snapshot_message_positions position
-            \\join messages m on m.id = position.message_row_id
-            \\where m.sort_index < 0
-        , .{next_sort});
-        try self.conn.execNoArgs(
-            \\update messages
-            \\set sort_index = (
-            \\    select position.sort_index from snapshot_message_restore_positions position
-            \\    where position.message_row_id = messages.id
-            \\)
-            \\where id in (select message_row_id from snapshot_message_restore_positions);
-        );
+        var restore: std.ArrayList(struct { row_id: i64, sort_index: i64 }) = .empty;
+        var next_sort = offset;
+        var next_uncarried: usize = 0;
+        for (messages, 0..) |message, message_index| {
+            if (last_stored_carried) |last_stored| {
+                const flush_before: ?i64 = if (message.message_id.len != 0)
+                    stored_positions.get(message.message_id)
+                else
+                    null;
+                const bound: ?i64 = if (flush_before) |stored| stored else if (message_index > last_stored) std.math.maxInt(i64) else null;
+                if (bound) |limit| {
+                    while (next_uncarried < uncarried.items.len and uncarried.items[next_uncarried].original < limit) : (next_uncarried += 1) {
+                        try restore.append(arena, .{ .row_id = uncarried.items[next_uncarried].row_id, .sort_index = next_sort });
+                        next_sort += 1;
+                    }
+                }
+            }
+            try self.insertMessage(thread_row_id, next_sort, message);
+            if (message.message_id.len != 0) try self.insertMessageKey(thread_row_id, next_sort, message, store_revision);
+            next_sort += 1;
+        }
+        for (uncarried.items[next_uncarried..]) |row| {
+            try restore.append(arena, .{ .row_id = row.row_id, .sort_index = next_sort });
+            next_sort += 1;
+        }
+        for (restore.items) |position| {
+            try self.conn.exec("update messages set sort_index = ?1 where id = ?2", .{ position.sort_index, position.row_id });
+        }
         try self.conn.exec(
             \\delete from client_message_keys
             \\where thread_id = ?1 and not exists (
@@ -8364,6 +8413,88 @@ test "snapshot missing unobserved turn rows preserves them in transcript order" 
         if (rows.err) |err| return err;
         try std.testing.expectEqual(@as(usize, 3), row_count);
     }
+}
+
+test "stale snapshot keeps an unobserved middle turn in its stored position" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-order", "Order workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("order-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-order", "Order thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("order-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    // Three turns commit in order; the middle one came from another client
+    // (an agent's send_chat_message) while the GUI followed the others.
+    const turns = [_]struct { turn_id: []const u8, user_id: []const u8 }{
+        .{ .turn_id = "turn-a", .user_id = "gui-msg:a" },
+        .{ .turn_id = "turn-b", .user_id = "cli-turn-b:user" },
+        .{ .turn_id = "turn-c", .user_id = "gui-msg:c" },
+    };
+    for (turns) |turn| {
+        const commit_messages = [_]store_protocol.Message{
+            .{ .message_id = turn.user_id, .role = "user", .author = "You", .body = turn.turn_id },
+            .{ .message_id = "", .role = "assistant", .author = "Claude", .body = turn.turn_id },
+        };
+        _ = try store.commitTurn(.{
+            .turn_id = turn.turn_id,
+            .workspace_id = workspace.workspace_id,
+            .local_thread_id = thread.local_thread_id,
+            .status = .completed,
+            .started_at_ms = 10,
+            .finished_at_ms = 20,
+            .provider = "claude",
+            .user_message_id = turn.user_id,
+            .messages = &commit_messages,
+        });
+    }
+
+    // The GUI never observed turn-b and appends one row of its own.
+    const gui_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:a", .role = "user", .author = "You", .body = "turn-a" },
+        .{ .message_id = "turn:turn-a:msg:1", .role = "assistant", .author = "Claude", .body = "turn-a" },
+        .{ .message_id = "gui-msg:c", .role = "user", .author = "You", .body = "turn-c" },
+        .{ .message_id = "turn:turn-c:msg:1", .role = "assistant", .author = "Claude", .body = "turn-c" },
+        .{ .message_id = "gui-local:notice", .role = "system", .author = "Verde", .body = "newest" },
+    };
+    var gui_thread = testThread("thread-order", "Order thread");
+    gui_thread.messages = &gui_messages;
+    var gui_workspace = testWorkspace("workspace-order", "Order workspace");
+    gui_workspace.threads = &.{gui_thread};
+    const gui_workspaces = [_]store_protocol.Workspace{gui_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("order-flush", 5, false, testSnapshot(&gui_workspaces)) });
+
+    const expected_ids = [_][]const u8{
+        "gui-msg:a",        "turn:turn-a:msg:1",
+        "cli-turn-b:user",  "turn:turn-b:msg:1",
+        "gui-msg:c",        "turn:turn-c:msg:1",
+        "gui-local:notice",
+    };
+    var rows = try store.conn.rows(
+        "select m.message_id, m.sort_index, k.sort_index from messages m left join client_message_keys k on k.thread_id = m.thread_id and k.message_id = m.message_id where m.thread_id = (select id from threads where local_thread_id = ?1) order by m.sort_index",
+        .{thread.local_thread_id},
+    );
+    defer rows.deinit();
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        try std.testing.expect(row_count < expected_ids.len);
+        try std.testing.expectEqualStrings(expected_ids[row_count], row.text(0));
+        try std.testing.expectEqual(@as(i64, @intCast(row_count)), row.int(1));
+        try std.testing.expectEqual(row.int(1), row.int(2));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(expected_ids.len, row_count);
 }
 
 test "accepted multi-image user row and multi-image draft survive snapshot replace" {
