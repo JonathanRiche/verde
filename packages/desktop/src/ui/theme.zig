@@ -160,10 +160,13 @@ pub const verde_dark_colors: ThemeColors = .{
 };
 
 /// Verde Light `[verde]` roles, baked in from the approved colors.toml.
+/// Light surface ladder: page < composer/tool cards (`panel_alt`) < message
+/// cards (`panel`), each a visible step apart, with a firmer hairline. Text
+/// tiers still clear 4.5:1 on every rung (see the contrast-floor test).
 pub const verde_light_colors: ThemeColors = .{
-    .background = hexColor("#F7F9F8"),
+    .background = hexColor("#EDF1EF"),
     .panel = hexColor("#FFFFFF"),
-    .panel_alt = hexColor("#F3F6F4"),
+    .panel_alt = hexColor("#F6F8F7"),
     .panel_muted = hexColor("#DCE2DF"),
     .text = hexColor("#0F1715"),
     .text_muted = hexColor("#3B4743"),
@@ -171,7 +174,7 @@ pub const verde_light_colors: ThemeColors = .{
     .accent = hexColor("#15803D"),
     .accent_dim = hexColor("#15803D1F"),
     .border = hexColor("#A6D4B8"),
-    .border_muted = hexColor("#C5CECA"),
+    .border_muted = hexColor("#B4BEBA"),
     .warning = hexColor("#B45309"),
     .diff_add = hexColor("#1A7F43"),
     .diff_remove = hexColor("#C4302B"),
@@ -392,8 +395,11 @@ pub fn warning() [4]f32 {
     return current_colors.warning;
 }
 
+/// Success follows the theme's green slot, but some Omarchy themes put a
+/// non-green colour there (matte-black: amber `#FFC107`, the accent's hue),
+/// which made Done/Ready read as Working. Keep the slot's tone, force a green hue.
 pub fn success() [4]f32 {
-    return current_colors.diff_add;
+    return withRoleHue(current_colors.diff_add, 75.0, 170.0, 142.0);
 }
 
 pub fn danger() [4]f32 {
@@ -402,6 +408,147 @@ pub fn danger() [4]f32 {
 
 pub fn selection() [4]f32 {
     return current_colors.selection;
+}
+
+/// Decoration-only text tier (dividers, disabled glyph ghosts, watermark
+/// counters). Not for anything a user must read: `text_subtle` is the
+/// faintest readable tier and is held to ~4.5:1 on panel surfaces.
+pub fn textFaint() [4]f32 {
+    return mix(current_colors.text_subtle, current_colors.background, 0.42);
+}
+
+/// Shared segmented control (settings, pickers, transcript toggles): one
+/// bordered track with the selected segment drawn as a tinted panel with an
+/// accent hairline on top. `base` is the track fill.
+pub fn segmentedTrackFill() [4]f32 {
+    return mix(background(), COLOR_WHITE, 0.16);
+}
+
+pub fn segmentedTrackBorder(base: [4]f32) [4]f32 {
+    return mix(base, COLOR_WHITE, 0.10);
+}
+
+pub fn segmentedHoverFill() [4]f32 {
+    return mix(background(), COLOR_WHITE, 0.22);
+}
+
+pub fn segmentedSelectedFill(base: [4]f32) [4]f32 {
+    return mix(base, accent(), 0.18);
+}
+
+pub fn segmentedSelectedBorder(base: [4]f32) [4]f32 {
+    return mix(base, accent(), 0.62);
+}
+
+/// Opaque surface of the user's own transcript turns: a light accent wash
+/// over the panel. Text on it uses the theme text colour (never accent).
+pub fn userBubbleFill() [4]f32 {
+    return userBubbleFillFor(current_colors);
+}
+
+fn userBubbleFillFor(active: ThemeColors) [4]f32 {
+    const light = relativeLuma(active.background) > relativeLuma(active.text);
+    const fill = mix(active.panel, active.accent, if (light) 0.07 else 0.13);
+    return .{ fill[0], fill[1], fill[2], 1.0 };
+}
+
+/// 1px edge of the user's transcript turns (accent-leaning hairline).
+pub fn userBubbleBorder() [4]f32 {
+    const light = isLightPalette();
+    return mix(current_colors.panel, current_colors.accent, if (light) 0.42 else 0.38);
+}
+
+/// Status colours shared by tool rows, sidebar and pickers. Running is the
+/// accent unless the accent shares success's hue (Verde Dark/Light/Legacy are
+/// green-accented), where Working and Done would look identical; then it
+/// falls back to the warning amber, or an info blue when warning is green too.
+/// Done is neutral; failed is danger. Colour is never the only cue.
+pub fn statusRunning() [4]f32 {
+    return statusRunningFor(current_colors);
+}
+
+/// Hue distance (degrees) under which running and success read as one colour.
+const STATUS_HUE_MIN_SEPARATION: f32 = 35.0;
+const STATUS_INFO_HUE: f32 = 212.0;
+
+fn statusRunningFor(active: ThemeColors) [4]f32 {
+    const success_hue = hueDegrees(withRoleHue(active.diff_add, 75.0, 170.0, 142.0)) orelse return active.accent;
+    const accent_hue = hueDegrees(active.accent) orelse return active.accent;
+    if (hueDistance(accent_hue, success_hue) >= STATUS_HUE_MIN_SEPARATION) return active.accent;
+    if (hueDegrees(active.warning)) |warning_hue| {
+        if (hueDistance(warning_hue, success_hue) >= STATUS_HUE_MIN_SEPARATION) return active.warning;
+    }
+    return withHue(active.accent, STATUS_INFO_HUE);
+}
+
+fn hueDistance(a: f32, b: f32) f32 {
+    const d = @abs(a - b);
+    return @min(d, 360.0 - d);
+}
+
+/// Scrollbar thumb colour shared by every scrollable surface: a quiet
+/// border-tier mark at rest that firms up while hovered or dragged. Mixed
+/// toward the subtle text tier so it stays findable on themes whose
+/// `border_muted` nearly matches the background.
+pub fn scrollbarThumb(hovered: bool) [4]f32 {
+    const base = mix(current_colors.border_muted, current_colors.text_subtle, if (hovered) 0.55 else 0.30);
+    return withAlpha(base, if (hovered) 235 else 130);
+}
+
+pub fn statusDone() [4]f32 {
+    return current_colors.text_muted;
+}
+
+pub fn statusSuccess() [4]f32 {
+    return success();
+}
+
+pub fn statusFailed() [4]f32 {
+    return current_colors.diff_remove;
+}
+
+/// WCAG 2.x contrast ratio between two opaque colours (1..21).
+pub fn contrastRatio(a: [4]f32, b: [4]f32) f32 {
+    const la = wcagLuminance(a);
+    const lb = wcagLuminance(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+fn wcagChannel(c: f32) f32 {
+    const v = clampf(c, 0.0, 1.0);
+    return if (v <= 0.04045) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn wcagLuminance(color: [4]f32) f32 {
+    return 0.2126 * wcagChannel(color[0]) + 0.7152 * wcagChannel(color[1]) + 0.0722 * wcagChannel(color[2]);
+}
+
+/// Contrast floors for the readable text tiers against panel surfaces.
+pub const MUTED_TEXT_MIN_CONTRAST: f32 = 6.0;
+pub const SUBTLE_TEXT_MIN_CONTRAST: f32 = 4.6;
+
+/// Steps `color` toward `toward` until it reaches `min_ratio` on `backing`
+/// (or lands on `toward`).
+fn ensureContrast(color: [4]f32, backing: [4]f32, toward: [4]f32, min_ratio: f32) [4]f32 {
+    if (contrastRatio(color, backing) >= min_ratio) return color;
+    var amount: f32 = 0.05;
+    while (amount < 1.0) : (amount += 0.05) {
+        const candidate = mix(color, toward, amount);
+        if (contrastRatio(candidate, backing) >= min_ratio) return candidate;
+    }
+    return toward;
+}
+
+/// Lifts the muted/subtle text tiers until helper text (placeholders, hints,
+/// section labels) is readable on every panel surface. Approved built-in
+/// palettes already clear the floors; derived Omarchy mappings (subtle mixed
+/// halfway into the background, or `dark_foreground`) often do not.
+fn ensureReadableTextTiers(target: *ThemeColors) void {
+    const surfaces = [_][4]f32{ target.background, target.panel, target.panel_alt };
+    for (surfaces) |surface| {
+        target.text_muted = ensureContrast(target.text_muted, surface, target.text, MUTED_TEXT_MIN_CONTRAST);
+        target.text_subtle = ensureContrast(target.text_subtle, surface, target.text, SUBTLE_TEXT_MIN_CONTRAST);
+    }
 }
 
 /// Chooses the active theme foreground or background token with the clearest
@@ -492,13 +639,15 @@ pub fn syncLegacyColors() void {
 
 fn syncMarkdownColors() void {
     md.text_body = current_colors.text;
-    md.text_h1 = mix(current_colors.warning, current_colors.text, 0.18);
-    md.text_h2 = mix(current_colors.warning, current_colors.text, 0.32);
+    // Headings and inline code stay neutral: warning maps to red in many
+    // Omarchy themes, and a red-tinted heading or `code` span reads as an error.
+    md.text_h1 = current_colors.text;
+    md.text_h2 = current_colors.text;
     md.text_h3 = mix(current_colors.accent, current_colors.text, 0.45);
     md.text_h4_h6 = mix(current_colors.text, current_colors.background, 0.14);
     md.text_quote = current_colors.text_muted;
 
-    md.inline_code = mix(current_colors.warning, current_colors.text, 0.18);
+    md.inline_code = current_colors.text;
     md.link = mix(current_colors.accent, current_colors.text, 0.18);
     md.selection_fill = withAlpha(current_colors.selection, 210);
 
@@ -506,7 +655,8 @@ fn syncMarkdownColors() void {
     md.quote_accent = md.link;
     md.code_bg = sink(current_colors.panel, 0.035);
     md.code_border = current_colors.panel_muted;
-    md.inline_code_pill = withAlpha(current_colors.panel_alt, 235);
+    // A visible neutral chip carries inline code (its text is plain `text`).
+    md.inline_code_pill = withAlpha(current_colors.panel_muted, 170);
     md.rule = current_colors.panel_muted;
     md.table_border = current_colors.panel_muted;
     md.table_header_bg = withAlpha(current_colors.panel_alt, 210);
@@ -725,6 +875,8 @@ pub fn applyConfigTheme(allocator: std.mem.Allocator, config: ThemeConfig) void 
             current_colors = builtinColors(config.source, system_appearance);
         },
     }
+    // Explicit user overrides (applied next) still win over the floors.
+    ensureReadableTextTiers(&current_colors);
     syncLegacyColors();
     applyThemeColorOverrides(config.colors);
 }
@@ -829,6 +981,31 @@ pub fn raiseAgainst(color: [4]f32, amount: f32, backing: [4]f32, foreground: [4]
 /// `sink` for an explicit palette given by its background and text poles.
 pub fn sinkAgainst(color: [4]f32, amount: f32, backing: [4]f32, foreground: [4]f32) [4]f32 {
     return if (relativeLuma(backing) > relativeLuma(foreground)) lighten(color, amount) else darken(color, amount);
+}
+
+/// HSL hue of `color` in degrees, or null for near-greys with no usable hue.
+fn hueDegrees(color: [4]f32) ?f32 {
+    const max_c = @max(color[0], @max(color[1], color[2]));
+    const min_c = @min(color[0], @min(color[1], color[2]));
+    const delta = max_c - min_c;
+    if (delta <= 0.04) return null;
+    var h: f32 = if (max_c == color[0])
+        @mod((color[1] - color[2]) / delta, 6.0)
+    else if (max_c == color[1])
+        (color[2] - color[0]) / delta + 2.0
+    else
+        (color[0] - color[1]) / delta + 4.0;
+    h *= 60.0;
+    return if (h < 0.0) h + 360.0 else h;
+}
+
+/// Keeps a semantic slot (success, warning) inside its expected hue band so a
+/// theme's ANSI choices cannot make two status roles look identical. Near-grey
+/// colours are left alone.
+fn withRoleHue(color: [4]f32, min_hue: f32, max_hue: f32, fallback_hue: f32) [4]f32 {
+    const hue = hueDegrees(color) orelse return color;
+    if (hue >= min_hue and hue <= max_hue) return color;
+    return withHue(color, fallback_hue);
 }
 
 /// Returns `color` with its hue replaced by `hue_degrees`, keeping its HSL
@@ -971,9 +1148,14 @@ fn applyOmarchyPalette(parsed: OmarchyPalette, target: *ThemeColors) void {
         target.panel_muted = value;
         target.border_muted = value;
     }
-    if (parsed.green orelse parsed.color2) |value| target.diff_add = value;
+    // Additions must read green; some themes put another hue in the green
+    // slot (matte-black: amber `#FFC107`, the accent's hue), which made "+N"
+    // counts and added diff lines look like running/warning chrome.
+    if (parsed.green orelse parsed.color2) |value| target.diff_add = withRoleHue(value, 75.0, 170.0, 142.0);
     if (parsed.red orelse parsed.color1) |value| target.diff_remove = value;
-    if (parsed.yellow orelse parsed.color3) |value| target.warning = value;
+    // Warning must read as amber; some themes put red in the yellow slot
+    // (matte-black: `#b91c1c`), which turned warning chrome into error maroon.
+    if (parsed.yellow orelse parsed.color3) |value| target.warning = withRoleHue(value, 25.0, 70.0, 40.0);
     if (parsed.light_foreground) |value| {
         target.text_muted = value;
     } else if (parsed.color7) |value| {
@@ -1128,6 +1310,19 @@ test "parse Omarchy colors.toml maps palette into semantic colors" {
     try std.testing.expectEqual(rgb(0x44, 0x4b, 0x6a), parsed.border_muted);
 }
 
+test "Omarchy diff additions stay green when the theme puts amber in the green slot" {
+    var parsed: ThemeColors = .{};
+    applyOmarchyColorsToml(
+        \\accent = "#e68e0d"
+        \\background = "#121212"
+        \\color2 = "#FFC107"
+        \\
+    , &parsed);
+    const hue = hueDegrees(parsed.diff_add).?;
+    try std.testing.expect(hue >= 75.0 and hue <= 170.0);
+    try std.testing.expect(hueDistance(hue, hueDegrees(parsed.accent).?) >= 60.0);
+}
+
 test "Omarchy colors.toml prefers [verde] roles and ignores other sections" {
     var parsed: ThemeColors = .{};
     applyOmarchyColorsToml(
@@ -1202,4 +1397,68 @@ test "raise and sink follow the palette polarity" {
     current_colors = verde_light_colors;
     try std.testing.expect(relativeLuma(raise(current_colors.panel, 0.08)) < relativeLuma(current_colors.panel));
     try std.testing.expect(relativeLuma(sink(current_colors.panel_alt, 0.03)) > relativeLuma(current_colors.panel_alt));
+}
+
+test "readable text tiers clear the contrast floors on Omarchy-derived palettes" {
+    var parsed: ThemeColors = verde_legacy_colors;
+    applyOmarchyColorsToml(
+        \\accent = "#e68e0d"
+        \\muted = "#333333"
+        \\background = "#121212"
+        \\lighter_background = "#1e1e1e"
+        \\foreground = "#bebebe"
+        \\dark_foreground = "#555555"
+        \\light_foreground = "#8a8a8d"
+        \\
+    , &parsed);
+    try std.testing.expect(contrastRatio(parsed.text_subtle, parsed.panel_alt) < 4.5);
+    ensureReadableTextTiers(&parsed);
+    for ([_][4]f32{ parsed.background, parsed.panel, parsed.panel_alt }) |surface| {
+        try std.testing.expect(contrastRatio(parsed.text_subtle, surface) >= 4.5);
+        try std.testing.expect(contrastRatio(parsed.text_muted, surface) >= contrastRatio(parsed.text_subtle, surface));
+    }
+
+    // Approved built-in palettes already clear the floors and stay untouched.
+    var light = verde_light_colors;
+    ensureReadableTextTiers(&light);
+    try std.testing.expectEqual(verde_light_colors.text_subtle, light.text_subtle);
+    // The light ladder's rungs stay visibly apart: page, composer, card.
+    try std.testing.expect(relativeLuma(verde_light_colors.background) < relativeLuma(verde_light_colors.panel_alt));
+    try std.testing.expect(relativeLuma(verde_light_colors.panel_alt) < relativeLuma(verde_light_colors.panel));
+    try std.testing.expect(contrastRatio(verde_light_colors.panel, verde_light_colors.background) >= 1.12);
+    for ([_]ThemeColors{ verde_dark_colors, verde_light_colors, verde_legacy_colors }) |palette_colors| {
+        var tiers = palette_colors;
+        ensureReadableTextTiers(&tiers);
+        try std.testing.expect(contrastRatio(tiers.text_subtle, tiers.panel_alt) >= 4.5);
+        try std.testing.expect(contrastRatio(tiers.text, userBubbleFillFor(tiers)) >= 4.5);
+    }
+}
+
+test "status roles keep their hue band when a theme swaps ANSI slots" {
+    // matte-black: green slot is amber, yellow slot is red.
+    const amber = withRoleHue(comptime hexColor("#FFC107"), 75.0, 170.0, 142.0);
+    try std.testing.expect(hueDegrees(amber).? > 120.0 and hueDegrees(amber).? < 160.0);
+    const red_warning = withRoleHue(comptime hexColor("#b91c1c"), 25.0, 70.0, 40.0);
+    try std.testing.expect(hueDegrees(red_warning).? > 30.0 and hueDegrees(red_warning).? < 50.0);
+    // In-band colours are untouched.
+    const green = comptime hexColor("#4FD18B");
+    try std.testing.expectEqual(green, withRoleHue(green, 75.0, 170.0, 142.0));
+}
+
+test "running status never shares success's hue" {
+    // Verde Dark/Light are green-accented: running must leave the green band.
+    for ([_]ThemeColors{ verde_dark_colors, verde_light_colors, verde_legacy_colors }) |palette_colors| {
+        const success_hue = hueDegrees(withRoleHue(palette_colors.diff_add, 75.0, 170.0, 142.0)).?;
+        const running_hue = hueDegrees(statusRunningFor(palette_colors)).?;
+        try std.testing.expect(hueDistance(running_hue, success_hue) >= STATUS_HUE_MIN_SEPARATION);
+    }
+    // An amber accent (Omarchy) already differs from green and stays the accent.
+    var amber = verde_dark_colors;
+    amber.accent = comptime hexColor("#e68e0d");
+    try std.testing.expectEqual(amber.accent, statusRunningFor(amber));
+    // Green warning too: fall back to an info hue.
+    var all_green = verde_dark_colors;
+    all_green.warning = comptime hexColor("#4FD18B");
+    const info_hue = hueDegrees(statusRunningFor(all_green)).?;
+    try std.testing.expect(@abs(info_hue - STATUS_INFO_HUE) < 2.0);
 }

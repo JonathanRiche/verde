@@ -2148,8 +2148,13 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
     if (selected_target) {
         self.requestTranscriptScrollToBottom();
     }
-    var notice_buf: [96]u8 = undefined;
-    self.setSidebarNotice(providerNoticeFmt(&notice_buf, thread.provider, "Waiting for {s} reply...", "Waiting for provider reply..."));
+    // The selected chat already shows its own pending/working card, so the
+    // wait notice would only repeat it; keep it for sends to a chat that is
+    // not on screen.
+    if (!selected_target) {
+        var notice_buf: [96]u8 = undefined;
+        self.setSidebarNotice(providerNoticeFmt(&notice_buf, thread.provider, "Waiting for {s} reply...", "Waiting for provider reply..."));
+    }
     return true;
 }
 

@@ -15,6 +15,8 @@ const updater = @import("../app/updater.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
 const text_measure = @import("text_measure.zig");
+const tooltip = @import("tooltip.zig");
+const chat_markdown = @import("chat_markdown.zig");
 const utils = @import("../utils.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -181,6 +183,10 @@ const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 /// Parks controls of inactive pages/rows above the panel.
 const OFFSCREEN_Y: f32 = -10000.0;
 const NF_COD_CHEVRON_UP = "\u{EAB7}";
+const NF_COD_CLOSE = "\u{EA76}";
+const NF_COD_CHECK = "\u{EAB2}";
+const NF_COD_ADD = "\u{EA60}";
+const NF_COD_REMOVE = "\u{EB3B}";
 
 const Metrics = struct {
     modal_pad: f32,
@@ -410,7 +416,10 @@ fn raisedSurface(amount: f32) [4]f32 {
     return theme.mix(theme.background(), theme.COLOR_WHITE, amount);
 }
 
+/// Cards sit above the drawer: lighter than it on dark palettes, and on light
+/// palettes the brightest surface (a darker card there read as a sunken well).
 fn cardSurface() [4]f32 {
+    if (theme.isLightPalette()) return theme.sink(theme.COLOR_PANEL, 0.03);
     return raisedSurface(0.10);
 }
 
@@ -433,18 +442,21 @@ fn sidebarDockWidth(state: *const runtime.AppState, width: f32) f32 {
     return theme.clampf(width * 0.19, theme.scaledUi(260.0), @min(theme.scaledUi(360.0), width * 0.32));
 }
 
-fn panelWidth(state: *const runtime.AppState, width: f32, dock_x: f32) f32 {
-    const preferred = if (state.settings_controller.active_category == .connections)
-        theme.scaledUi(760.0)
-    else
-        theme.scaledUi(560.0);
+/// One drawer width for every page so switching categories never resizes the
+/// panel; Connections rows wrap their buttons when the width runs short.
+const PANEL_W_UI: f32 = 640.0;
+/// Dims the whole window behind the drawer (sidebar, workspace, Companion),
+/// as strongly as the command palette; clicks there dismiss (see registerHits).
+const SCRIM_ALPHA: f32 = 0.55;
+
+fn panelWidth(width: f32, dock_x: f32) f32 {
     const max_w = @max(width - dock_x - theme.scaledUi(12.0), theme.scaledUi(300.0));
-    return @min(preferred, max_w);
+    return @min(theme.scaledUi(PANEL_W_UI), max_w);
 }
 
 fn layoutPanel(state: *const runtime.AppState, width: f32, height: f32) palette.Rect {
     const dock_x = sidebarDockWidth(state, width);
-    const modal_w = panelWidth(state, width, dock_x);
+    const modal_w = panelWidth(width, dock_x);
     return .{
         .x = dock_x,
         .y = 0.0,
@@ -497,6 +509,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const appearance_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         labeled + m.row_gap +
         m.row_h + m.row_gap +
+        // "Motion" group label above Reduce motion and its per-area switches.
+        m.label_h + m.inner_gap +
         m.row_h + m.row_gap +
         @as(f32, @floatFromInt(REDUCED_MOTION_PARTS.len)) * (m.row_h + m.row_gap) -
         m.row_gap;
@@ -553,7 +567,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const runtimes_w = content_w;
     const runtimes_h = planRuntimeCard(state, 0.0, 0.0, runtimes_w, m).height;
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 9.0 + m.inner_gap * 11.0;
-    const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // A single switch: the card hugs it (no reserved label/hint rows).
+    const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h;
     const updates_notes_w = @max(content_w - m.card_pad * 2.0, theme.scaledUi(80.0));
     const updates_notes_h = notesBlockHeight(state, updates_notes_w, m);
     const package_hint_h = if (state.settings_controller.package_update_command != null) wrappedNotesRows(PACKAGE_UPDATE_HINT, updates_notes_w) * notesLineHeight() + m.label_h + m.inner_gap else 0.0;
@@ -610,7 +625,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const theme_dropdown: palette.Rect = .{ .x = theme_x, .y = theme_row_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const ui_font_y = theme_row_y + m.row_h + m.row_gap;
     const ui_stepper = stepperRects(appearance_card, m.card_pad, ui_font_y, m);
-    const reduced_motion_y = ui_font_y + m.row_h + m.row_gap;
+    const reduced_motion_y = ui_font_y + m.row_h + m.row_gap + m.label_h + m.inner_gap;
     const reduced_motion: palette.Rect = .{ .x = theme_x, .y = reduced_motion_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const reduced_motion_hint_y = reduced_motion_y + m.row_h;
     // Per-area switches sit indented under the master toggle.
@@ -644,10 +659,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const transcript_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = transcript_h };
     const tool_group_y = transcript_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
-    const tool_group_w = (content_w - m.card_pad * 2.0 - m.inner_gap * 2.0) / 3.0;
+    const tool_group_w = (content_w - m.card_pad * 2.0) / 3.0;
     const tool_groups_collapsed: palette.Rect = .{ .x = transcript_card.x + m.card_pad, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
-    const tool_groups_expanded: palette.Rect = .{ .x = tool_groups_collapsed.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
-    const tool_groups_remember_last: palette.Rect = .{ .x = tool_groups_expanded.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+    const tool_groups_expanded: palette.Rect = .{ .x = tool_groups_collapsed.x + tool_group_w, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+    const tool_groups_remember_last: palette.Rect = .{ .x = tool_groups_expanded.x + tool_group_w, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
     const diff_layout_y = tool_group_y + m.row_h + m.row_gap + m.label_h + m.inner_gap;
     const diff_layout_w = (content_w - m.card_pad * 2.0) * 0.5;
     const diff_layout_stacked: palette.Rect = .{ .x = transcript_card.x + m.card_pad, .y = diff_layout_y, .w = diff_layout_w, .h = m.row_h };
@@ -824,10 +839,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const open_x = workspace_card.x + m.card_pad;
     const workspace_tabs_label_y = workspace_card.y + m.card_pad + m.title_h + m.row_gap;
     const workspace_tabs_y = workspace_tabs_label_y + m.label_h + m.inner_gap;
-    const workspace_tabs_w = (content_w - m.card_pad * 2.0 - m.inner_gap * 2.0) / 3.0;
+    const workspace_tabs_w = (content_w - m.card_pad * 2.0) / 3.0;
     const workspace_tabs_automatic: palette.Rect = .{ .x = open_x, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
-    const workspace_tabs_always: palette.Rect = .{ .x = workspace_tabs_automatic.x + workspace_tabs_w + m.inner_gap, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
-    const workspace_tabs_disabled: palette.Rect = .{ .x = workspace_tabs_always.x + workspace_tabs_w + m.inner_gap, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
+    const workspace_tabs_always: palette.Rect = .{ .x = workspace_tabs_automatic.x + workspace_tabs_w, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
+    const workspace_tabs_disabled: palette.Rect = .{ .x = workspace_tabs_always.x + workspace_tabs_w, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
     const open_y = workspace_tabs_y + m.row_h + m.row_gap + m.label_h + m.inner_gap;
     const open_cells = [_]palette.Rect{.{ .x = 0.0, .y = offscreen_y, .w = 0.0, .h = 0.0 }} ** OPEN_CHOICES.len;
     const custom_open: ?palette.Rect = null;
@@ -923,25 +938,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const updates_links_y = updates_notes_y + updates_notes_h + m.inner_gap;
     var updates_notes_toggle: ?palette.Rect = null;
     if (state.settings_controller.update.release != null) {
-        updates_notes_toggle = .{
-            .x = updates_card.x + m.card_pad,
-            .y = updates_links_y,
-            .w = settingsTextWidth(theme.scaledUi(NOTES_LINK_FONT_SIZE), notesToggleLabel(state)),
-            .h = m.label_h,
-        };
+        updates_notes_toggle = textLinkRect(updates_card.x + m.card_pad, updates_links_y, m.label_h, notesToggleLabel(state));
     }
-    const release_page_x = if (updates_notes_toggle) |toggle| toggle.x + toggle.w + m.row_gap * 2.0 else updates_card.x + m.card_pad;
-    const updates_release_page: palette.Rect = .{
-        .x = release_page_x,
-        .y = updates_links_y,
-        .w = settingsTextWidth(theme.scaledUi(NOTES_LINK_FONT_SIZE), RELEASE_PAGE_LABEL),
-        .h = m.label_h,
-    };
+    const release_page_x = if (updates_notes_toggle) |toggle| toggle.x + toggle.w + m.row_gap else updates_card.x + m.card_pad;
+    const updates_release_page = textLinkRect(release_page_x + if (updates_notes_toggle == null) 0.0 else theme.scaledUi(TEXT_LINK_PAD_UI), updates_links_y, m.label_h, RELEASE_PAGE_LABEL);
 
     y = if (category == .app) updates_card.y + updates_card.h + m.card_gap else offscreen_y;
 
     const notifications_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = notifications_h };
-    const notifications_toggle_y = notifications_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const notifications_toggle_y = notifications_card.y + m.card_pad + m.title_h + m.row_gap;
     const notifications_toggle: palette.Rect = .{ .x = notifications_card.x + m.card_pad, .y = notifications_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const notifications_hint_y = notifications_toggle_y + m.row_h + m.inner_gap;
 
@@ -1454,35 +1459,20 @@ fn drawCommitDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void
     const visible_count = commitMenuVisibleCount(state, menu_kind);
     const scroll = commitMenuScroll(state, menu_kind);
     const menu = commitMenuRect(state, layout, menu_kind);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
     const selected_index = commitMenuSelectedIndex(state, menu_kind) orelse std.math.maxInt(usize);
     for (0..visible_count) |visible_index| {
         const option_index = scroll + visible_index;
         const row = dropdownOptionRect(menu, visible_index);
-        const selected = option_index == selected_index;
-        const hovered = state.settings_controller.commit_menu_hover_index == option_index;
-        if (selected or hovered) {
-            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
-            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
-        }
-        const dot_size = theme.scaledUi(6.0);
-        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
-        queueRoundedRectClipped(state, .{ .x = row.x + theme.scaledUi(10.0), .y = row.y + (row.h - dot_size) * 0.5, .w = dot_size, .h = dot_size }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
         var label_buf: [128]u8 = undefined;
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(25.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(42.0),
-            .h = theme.scaledUi(15.0),
-        }, commitMenuLabel(state, menu_kind, option_index, &label_buf), paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, commitMenuLabel(state, menu_kind, option_index, &label_buf), option_index == selected_index, state.settings_controller.commit_menu_hover_index == option_index, layout.body_clip);
     }
     if (count > visible_count) {
         const track: palette.Rect = .{ .x = menu.x + menu.w - theme.scaledUi(5.0), .y = menu.y + theme.scaledUi(4.0), .w = theme.scaledUi(2.0), .h = menu.h - theme.scaledUi(8.0) };
         const thumb_h = track.h * @as(f32, @floatFromInt(visible_count)) / @as(f32, @floatFromInt(count));
         const progress = @as(f32, @floatFromInt(scroll)) / @as(f32, @floatFromInt(commitMenuMaxScroll(state, menu_kind)));
         queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
-        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + (track.h - thumb_h) * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + (track.h - thumb_h) * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(mouseIn(state, menu))), theme.scaledUi(1.0), layout.body_clip);
     }
 }
 
@@ -1561,7 +1551,9 @@ fn registerOpenActionOptionHits(
 }
 
 /// Registers palette hit targets for the settings modal.
-pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
+pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, sink_queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
+    // Chrome hits go straight to the sink; page hits are buffered (below).
+    var queue_hit = sink_queue_hit;
     focus_stop_count = 0;
     if (!state.settings_controller.modal_visible) {
         keyboard_focus = null;
@@ -1588,6 +1580,10 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         recordFocusStop(.settings_category, index, layout.nav[index], null);
     }
     focus_body_clip = layout.body_clip;
+    // Page hits go through a buffer: see `flushBufferedHits` below.
+    buffered_hit_count = 0;
+    buffered_hit_sink = sink_queue_hit;
+    queue_hit = bufferHit;
     const category = state.settings_controller.active_category;
     if (category == .appearance) {
         queueControlHit(state, layout.theme_dropdown, layout.body_clip, .theme_dropdown, queue_hit);
@@ -1725,6 +1721,17 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         _ = phoneCard(state, layout.phone_card, layout.body_clip, false, queue_hit);
         registerRuntimeCardHits(state, layout, queue_hit);
     }
+    // The page's focus stops are complete now: drop hits the opaque band
+    // under the header hides (`topBandOpaqueHeight`), so a click on the blank
+    // band never toggles a control the user cannot see.
+    const band = topBandOpaqueHeight(layout.body_clip, state.settings_controller.scroll_y, layout.max_scroll_y);
+    var hit_clip = layout.body_clip;
+    hit_clip.y += band;
+    hit_clip.h = @max(hit_clip.h - band, 0.0);
+    flushBufferedHits(state, hit_clip, sink_queue_hit);
+    // Dropdown menus draw above the band, so their option rows keep the
+    // full body clip and go straight to the sink.
+    queue_hit = sink_queue_hit;
     // Close ends the Tab cycle: nav, then the page, then the header button.
     recordFocusStop(.settings_close, 0, layout.close, null);
     registerThemeOptionHits(state, layout, queue_hit);
@@ -1775,9 +1782,25 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawCardTitle(state, layout.appearance_card, "Appearance", layout.body_clip);
         drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
         drawThemeDropdown(state, layout);
-        drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font", state.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
+        drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font", "px", state.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
         const motion = state.settings_controller.draft.reduced_motion;
+        // Group label so the master switch and its indented per-area
+        // switches read as one "Motion" section.
+        queueText(state, .{
+            .x = layout.reduced_motion.x,
+            .y = layout.reduced_motion.y - m.inner_gap - m.label_h,
+            .w = layout.reduced_motion.w,
+            .h = m.label_h,
+        }, "Motion", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
         drawSwitchRow(state, layout.reduced_motion, "Reduce motion", motion.all(), isControlHovered(state, .reduced_motion), layout.body_clip);
+        // Nesting cue: a 1px rule down the indent ties the per-area switches
+        // to the master toggle above them.
+        const first_part = layout.reduced_motion_parts[0];
+        const last_part = layout.reduced_motion_parts[REDUCED_MOTION_PARTS.len - 1];
+        const rule_w = @max(@round(theme.scaledUi(1.0)), 1.0);
+        const rule_x = @round(layout.reduced_motion.x + theme.scaledUi(4.0));
+        const rule_top = @round(first_part.y);
+        queueRoundedRectClipped(state, .{ .x = rule_x, .y = rule_top, .w = rule_w, .h = @round(last_part.y + last_part.h) - rule_top }, paletteColor(theme.borderMuted()), 0.0, layout.body_clip);
         for (REDUCED_MOTION_PARTS, layout.reduced_motion_parts) |part, rect| {
             drawSwitchRow(state, rect, part.label, reducedMotionPart(motion, part.part), isControlHovered(state, part.control), layout.body_clip);
         }
@@ -1809,9 +1832,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             .w = layout.workspace_card.w - m.card_pad * 2.0,
             .h = m.label_h,
         }, "Tabs", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
-        drawToggleCell(state, layout.workspace_tabs_automatic, "Auto", state.settings_controller.draft.workspace_tabs == .automatic, isControlHovered(state, .workspace_tabs_automatic), layout.body_clip);
-        drawToggleCell(state, layout.workspace_tabs_always, "Always", state.settings_controller.draft.workspace_tabs == .always, isControlHovered(state, .workspace_tabs_always), layout.body_clip);
-        drawToggleCell(state, layout.workspace_tabs_disabled, "Off", state.settings_controller.draft.workspace_tabs == .disabled, isControlHovered(state, .workspace_tabs_disabled), layout.body_clip);
+        const tabs_mode = state.settings_controller.draft.workspace_tabs;
+        drawSegmentedTriple(state, layout.workspace_tabs_automatic, layout.workspace_tabs_always, layout.workspace_tabs_disabled, .{ "Auto", "Always", "Off" }, if (tabs_mode == .automatic) 0 else if (tabs_mode == .always) 1 else 2, .{ isControlHovered(state, .workspace_tabs_automatic), isControlHovered(state, .workspace_tabs_always), isControlHovered(state, .workspace_tabs_disabled) }, layout.body_clip);
         queueText(state, .{
             .x = layout.open_action_dropdown.x,
             .y = layout.open_action_dropdown.y - m.inner_gap - m.label_h,
@@ -1841,8 +1863,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         }, "New tab", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
         drawSegmentedPair(state, layout.workspace_new_tab_chat, layout.workspace_new_tab_terminal, "Chat", "Terminal", state.settings_controller.draft.workspace_new_tab_pane == .chat, isControlHovered(state, .workspace_new_tab_chat), isControlHovered(state, .workspace_new_tab_terminal), layout.body_clip);
         drawSwitchRow(state, layout.workspace_unzoom_on_navigation, "Unzoom on navigate", state.settings_controller.draft.unzoom_on_pane_navigation, isControlHovered(state, .workspace_unzoom_on_navigation), layout.body_clip);
-        drawStepperRow(state, layout.workspace_card, m, layout.workspace_pane_gap_dec.y, "Pane gap", state.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP, .workspace_pane_gap_dec, .workspace_pane_gap_inc, layout.workspace_pane_gap_dec, layout.workspace_pane_gap_inc, layout.body_clip);
-        drawStepperRow(state, layout.workspace_card, m, layout.workspace_panes_per_view_dec.y, "Panes per view", @floatFromInt(state.settings_controller.draft.workspace_panes_per_view), @floatFromInt(app_config.MIN_WORKSPACE_PANES_PER_VIEW), @floatFromInt(app_config.MAX_WORKSPACE_PANES_PER_VIEW), .workspace_panes_per_view_dec, .workspace_panes_per_view_inc, layout.workspace_panes_per_view_dec, layout.workspace_panes_per_view_inc, layout.body_clip);
+        drawStepperRow(state, layout.workspace_card, m, layout.workspace_pane_gap_dec.y, "Pane gap", "px", state.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP, .workspace_pane_gap_dec, .workspace_pane_gap_inc, layout.workspace_pane_gap_dec, layout.workspace_pane_gap_inc, layout.body_clip);
+        drawStepperRow(state, layout.workspace_card, m, layout.workspace_panes_per_view_dec.y, "Panes per view", "", @floatFromInt(state.settings_controller.draft.workspace_panes_per_view), @floatFromInt(app_config.MIN_WORKSPACE_PANES_PER_VIEW), @floatFromInt(app_config.MAX_WORKSPACE_PANES_PER_VIEW), .workspace_panes_per_view_dec, .workspace_panes_per_view_inc, layout.workspace_panes_per_view_dec, layout.workspace_panes_per_view_inc, layout.body_clip);
         queueText(state, .{
             .x = layout.workspace_scroll_mode_automatic.x,
             .y = layout.workspace_scroll_mode_automatic.y - m.inner_gap - m.label_h,
@@ -1864,7 +1886,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             layout.body_clip,
         );
         if (state.settings_controller.draft.workspace_scroll_mode == .automatic) {
-            drawStepperRow(state, layout.workspace_card, m, layout.workspace_scroll_threshold_dec.y, "Start after", @floatFromInt(state.settings_controller.draft.workspace_scroll_threshold), @floatFromInt(app_config.MIN_WORKSPACE_SCROLL_THRESHOLD), @floatFromInt(app_config.MAX_WORKSPACE_SCROLL_THRESHOLD), .workspace_scroll_threshold_dec, .workspace_scroll_threshold_inc, layout.workspace_scroll_threshold_dec, layout.workspace_scroll_threshold_inc, layout.body_clip);
+            drawStepperRow(state, layout.workspace_card, m, layout.workspace_scroll_threshold_dec.y, "Start after", "", @floatFromInt(state.settings_controller.draft.workspace_scroll_threshold), @floatFromInt(app_config.MIN_WORKSPACE_SCROLL_THRESHOLD), @floatFromInt(app_config.MAX_WORKSPACE_SCROLL_THRESHOLD), .workspace_scroll_threshold_dec, .workspace_scroll_threshold_inc, layout.workspace_scroll_threshold_dec, layout.workspace_scroll_threshold_inc, layout.body_clip);
         }
         queueText(state, .{
             .x = layout.workspace_scroll_horizontal.x,
@@ -1878,9 +1900,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawCard(state, layout.transcript_card, layout.body_clip);
         drawCardTitle(state, layout.transcript_card, "Transcript", layout.body_clip);
         drawFieldLabel(state, layout.transcript_card, m, "Tool groups", layout.body_clip);
-        drawToggleCell(state, layout.tool_groups_collapsed, "Collapse", state.settings_controller.draft.tool_call_group_preference == .collapsed, isControlHovered(state, .tool_groups_collapsed), layout.body_clip);
-        drawToggleCell(state, layout.tool_groups_expanded, "Expand", state.settings_controller.draft.tool_call_group_preference == .expanded, isControlHovered(state, .tool_groups_expanded), layout.body_clip);
-        drawToggleCell(state, layout.tool_groups_remember_last, "Remember", state.settings_controller.draft.tool_call_group_preference == .remember_last, isControlHovered(state, .tool_groups_remember_last), layout.body_clip);
+        const group_pref = state.settings_controller.draft.tool_call_group_preference;
+        drawSegmentedTriple(state, layout.tool_groups_collapsed, layout.tool_groups_expanded, layout.tool_groups_remember_last, .{ "Collapse", "Expand", "Remember" }, if (group_pref == .collapsed) 0 else if (group_pref == .expanded) 1 else 2, .{ isControlHovered(state, .tool_groups_collapsed), isControlHovered(state, .tool_groups_expanded), isControlHovered(state, .tool_groups_remember_last) }, layout.body_clip);
         queueText(state, .{
             .x = layout.diff_layout_stacked.x,
             .y = layout.diff_layout_stacked.y - m.inner_gap - m.label_h,
@@ -1920,7 +1941,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     } else if (category == .terminal) {
         drawCard(state, layout.terminal_card, layout.body_clip);
         drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
-        drawStepperRow(state, layout.terminal_card, m, layout.terminal_font_dec.y, "Font size", state.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE, .terminal_font_dec, .terminal_font_inc, layout.terminal_font_dec, layout.terminal_font_inc, layout.body_clip);
+        drawStepperRow(state, layout.terminal_card, m, layout.terminal_font_dec.y, "Font size", "", state.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE, .terminal_font_dec, .terminal_font_inc, layout.terminal_font_dec, layout.terminal_font_inc, layout.body_clip);
     } else if (category == .browser) {
         drawCard(state, layout.browser_card, layout.body_clip);
         drawCardTitle(state, layout.browser_card, "Browser", layout.body_clip);
@@ -2052,7 +2073,15 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                 line_y += line_h;
             }
         } else {
-            const notes = if (state.settings_controller.update.release) |release| releaseNotesPreview(release.notes) else "Release notes appear here when a release is found.";
+            var preview_buf: [NOTES_LINE_BYTES]u8 = undefined;
+            var fit_buf: [NOTES_LINE_BYTES]u8 = undefined;
+            // The collapsed preview has two wrapped rows; ellipsize to a bit
+            // less than two full rows so word wrap never pushes text past
+            // the second row and gets cut without an ellipsis.
+            const notes = if (state.settings_controller.update.release) |release|
+                wordEllipsized(ellipsizedText(&fit_buf, releaseNotesPreview(&preview_buf, release.notes), theme.scaledUi(NOTES_FONT_SIZE), notes_w * 2.0 * 0.85))
+            else
+                "Release notes appear here when a release is found.";
             const notes_rect: palette.Rect = .{
                 .x = notes_x,
                 .y = layout.updates_notes_y,
@@ -2064,11 +2093,9 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             }
         }
         if (layout.updates_notes_toggle) |toggle_rect| {
-            const toggle_color = if (isControlHovered(state, .updates_notes_toggle)) theme.COLOR_WHITE else textLabel();
-            queueText(state, toggle_rect, notesToggleLabel(state), paletteColor(toggle_color), theme.scaledUi(NOTES_LINK_FONT_SIZE), layout.body_clip);
+            drawTextLink(state, toggle_rect, notesToggleLabel(state), isControlHovered(state, .updates_notes_toggle), layout.body_clip);
         }
-        const release_page_color = if (isControlHovered(state, .updates_release_page)) theme.COLOR_WHITE else textLabel();
-        queueText(state, layout.updates_release_page, RELEASE_PAGE_LABEL, paletteColor(release_page_color), theme.scaledUi(NOTES_LINK_FONT_SIZE), layout.body_clip);
+        drawTextLink(state, layout.updates_release_page, RELEASE_PAGE_LABEL, isControlHovered(state, .updates_release_page), layout.body_clip);
 
         drawCard(state, layout.notifications_card, layout.body_clip);
         drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
@@ -2077,9 +2104,10 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawCard(state, layout.files_card, layout.body_clip);
         drawCardTitle(state, layout.files_card, "Files", layout.body_clip);
         queueText(state, .{ .x = layout.files_open_verde.x, .y = layout.files_open_verde.y - m.inner_gap - m.label_h, .w = layout.files_open_verde.w * 3.0, .h = m.label_h }, "Open file links in", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
-        drawSegmentedTriple(state, layout.files_open_verde, layout.files_open_system, layout.files_open_neovim, .{ "Verde", "System Default", "Neovim (Terminal)" }, @intFromEnum(state.settings_controller.draft.file_open_target), .{ isControlHovered(state, .files_open_verde), isControlHovered(state, .files_open_system), isControlHovered(state, .files_open_neovim) }, layout.body_clip);
+        drawSegmentedTriple(state, layout.files_open_verde, layout.files_open_system, layout.files_open_neovim, .{ "Verde", "System default", "Neovim (terminal)" }, @intFromEnum(state.settings_controller.draft.file_open_target), .{ isControlHovered(state, .files_open_verde), isControlHovered(state, .files_open_system), isControlHovered(state, .files_open_neovim) }, layout.body_clip);
     }
 
+    drawBodyEdgeFades(state, layout);
     drawBodyScrollbar(state, layout);
     drawFocusRing(state);
     drawThemeDropdownMenu(state, layout);
@@ -2737,14 +2765,16 @@ fn setFocus(state: *runtime.AppState, stop_index: usize) void {
     keyboard_focus = .{ .action = stop.action, .index = stop.index };
     focus_ring_visible = true;
     if (stop.clip) |clip| {
-        // Scroll just enough to reveal the stop plus a small margin.
-        const margin = theme.scaledUi(12.0);
+        // Scroll just enough to bring the stop clear of the edge fades
+        // (`drawBodyEdgeFades`), so a focused control is never dimmed.
+        const top_margin = theme.scaledUi(BODY_FADE_UI + BODY_FADE_INSET_UI);
+        const bottom_margin = theme.scaledUi(BODY_FADE_UI);
         const top = stop.rect.y;
         const bottom = stop.rect.y + stop.rect.h;
-        if (top < clip.y) {
-            state.settings_controller.scroll_y = @max(0.0, state.settings_controller.scroll_y - (clip.y - top + margin));
-        } else if (bottom > clip.y + clip.h) {
-            state.settings_controller.scroll_y += bottom - (clip.y + clip.h) + margin;
+        if (top < clip.y + top_margin and state.settings_controller.scroll_y > 0.0) {
+            state.settings_controller.scroll_y = @max(0.0, state.settings_controller.scroll_y - (clip.y + top_margin - top));
+        } else if (bottom > clip.y + clip.h - bottom_margin) {
+            state.settings_controller.scroll_y += bottom - (clip.y + clip.h - bottom_margin);
         }
     }
     state.markDirty();
@@ -2924,13 +2954,18 @@ pub fn closeDropdowns(state: *runtime.AppState) void {
     state.markDirty();
 }
 
+const FOCUS_RING_GAP_UI: f32 = 5.0;
+
 // Focus ring: accent outline offset outside the focused control.
 fn drawFocusRing(state: *runtime.AppState) void {
     if (!focus_ring_visible) return;
     const index = focusedStopIndex() orelse return;
     const stop = focus_stops[index];
     const ring_w = @max(1.0, @round(theme.scaledUi(2.0)));
-    const gap = ring_w;
+    // At least 4px of clear space between the ring and what it encloses
+    // (switch-row labels start at the row's left edge); the radius stays
+    // concentric with the control's corners.
+    const gap = @max(@round(theme.scaledUi(FOCUS_RING_GAP_UI)), ring_w);
     const left = @round(stop.rect.x - gap);
     const top = @round(stop.rect.y - gap);
     const ring: palette.Rect = .{
@@ -3140,11 +3175,14 @@ const NotesLine = struct {
     heading: bool,
 };
 
-/// Yields trimmed, non-empty release-note lines with markdown heading
-/// markers stripped, capped at MAX_EXPANDED_NOTES_LINES.
+/// Yields trimmed, non-empty release-note lines as plain text: heading
+/// markers and inline markdown are stripped and list items get a bullet,
+/// capped at MAX_EXPANDED_NOTES_LINES. Each returned text lives in the
+/// iterator's buffer until the next call.
 const NotesLineIterator = struct {
     remaining: []const u8,
     emitted: usize = 0,
+    buf: [NOTES_LINE_BYTES]u8 = undefined,
 
     fn init(notes: []const u8) NotesLineIterator {
         return .{ .remaining = std.mem.trim(u8, notes, &std.ascii.whitespace) };
@@ -3157,13 +3195,37 @@ const NotesLineIterator = struct {
             self.remaining = std.mem.trimStart(u8, self.remaining[line_end..], &std.ascii.whitespace);
             const heading = line.len > 0 and line[0] == '#';
             line = std.mem.trimStart(u8, std.mem.trimStart(u8, line, "#"), " ");
-            if (line.len == 0) continue;
+            // Thematic breaks (`---`, `***`) carry no text.
+            if (line.len >= 3 and std.mem.trim(u8, line, "-*_ ").len == 0) continue;
+            const item = listItemBody(line);
+            var out: []const u8 = undefined;
+            if (item) |body| {
+                const bullet = "\u{2022} ";
+                @memcpy(self.buf[0..bullet.len], bullet);
+                out = self.buf[0 .. bullet.len + stripInlineMarkdown(self.buf[bullet.len..], body).len];
+            } else {
+                out = stripInlineMarkdown(&self.buf, line);
+            }
+            if (std.mem.trim(u8, out, " ").len == 0) continue;
             self.emitted += 1;
-            return .{ .text = line, .heading = heading };
+            return .{ .text = out, .heading = heading };
         }
         return null;
     }
 };
+
+const NOTES_LINE_BYTES: usize = 1024;
+
+/// Body of a `- `, `* ` or `+ ` list item, else null.
+fn listItemBody(line: []const u8) ?[]const u8 {
+    if (line.len < 2 or line[1] != ' ') return null;
+    return switch (line[0]) {
+        '-', '*', '+' => std.mem.trimStart(u8, line[2..], " "),
+        else => null,
+    };
+}
+
+const stripInlineMarkdown = chat_markdown.stripInlineMarkdown;
 
 fn notesLineHeight() f32 {
     return theme.scaledUi(NOTES_FONT_SIZE * 1.25);
@@ -3190,29 +3252,105 @@ fn notesBlockHeight(state: *const runtime.AppState, usable_w: f32, m: Metrics) f
     return @max(total, collapsed_h);
 }
 
+/// Text links ("Show full notes", "Open release page"): accent text that
+/// underlines on hover, inside a 28px-tall hit target centered on the line
+/// so they are as easy to hit as buttons. The text starts `TEXT_LINK_PAD_UI`
+/// inside the target's left edge, which the caller offsets the rect by.
+const TEXT_LINK_HIT_UI: f32 = 28.0;
+const TEXT_LINK_PAD_UI: f32 = 6.0;
+
+fn textLinkRect(text_x: f32, line_y: f32, line_h: f32, label: []const u8) palette.Rect {
+    const hit_h = @max(theme.scaledUi(TEXT_LINK_HIT_UI), line_h);
+    const pad = theme.scaledUi(TEXT_LINK_PAD_UI);
+    return .{
+        .x = text_x - pad,
+        .y = line_y + (line_h - hit_h) * 0.5,
+        .w = settingsTextWidth(theme.scaledUi(NOTES_LINK_FONT_SIZE), label) + pad * 2.0,
+        .h = hit_h,
+    };
+}
+
+fn drawTextLink(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool, clip: palette.Rect) void {
+    const font = theme.scaledUi(NOTES_LINK_FONT_SIZE);
+    const pad = theme.scaledUi(TEXT_LINK_PAD_UI);
+    const text_w = settingsTextWidth(font, label);
+    const text_h = font * 1.25;
+    const text_y = rect.y + (rect.h - text_h) * 0.5;
+    const color = readableOn(theme.accent(), cardSurface());
+    queueText(state, .{ .x = rect.x + pad, .y = text_y, .w = text_w + theme.scaledUi(2.0), .h = text_h }, label, paletteColor(color), font, clip);
+    if (hovered) {
+        const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+        const left = @round(rect.x + pad);
+        queueRoundedRectClipped(state, .{ .x = left, .y = @round(text_y + text_h), .w = @round(rect.x + pad + text_w) - left, .h = stroke }, paletteColor(color), 0.0, clip);
+    }
+}
+
+/// Moves an ellipsized cut back to the last word boundary ("so Gatekeeper…"
+/// rather than "so Gateke…"). `fitted` must be `ellipsizedText` output, so its
+/// buffer is writable; short or unbroken text is returned unchanged.
+fn wordEllipsized(fitted: []const u8) []const u8 {
+    const ellipsis = "\u{2026}";
+    if (!std.mem.endsWith(u8, fitted, ellipsis)) return fitted;
+    const kept = fitted[0 .. fitted.len - ellipsis.len];
+    const space = std.mem.lastIndexOfScalar(u8, kept, ' ') orelse return fitted;
+    // Keep at least half the text so one long word does not empty the preview.
+    if (space < kept.len / 2) return fitted;
+    const word_end = std.mem.trimEnd(u8, kept[0..space], " ,;:-").len;
+    const buf: [*]u8 = @constCast(fitted.ptr);
+    @memcpy(buf[word_end .. word_end + ellipsis.len], ellipsis);
+    return buf[0 .. word_end + ellipsis.len];
+}
+
+test "release preview ellipsis lands on a word boundary" {
+    var buf: [64]u8 = undefined;
+    const source = "signed with a Developer ID, so Gateke\u{2026}";
+    @memcpy(buf[0..source.len], source);
+    try std.testing.expectEqualStrings("signed with a Developer ID, so\u{2026}", wordEllipsized(buf[0..source.len]));
+    try std.testing.expectEqualStrings("short", wordEllipsized("short"));
+}
+
 fn notesToggleLabel(state: *const runtime.AppState) []const u8 {
     return if (state.settings_controller.update_notes_expanded) "Show less" else "Show full notes";
 }
 
-fn releaseNotesPreview(notes: []const u8) []const u8 {
-    var remaining = std.mem.trim(u8, notes, &std.ascii.whitespace);
-    while (remaining.len > 0) {
-        const line_end = std.mem.indexOfAny(u8, remaining, "\r\n") orelse remaining.len;
-        var line = std.mem.trim(u8, remaining[0..line_end], &std.ascii.whitespace);
-        if (line.len > 0 and line[0] != '#') {
-            if (std.mem.startsWith(u8, line, "* ") or std.mem.startsWith(u8, line, "- ")) line = line[2..];
-            return line[0..@min(line.len, 220)];
-        }
-        remaining = std.mem.trimStart(u8, remaining[line_end..], &std.ascii.whitespace);
+/// First body line of the release notes as plain text (no list marker or
+/// inline markdown), written into `buf`.
+fn releaseNotesPreview(buf: []u8, notes: []const u8) []const u8 {
+    var iter = NotesLineIterator.init(notes);
+    while (iter.next()) |line| {
+        if (line.heading) continue;
+        const bullet = "\u{2022} ";
+        const text = if (std.mem.startsWith(u8, line.text, bullet)) line.text[bullet.len..] else line.text;
+        const n = @min(text.len, buf.len);
+        @memcpy(buf[0..n], text[0..n]);
+        return buf[0..n];
     }
     return "No release notes were provided.";
 }
 
+test "release notes preview drops markdown syntax" {
+    var buf: [NOTES_LINE_BYTES]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Faster startup and the new_session flag, see notes",
+        releaseNotesPreview(&buf, "## v1.2\n\n- **Faster** startup and the `new_session` flag, see [notes](https://x.y/z)\n- more"),
+    );
+    try std.testing.expectEqualStrings("No release notes were provided.", releaseNotesPreview(&buf, "# Only a heading\n"));
+    var iter = NotesLineIterator.init("### Fixes\n---\n* __Bold__ fix with *emphasis* and 2 * 3\n");
+    const heading = iter.next().?;
+    try std.testing.expect(heading.heading);
+    try std.testing.expectEqualStrings("Fixes", heading.text);
+    try std.testing.expectEqualStrings("\u{2022} Bold fix with emphasis and 2 * 3", iter.next().?.text);
+    try std.testing.expect(iter.next() == null);
+}
+
 fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
-    _ = width;
-    _ = height;
-    queueRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), 0.0);
-    queueBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 110)), 0.0, theme.scaledUi(1.0));
+    // Scrim over the sidebar and workspace, like the other modals; the
+    // full-window `modal_dismiss` hit makes a click on it close settings.
+    queueRoundedRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.scrim(SCRIM_ALPHA)), 0.0);
+    // One bordered panel with a whole-pixel stroke. The edge is mixed from the
+    // panel and text colors so it stays neutral in themes whose border role
+    // is accent-tinted (accent is reserved for focus and primary actions).
+    queuePanelClipped(state, modal, theme.COLOR_PANEL, theme.mix(theme.COLOR_PANEL, theme.COLOR_WHITE, 0.16), 0.0, .{ .x = 0.0, .y = 0.0, .w = width, .h = height });
 }
 
 fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout) void {
@@ -3227,7 +3365,8 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout) void {
         .h = theme.scaledUi(22.0),
     }, "Settings", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), layout.modal);
 
-    drawIconButton(state, layout.close, "×", state.settings_controller.close_hovered);
+    drawCloseButton(state, layout.close, state.settings_controller.close_hovered);
+    tooltip.queue(state, layout.close, "Close settings (Esc)");
 }
 
 const PROVIDERS_RECHECK_LABEL = "Check again";
@@ -3236,7 +3375,7 @@ const PROVIDER_NEEDS_NODE_BADGE = runtime.provider_setup.NEEDS_NODE_STATUS;
 const PROVIDER_GET_NODE_LABEL = "Get Node.js";
 const PROVIDERS_UPDATE_HINT = "Update uses the tool that installed that copy, such as mise.";
 /// Enable switch plus its margins at a provider row's right edge.
-const PROVIDER_SWITCH_RESERVE_UI: f32 = 10.0 + 40.0 + 20.0;
+const PROVIDER_SWITCH_RESERVE_UI: f32 = 40.0 + 20.0;
 
 fn providerRowHeight() f32 {
     return theme.scaledUi(46.0);
@@ -3346,7 +3485,8 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
     const status_font = theme.scaledUi(11.5);
     const name_font = theme.scaledUi(13.0);
     const dot = theme.scaledUi(7.0);
-    const inset = theme.scaledUi(10.0);
+    // Rows start on the card's content edge, like switch-row labels.
+    const inset: f32 = 0.0;
     const logo = theme.scaledUi(18.0);
     const logo_gap = theme.scaledUi(10.0);
     for (layout.provider_rows, layout.provider_updates, 0..) |row, update, index| {
@@ -3409,8 +3549,8 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
         switch (action) {
             .install => drawActionButton(state, update, "Install", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
             .update => drawActionButton(state, update, "Update", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
-            .sign_in => drawActionButton(state, update, "Sign in", .primary, isControlHovered(state, providerUpdateControl(index)), clip),
-            .get_node => drawActionButton(state, update, PROVIDER_GET_NODE_LABEL, .primary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .sign_in => drawActionButton(state, update, "Sign in", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .get_node => drawActionButton(state, update, PROVIDER_GET_NODE_LABEL, .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
             .pending => drawActionButton(state, update, "Checking…", .disabled, false, clip),
             .latest => queueCenteredText(state, update, "Latest", paletteColor(textHint()), theme.scaledUi(12.0), clip),
             .none => {},
@@ -3819,8 +3959,10 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     const recovery = runtime.runtimeStatusRecovery(status);
     const primary_label = runtime.runtimeRecoveryLabel(recovery, status);
     switch (recovery) {
-        .retry => pushButton(plan, if (status == .offline or status == .paired_offline) .connect else .retry, primary_label, .primary),
-        .reconnect => pushButton(plan, .reconnect, primary_label, .primary),
+        // Retries ("Retry", "Retry now", "Reconnect") share one outline style
+        // across rows and accounts; filled stays for corrective actions.
+        .retry => pushButton(plan, if (status == .offline or status == .paired_offline) .connect else .retry, primary_label, .secondary),
+        .reconnect => pushButton(plan, .reconnect, primary_label, .secondary),
         .credential => pushButton(plan, .connect, primary_label, .primary),
         .repair => pushButton(plan, .pair_device, primary_label, .primary),
         .review_trust => pushButton(plan, .review_trust, primary_label, .primary),
@@ -4117,11 +4259,13 @@ fn planAccountButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, acc
     const account = state.runtime_connections.accounts.accountAt(account_index) orelse return;
     if (account.lent) return;
     if (account.session_unavailable or account.phase == .failed) {
-        pushButton(plan, .account_sign_in, "Retry", .primary);
+        pushButton(plan, .account_sign_in, "Retry", .secondary);
         return;
     }
     if (account.canSignIn()) {
-        pushButton(plan, .account_sign_in, "Sign in", .primary);
+        // Outline, not filled: sign-in rows repeat per account, and the card
+        // keeps at most one filled primary (see `limitCardPrimaries`).
+        pushButton(plan, .account_sign_in, "Sign in", .secondary);
         return;
     }
     if (account.signedIn()) {
@@ -4182,11 +4326,26 @@ fn planRuntimeCard(state: *runtime.AppState, x: f32, y: f32, w: f32, m: Metrics)
         plan.row_count += 1;
     }
     if (open_account) |account_plan| cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, m);
+    limitCardPrimaries(plan.rows[0..plan.row_count]);
     plan.hint_y = cursor_y + m.row_gap - m.inner_gap;
     pass.y = plan.hint_y;
     pass.text(RUNTIME_HINT, textHint(), theme.scaledUi(12.0), null);
     plan.height = pass.y + m.card_pad - y;
     return plan;
+}
+
+/// Accent budget: the card keeps one filled primary (the first row's, in
+/// display order); every later row's primary drops to an outline button.
+/// Runs after layout, which depends on labels and placement only, so header
+/// placement chosen from the original style is kept.
+fn limitCardPrimaries(rows: []RuntimeRowPlan) void {
+    var seen = false;
+    for (rows) |*row| {
+        for (row.button_styles[0..row.button_count]) |*style| {
+            if (style.* != .primary) continue;
+            if (seen) style.* = .secondary else seen = true;
+        }
+    }
 }
 
 /// Extends an account tile around its machine rows; returns the next y.
@@ -4224,7 +4383,8 @@ fn headerButtonCount(plan: *const RuntimeRowPlan) usize {
     const style = plan.button_styles[0];
     if (style == .primary) return 1;
     return switch (plan.button_actions[0]) {
-        .disable => 1,
+        // Retries stay in the header like the row's other main actions.
+        .disable, .retry, .reconnect, .connect => 1,
         .set_workspace_default => if (style == .disabled) 0 else 1,
         else => 0,
     };
@@ -4294,6 +4454,11 @@ fn planRuntimeRow(state: *runtime.AppState, entry: RuntimeDisplayRow, tile_x: f3
     plan.header = .{ .x = tile_x, .y = y, .w = tile_w, .h = header_bottom + cm.pad_y - y };
     plan.detail_y = plan.header.y + plan.header.h + cm.pad_y;
     var bottom = plan.header.y + plan.header.h;
+    // The body pass wraps text to the tile's width, so the tile's x/w must be
+    // known before measuring (only its height is still open). Measuring with
+    // an unset tile wrapped every word onto its own line and inflated the
+    // expanded card into a tall blank slab.
+    plan.tile = .{ .x = tile_x, .y = y, .w = tile_w, .h = bottom - y };
     if (plan.expanded) {
         var pass = rowBodyPass(state, &plan, ZERO_RECT, false, null);
         runtimeRowBody(&pass, &plan);
@@ -4935,15 +5100,22 @@ fn disclosureWidth(label: []const u8) f32 {
     return connTextWidth(theme.scaledUi(12.5), label) + theme.scaledUi(DISCLOSURE_PAD_UI * 2.0 + 5.0 + 12.0);
 }
 
-/// Borderless "Details ⌄" toggle; washes on hover like other quiet controls.
+/// Borderless "Details ⌄" toggle styled like the other text links (accent
+/// text, underline on hover) inside the row's button-height hit target.
 fn drawDisclosure(state: *runtime.AppState, rect: palette.Rect, label: []const u8, open: bool, hovered: bool, clip: palette.Rect) void {
-    if (hovered) queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), radiusSm(), clip);
     const font = theme.scaledUi(12.5);
-    const color = paletteColor(if (hovered or open) theme.COLOR_WHITE else textLabel());
+    const link = readableOn(theme.accent(), cardSurface());
+    const color = paletteColor(link);
     const text_w = connTextWidth(font, label);
     const text_h = font * 1.25;
     const text_x = rect.x + theme.scaledUi(DISCLOSURE_PAD_UI);
-    queueText(state, .{ .x = text_x, .y = rect.y + (rect.h - text_h) * 0.5, .w = text_w + theme.scaledUi(2.0), .h = text_h }, label, color, font, clip);
+    const text_y = rect.y + (rect.h - text_h) * 0.5;
+    queueText(state, .{ .x = text_x, .y = text_y, .w = text_w + theme.scaledUi(2.0), .h = text_h }, label, color, font, clip);
+    if (hovered) {
+        const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+        const left = @round(text_x);
+        queueRoundedRectClipped(state, .{ .x = left, .y = @round(text_y + text_h), .w = @round(text_x + text_w) - left, .h = stroke }, color, 0.0, clip);
+    }
     const icon = theme.scaledUi(12.0);
     queueIconText(state, .{
         .x = text_x + text_w + theme.scaledUi(5.0),
@@ -5130,6 +5302,14 @@ test "details disclosures toggle by identity and forget the oldest when full" {
 }
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
+    // Light palettes separate the white card from the drawer with a hairline;
+    // dark palettes already read by fill.
+    if (theme.isLightPalette()) {
+        // Opaque edge mixed from the card and text colours: a translucent
+        // text tint vanished against the near-white drawer.
+        queuePanelClipped(state, rect, cardSurface(), theme.mix(cardSurface(), theme.COLOR_WHITE, 0.18), radiusMd(), clip);
+        return;
+    }
     queueRoundedRectClipped(state, rect, paletteColor(cardSurface()), radiusMd(), clip);
 }
 
@@ -5214,67 +5394,64 @@ fn drawCompanionCharacterDropdown(state: *runtime.AppState, layout: SettingsLayo
 fn drawCompanionCharacterDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
     if (!state.settings_controller.companion_character_dropdown_open) return;
     const menu = companionCharacterMenuRect(layout);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
 
     const selected = companionCharacterIndex(state.settings_controller.draft.companion_character);
     for (0..companionCharacterCount()) |choice_index| {
         const row = companionCharacterOptionRect(layout, choice_index);
-        const is_selected = choice_index == selected;
-        const hovered = state.settings_controller.companion_character_hover_index == choice_index;
-        if (is_selected or hovered) {
-            const fill = if (is_selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
-            queueRoundedRectClipped(state, row, paletteColor(fill), theme.scaledUi(4.0), layout.body_clip);
-        }
-
-        const dot_size = theme.scaledUi(6.0);
-        const dot_color = if (is_selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
-        queueRoundedRectClipped(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + (row.h - dot_size) * 0.5,
-            .w = dot_size,
-            .h = dot_size,
-        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(25.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(42.0),
-            .h = theme.scaledUi(15.0),
-        }, companionCharacterLabel(choice_index), paletteColor(if (is_selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, companionCharacterLabel(choice_index), choice_index == selected, state.settings_controller.companion_character_hover_index == choice_index, layout.body_clip);
     }
+}
+
+/// Popup surface shared by every settings dropdown: one bordered panel.
+/// Settings dropdown popovers share the composer pickers' chrome: panel_alt
+/// fill, a 1px panel_muted edge, and a soft shadow so the list reads as a
+/// layer above the card instead of a flat continuation of it.
+fn drawDropdownMenuSurface(state: *runtime.AppState, menu: palette.Rect, clip: palette.Rect) void {
+    const shadow_alpha: f32 = if (theme.isLightPalette()) 0.04 else 0.14;
+    for ([_]f32{ 10.0, 6.0, 3.0 }) |spread| {
+        const s = theme.scaledUi(spread);
+        queueRoundedRectClipped(state, .{ .x = menu.x - s, .y = menu.y - s + s * 0.5, .w = menu.w + s * 2.0, .h = menu.h + s * 2.0 }, paletteColor(theme.scrim(shadow_alpha)), radiusSm() + s, clip);
+    }
+    queuePanelClipped(state, menu, theme.COLOR_PANEL_ALT, theme.COLOR_PANEL_MUTED, radiusSm(), clip);
+}
+
+/// One dropdown option, matching the composer pickers: label in the primary
+/// text color, a neutral wash for hover / keyboard highlight, and the current
+/// choice marked only by a trailing accent check (no bullets, no accent row).
+fn drawDropdownOptionRow(state: *runtime.AppState, row: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
+    // The highlight sits inside the popover edge like the picker rows.
+    const inset = theme.scaledUi(4.0);
+    if (hovered) queueRoundedRectClipped(state, .{ .x = row.x + inset, .y = row.y + inset * 0.5, .w = @max(row.w - inset * 2.0, 0.0), .h = @max(row.h - inset, 0.0) }, paletteColor(controlHoverSurface()), theme.scaledUi(6.0), clip);
+    const pad = theme.scaledUi(12.0);
+    const check_size = theme.scaledUi(14.0);
+    const check_slot = check_size + pad;
+    var label_buf: [256]u8 = undefined;
+    const label_w = @max(row.w - pad - check_slot, 0.0);
+    queueText(state, .{
+        .x = row.x + pad,
+        .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+        .w = label_w,
+        .h = theme.scaledUi(15.0),
+    }, ellipsizedText(&label_buf, label, theme.scaledUi(13.0), label_w), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+    if (selected) queueIconText(state, .{
+        .x = row.x + row.w - pad - check_size,
+        .y = row.y + (row.h - check_size) * 0.5,
+        .w = check_size,
+        .h = check_size,
+    }, NF_COD_CHECK, paletteColor(theme.accent()), check_size, clip);
 }
 
 // Appearance theme selector popup rows.
 fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
     if (!state.settings_controller.theme_dropdown_open) return;
     const menu = themeMenuRect(state, layout);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
 
     for (0..themeMenuVisibleCount(state)) |visible_index| {
         const choice_index = state.settings_controller.theme_menu_scroll + visible_index;
         const row = themeOptionRect(state, layout, visible_index);
-        const selected = choice_index == state.settings_controller.draft.theme_choice;
-        const hovered = state.settings_controller.theme_hover_index == choice_index;
-        if (selected or hovered) {
-            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
-            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
-        }
-
-        const dot_size = theme.scaledUi(6.0);
-        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
-        queueRoundedRectClipped(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + (row.h - dot_size) * 0.5,
-            .w = dot_size,
-            .h = dot_size,
-        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(25.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(42.0),
-            .h = theme.scaledUi(15.0),
-        }, state.settingsThemeChoiceLabel(choice_index), paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, state.settingsThemeChoiceLabel(choice_index), choice_index == state.settings_controller.draft.theme_choice, state.settings_controller.theme_hover_index == choice_index, layout.body_clip);
     }
 
     const count = state.settingsThemeChoiceCount();
@@ -5291,7 +5468,7 @@ fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void 
         const max_scroll = themeMenuMaxScroll(state);
         const progress = @as(f32, @floatFromInt(state.settings_controller.theme_menu_scroll)) / @as(f32, @floatFromInt(max_scroll));
         queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
-        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(mouseIn(state, menu))), theme.scaledUi(1.0), layout.body_clip);
     }
 }
 
@@ -5335,35 +5512,14 @@ fn drawChatTitleDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, p
     const visible_count = if (provider_menu) count else titleModelMenuVisibleCount(state);
     const scroll = if (provider_menu) 0 else state.settings_controller.title_model_menu_scroll;
     const menu = if (provider_menu) titleProviderMenuRect(state, layout) else titleModelMenuRect(state, layout);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
 
     const selected_index = if (provider_menu) state.settingsChatTitleProviderSelectedIndex() else state.settingsChatTitleModelSelectedIndex() orelse std.math.maxInt(usize);
     for (0..visible_count) |visible_index| {
         const option_index = scroll + visible_index;
         const row = dropdownOptionRect(menu, visible_index);
-        const selected = option_index == selected_index;
-        const hovered = state.settings_controller.title_menu_hover_index == option_index;
-        if (selected or hovered) {
-            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
-            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
-        }
-
-        const dot_size = theme.scaledUi(6.0);
-        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
-        queueRoundedRectClipped(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + (row.h - dot_size) * 0.5,
-            .w = dot_size,
-            .h = dot_size,
-        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
         const label = if (provider_menu) state.settingsChatTitleProviderLabel(option_index) else state.settingsChatTitleModelLabel(option_index);
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(25.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(42.0),
-            .h = theme.scaledUi(15.0),
-        }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, label, option_index == selected_index, state.settings_controller.title_menu_hover_index == option_index, layout.body_clip);
     }
 
     if (!provider_menu and count > visible_count) {
@@ -5377,7 +5533,7 @@ fn drawChatTitleDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, p
         const travel = track.h - thumb_h;
         const progress = @as(f32, @floatFromInt(scroll)) / @as(f32, @floatFromInt(titleModelMenuMaxScroll(state)));
         queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
-        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(mouseIn(state, menu))), theme.scaledUi(1.0), layout.body_clip);
     }
 }
 
@@ -5393,8 +5549,7 @@ fn drawNewChatDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, kin
     const visible_count = if (kind == .model) newChatModelMenuVisibleCount(state) else @min(count, TITLE_MENU_MAX_ROWS);
     const scroll = if (kind == .model) state.settings_controller.new_chat_model_menu_scroll else 0;
     const menu = newChatMenuRect(state, layout, kind);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
 
     const selected_index = switch (kind) {
         .provider => state.settingsNewChatProviderSelectedIndex(),
@@ -5404,70 +5559,24 @@ fn drawNewChatDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, kin
     for (0..visible_count) |visible_index| {
         const option_index = scroll + visible_index;
         const row = dropdownOptionRect(menu, visible_index);
-        const selected = option_index == selected_index;
-        const hovered = state.settings_controller.new_chat_menu_hover_index == option_index;
-        if (selected or hovered) queueRoundedRectClipped(state, row, paletteColor(if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface()), theme.scaledUi(4.0), layout.body_clip);
         const label = switch (kind) {
             .provider => state.settingsNewChatProviderLabel(option_index),
             .model => state.settingsNewChatModelLabel(option_index),
             .reasoning => state.settingsNewChatReasoningLabel(option_index),
         };
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(20.0),
-            .h = theme.scaledUi(15.0),
-        }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, label, option_index == selected_index, state.settings_controller.new_chat_menu_hover_index == option_index, layout.body_clip);
     }
 }
 
 fn drawOpenActionDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
     if (!state.settings_controller.open_action_dropdown_open) return;
     const menu = openActionMenuRect(layout);
-    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    drawDropdownMenuSurface(state, menu, layout.body_clip);
     const selected_index = openActionSelectedIndex(state);
     for (OPEN_CHOICES, 0..) |choice, option_index| {
         const row = dropdownOptionRect(menu, option_index);
-        const selected = option_index == selected_index;
-        const hovered = state.settings_controller.open_action_hover_index == option_index;
-        if (selected or hovered) {
-            queueRoundedRectClipped(state, row, paletteColor(if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface()), theme.scaledUi(4.0), layout.body_clip);
-        }
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
-            .w = row.w - theme.scaledUi(20.0),
-            .h = theme.scaledUi(15.0),
-        }, choice.label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+        drawDropdownOptionRow(state, row, choice.label, option_index == selected_index, state.settings_controller.open_action_hover_index == option_index, layout.body_clip);
     }
-}
-
-fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
-    const bg = if (selected)
-        theme.withAlpha(theme.accent(), 44)
-    else if (hovered)
-        controlHoverSurface()
-    else
-        controlSurface();
-    queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
-    // Unselected cells need a visible edge or they read as disabled.
-    const border = if (selected) theme.withAlpha(theme.accent(), 140) else theme.withAlpha(theme.COLOR_WHITE, 26);
-    queueBorderClipped(state, rect, paletteColor(border), radiusSm(), theme.scaledUi(1.0), clip);
-
-    const dot_size = theme.scaledUi(7.0);
-    const dot_x = rect.x + theme.scaledUi(10.0);
-    const dot_y = rect.y + (rect.h - dot_size) * 0.5;
-    const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 180);
-    queueRoundedRectClipped(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(dot_color), theme.scaledUi(3.5), clip);
-
-    const text_color = if (selected or hovered) theme.COLOR_WHITE else textLabel();
-    queueText(state, .{
-        .x = rect.x + theme.scaledUi(24.0),
-        .y = rect.y + (rect.h - theme.scaledUi(16.0)) * 0.5,
-        .w = rect.w - theme.scaledUi(28.0),
-        .h = theme.scaledUi(16.0),
-    }, label, paletteColor(text_color), theme.scaledUi(13.0), clip);
 }
 
 // Boolean setting row: label on the left, switch track on the right.
@@ -5499,21 +5608,27 @@ fn toggleReducedMotionPart(motion: *app_config.ReducedMotion, part: app_config.R
     }
 }
 
+/// How far a switch row's hover wash bleeds past its rect, so the label and
+/// track can sit on the card's content edges (aligned with field labels,
+/// dropdowns, and steppers) while the wash still frames them.
+const ROW_HOVER_BLEED_UI: f32 = 8.0;
+
 fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8, on: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered) {
-        queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), radiusSm(), clip);
+        const bleed = theme.scaledUi(ROW_HOVER_BLEED_UI);
+        queueRoundedRectClipped(state, .{ .x = rect.x - bleed, .y = rect.y, .w = rect.w + bleed * 2.0, .h = rect.h }, paletteColor(controlHoverSurface()), radiusSm(), clip);
     }
     queueText(state, .{
-        .x = rect.x + theme.scaledUi(10.0),
+        .x = rect.x,
         .y = rect.y + (rect.h - theme.scaledUi(16.0)) * 0.5,
-        .w = rect.w - theme.scaledUi(70.0),
+        .w = rect.w - theme.scaledUi(60.0),
         .h = theme.scaledUi(16.0),
     }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 
     const track_w = theme.scaledUi(40.0);
     const track_h = theme.scaledUi(22.0);
     drawSwitchTrack(state, .{
-        .x = rect.x + rect.w - theme.scaledUi(10.0) - track_w,
+        .x = rect.x + rect.w - track_w,
         .y = rect.y + (rect.h - track_h) * 0.5,
         .w = track_w,
         .h = track_h,
@@ -5523,17 +5638,25 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
 /// The switch alone (track and knob); `hovered` brightens an off track.
 fn drawSwitchTrack(state: *runtime.AppState, track: palette.Rect, on: bool, hovered: bool, clip: palette.Rect) void {
     const track_h = track.h;
-    const track_color = if (on) theme.withAlpha(theme.accent(), 200) else if (hovered) controlHoverSurface() else controlSurface();
-    queueRoundedRectClipped(state, track, paletteColor(track_color), track_h * 0.5, clip);
-    if (!on) {
-        queueBorderClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), track_h * 0.5, theme.scaledUi(1.0), clip);
+    if (on) {
+        queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.accent(), 200)), track_h * 0.5, clip);
+    } else {
+        queuePanelClipped(state, track, if (hovered) controlHoverSurface() else controlSurface(), theme.withAlpha(theme.COLOR_WHITE, 34), track_h * 0.5, clip);
     }
 
     const knob_pad = theme.scaledUi(3.0);
     const knob = track_h - knob_pad * 2.0;
     const knob_x = if (on) track.x + track.w - knob_pad - knob else track.x + knob_pad;
-    const knob_color = if (on) theme.foregroundOn(theme.accent()) else theme.withAlpha(theme.COLOR_WHITE, 190);
-    queueRoundedRectClipped(state, .{ .x = knob_x, .y = track.y + knob_pad, .w = knob, .h = knob }, paletteColor(knob_color), knob * 0.5, clip);
+    const knob_rect: palette.Rect = .{ .x = knob_x, .y = track.y + knob_pad, .w = knob, .h = knob };
+    if (on) {
+        queueRoundedRectClipped(state, knob_rect, paletteColor(theme.foregroundOn(theme.accent())), knob * 0.5, clip);
+    } else if (theme.isLightPalette()) {
+        // A dark text-colored knob on a light track reads as "on"; light
+        // themes get a raised white knob with a hairline instead.
+        queuePanelClipped(state, knob_rect, cardSurface(), theme.withAlpha(theme.COLOR_WHITE, 70), knob * 0.5, clip);
+    } else {
+        queueRoundedRectClipped(state, knob_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 190)), knob * 0.5, clip);
+    }
 }
 
 fn browserScrollSliderHitRect(row: palette.Rect) palette.Rect {
@@ -5559,7 +5682,7 @@ fn browserScrollSpeedFromPoint(track: palette.Rect, x: f32) f32 {
 fn drawBrowserScrollSpeedSlider(state: *runtime.AppState, row: palette.Rect, value: f32, hovered: bool, clip: palette.Rect) void {
     const hit = browserScrollSliderHitRect(row);
     queueText(state, .{
-        .x = row.x + theme.scaledUi(10.0),
+        .x = row.x,
         .y = row.y + (row.h - theme.scaledUi(16.0)) * 0.5,
         .w = @max(hit.x - row.x - theme.scaledUi(16.0), 1.0),
         .h = theme.scaledUi(16.0),
@@ -5593,24 +5716,7 @@ fn drawSegmentedPair(
     right_hovered: bool,
     clip: palette.Rect,
 ) void {
-    const container: palette.Rect = .{ .x = left.x, .y = left.y, .w = left.w + right.w, .h = left.h };
-    queueRoundedRectClipped(state, container, paletteColor(controlSurface()), radiusSm(), clip);
-    queueBorderClipped(state, container, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 26)), radiusSm(), theme.scaledUi(1.0), clip);
-
-    if (left_hovered and !left_selected) {
-        queueRoundedRectClipped(state, left, paletteColor(controlHoverSurface()), radiusSm(), clip);
-    }
-    if (right_hovered and left_selected) {
-        queueRoundedRectClipped(state, right, paletteColor(controlHoverSurface()), radiusSm(), clip);
-    }
-    const selected_rect = if (left_selected) left else right;
-    queueRoundedRectClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.accent(), 44)), radiusSm(), clip);
-    queueBorderClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.accent(), 150)), radiusSm(), theme.scaledUi(1.0), clip);
-
-    const left_color = if (left_selected or left_hovered) theme.COLOR_WHITE else textLabel();
-    const right_color = if (!left_selected or right_hovered) theme.COLOR_WHITE else textLabel();
-    queueCenteredText(state, left, left_label, paletteColor(left_color), theme.scaledUi(13.0), clip);
-    queueCenteredText(state, right, right_label, paletteColor(right_color), theme.scaledUi(13.0), clip);
+    drawSegmented(state, &.{ left, right }, &.{ left_label, right_label }, if (left_selected) 0 else 1, &.{ left_hovered, right_hovered }, clip);
 }
 
 // Three-option exclusive choice rendered as one segmented control.
@@ -5624,24 +5730,65 @@ fn drawSegmentedTriple(
     hovered: [3]bool,
     clip: palette.Rect,
 ) void {
-    const segments = [3]palette.Rect{ first, second, third };
-    const container: palette.Rect = .{ .x = first.x, .y = first.y, .w = first.w + second.w + third.w, .h = first.h };
-    queueRoundedRectClipped(state, container, paletteColor(controlSurface()), radiusSm(), clip);
-    queueBorderClipped(state, container, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 26)), radiusSm(), theme.scaledUi(1.0), clip);
+    drawSegmented(state, &.{ first, second, third }, &labels, selected_index, &hovered, clip);
+}
 
-    for (segments, 0..) |segment, index| {
-        if (hovered[index] and index != selected_index) {
-            queueRoundedRectClipped(state, segment, paletteColor(controlHoverSurface()), radiusSm(), clip);
+/// One segmented-control geometry and colour set for Settings and the
+/// composer's run-config steppers, so a selected segment looks identical in
+/// both: a 9px track in `theme.segmentedTrackFill` with a 1px border, and the
+/// selected segment as a tinted, accent-bordered thumb inset 4px from the
+/// track edges (2px between segments) with the track radius less 2px.
+pub fn segmentedTrackRadius() f32 {
+    return theme.scaledUi(9.0);
+}
+
+pub fn segmentedThumbRadius() f32 {
+    return @max(segmentedTrackRadius() - 2.0, 2.0);
+}
+
+/// Thumb rect for `segment` at `index` of `count` tiled segments.
+fn segmentThumbRect(segment: palette.Rect, index: usize, count: usize) palette.Rect {
+    const outer = theme.scaledUi(4.0);
+    const inner = theme.scaledUi(2.0);
+    const left = if (index == 0) outer else inner;
+    const right = if (index + 1 == count) outer else inner;
+    return .{ .x = segment.x + left, .y = segment.y + outer, .w = @max(segment.w - left - right, 0.0), .h = @max(segment.h - outer * 2.0, 0.0) };
+}
+
+/// Exclusive choice drawn as one joined control: the container is one
+/// bordered track and the selected segment one tinted, bordered thumb on
+/// top. `segments` must tile left to right without gaps.
+fn drawSegmented(
+    state: *runtime.AppState,
+    segments: []const palette.Rect,
+    labels: []const []const u8,
+    selected_index: usize,
+    hovered: []const bool,
+    clip: palette.Rect,
+) void {
+    if (segments.len == 0) return;
+    const first = segments[0];
+    const last = segments[segments.len - 1];
+    const container: palette.Rect = .{ .x = first.x, .y = first.y, .w = last.x + last.w - first.x, .h = first.h };
+    const track = theme.segmentedTrackFill();
+    queuePanelClipped(state, container, track, theme.segmentedTrackBorder(track), segmentedTrackRadius(), clip);
+
+    for (segments, hovered, 0..) |segment, is_hovered, index| {
+        if (is_hovered and index != selected_index) {
+            queueRoundedRectClipped(state, segmentThumbRect(segment, index, segments.len), paletteColor(theme.segmentedHoverFill()), segmentedThumbRadius(), clip);
         }
     }
-    const selected = segments[@min(selected_index, segments.len - 1)];
-    queueRoundedRectClipped(state, selected, paletteColor(theme.withAlpha(theme.accent(), 44)), radiusSm(), clip);
-    queueBorderClipped(state, selected, paletteColor(theme.withAlpha(theme.accent(), 150)), radiusSm(), theme.scaledUi(1.0), clip);
+    const selected_at = @min(selected_index, segments.len - 1);
+    queuePanelClipped(state, segmentThumbRect(segments[selected_at], selected_at, segments.len), theme.segmentedSelectedFill(track), theme.segmentedSelectedBorder(track), segmentedThumbRadius(), clip);
 
-    for (segments, labels, 0..) |segment, label, index| {
-        const color = if (index == selected_index or hovered[index]) theme.COLOR_WHITE else textLabel();
+    for (segments, labels, hovered, 0..) |segment, label, is_hovered, index| {
+        const color = if (index == selected_index or is_hovered) theme.COLOR_WHITE else textLabel();
         queueCenteredText(state, segment, label, paletteColor(color), theme.scaledUi(13.0), clip);
     }
+}
+
+fn insetRect(rect: palette.Rect, amount: f32) palette.Rect {
+    return .{ .x = rect.x + amount, .y = rect.y + amount, .w = @max(rect.w - amount * 2.0, 0.0), .h = @max(rect.h - amount * 2.0, 0.0) };
 }
 
 /// `danger` is a de-emphasized destructive action (Remove, Revoke, Forget);
@@ -5675,7 +5822,8 @@ const NavigationCardLayout = struct {
 fn navigationCardHeight(m: Metrics) f32 {
     return m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.row_h + m.inner_gap + m.row_h + m.inner_gap +
-        m.label_h * 2.0;
+        // Two help lines, plus the notice line while one is showing.
+        m.label_h * @as(f32, if (navigation_notice_len > 0) 3.0 else 2.0);
 }
 
 fn layoutNavigationCard(card: palette.Rect, m: Metrics) NavigationCardLayout {
@@ -5875,14 +6023,19 @@ fn drawNavigationCard(state: *runtime.AppState, layout: SettingsLayout, m: Metri
 
     const text_w = card.w - m.card_pad * 2.0;
     const font_size = theme.scaledUi(12.5);
-    var hint_buf: [160]u8 = undefined;
-    const hint = ellipsizedText(&hint_buf, "Steps through workspaces and chats you visited. Click a shortcut to add a key or mouse button.", font_size, text_w);
-    queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y, .w = text_w, .h = m.label_h }, hint, paletteColor(textHint()), font_size, layout.body_clip);
+    // One sentence per line so the help never ellipsizes mid-sentence at the
+    // drawer's fixed width.
+    const help = [_][]const u8{ "Steps through workspaces and chats you visited.", "Click a shortcut to add a key or mouse button." };
+    for (help, 0..) |line, index| {
+        var hint_buf: [160]u8 = undefined;
+        const hint = ellipsizedText(&hint_buf, line, font_size, text_w);
+        queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y + m.label_h * @as(f32, @floatFromInt(index)), .w = text_w, .h = m.label_h }, hint, paletteColor(textHint()), font_size, layout.body_clip);
+    }
     if (navigation_notice_len > 0) {
         var notice_buf: [160]u8 = undefined;
         const notice = ellipsizedText(&notice_buf, navigation_notice_buf[0..navigation_notice_len], font_size, text_w);
         const color = if (navigation_notice_warning) theme.warning() else textLabel();
-        queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y + m.label_h, .w = text_w, .h = m.label_h }, notice, paletteColor(color), font_size, layout.body_clip);
+        queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y + m.label_h * 2.0, .w = text_w, .h = m.label_h }, notice, paletteColor(color), font_size, layout.body_clip);
     }
 }
 
@@ -5915,6 +6068,18 @@ fn drawNavigationRow(
     drawActionButton(state, reset, "Reset", if (is_default) .disabled else .secondary, !is_default and isControlHovered(state, reset_control), layout.body_clip);
 }
 
+/// `color` mixed toward the text colour until it reaches 4.5:1 against
+/// `backing` (danger outlines and text links stay readable in every theme).
+fn readableOn(color: [4]f32, backing: [4]f32) [4]f32 {
+    var result = color;
+    var amount: f32 = 0.0;
+    while (theme.contrastRatio(result, backing) < 4.5 and amount < 1.0) {
+        amount = @min(amount + 0.1, 1.0);
+        result = theme.mix(color, theme.COLOR_WHITE, amount);
+    }
+    return result;
+}
+
 fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, style: ButtonStyle, hovered: bool, clip: palette.Rect) void {
     var button_fill: ?[4]f32 = null;
     switch (style) {
@@ -5926,17 +6091,21 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
         },
         .secondary => {
             const bg = if (hovered) controlHoverSurface() else controlSurface();
-            queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
-            queueBorderClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 30)), radiusSm(), theme.scaledUi(1.0), clip);
+            queuePanelClipped(state, rect, bg, theme.withAlpha(theme.COLOR_WHITE, 30), radiusSm(), clip);
         },
         .disabled => {
-            queueBorderClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 16)), radiusSm(), theme.scaledUi(1.0), clip);
+            queuePanelClipped(state, rect, theme.withAlpha(controlSurface(), 0), theme.withAlpha(theme.COLOR_WHITE, 16), radiusSm(), clip);
         },
         .danger => {
-            // Quiet until hovered so destructive verbs never outweigh the
-            // row's main action.
-            const fill = if (hovered) theme.mix(controlSurface(), theme.danger(), 0.18) else theme.withAlpha(controlSurface(), 0);
-            queuePanelClipped(state, rect, fill, theme.withAlpha(theme.danger(), if (hovered) 140 else 70), radiusSm(), clip);
+            // Outline at rest so destructive verbs never outweigh the row's
+            // main action, but with a readable edge and label; hover fills.
+            if (hovered) {
+                const bg = theme.danger();
+                button_fill = bg;
+                queuePanelClipped(state, rect, bg, bg, radiusSm(), clip);
+            } else {
+                queuePanelClipped(state, rect, theme.withAlpha(controlSurface(), 0), theme.withAlpha(theme.danger(), 170), radiusSm(), clip);
+            }
         },
         .danger_confirm => {
             const bg = if (hovered) theme.mix(theme.danger(), theme.foregroundOn(theme.danger()), 0.10) else theme.danger();
@@ -5946,8 +6115,8 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
     }
     const text_color = if (style == .disabled)
         textHint()
-    else if (style == .danger)
-        theme.mix(theme.danger(), theme.COLOR_WHITE, 0.25)
+    else if (style == .danger and button_fill == null)
+        readableOn(theme.mix(theme.danger(), theme.COLOR_WHITE, 0.25), cardSurface())
     else if (button_fill) |fill|
         theme.foregroundOn(fill)
     else
@@ -5956,6 +6125,96 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
 }
 
 // Thin overlay scrollbar so overflow in the modal body is discoverable.
+/// Scrolled content passes under the drawer header through an opaque inset
+/// and a fade about one control row deep, so a heading or segmented control
+/// leaving the viewport dissolves rather than showing a sawn-off strip. The
+/// bottom edge fades while more content remains below. Both grow with the
+/// scroll distance so content at rest is never dimmed.
+const BODY_FADE_UI: f32 = 36.0;
+const BODY_FADE_INSET_UI: f32 = 12.0;
+const BODY_FADE_STEPS: usize = 12;
+
+fn drawBodyEdgeFades(state: *runtime.AppState, layout: SettingsLayout) void {
+    if (layout.max_scroll_y <= 0.0) return;
+    const clip = layout.body_clip;
+    const scroll = state.settings_controller.scroll_y;
+    const band = topBandHeight(clip);
+    const top_depth = @min(@min(scroll, band + theme.scaledUi(BODY_FADE_UI)), clip.h * 0.4);
+    const bottom_depth = @min(@min(layout.max_scroll_y - scroll, theme.scaledUi(BODY_FADE_UI)), clip.h * 0.3);
+    if (top_depth > 0.5) drawBodyFade(state, clip, top_depth, topBandOpaqueHeight(clip, scroll, layout.max_scroll_y), true);
+    if (bottom_depth > 0.5) drawBodyFade(state, clip, bottom_depth, 0.0, false);
+}
+
+/// Height of the opaque band under the drawer header: at least the inset,
+/// grown to cover whatever is left of a control the top edge cuts through
+/// (from this frame's focus-stop rects), so no sawn-off strip of a segmented
+/// control or button shows above the fade.
+fn topBandHeight(clip: palette.Rect) f32 {
+    var band = theme.scaledUi(BODY_FADE_INSET_UI);
+    for (focus_stops[0..focus_stop_count]) |stop| {
+        if (stop.clip == null) continue;
+        const bottom = stop.rect.y + stop.rect.h;
+        if (stop.rect.y < clip.y and bottom > clip.y) band = @max(band, bottom - clip.y + theme.scaledUi(2.0));
+    }
+    return @min(band, clip.h * 0.3);
+}
+
+/// The band actually painted opaque this frame (none at rest or before the
+/// page scrolls past it). Hits use the same height so a control the band
+/// hides is not clickable through it.
+fn topBandOpaqueHeight(clip: palette.Rect, scroll: f32, max_scroll: f32) f32 {
+    if (max_scroll <= 0.0) return 0.0;
+    const depth = @min(@min(scroll, topBandHeight(clip) + theme.scaledUi(BODY_FADE_UI)), clip.h * 0.4);
+    if (depth <= 0.5) return 0.0;
+    return @min(topBandHeight(clip), depth);
+}
+
+/// Page hits are buffered while the body registers (focus stops and the band
+/// they define are only complete afterwards), then queued clipped below the
+/// opaque band.
+const BufferedHit = struct { rect: palette.Rect, action: runtime.PaletteModalAction, index: usize };
+const MAX_BUFFERED_HITS: usize = 768;
+var buffered_hits: [MAX_BUFFERED_HITS]BufferedHit = undefined;
+var buffered_hit_count: usize = 0;
+/// Real hit sink while buffering; overflow goes straight to it.
+var buffered_hit_sink: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void = null;
+
+fn bufferHit(state: *runtime.AppState, rect: palette.Rect, action: runtime.PaletteModalAction, index: usize) void {
+    if (buffered_hit_count < buffered_hits.len) {
+        buffered_hits[buffered_hit_count] = .{ .rect = rect, .action = action, .index = index };
+        buffered_hit_count += 1;
+    } else if (buffered_hit_sink) |sink| sink(state, rect, action, index);
+}
+
+/// Queues the buffered page hits that remain visible inside `hit_clip`.
+fn flushBufferedHits(state: *runtime.AppState, hit_clip: palette.Rect, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
+    for (buffered_hits[0..buffered_hit_count]) |hit| {
+        if (intersectRect(hit.rect, hit_clip)) |visible| queue_hit(state, visible, hit.action, hit.index);
+    }
+    buffered_hit_count = 0;
+    buffered_hit_sink = null;
+}
+
+/// One edge: an opaque `inset` band of the drawer colour, then stacked bands
+/// fading inward (no gradient primitive).
+fn drawBodyFade(state: *runtime.AppState, clip: palette.Rect, depth: f32, inset: f32, top: bool) void {
+    const drawer = paletteColor(theme.COLOR_PANEL);
+    if (inset > 0.0) {
+        const y = if (top) clip.y else clip.y + clip.h - inset;
+        queueRoundedRectClipped(state, .{ .x = clip.x, .y = y, .w = clip.w, .h = inset }, drawer, 0.0, clip);
+    }
+    const fade_h = depth - inset;
+    const step_h = fade_h / @as(f32, @floatFromInt(BODY_FADE_STEPS));
+    for (0..BODY_FADE_STEPS) |step| {
+        const t = (@as(f32, @floatFromInt(step)) + 0.5) / @as(f32, @floatFromInt(BODY_FADE_STEPS));
+        const alpha = (1.0 - t) * (1.0 - t);
+        const color = paletteColor(theme.withAlpha(theme.COLOR_PANEL, @intFromFloat(@round(alpha * 255.0))));
+        const offset = inset + step_h * @as(f32, @floatFromInt(step));
+        const y = if (top) clip.y + offset else clip.y + clip.h - offset - step_h;
+        queueRoundedRectClipped(state, .{ .x = clip.x, .y = y, .w = clip.w, .h = step_h }, color, 0.0, clip);
+    }
+}
+
 fn drawBodyScrollbar(state: *runtime.AppState, layout: SettingsLayout) void {
     if (layout.max_scroll_y <= 0.0) return;
     const track: palette.Rect = .{
@@ -5970,7 +6229,12 @@ fn drawBodyScrollbar(state: *runtime.AppState, layout: SettingsLayout) void {
     const travel = @max(track.h - thumb_h, 0.0);
     const progress = state.settings_controller.scroll_y / layout.max_scroll_y;
     queueRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 16)), track.w * 0.5);
-    queueRoundedRect(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 90)), track.w * 0.5);
+    queueRoundedRect(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.scrollbarThumb(mouseIn(state, layout.body_clip))), track.w * 0.5);
+}
+
+/// Scrollbar thumbs brighten while the pointer is over the area they scroll.
+fn mouseIn(state: *const runtime.AppState, rect: palette.Rect) bool {
+    return pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
 }
 
 fn drawStepperRow(
@@ -5979,6 +6243,8 @@ fn drawStepperRow(
     m: Metrics,
     row_y: f32,
     label: []const u8,
+    /// Suffix after the value ("px"); empty for plain counts.
+    unit: []const u8,
     value: f32,
     min_value: f32,
     max_value: f32,
@@ -5988,43 +6254,65 @@ fn drawStepperRow(
     inc_rect: palette.Rect,
     clip: palette.Rect,
 ) void {
+    // Same label style as switch rows: these are inline row labels, not
+    // the muted field labels that sit above a control.
     queueText(state, .{
         .x = card.x + m.card_pad,
-        .y = row_y + (m.row_h - theme.scaledUi(15.0)) * 0.5,
+        .y = row_y + (m.row_h - theme.scaledUi(16.0)) * 0.5,
         .w = card.w * 0.5,
-        .h = theme.scaledUi(15.0),
-    }, label, paletteColor(textLabel()), theme.scaledUi(13.5), clip);
+        .h = theme.scaledUi(16.0),
+    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 
     const pill_x = dec_rect.x;
     const pill: palette.Rect = .{ .x = pill_x, .y = row_y, .w = m.stepperW(), .h = m.row_h };
-    queueRoundedRectClipped(state, pill, paletteColor(controlSurface()), radiusSm(), clip);
+    // Bordered like the dropdowns so the two 32px step targets read as
+    // buttons, not loose glyphs.
+    queuePanelClipped(state, pill, controlSurface(), theme.withAlpha(theme.COLOR_WHITE, 24), radiusSm(), clip);
 
-    var value_buf: [8]u8 = undefined;
-    const value_text = std.fmt.bufPrint(&value_buf, "{d:.0}", .{value}) catch "?";
+    var value_buf: [16]u8 = undefined;
+    const value_text = (if (unit.len > 0)
+        std.fmt.bufPrint(&value_buf, "{d:.0} {s}", .{ value, unit })
+    else
+        std.fmt.bufPrint(&value_buf, "{d:.0}", .{value})) catch "?";
     const value_rect: palette.Rect = .{ .x = dec_rect.x + m.step_w, .y = row_y, .w = m.value_w, .h = m.row_h };
-    queueRoundedRectClipped(state, .{ .x = dec_rect.x + m.step_w - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
-    queueRoundedRectClipped(state, .{ .x = inc_rect.x - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
+    // Whole-pixel dividers between the step buttons and the value.
+    const divider_w = @max(@round(theme.scaledUi(1.0)), 1.0);
+    const divider_y = @round(row_y + theme.scaledUi(6.0));
+    const divider_h = @round(row_y + m.row_h - theme.scaledUi(6.0)) - divider_y;
+    queueRoundedRectClipped(state, .{ .x = @round(dec_rect.x + m.step_w), .y = divider_y, .w = divider_w, .h = divider_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
+    queueRoundedRectClipped(state, .{ .x = @round(inc_rect.x) - divider_w, .y = divider_y, .w = divider_w, .h = divider_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
     queueCenteredText(state, value_rect, value_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 
     const at_min = value <= min_value;
     const at_max = value >= max_value;
-    drawStepButton(state, dec_rect, "−", !at_min, isControlHovered(state, dec_control), clip);
-    drawStepButton(state, inc_rect, "+", !at_max, isControlHovered(state, inc_control), clip);
+    drawStepButton(state, dec_rect, NF_COD_REMOVE, !at_min, isControlHovered(state, dec_control), clip);
+    drawStepButton(state, inc_rect, NF_COD_ADD, !at_max, isControlHovered(state, inc_control), clip);
 }
 
-fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, enabled: bool, hovered: bool, clip: palette.Rect) void {
+/// One 32x36 step target; the icon-font glyph keeps − and + the same weight.
+fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, enabled: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered and enabled) {
-        queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), theme.scaledUi(5.0), clip);
+        const inset = theme.scaledUi(2.0);
+        queueRoundedRectClipped(state, .{ .x = rect.x + inset, .y = rect.y + inset, .w = rect.w - inset * 2.0, .h = rect.h - inset * 2.0 }, paletteColor(controlHoverSurface()), theme.scaledUi(5.0), clip);
     }
     const text_color = if (enabled) theme.COLOR_WHITE else textHint();
-    queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(15.0), clip);
+    const icon = theme.scaledUi(14.0);
+    queueIconText(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, glyph, paletteColor(text_color), icon, clip);
 }
 
-fn drawIconButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool) void {
+/// Same close button as the side panel and toasts: codicon close glyph,
+/// muted until hovered, rounded hover square.
+fn drawCloseButton(state: *runtime.AppState, rect: palette.Rect, hovered: bool) void {
     if (hovered) {
         queueRoundedRect(state, rect, paletteColor(controlHoverSurface()), radiusSm());
     }
-    queueCenteredText(state, rect, label, paletteColor(if (hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(17.0), rect);
+    const glyph = theme.scaledUi(14.0);
+    queueIconText(state, .{
+        .x = rect.x + (rect.w - glyph) * 0.5,
+        .y = rect.y + (rect.h - glyph) * 0.5,
+        .w = glyph,
+        .h = glyph,
+    }, NF_COD_CLOSE, paletteColor(if (hovered) theme.COLOR_WHITE else textLabel()), glyph, rect);
 }
 
 // Header/footer chrome strip. The fill is inset by the modal border width and
@@ -6659,4 +6947,41 @@ pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
         },
     }
     state.markDirty();
+}
+
+var band_test_hits: [8]palette.Rect = undefined;
+var band_test_hit_count: usize = 0;
+
+fn recordBandTestHit(_: *runtime.AppState, rect: palette.Rect, _: runtime.PaletteModalAction, _: usize) void {
+    band_test_hits[band_test_hit_count] = rect;
+    band_test_hit_count += 1;
+}
+
+test "a control hidden by the scrolled top band takes no clicks" {
+    theme.applyTheme(1.0);
+    const clip: palette.Rect = .{ .x = 100.0, .y = 60.0, .w = 500.0, .h = 600.0 };
+    // A 36px segmented control cut by the top edge: its last 16px lie below
+    // the body's top, and the opaque band grows to cover them.
+    const cut: palette.Rect = .{ .x = 120.0, .y = 40.0, .w = 400.0, .h = 36.0 };
+    const visible: palette.Rect = .{ .x = 120.0, .y = 300.0, .w = 400.0, .h = 36.0 };
+    focus_stop_count = 0;
+    recordFocusStop(.settings_control, 0, cut, clip);
+    recordFocusStop(.settings_control, 1, visible, clip);
+    defer focus_stop_count = 0;
+    const band = topBandOpaqueHeight(clip, 400.0, 900.0);
+    try std.testing.expect(band >= cut.y + cut.h - clip.y);
+    // At rest nothing is hidden.
+    try std.testing.expectEqual(@as(f32, 0.0), topBandOpaqueHeight(clip, 0.0, 900.0));
+
+    var state: runtime.AppState = undefined;
+    buffered_hit_count = 0;
+    band_test_hit_count = 0;
+    bufferHit(&state, cut, .settings_control, 0);
+    bufferHit(&state, visible, .settings_control, 1);
+    var hit_clip = clip;
+    hit_clip.y += band;
+    hit_clip.h -= band;
+    flushBufferedHits(&state, hit_clip, recordBandTestHit);
+    try std.testing.expectEqual(@as(usize, 1), band_test_hit_count);
+    try std.testing.expectEqual(visible.y, band_test_hits[0].y);
 }

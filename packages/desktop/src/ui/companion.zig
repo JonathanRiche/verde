@@ -43,11 +43,20 @@ const CLOSE_MS: i64 = 160;
 const PANEL_WIDTH: f32 = 420.0;
 const PANEL_INSET: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 64.0;
+/// Gap between the floating panel's bottom and the chat composer below it.
+const COMPOSER_GUTTER: f32 = 10.0;
+/// Gap between the pane header row and the floating panel's top edge.
+const PANEL_HEADER_GAP: f32 = 8.0;
+/// The floating panel only stops above the chat composer while it keeps at
+/// least this height; shorter windows keep the full-height panel.
+const PANEL_MIN_ABOVE_COMPOSER: f32 = 380.0;
 const FOOTER_HEIGHT: f32 = 132.0;
 const CONTENT_INSET: f32 = 14.0;
 const SECTION_TITLE_HEIGHT: f32 = 24.0;
 const INBOX_ROW_HEIGHT: f32 = 46.0;
 const ROW_GAP: f32 = 6.0;
+/// Space between the header (or inbox/crew) and the conversation clip.
+const BODY_TOP_GAP: f32 = 12.0;
 const MAX_INBOX_ROWS_SHOWN: usize = 3;
 /// Crew: a one-line summary header, then one-line rows when open.
 const CREW_HEADER_HEIGHT: f32 = 26.0;
@@ -81,11 +90,28 @@ const MENU_ROW_HEIGHT: f32 = 40.0;
 const MENU_ACTION_HEIGHT: f32 = 34.0;
 const BRAIN_ROW_HEIGHT: f32 = 30.0;
 const SUGGESTION_HEIGHT: f32 = 36.0;
+/// Empty-conversation suggestion rows: list-row height and spacing.
+const EMPTY_ROW_HEIGHT: f32 = 38.0;
+const EMPTY_ROW_GAP: f32 = 2.0;
+const EMPTY_ROW_FONT: f32 = 13.5;
+/// Left and right inner padding of a suggestion row (label / chevron).
+const EMPTY_ROW_PAD: f32 = 14.0;
+/// Empty-state tagline and pitch: the app's 13px secondary tier.
+const EMPTY_META_FONT: f32 = 13.0;
 /// Conversation text uses the chat transcript's face, size and leading
 /// (chat_panel TRANSCRIPT_MARKDOWN_FONT_SIZE / markdownOptions), so a
 /// companion reply reads like any other chat.
 const TRANSCRIPT_FONT_CSS: f32 = 18.0;
 const TRANSCRIPT_LINE_HEIGHT_FACTOR: f32 = 1.43;
+/// Tool traces and system notes: one readable line under the reply text
+/// (they were 10.5–11px and read as noise).
+const TRACE_FONT: f32 = 12.0;
+/// Header meta (brain line), tooltips, row details and footer labels.
+const META_FONT: f32 = 12.0;
+const NOTE_FONT: f32 = 12.5;
+const TRACE_LINE_HEIGHT: f32 = 18.0;
+const TRACE_ROW_HEIGHT: f32 = 26.0;
+const NOTE_ROW_HEIGHT: f32 = 24.0;
 /// Smaller UI text (schedule details) keeps the compact panel leading.
 const LINE_HEIGHT_FACTOR: f32 = 1.45;
 /// Reading column cap, matching chat_panel CHAT_CONTENT_MAX_WIDTH; matters
@@ -125,6 +151,9 @@ pub const Geometry = struct {
     /// Notification text area; zero-sized when the bubble shows no text.
     dock_text: palette.Rect,
     panel: palette.Rect,
+    /// The open panel is a flush column at the right of the pane area that
+    /// the panes reflow around (`paneReserve`), not a floating card.
+    docked: bool = false,
     header: palette.Rect,
     avatar: palette.Rect,
     name_button: palette.Rect,
@@ -499,15 +528,20 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     const geometry = computeGeometry(state, width, height);
     // Ease out in both directions so each starts quickly and lands softly.
     const progress = companion.panel_progress;
-    const shown = if (opening) theme.easeOutCubic(progress) else 1.0 - theme.easeOutCubic(1.0 - progress);
+    // Settings is a modal drawer: the open panel steps back to its dock
+    // bubble (under the settings scrim) so only one foreground surface
+    // competes for attention. Its state is untouched and it returns when
+    // settings closes.
+    const settings_over = state.settings_controller.modal_visible;
+    const shown = if (settings_over) 0.0 else if (opening) theme.easeOutCubic(progress) else 1.0 - theme.easeOutCubic(1.0 - progress);
     if (shown < 1.0) {
         const start = transformMark(state);
         renderDock(state, geometry);
         if (shown == 0.0) {
             // Live voice started from the keybind: the call pill by the bubble.
             renderLivePill(state, geometry);
-            if (companion.menu == .live_settings) renderLiveSettings(state, geometry) else renderLivePillTooltip(state, geometry);
-            renderDockTooltip(state, geometry);
+            if (companion.menu == .live_settings) renderLiveSettings(state, geometry) else if (!settings_over) renderLivePillTooltip(state, geometry);
+            if (!settings_over) renderDockTooltip(state, geometry);
         }
         if (shown > 0.0) transformSince(state, start, 1.0 - shown, 0.0, 6.0 * companionScale() * shown, null);
     }
@@ -566,6 +600,91 @@ pub fn computeGeometry(state: *runtime.AppState, width: f32, height: f32) Geomet
     return computeGeometryAt(state, width, height, companionScale());
 }
 
+/// Bottom edge of the floating (not expanded) panel. It stops above the
+/// focused chat composer it would otherwise cover, so the composer's send /
+/// stop button and its footer chips stay visible and clickable. Uses the
+/// composer rects painted this frame (the workspace paints before the
+/// Companion); with no live composer under the panel, or too little room
+/// above it, the panel keeps its full height.
+fn floatingPanelBottom(state: *const runtime.AppState, window_h: f32, panel_x: f32, inset: f32, top_y: f32, s: f32) f32 {
+    const full = window_h - inset;
+    const composer = &state.composer_controller;
+    if (!composer.toolbar_overlay_valid or !composer.input_bounds_valid) return full;
+    // The composer ends left of the panel: nothing to uncover.
+    if (composer.input_max[0] <= panel_x or composer.input_min[1] >= full) return full;
+    var top = composer.input_min[1];
+    for ([_]palette.Rect{ composer.toolbar_directory_rect, composer.toolbar_runtime_rect }) |chip| {
+        if (chip.w <= 0.0 or chip.h <= 0.0 or chip.x + chip.w <= panel_x) continue;
+        top = @min(top, chip.y);
+    }
+    const bottom = top - COMPOSER_GUTTER * s;
+    if (bottom - top_y < PANEL_MIN_ABOVE_COMPOSER * s) return full;
+    return @min(bottom, full);
+}
+
+/// Bottom of the workspace's pane header row (title plus Commit / folder /
+/// split / more actions), in window coordinates. `layout.renderRoot` sets it
+/// each frame before rendering the Companion so the floating panel starts
+/// below those actions instead of covering them. Zero means no header.
+pub var pane_header_bottom: f32 = 0.0;
+
+/// The workspace pane area left of an open right side panel, in window
+/// coordinates (zero-sized until `layout.renderRoot` sets it each frame).
+/// The open panel docks at its right edge; expanded, it fills it.
+pub var pane_area: palette.Rect = .{};
+/// The floating panel never narrows below this beside a side panel.
+const PANEL_MIN_WIDTH: f32 = 300.0;
+/// Panes keep at least this width beside the docked panel; narrower windows
+/// fall back to the floating panel over the panes.
+const DOCK_MIN_PANE_WIDTH: f32 = 480.0;
+
+/// Width the pane area gives up to the docked Companion column at its right
+/// edge, or zero while the panel is closed, expanded, stepped back behind
+/// Settings, or the panes would get too narrow. `panes` is the pane area left
+/// of the right side panel; callers lay panes out in
+/// `panes.w - paneReserve(state, panes)` so the order reads
+/// [panes][companion][right panel] and the panel never covers a transcript.
+pub fn paneReserve(state: *const runtime.AppState, panes: palette.Rect) f32 {
+    if (!dockedColumnActive(state, panes)) return 0.0;
+    return dockedColumnWidth();
+}
+
+fn dockedColumnWidth() f32 {
+    return PANEL_WIDTH * companionScale();
+}
+
+fn dockedColumnActive(state: *const runtime.AppState, panes: palette.Rect) bool {
+    if (panes.w <= 0.0 or panes.h <= 0.0) return false;
+    if (!state.isCompanionEnabled()) return false;
+    const companion = &state.companion_controller;
+    if (companion.visibility != .sidecar_open or companion.expanded) return false;
+    if (state.settings_controller.modal_visible) return false;
+    return panes.w - dockedColumnWidth() >= DOCK_MIN_PANE_WIDTH * companionScale();
+}
+
+/// Window area the Companion currently occupies (the open panel, else its
+/// dock bubble), or null while it is disabled. Toasts keep clear of it.
+pub fn occupiedRect(state: *runtime.AppState, width: f32, height: f32) ?palette.Rect {
+    if (!state.isCompanionEnabled()) return null;
+    const geometry = computeGeometry(state, width, height);
+    const open = state.companion_controller.visibility == .sidecar_open and !state.settings_controller.modal_visible;
+    return if (open) geometry.panel else geometry.dock;
+}
+
+fn paneAreaRight(window_w: f32) f32 {
+    if (pane_area.w <= 0.0) return window_w;
+    return @min(pane_area.x + pane_area.w, window_w);
+}
+
+/// Top edge of the floating panel: under the pane header row with a small
+/// gap, or the plain window inset when that would leave too short a panel.
+fn floatingPanelTop(window_h: f32, inset: f32, s: f32) f32 {
+    if (pane_header_bottom <= 0.0) return inset;
+    const top = pane_header_bottom + PANEL_HEADER_GAP * s;
+    if (window_h - inset - top < PANEL_MIN_ABOVE_COMPOSER * s) return inset;
+    return @max(top, inset);
+}
+
 fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) Geometry {
     const companion = &state.companion_controller;
     const window: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = @max(width, 0.0), .h = @max(height, 0.0) };
@@ -608,9 +727,25 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     // Expanded, it fills the workspace area edge to edge like a pane: no inset,
     // no floating chrome (see `renderPanel`).
     const inset = if (companion.expanded) 0.0 else @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
-    const expanded_w = window.w - @max(companion.workspace_left, 0.0);
-    const panel_w = @max(@min(if (companion.expanded) @max(expanded_w, PANEL_WIDTH * s) else PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
-    const panel: palette.Rect = .{ .x = window.w - inset - panel_w, .y = inset, .w = panel_w, .h = @max(window.h - inset * 2.0, 0.0) };
+    // Both forms stay inside the pane area: left of an open right side panel
+    // (they never overlap its rows) and, expanded, right of the sidebar.
+    const area_right = paneAreaRight(window.w);
+    const area_left = @max(companion.workspace_left, 0.0);
+    const expanded_w = area_right - area_left;
+    const floating_w = @min(PANEL_WIDTH * s, @max(area_right - area_left - inset * 2.0, PANEL_MIN_WIDTH * s));
+    const panel_w = @max(@min(if (companion.expanded) @max(expanded_w, PANEL_MIN_WIDTH * s) else floating_w, area_right - inset * 2.0), 0.0);
+    const panel_x = @max(area_right - inset - panel_w, 0.0);
+    const panel_top = if (companion.expanded) inset else floatingPanelTop(window.h, inset, s);
+    const panel_bottom = if (companion.expanded) window.h - inset else floatingPanelBottom(state, window.h, panel_x, inset, panel_top, s);
+    // Docked: a flush, full-height column at the pane area's right edge
+    // that the panes reflow around (see `paneReserve`).
+    const docked = dockedColumnActive(state, pane_area);
+    const panel: palette.Rect = if (docked) .{
+        .x = pane_area.x + pane_area.w - dockedColumnWidth(),
+        .y = pane_area.y,
+        .w = dockedColumnWidth(),
+        .h = pane_area.h,
+    } else .{ .x = panel_x, .y = panel_top, .w = panel_w, .h = @max(panel_bottom - panel_top, 0.0) };
     const header: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = @min(HEADER_HEIGHT * s, panel.h) };
     // Crew placement: stacked above the conversation, or, when expanded with
     // room to spare, in a right-hand column beside the body and composer so
@@ -644,8 +779,12 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const text_right = (if (switcher) prev_button.x else live_button.x) - 8.0 * s;
     const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
     const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
-    const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 40.0 * s, @max(text_right - text_x, 0.0));
-    const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 35.0 * s, .w = brain_w + 4.0 * s, .h = 20.0 * s };
+    // The chip shows whole " · " segments that fit (provider · model ·
+    // reasoning, dropping from the right), never a word cut mid-way.
+    const brain_room = @max(text_right - text_x - 40.0 * s, 0.0);
+    const brain_label = brainChipLabel(companion.identity.brain.slice(), META_FONT * s, brain_room);
+    const brain_w = @min(text_measure.textWidth(.ui, META_FONT * s, brain_label) + 40.0 * s, @max(text_right - text_x, 0.0));
+    const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 34.0 * s, .w = brain_w + 4.0 * s, .h = 22.0 * s };
 
     // Body stack between header and footer: inbox, crew, conversation, approval.
     // The schedules view takes the inbox, crew, and conversation's place.
@@ -681,7 +820,10 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         crew = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(crew_h, cap) };
         top = crew.y + crew.h;
     }
-    const body: palette.Rect = .{ .x = content.x, .y = top + 4.0 * s, .w = content.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
+    // A clear 12px gutter under the header divider: scrolled text clips
+    // (and fades) there instead of appearing to slide under the header.
+    const body_gap = BODY_TOP_GAP * s;
+    const body: palette.Rect = .{ .x = content.x, .y = top + body_gap, .w = content.w, .h = @max(bottom - top - body_gap, 0.0) };
     const conversation: palette.Rect = if (schedules_view) .{ .x = body.x, .y = body.y } else body;
     const schedules: palette.Rect = if (schedules_view) body else .{ .x = body.x, .y = body.y };
 
@@ -692,6 +834,7 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .dock_avatar = dock_avatar,
         .dock_text = dock_text,
         .panel = panel,
+        .docked = docked,
         .header = header,
         .avatar = avatar,
         .name_button = name_button,
@@ -992,16 +1135,26 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
     if (geometry.panel.w <= 0.0 or geometry.panel.h <= 0.0) return;
     const s = companionScale();
     const chrome = theme.companionChrome();
-    if (state.companion_controller.expanded) {
-        // Flush with the workspace like a maximized pane: square, no shadow,
-        // only a hairline against the sidebar.
+    if (state.companion_controller.expanded or geometry.docked) {
+        // Flush with the workspace like a maximized pane or the right side
+        // panel: square, no shadow, only a hairline against the panes.
         queueRect(state, geometry.panel, color(surface()));
-        queueRect(state, .{ .x = geometry.panel.x, .y = geometry.panel.y, .w = snappedStroke(1.0 * s), .h = geometry.panel.h }, color(chrome.border));
+        queueRect(state, .{ .x = geometry.panel.x, .y = geometry.panel.y, .w = snappedStroke(1.0 * s), .h = geometry.panel.h }, color(chrome.menu_border));
     } else {
-        queueRect(state, geometry.window, color(theme.scrim(0.18)));
-        queueRoundedRectClipped(state, expandedOffsetRect(geometry.panel, 8.0 * s, 18.0 * s), color(theme.scrim(0.16)), 18.0 * s, geometry.window);
-        queueRoundedRectClipped(state, offsetRect(geometry.panel, 0.0, 4.0 * s), color(theme.scrim(0.24)), 14.0 * s, geometry.window);
-        queuePanel(state, geometry.panel, color(surface()), color(chrome.border), 14.0 * s, 1.0 * s);
+        // Light palettes skip the window dim and use a far lighter shadow:
+        // black at dark-theme strength read as a heavy grey slab there.
+        const light = theme.isLightPalette();
+        if (!light) queueRect(state, geometry.window, color(theme.scrim(0.18)));
+        // Soft drop shadow without a blur primitive: low-alpha rounded rects
+        // that grow outward, so the edge fades instead of ending in a slab.
+        const shadow_alpha: f32 = if (light) 0.025 else 0.08;
+        for ([_]f32{ 14.0, 9.0, 4.0 }) |spread| {
+            queueRoundedRectClipped(state, expandedOffsetRect(geometry.panel, spread * s, spread * 0.4 * s), color(theme.scrim(shadow_alpha)), (14.0 + spread) * s, geometry.window);
+        }
+        // Neutral edge: themes whose border role is accent-tinted would
+        // otherwise outline the panel in accent, and only the focused
+        // composer should carry accent.
+        queuePanel(state, geometry.panel, color(surface()), color(chrome.menu_border), 14.0 * s, 1.0 * s);
     }
     renderHeader(state, geometry);
     if (state.companion_controller.view == .schedules) {
@@ -1049,8 +1202,83 @@ fn headerTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32)
     }
     if (pointInRect(geometry.name_button, x, y) or pointInRect(geometry.avatar, x, y))
         return .{ .target = geometry.name_button, .label = "Companions, past conversations, rename, orders" };
-    if (pointInRect(geometry.brain_button, x, y)) return .{ .target = geometry.brain_button, .label = "Brain: provider, model, reasoning" };
+    // The chip may show only its leading segments; the tooltip names all.
+    if (pointInRect(geometry.brain_button, x, y)) {
+        const brain = companion.identity.brain.slice();
+        return .{ .target = geometry.brain_button, .label = if (brain.len == 0) "Change provider, model, reasoning" else framePrint(state, "{s} · change provider, model, reasoning", .{brain}) };
+    }
     return null;
+}
+
+/// Brain chip text for a "Provider · model · reasoning" label: the model's
+/// short readable name with its reasoning level ("Wonder Full 1.0 · Low"),
+/// else the model alone (the caller ellipsizes it if even that is too
+/// wide). The provider only shows when there is no model segment; the
+/// tooltip carries the full label. Never cuts a word.
+fn brainChipLabel(label: []const u8, font: f32, max_w: f32) []const u8 {
+    const separator = " \u{00B7} ";
+    var parts: [3][]const u8 = .{ "", "", "" };
+    var count: usize = 0;
+    var rest = label;
+    while (count < parts.len) {
+        const cut = std.mem.indexOf(u8, rest, separator) orelse {
+            parts[count] = rest;
+            count += 1;
+            break;
+        };
+        parts[count] = rest[0..cut];
+        count += 1;
+        rest = rest[cut + separator.len ..];
+    }
+    if (count < 2) return label;
+    const model = prettyModelName(&brain_model_buf, stripProviderPrefix(parts[1], parts[0]));
+    if (count >= 3) {
+        const with_level = std.fmt.bufPrint(&brain_label_buf, "{s}{s}{s}", .{ model, separator, parts[2] }) catch model;
+        if (text_measure.textWidth(.ui, font, with_level) <= max_w) return with_level;
+    }
+    return std.fmt.bufPrint(&brain_label_buf, "{s}", .{model}) catch model;
+}
+
+/// "muse-wonder-full-1.0" under provider "Muse" → "wonder-full-1.0": the
+/// provider already appears in the tooltip, so the chip leads with the model.
+fn stripProviderPrefix(model: []const u8, provider: []const u8) []const u8 {
+    if (provider.len == 0 or model.len <= provider.len + 1) return model;
+    if (!std.ascii.eqlIgnoreCase(model[0..provider.len], provider)) return model;
+    const next = model[provider.len];
+    if (next != '-' and next != '_' and next != ' ') return model;
+    return model[provider.len + 1 ..];
+}
+
+var brain_model_buf: [96]u8 = undefined;
+var brain_label_buf: [128]u8 = undefined;
+
+/// "muse-wonder-full-1.0" → "Muse Wonder Full 1.0"; names that already read
+/// as words (with spaces or capitals) are kept as they are.
+fn prettyModelName(buf: []u8, raw: []const u8) []const u8 {
+    if (raw.len == 0 or raw.len > buf.len) return raw;
+    if (std.mem.indexOfScalar(u8, raw, ' ') != null) return raw;
+    for (raw) |c| if (std.ascii.isUpper(c)) return raw;
+    if (std.mem.indexOfAny(u8, raw, "-_") == null) return raw;
+    var start_of_word = true;
+    for (raw, 0..) |c, i| {
+        if (c == '-' or c == '_') {
+            buf[i] = ' ';
+            start_of_word = true;
+        } else {
+            buf[i] = if (start_of_word) std.ascii.toUpper(c) else c;
+            start_of_word = false;
+        }
+    }
+    return buf[0..raw.len];
+}
+
+test "companion brain chip prefers the model's readable name" {
+    const full = "Muse \u{00B7} muse-wonder-full-1.0 \u{00B7} Low";
+    try std.testing.expectEqualStrings("Wonder Full 1.0 \u{00B7} Low", brainChipLabel(full, 12.0, 10_000.0));
+    // Short on space: reasoning goes first, the model name stays.
+    try std.testing.expectEqualStrings("Wonder Full 1.0", brainChipLabel(full, 12.0, 1.0));
+    try std.testing.expectEqualStrings("Opus 4.1", brainChipLabel("Claude \u{00B7} Opus 4.1", 12.0, 10_000.0));
+    try std.testing.expectEqualStrings("New-chat default", brainChipLabel("New-chat default", 12.0, 10_000.0));
 }
 
 fn renderHeaderTooltip(state: *runtime.AppState, geometry: Geometry) void {
@@ -1062,7 +1290,7 @@ fn renderHeaderTooltip(state: *runtime.AppState, geometry: Geometry) void {
 fn renderTooltip(state: *runtime.AppState, window: palette.Rect, target: palette.Rect, label: []const u8) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
-    const font = 11.0 * s;
+    const font = META_FONT * s;
     const pad_x = 8.0 * s;
     const text_w = text_measure.textWidth(.ui, font, label);
     const w = text_w + pad_x * 2.0;
@@ -1091,21 +1319,28 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     queueChevronDown(state, .{ .x = caret_x, .y = name_rect.y + (name_rect.h - 13.0 * s) * 0.5, .w = 13.0 * s, .h = 13.0 * s }, color(chrome.text_muted), header);
 
     const brain = geometry.brain_button;
-    queuePanel(state, brain, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
-    queueRoundedRect(state, .{ .x = brain.x + 8.0 * s, .y = brain.y + (brain.h - 6.0 * s) * 0.5, .w = 6.0 * s, .h = 6.0 * s }, color(chrome.accent), 3.0 * s);
+    // Composer-chip style: a borderless rounded chip that brightens on hover,
+    // label then chevron; no decorative status dot.
+    const brain_hovered = headerButtonHovered(state, brain);
+    const brain_fill = opaqueOver(surface(), chrome.menu_hover);
+    queueRoundedRect(state, brain, color(if (brain_hovered) opaqueOver(brain_fill, chrome.menu_hover) else brain_fill), 8.0 * s);
     const brain_w = @max(brain.w - 36.0 * s, 0.0);
-    queueText(state, .{ .x = brain.x + 19.0 * s, .y = brain.y + 2.5 * s, .w = brain_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, brain_w, identity.brain.slice()), color(chrome.text_muted), 11.0 * s, brain);
-    queueChevronDown(state, .{ .x = brain.x + brain.w - 17.0 * s, .y = brain.y + (brain.h - 10.0 * s) * 0.5, .w = 10.0 * s, .h = 10.0 * s }, color(chrome.text_subtle), brain);
+    // Frame copy: the chip label lives in a scratch buffer that the next
+    // geometry pass (hit testing) overwrites before the batch is drawn.
+    const brain_label = framePrint(state, "{s}", .{brainChipLabel(identity.brain.slice(), META_FONT * s, brain_w)});
+    queueText(state, .{ .x = brain.x + 10.0 * s, .y = brain.y + (brain.h - 17.0 * s) * 0.5, .w = brain_w, .h = 17.0 * s }, truncatedText(state, .ui, META_FONT * s, brain_w, brain_label), color(if (brain_hovered) chrome.text else chrome.text_muted), META_FONT * s, brain);
+    const brain_chevron = 12.0 * s;
+    queueIcon(state, .{ .x = brain.x + brain.w - 8.0 * s - brain_chevron, .y = brain.y + (brain.h - brain_chevron) * 0.5, .w = brain_chevron, .h = brain_chevron }, NF_COD_CHEVRON_DOWN, color(chrome.text_muted), brain);
 
     if (identity.count > 1) {
         renderHeaderButton(state, geometry.prev_button, "‹");
         renderHeaderButton(state, geometry.next_button, "›");
     }
-    renderHeaderButton(state, geometry.new_button, "+");
+    renderHeaderIconButton(state, geometry.new_button, NF_COD_ADD);
     renderSchedulesButton(state, geometry.schedules_button);
     renderHeaderIconButton(state, geometry.expand_button, if (state.companion_controller.expanded) NF_MD_ARROW_COLLAPSE else NF_MD_ARROW_EXPAND);
     renderLiveButton(state, geometry.live_button);
-    renderHeaderButton(state, geometry.close_button, "−");
+    renderHeaderIconButton(state, geometry.close_button, NF_COD_CHROME_MINIMIZE);
     const divider_inset = snappedStroke(1.0 * s);
     queueRect(state, .{ .x = header.x + divider_inset, .y = header.y + header.h - 1.0 * s, .w = @max(header.w - divider_inset * 2.0, 0.0), .h = 1.0 * s }, color(hairline()));
 }
@@ -1114,6 +1349,9 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
 /// legible small caret glyph.
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
+/// Icon-font glyphs so every header button draws from one family.
+const NF_COD_ADD = "\u{EA60}";
+const NF_COD_CHROME_MINIMIZE = "\u{EABA}";
 /// Same expand / collapse glyphs as the workspace pane zoom control.
 const NF_MD_ARROW_EXPAND = "\u{F0616}";
 const NF_MD_ARROW_COLLAPSE = "\u{F0615}";
@@ -1140,13 +1378,14 @@ fn renderSchedulesButton(state: *runtime.AppState, rect: palette.Rect) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
     const active = state.companion_controller.view == .schedules;
+    const hovered = headerButtonHovered(state, rect);
     if (active) {
         queuePanel(state, rect, color(opaqueOver(surface(), chrome.menu_selected)), color(chrome.accent), 7.0 * s, 1.0 * s);
     } else {
-        queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+        queuePanel(state, rect, color(headerButtonFill(hovered)), color(hairline()), 7.0 * s, 1.0 * s);
     }
     const icon = 15.0 * s;
-    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, NF_COD_WATCH, color(if (active) chrome.accent else chrome.text_muted), rect);
+    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, NF_COD_WATCH, color(if (active) chrome.accent else headerGlyphColor(hovered)), rect);
     const label = scheduleBadgeLabel(state) orelse return;
     const font = 9.0 * s;
     const badge_h = 14.0 * s;
@@ -1161,18 +1400,34 @@ fn renderSchedulesButton(state: *runtime.AppState, rect: palette.Rect) void {
 fn renderHeaderIconButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
     const s = companionScale();
-    const chrome = theme.companionChrome();
-    queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+    const hovered = headerButtonHovered(state, rect);
+    queuePanel(state, rect, color(headerButtonFill(hovered)), color(hairline()), 7.0 * s, 1.0 * s);
     const icon = 15.0 * s;
-    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, glyph, color(chrome.text_muted), rect);
+    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, glyph, color(headerGlyphColor(hovered)), rect);
+}
+
+/// Header buttons are 28px squares; the hover wash shows the whole target,
+/// not just the 15px glyph.
+fn headerButtonHovered(state: *runtime.AppState, rect: palette.Rect) bool {
+    if (state.companion_controller.menu != .none) return false;
+    return pointInRect(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+}
+
+fn headerButtonFill(hovered: bool) [4]f32 {
+    return if (hovered) theme.companionChrome().menu_hover else surface();
+}
+
+fn headerGlyphColor(hovered: bool) [4]f32 {
+    const chrome = theme.companionChrome();
+    return if (hovered) chrome.text else chrome.text_muted;
 }
 
 fn renderHeaderButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
     const s = companionScale();
-    const chrome = theme.companionChrome();
-    queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
-    queueCenteredText(state, rect, glyph, color(chrome.text_muted), 14.0 * s, .ui_bold, rect);
+    const hovered = headerButtonHovered(state, rect);
+    queuePanel(state, rect, color(headerButtonFill(hovered)), color(hairline()), 7.0 * s, 1.0 * s);
+    queueCenteredText(state, rect, glyph, color(headerGlyphColor(hovered)), 14.0 * s, .ui_bold, rect);
 }
 
 fn attentionColor(chrome: theme.CompanionChrome, attention: controller.Attention) [4]f32 {
@@ -1188,7 +1443,7 @@ fn attentionColor(chrome: theme.CompanionChrome, attention: controller.Attention
 fn renderSectionTitle(state: *runtime.AppState, section: palette.Rect, title: []const u8) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
-    queueBoldText(state, .{ .x = section.x + 2.0 * s, .y = section.y + 2.0 * s, .w = section.w, .h = 16.0 * s }, title, color(chrome.text_subtle), 10.0 * s, section);
+    queueBoldText(state, .{ .x = section.x + 2.0 * s, .y = section.y + 2.0 * s, .w = section.w, .h = 16.0 * s }, title, color(chrome.text_muted), 12.0 * s, section);
 }
 
 // Needs-you inbox: every chat on the machine waiting on the user.
@@ -1214,7 +1469,7 @@ fn renderInbox(state: *runtime.AppState, geometry: Geometry) void {
         const text_w = @max(rect.w - (text_x - rect.x) - pill_w - 18.0 * s, 0.0);
         const label = framePrint(state, "{s}: {s}", .{ row.attention.label(), row.title.slice() });
         queueBoldText(state, .{ .x = text_x, .y = rect.y + 6.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, label), color(chrome.text), 12.0 * s, rect);
-        queueText(state, .{ .x = text_x, .y = rect.y + 24.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, row.detail.slice()), color(chrome.text_subtle), 11.0 * s, rect);
+        queueText(state, .{ .x = text_x, .y = rect.y + 24.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, META_FONT * s, text_w, row.detail.slice()), color(chrome.text_muted), META_FONT * s, rect);
         const pill: palette.Rect = .{ .x = rect.x + rect.w - pill_w - 10.0 * s, .y = rect.y + (rect.h - 24.0 * s) * 0.5, .w = pill_w, .h = 24.0 * s };
         queuePanel(state, pill, color(surface()), color(chrome.border), 8.0 * s, 1.0 * s);
         queueCenteredText(state, pill, "Open", color(chrome.text), 11.0 * s, .ui_bold, pill);
@@ -1255,7 +1510,7 @@ fn renderCrew(state: *runtime.AppState, geometry: Geometry) void {
             .show_all => {
                 const label = if (companion.crew_show_all) "Hide older" else framePrint(state, "Show all · {d} older", .{lines.tidied_count});
                 const text_w = @max(rect.w - 20.0 * s, 0.0);
-                queueBoldText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 15.0 * s) * 0.5, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui_bold, 10.5 * s, text_w, label), color(chrome.accent), 10.5 * s, rect);
+                queueBoldText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 15.0 * s) * 0.5, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, label), color(chrome.accent), 12.0 * s, rect);
             },
         }
     }
@@ -1292,15 +1547,15 @@ fn renderCrewRow(state: *runtime.AppState, rect: palette.Rect, row: *const contr
     queueRoundedRect(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - dot) * 0.5, .w = dot, .h = dot }, color(accent), dot * 0.5);
     const status = row.attention.label();
     const chip_h = 18.0 * s;
-    const chip_w = text_measure.textWidth(.ui_bold, 10.0 * s, status) + 14.0 * s;
+    const chip_w = text_measure.textWidth(.ui_bold, 11.5 * s, status) + 14.0 * s;
     const chip: palette.Rect = .{ .x = rect.x + rect.w - chip_w - 6.0 * s, .y = rect.y + (rect.h - chip_h) * 0.5, .w = chip_w, .h = chip_h };
     queueRoundedRect(state, chip, color(opaqueOver(chrome.surface_deep, theme.withAlpha(accent, 40))), chip_h * 0.5);
-    queueCenteredText(state, chip, status, color(accent), 10.0 * s, .ui_bold, chip);
+    queueCenteredText(state, chip, status, color(accent), 11.5 * s, .ui_bold, chip);
 
     const text_x = rect.x + 26.0 * s;
     const available = @max(chip.x - 8.0 * s - text_x, 0.0);
     const title_font = 11.5 * s;
-    const provider_font = 10.0 * s;
+    const provider_font = 11.5 * s;
     const provider = row.provider.slice();
     const provider_w = if (provider.len > 0) text_measure.textWidth(.ui, provider_font, provider) else 0.0;
     const gap = 6.0 * s;
@@ -1326,7 +1581,7 @@ fn renderCrewDoneFold(state: *runtime.AppState, rect: palette.Rect, done_count: 
     const button = crewClearButton(rect);
     const text_x = rect.x + 26.0 * s;
     const text_w = @max(button.x - 8.0 * s - text_x, 0.0);
-    queueBoldText(state, .{ .x = text_x, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 11.0 * s, text_w, framePrint(state, "{d} done", .{done_count})), color(chrome.text_muted), 11.0 * s, rect);
+    queueBoldText(state, .{ .x = text_x, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, framePrint(state, "{d} done", .{done_count})), color(chrome.text_muted), 12.0 * s, rect);
     queuePanel(state, button, color(chrome.surface_deep), color(chrome.border), 7.0 * s, 1.0 * s);
     queueCenteredText(state, button, CREW_CLEAR_LABEL, color(chrome.text_muted), 10.5 * s, .ui_bold, button);
 }
@@ -1383,7 +1638,7 @@ fn renderErrorStrip(state: *runtime.AppState, geometry: Geometry) void {
     const rect = geometry.error_strip;
     queuePanel(state, rect, color(opaqueOver(surface(), chrome.failure_card)), color(opaqueOver(surface(), chrome.failure_border)), 8.0 * s, 1.0 * s);
     const text_w = @max(rect.w - 20.0 * s, 0.0);
-    queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, message)), color(chrome.failure_fg), 11.0 * s, rect);
+    queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, singleLineText(state, message)), color(chrome.failure_fg), 12.0 * s, rect);
 }
 
 // Welcome-back offer: one click asks the companion for a recap.
@@ -1413,7 +1668,7 @@ fn renderApproval(state: *runtime.AppState, geometry: Geometry) void {
     const text_w = @max(card.w - 24.0 * s, 0.0);
     const title = if (frame.approval_title.slice().len > 0) frame.approval_title.slice() else "Approval needed";
     queueBoldText(state, .{ .x = card.x + 12.0 * s, .y = card.y + 9.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, singleLineText(state, title)), color(chrome.approval_title), 12.0 * s, card);
-    queueText(state, .{ .x = card.x + 12.0 * s, .y = card.y + 28.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, frame.approval_body.slice())), color(chrome.approval_body), 11.0 * s, card);
+    queueText(state, .{ .x = card.x + 12.0 * s, .y = card.y + 28.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, META_FONT * s, text_w, singleLineText(state, frame.approval_body.slice())), color(chrome.approval_body), META_FONT * s, card);
     const buttons = approvalButtons(card);
     queuePanel(state, buttons[0], color(surface()), color(chrome.border), 8.0 * s, 1.0 * s);
     queueCenteredText(state, buttons[0], "Deny", color(chrome.text), 11.5 * s, .ui_bold, buttons[0]);
@@ -1439,7 +1694,7 @@ fn renderFooter(state: *runtime.AppState, geometry: Geometry) void {
     if (state.companion_controller.editingSettings()) {
         const s = companionScale();
         const label = if (state.companion_controller.orders_mode) "STANDING ORDERS · Enter to save, Esc to cancel" else "RENAME · Enter to save, Esc to cancel";
-        queueBoldText(state, .{ .x = composer.x + 4.0 * s, .y = footer.y - 18.0 * s, .w = composer.w, .h = 15.0 * s }, label, color(chrome.identity_fg), 10.0 * s, geometry.panel);
+        queueBoldText(state, .{ .x = composer.x + 4.0 * s, .y = footer.y - 18.0 * s, .w = composer.w, .h = 15.0 * s }, label, color(chrome.identity_fg), META_FONT * s, geometry.panel);
     }
 }
 
@@ -1642,8 +1897,8 @@ fn conversationItemHeight(state: *runtime.AppState, item: *const controller.Acti
             const label_h: f32 = if (voiceSpeaker(item) != null) VOICE_LABEL_H * s else 0.0;
             break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s + label_h;
         },
-        .tool, .process => 24.0 * s,
-        .system => if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) 0.0 else 22.0 * s,
+        .tool, .process => TRACE_ROW_HEIGHT * s,
+        .system => if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) 0.0 else NOTE_ROW_HEIGHT * s,
     };
 }
 
@@ -1699,7 +1954,7 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
     if (layout.live_note_icon) |icon| queueWaveform(state, icon, color(chrome.text_subtle), conversation);
     const text_color = switch (item.kind) {
         .user, .assistant, .streaming => chrome.text,
-        .tool, .process, .system => chrome.text_subtle,
+        .tool, .process, .system => chrome.text_muted,
     };
     if (item.kind == .tool or item.kind == .process) {
         const status = item.status orelse .completed;
@@ -1715,7 +1970,7 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
             .failed => chrome.danger,
             .cancelled => chrome.text_subtle,
         };
-        queueText(state, .{ .x = columnX(conversation) + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
+        queueText(state, .{ .x = columnX(conversation) + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = TRACE_LINE_HEIGHT * s }, glyph, color(glyph_color), TRACE_FONT * s, conversation);
     }
     for (layout.lines[0..layout.count], 0..) |line, index| {
         const last = index + 1 == layout.count;
@@ -1802,18 +2057,18 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
             else
                 item.author.slice();
             const text_w = @max(widths.text - 20.0 * s, 0.0);
-            layout.text = truncatedText(state, .mono, 10.5 * s, text_w, label);
-            layout.lines[0] = .{ .x = x + 18.0 * s, .y = y + 4.0 * s, .w = text_w, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .mono, .font = 10.5 * s };
+            layout.text = truncatedText(state, .mono, TRACE_FONT * s, text_w, label);
+            layout.lines[0] = .{ .x = x + 18.0 * s, .y = y + 4.0 * s, .w = text_w, .h = TRACE_LINE_HEIGHT * s, .text = layout.text, .offset = 0, .role = .mono, .font = TRACE_FONT * s };
             layout.count = 1;
         },
         .system => {
             if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) return layout;
             // Live notes lead with the waveform, like the phones' VoiceNote.
             const indent: f32 = if (isLiveNote(item)) 16.0 * s else 0.0;
-            if (indent > 0.0) layout.live_note_icon = .{ .x = x, .y = y + 3.0 * s + (16.0 * s - 11.0 * s) * 0.5, .w = 11.0 * s, .h = 11.0 * s };
+            if (indent > 0.0) layout.live_note_icon = .{ .x = x, .y = y + 3.0 * s + (TRACE_LINE_HEIGHT * s - 11.0 * s) * 0.5, .w = 11.0 * s, .h = 11.0 * s };
             const text_w = @max(widths.text - indent, 0.0);
-            layout.text = truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, item.body.slice()));
-            layout.lines[0] = .{ .x = x + indent, .y = y + 3.0 * s, .w = text_w, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .ui, .font = 11.0 * s };
+            layout.text = truncatedText(state, .ui, NOTE_FONT * s, text_w, singleLineText(state, item.body.slice()));
+            layout.lines[0] = .{ .x = x + indent, .y = y + 3.0 * s, .w = text_w, .h = TRACE_LINE_HEIGHT * s, .text = layout.text, .offset = 0, .role = .ui, .font = NOTE_FONT * s };
             layout.count = 1;
         },
     }
@@ -2036,18 +2291,18 @@ const EmptyStateLayout = struct {
 fn emptyStateLayout(conversation: palette.Rect) EmptyStateLayout {
     const s = companionScale();
     const content_w = @max(conversation.w - CONTENT_INSET * 2.0 * s, 0.0);
-    const block_h = 74.0 * s + 22.0 * s + 18.0 * s + 40.0 * s + 3.0 * (SUGGESTION_HEIGHT + 8.0) * s;
+    const block_h = 74.0 * s + 26.0 * s + 22.0 * s + 66.0 * s + 3.0 * (EMPTY_ROW_HEIGHT + EMPTY_ROW_GAP) * s;
     const top = conversation.y + @max((conversation.h - block_h) * 0.4, 12.0 * s);
     const avatar_w = 70.0 * s;
     const avatar: palette.Rect = .{ .x = conversation.x + (conversation.w - avatar_w) * 0.5, .y = top, .w = avatar_w, .h = 72.0 * s };
     const title_y = avatar.y + avatar.h + 10.0 * s;
-    const tagline_y = title_y + 24.0 * s;
-    const pitch_y = tagline_y + 20.0 * s;
+    const tagline_y = title_y + 26.0 * s;
+    const pitch_y = tagline_y + 22.0 * s;
     var suggestions: [3]palette.Rect = undefined;
-    var y = pitch_y + 44.0 * s;
+    var y = pitch_y + 66.0 * s;
     for (&suggestions) |*rect| {
-        rect.* = .{ .x = conversation.x + CONTENT_INSET * s, .y = y, .w = content_w, .h = SUGGESTION_HEIGHT * s };
-        y += (SUGGESTION_HEIGHT + 8.0) * s;
+        rect.* = .{ .x = conversation.x + CONTENT_INSET * s, .y = y, .w = content_w, .h = EMPTY_ROW_HEIGHT * s };
+        y += (EMPTY_ROW_HEIGHT + EMPTY_ROW_GAP) * s;
     }
     return .{ .avatar = avatar, .title_y = title_y, .tagline_y = tagline_y, .pitch_y = pitch_y, .suggestions = suggestions };
 }
@@ -2067,18 +2322,29 @@ fn renderEmptyState(state: *runtime.AppState, geometry: Geometry) void {
     const name = state.companion_controller.identity.name.slice();
     const title = framePrint(state, "Hi, I'm {s}.", .{name});
     queueCenteredText(state, .{ .x = conversation.x, .y = layout.title_y, .w = conversation.w, .h = 22.0 * s }, title, color(chrome.text), 16.0 * s, .ui_bold, conversation);
-    queueCenteredText(state, .{ .x = conversation.x, .y = layout.tagline_y, .w = conversation.w, .h = 17.0 * s }, companion_roster.characterTagline(character), color(chrome.identity_fg), 11.0 * s, .ui, conversation);
+    // Secondary tier in the app's muted text, not accent or the faint
+    // subtle tier: tagline and pitch read like the rest of Verde's meta.
+    queueCenteredText(state, .{ .x = conversation.x, .y = layout.tagline_y, .w = conversation.w, .h = 18.0 * s }, companion_roster.characterTagline(character), color(chrome.text_muted), EMPTY_META_FONT * s, .ui, conversation);
     const pitch_w = @max(conversation.w - CONTENT_INSET * 4.0 * s, 0.0);
-    const pitch = wrapText("I run Verde for you: I delegate work to chats in any workspace, watch them, and tell you when something needs you.", pitch_w, .ui, 11.5 * s, 3);
+    const pitch = wrapText("I run Verde for you: I delegate work to chats in any workspace, watch them, and tell you when something needs you.", pitch_w, .ui, EMPTY_META_FONT * s, 3);
     for (pitch.lines[0..pitch.count], 0..) |line, index| {
-        queueCenteredText(state, .{ .x = conversation.x, .y = layout.pitch_y + @as(f32, @floatFromInt(index)) * 16.0 * s, .w = conversation.w, .h = 16.0 * s }, line, color(chrome.text_subtle), 11.5 * s, .ui, conversation);
+        queueCenteredText(state, .{ .x = conversation.x, .y = layout.pitch_y + @as(f32, @floatFromInt(index)) * 19.0 * s, .w = conversation.w, .h = 19.0 * s }, line, color(chrome.text_muted), EMPTY_META_FONT * s, .ui, conversation);
     }
+    // Suggestions are plain list rows like the app's menus and sidebar: no
+    // card at rest, a neutral hover tint, primary text and a trailing chevron.
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
     for (layout.suggestions, 0..) |rect, index| {
         if (!rectInside(rect, conversation)) continue;
-        queuePanel(state, rect, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
-        const text_w = @max(rect.w - 36.0 * s, 0.0);
-        queueText(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, runtime.AppState.COMPANION_SUGGESTIONS[index]), color(chrome.text), 11.5 * s, rect);
-        queueText(state, .{ .x = rect.x + rect.w - 22.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "↗", color(chrome.accent), 11.5 * s, rect);
+        const hovered = state.companion_controller.menu == .none and pointInRect(rect, mouse_x, mouse_y);
+        if (hovered) queueRoundedRectClipped(state, rect, color(opaqueOver(surface(), chrome.menu_hover)), 8.0 * s, conversation);
+        // Same inner padding on both sides: the chevron's right edge sits as
+        // far inside the row as the label's left edge.
+        const chevron = 14.0 * s;
+        const pad = EMPTY_ROW_PAD * s;
+        const text_w = @max(rect.w - pad * 2.0 - chevron - 8.0 * s, 0.0);
+        queueText(state, .{ .x = rect.x + pad, .y = rect.y + (rect.h - 18.0 * s) * 0.5, .w = text_w, .h = 18.0 * s }, truncatedText(state, .ui, EMPTY_ROW_FONT * s, text_w, runtime.AppState.COMPANION_SUGGESTIONS[index]), color(chrome.text), EMPTY_ROW_FONT * s, rect);
+        queueIcon(state, .{ .x = rect.x + rect.w - pad - chevron, .y = rect.y + (rect.h - chevron) * 0.5, .w = chevron, .h = chevron }, NF_COD_CHEVRON_RIGHT, color(if (hovered) chrome.text_muted else chrome.text_subtle), rect);
     }
 }
 
@@ -2347,11 +2613,11 @@ fn renderSchedules(state: *runtime.AppState, geometry: Geometry) void {
 
     const title = if (companion.schedule_total > 0) framePrint(state, "SCHEDULED TASKS · {d}", .{companion.schedule_total}) else "SCHEDULED TASKS";
     const title_w = @max(layout.back.x - layout.title.x - 8.0 * s, 0.0);
-    queueBoldText(state, .{ .x = layout.title.x + 2.0 * s, .y = layout.title.y + 2.0 * s, .w = title_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 10.0 * s, title_w, title), color(chrome.text_subtle), 10.0 * s, body);
+    queueBoldText(state, .{ .x = layout.title.x + 2.0 * s, .y = layout.title.y + 2.0 * s, .w = title_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, title_w, title), color(chrome.text_muted), 12.0 * s, body);
     if (layout.back.w > 0.0) queueCenteredText(state, layout.back, "Back to chat", color(chrome.accent), 11.0 * s, .ui_bold, layout.back);
     const failure = companion.schedules_error.slice();
     if (layout.error_line.h > 0.0) {
-        queueText(state, layout.error_line, truncatedText(state, .ui, 11.0 * s, layout.error_line.w, singleLineText(state, failure)), color(chrome.danger), 11.0 * s, layout.error_line);
+        queueText(state, layout.error_line, truncatedText(state, .ui, 12.0 * s, layout.error_line.w, singleLineText(state, failure)), color(chrome.danger), 12.0 * s, layout.error_line);
     }
     const list = layout.list;
     if (list.h <= 0.0) return;
@@ -2440,7 +2706,7 @@ fn renderScheduleRow(state: *runtime.AppState, layout: *const SchedulesLayout, i
     const name = singleLineText(state, row.name.slice());
     queueBoldText(state, .{ .x = rl.text_x, .y = rl.head.y + 7.0 * s, .w = rl.text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.5 * s, rl.text_w, name), color(if (row.enabled) chrome.text else chrome.text_muted), 12.5 * s, clip);
     const when = framePrint(state, "{s} · {s}", .{ row.repeat_text.slice(), controller.formatScheduleNext(&buffer, row.enabled, row.next_run_ms, now_ms) });
-    queueText(state, .{ .x = rl.text_x, .y = rl.head.y + 25.0 * s, .w = rl.text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, rl.text_w, when), color(chrome.text_muted), 11.0 * s, clip);
+    queueText(state, .{ .x = rl.text_x, .y = rl.head.y + 25.0 * s, .w = rl.text_w, .h = 15.0 * s }, truncatedText(state, .ui, META_FONT * s, rl.text_w, when), color(chrome.text_muted), META_FONT * s, clip);
     const last = framePrint(state, "{s}", .{controller.formatScheduleLast(&buffer, row.last_status, row.last_run_ms, now_ms)});
     queueText(state, .{ .x = rl.text_x, .y = rl.head.y + 41.0 * s, .w = rl.text_w, .h = 14.0 * s }, truncatedText(state, .ui, 10.5 * s, rl.text_w, last), color(scheduleStatusColor(chrome, row.last_status)), 10.5 * s, clip);
 
@@ -2477,7 +2743,7 @@ fn renderScheduleDetail(state: *runtime.AppState, detail: palette.Rect, clip: pa
     const blocks = expandedScheduleBlocks(state);
     const layout = scheduleDetailLayout(&blocks, detail.x, detail.y, detail.w);
     for (0..layout.count) |index| {
-        queueBoldText(state, layout.captions[index], blocks.captions[index], color(chrome.text_subtle), 10.0 * s, clip);
+        queueBoldText(state, layout.captions[index], blocks.captions[index], color(chrome.text_muted), 12.0 * s, clip);
         const block = &layout.blocks[index];
         renderTextSelection(state, index, block, clip);
         const fill = color(if (blocks.danger[index]) chrome.danger else chrome.text);
@@ -2701,7 +2967,7 @@ fn renderCompanionMenu(state: *runtime.AppState, geometry: Geometry) void {
         const text_w = @max(rect.w - 20.0 * s, 0.0);
         queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, "Standing orders…", color(chrome.text), 12.0 * s, rect);
         const orders = companion.identity.orders.slice();
-        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, if (orders.len > 0) orders else "None yet. Rules it follows on every turn."), color(chrome.text_subtle), 10.5 * s, rect);
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, if (orders.len > 0) orders else "None yet. Rules it follows on every turn."), color(chrome.text_muted), 11.5 * s, rect);
     }
     for (layout.characters, 0..) |rect, index| {
         const character = characterAt(index).?;
@@ -2722,7 +2988,7 @@ fn renderCompanionMenu(state: *runtime.AppState, geometry: Geometry) void {
         queueCenteredText(state, close, "×", color(chrome.text_subtle), 14.0 * s, .ui_bold, rect);
         const text_w = @max(rect.w - 20.0 * s - close.w, 0.0);
         queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, row.title.slice()), color(chrome.text_muted), 12.0 * s, rect);
-        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, row.detail.slice()), color(chrome.text_subtle), 10.5 * s, rect);
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, row.detail.slice()), color(chrome.text_muted), 11.5 * s, rect);
     }
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
@@ -3008,10 +3274,10 @@ fn renderLiveButton(state: *runtime.AppState, rect: palette.Rect) void {
     if (on) {
         queuePanel(state, rect, color(chrome.accent), color(chrome.accent), 7.0 * s, 1.0 * s);
     } else {
-        queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+        queuePanel(state, rect, color(headerButtonFill(headerButtonHovered(state, rect))), color(hairline()), 7.0 * s, 1.0 * s);
     }
     const icon = 15.0 * s;
-    queueWaveform(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, color(if (on) chrome.accent_fg else chrome.text_muted), rect);
+    queueWaveform(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, color(if (on) chrome.accent_fg else headerGlyphColor(headerButtonHovered(state, rect))), rect);
 }
 
 /// The mobile Live glyph (`ic_waveform`): five rounded bars on a 24-unit
@@ -4158,6 +4424,11 @@ fn testState(allocator: std.mem.Allocator, state: *runtime.AppState) !void {
     state.folder_browser = .{};
     state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
+    // render() steps the panel back to its dock while Settings is open.
+    state.settings_controller.modal_visible = false;
+    // No chat composer painted: the floating panel keeps its full height.
+    state.composer_controller.toolbar_overlay_valid = false;
+    state.composer_controller.input_bounds_valid = false;
     state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
@@ -4582,7 +4853,7 @@ test "header plus starts a new conversation and every header control has a toolt
     const cases = .{
         .{ geometry.new_button, "New conversation with Juniper" },
         .{ geometry.close_button, "Minimize" },
-        .{ geometry.brain_button, "Brain: provider, model, reasoning" },
+        .{ geometry.brain_button, "provider, model, reasoning" },
         .{ geometry.name_button, "Companions, past conversations, rename, orders" },
     };
     inline for (cases) |case| {
@@ -4897,6 +5168,39 @@ test "expand covers the workspace beside the sidebar with a capped reading colum
     registerHits(&state, geometry);
     try std.testing.expectEqual(controller.HitAction.toggle_expand, state.companion_controller.hitAt(geometry.expand_button.x + 4.0, geometry.expand_button.y + 4.0).?);
 
+    // A chat composer under the floating panel: the panel stops above it so
+    // its send button and footer chips stay uncovered.
+    state.composer_controller.toolbar_overlay_valid = true;
+    state.composer_controller.input_bounds_valid = true;
+    state.composer_controller.input_min = .{ 1200.0, 640.0 };
+    state.composer_controller.input_max = .{ 2200.0, 840.0 };
+    state.composer_controller.toolbar_directory_rect = .{};
+    state.composer_controller.toolbar_runtime_rect = .{};
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectApproxEqAbs(640.0 - COMPOSER_GUTTER * companionScale(), geometry.panel.y + geometry.panel.h, 0.01);
+    try std.testing.expect(geometry.footer.y + geometry.footer.h <= 640.0);
+    // It also starts below the pane header row, leaving its actions clear.
+    pane_header_bottom = 60.0;
+    defer pane_header_bottom = 0.0;
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectApproxEqAbs(60.0 + PANEL_HEADER_GAP * companionScale(), geometry.panel.y, 0.01);
+    try std.testing.expectApproxEqAbs(640.0 - COMPOSER_GUTTER * companionScale(), geometry.panel.y + geometry.panel.h, 0.01);
+
+    // Given the pane area, the open panel docks as a flush column at its
+    // right edge and the panes give up exactly its width.
+    state.app_config.companion_enabled = true;
+    pane_area = .{ .x = 300.0, .y = 40.0, .w = 1800.0, .h = 860.0 };
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expect(geometry.docked);
+    try std.testing.expectApproxEqAbs(paneReserve(&state, pane_area), geometry.panel.w, 0.01);
+    try std.testing.expectApproxEqAbs(pane_area.x + pane_area.w, geometry.panel.x + geometry.panel.w, 0.01);
+    try std.testing.expectApproxEqAbs(pane_area.y, geometry.panel.y, 0.01);
+    try std.testing.expectApproxEqAbs(pane_area.h, geometry.panel.h, 0.01);
+    // Too narrow for panes beside it: back to the floating panel.
+    const narrow: palette.Rect = .{ .x = 300.0, .y = 40.0, .w = 600.0, .h = 860.0 };
+    try std.testing.expectEqual(@as(f32, 0.0), paneReserve(&state, narrow));
+    pane_area = .{};
+
     state.companion_controller.workspace_left = 300.0;
     state.companion_controller.expanded = true;
     geometry = computeGeometry(&state, window.w, window.h);
@@ -5121,7 +5425,7 @@ test "expanded panel moves the crew to a side column inside the window across si
                 try std.testing.expect(rectInside(geometry.crew, geometry.crew_column));
                 try std.testing.expect(rectFitsWindow(geometry.crew_column, window.w + 0.5, window.h + 0.5));
                 // The conversation keeps its full height beside the column...
-                try std.testing.expectApproxEqAbs(geometry.header.y + geometry.header.h + 4.0 * s, geometry.conversation.y, 0.01);
+                try std.testing.expectApproxEqAbs(geometry.header.y + geometry.header.h + BODY_TOP_GAP * s, geometry.conversation.y, 0.01);
                 try std.testing.expect(geometry.conversation.x + geometry.conversation.w <= geometry.crew_column.x + 0.5);
                 try std.testing.expect(composer.x + composer.w <= geometry.crew_column.x + 0.5);
                 // ...and its reading column stays centered in what is left.
