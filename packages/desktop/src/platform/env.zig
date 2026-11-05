@@ -17,7 +17,7 @@ const SYSTEM_PATH_DIRS = [_][]const u8{
     "/sbin",
 };
 /// Includes the default bin directories of the provider CLIs' official
-/// installers (Claude, Codex, Cursor, FX, and Muse use `.local/bin`), which a
+/// installers (Claude, Codex, Cursor, FX, Muse, and Antigravity use `.local/bin`), which a
 /// GUI launched before the install never sees on its inherited PATH.
 const HOME_PATH_SUFFIXES = [_][]const u8{
     ".local/bin",
@@ -332,6 +332,8 @@ fn appendWindowsUserPathDirsForOs(
         // Official Codex and Cursor Agent installer locations.
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "Programs", "OpenAI", "Codex", "bin" });
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "cursor-agent" });
+        // Official Antigravity CLI (agy) installer location.
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "agy", "bin" });
     }
     if (env_map.get("USERPROFILE")) |user_profile| {
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".bun", "bin" });

@@ -32,7 +32,7 @@ pub fn command(provider: Provider) ?[]const u8 {
         .codex => "codex login status",
         .claude => "claude auth status",
         .cursor => "cursor-agent status",
-        .opencode, .pi, .fx, .grok, .muse, .custom_acp => null,
+        .opencode, .pi, .fx, .antigravity, .grok, .muse, .custom_acp => null,
     };
 }
 
@@ -53,7 +53,7 @@ pub fn parse(provider: Provider, output: []const u8, exit_code: ?u32) Result {
             break :blk .unknown;
         },
         .claude => claudeLoggedIn(output),
-        .opencode, .pi, .fx, .grok, .muse, .custom_acp => .unknown,
+        .opencode, .pi, .fx, .antigravity, .grok, .muse, .custom_acp => .unknown,
     };
 }
 

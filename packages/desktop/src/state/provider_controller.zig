@@ -30,11 +30,13 @@ const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
 const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+const DEFAULT_ANTIGRAVITY_MODEL = provider_models.DEFAULT_ANTIGRAVITY_MODEL;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
 const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
+const ANTIGRAVITY_MODEL_OPTIONS = provider_models.ANTIGRAVITY_MODEL_OPTIONS;
 const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
 const CLAUDE_MODEL_OPTIONS = provider_models.CLAUDE_MODEL_OPTIONS;
@@ -81,10 +83,18 @@ pub const PiModelCacheState = struct {
 };
 
 pub const FxModelCacheStatus = OpencodeModelCacheStatus;
+pub const AntigravityModelCacheStatus = OpencodeModelCacheStatus;
 
 pub const FxModelCacheState = struct {
     mutex: Mutex = .{},
     status: FxModelCacheStatus = .idle,
+    models: ?[]const provider_types.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+pub const AntigravityModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: AntigravityModelCacheStatus = .idle,
     models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
@@ -174,6 +184,7 @@ pub const ProviderReadinessSnapshot = struct {
     pi: ProviderReadiness = .checking,
     fx: ProviderReadiness = .checking,
     grok: ProviderReadiness = .checking,
+    antigravity: ProviderReadiness = .checking,
     muse: ProviderReadiness = .checking,
     /// Ready when at least one `chat.custom_acp_agents` command resolves.
     custom_acp: ProviderReadiness = .checking,
@@ -203,6 +214,7 @@ pub const ProviderReadinessSnapshot = struct {
             .pi => self.pi,
             .fx => self.fx,
             .grok => self.grok,
+            .antigravity => self.antigravity,
             .muse => self.muse,
             .custom_acp => self.custom_acp,
         };
@@ -217,6 +229,7 @@ pub const ProviderReadinessSnapshot = struct {
             .pi => self.pi = readiness,
             .fx => self.fx = readiness,
             .grok => self.grok = readiness,
+            .antigravity => self.antigravity = readiness,
             .muse => self.muse = readiness,
             .custom_acp => self.custom_acp = readiness,
         }
@@ -269,7 +282,7 @@ pub const ProviderReadinessSnapshot = struct {
     }
 
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
-        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.muse == .ready or self.custom_acp == .ready;
+        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.antigravity == .ready or self.muse == .ready or self.custom_acp == .ready;
     }
 
     /// True when a provider Verde's MCP server can register with has its
@@ -284,7 +297,7 @@ pub const ProviderReadinessSnapshot = struct {
 };
 
 /// Providers `provider.mcp.set` can register Verde with (see `McpSummary`).
-const MCP_CAPABLE_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
+const MCP_CAPABLE_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity };
 
 fn mcpIntegrationProvider(provider: Provider) ?headless.providers_protocol.IntegrationProvider {
     return std.meta.stringToEnum(headless.providers_protocol.IntegrationProvider, @tagName(provider));
@@ -420,6 +433,7 @@ pub const State = struct {
     cursor_model_cache: CursorModelCacheState = .{},
     pi_model_cache: PiModelCacheState = .{},
     fx_model_cache: FxModelCacheState = .{},
+    antigravity_model_cache: AntigravityModelCacheState = .{},
     grok_model_cache: GrokModelCacheState = .{},
     muse_model_cache: MuseModelCacheState = .{},
     /// Picker rows for `chat.custom_acp_agents`, one per agent; rebuilt when
@@ -453,6 +467,7 @@ fn providerProtocolTag(provider: Provider) provider_types.Provider {
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
+        .antigravity => .antigravity,
     };
 }
 
@@ -612,6 +627,10 @@ pub fn fxModelCacheWorker(state: *FxModelCacheState, request: ModelCacheWorkerRe
     runModelCacheWorker(state, .fx, request);
 }
 
+pub fn antigravityModelCacheWorker(state: *AntigravityModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .antigravity, request);
+}
+
 /// Requests grok's dynamic model catalog through the session daemon.
 pub fn grokModelCacheWorker(state: *GrokModelCacheState, request: ModelCacheWorkerRequest) void {
     runModelCacheWorker(state, .grok, request);
@@ -713,6 +732,7 @@ fn publishProviderReadiness(state: *ProviderReadinessState, provider: Provider, 
         .pi => state.snapshot.pi = fetched.readiness,
         .fx => state.snapshot.fx = fetched.readiness,
         .grok => state.snapshot.grok = fetched.readiness,
+        .antigravity => state.snapshot.antigravity = fetched.readiness,
         .muse => state.snapshot.muse = fetched.readiness,
         .custom_acp => state.snapshot.custom_acp = fetched.readiness,
     }
@@ -816,7 +836,7 @@ fn runProviderReadinessJob(job: ReadinessJob) void {
 
 pub fn providerReadinessWorker(state: *ProviderReadinessState, request: ProviderReadinessWorkerRequest) void {
     defer request.deinit();
-    const providers = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse, .custom_acp };
+    const providers = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse, .custom_acp, .antigravity };
     var threads: [providers.len]?std.Thread = @splat(null);
     for (providers, 0..) |provider, index| {
         const job: ReadinessJob = .{
@@ -875,6 +895,13 @@ pub fn fxModelOptionsSnapshot(self: anytype) []const ModelOption {
         self.fx_model_options.items
     else
         FX_MODEL_OPTIONS[0..];
+}
+
+pub fn antigravityModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return if (self.antigravity_model_options.items.len > 0)
+        self.antigravity_model_options.items
+    else
+        ANTIGRAVITY_MODEL_OPTIONS[0..];
 }
 
 pub fn grokModelOptionsSnapshot(self: anytype) []const ModelOption {
@@ -962,6 +989,7 @@ pub fn cachedDefaultModelRefForProvider(self: anytype, provider: Provider) [:0]c
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
+        .antigravity => DEFAULT_ANTIGRAVITY_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
         .custom_acp => if (self.provider_controller.custom_acp_model_options.items.len > 0)
             self.provider_controller.custom_acp_model_options.items[0].value orelse "default"
@@ -994,6 +1022,10 @@ pub fn startPiModelOptionsRefresh(self: anytype) void {
 
 pub fn startFxModelOptionsRefresh(self: anytype) void {
     self.refreshFxModelOptionsCacheAsync();
+}
+
+pub fn startAntigravityModelOptionsRefresh(self: anytype) void {
+    self.refreshAntigravityModelOptionsCacheAsync();
 }
 
 pub fn startGrokModelOptionsRefresh(self: anytype) void {
@@ -1567,6 +1599,25 @@ pub fn refreshFxModelOptionsCacheAsync(self: anytype) void {
     };
 }
 
+pub fn refreshAntigravityModelOptionsCacheAsync(self: anytype) void {
+    self.pollAntigravityModelOptionsCache();
+
+    self.provider_controller.antigravity_model_cache.mutex.lock();
+    defer self.provider_controller.antigravity_model_cache.mutex.unlock();
+    if (self.provider_controller.antigravity_model_cache.status == .pending) return;
+
+    self.provider_controller.antigravity_model_cache.status = .pending;
+    self.provider_controller.antigravity_model_cache.worker = spawnModelCacheWorker(
+        self,
+        antigravityModelCacheWorker,
+        &self.provider_controller.antigravity_model_cache,
+        .antigravity,
+    ) orelse {
+        self.provider_controller.antigravity_model_cache.status = .idle;
+        return;
+    };
+}
+
 pub fn refreshGrokModelOptionsCacheAsync(self: anytype) void {
     self.pollGrokModelOptionsCache();
 
@@ -1799,10 +1850,44 @@ pub fn populateFxModelOptions(self: anytype, models: []const provider_types.Mode
         errdefer self.allocator.free(label);
         const value = try self.allocator.dupeZ(u8, model.model_id);
         errdefer self.allocator.free(value);
+        // The daemon probes each model's fx `effort` tiers into the shared
+        // effort-catalog field and its Fast lane into the shared fast flag.
+        const effort_values = try duplicateReasoningVariantKeys(self.allocator, model.grok_effort_values);
+        errdefer if (effort_values) |values| {
+            for (values) |effort_value| self.allocator.free(effort_value);
+            self.allocator.free(values);
+        };
         try self.fx_model_options.append(self.allocator, .{
             .label = label,
             .value = value,
-            .reasoning_supported = false,
+            .reasoning_supported = model.reasoning_supported,
+            .cursor_fast_supported = model.cursor_fast_supported,
+            .grok_effort_values = effort_values,
+        });
+    }
+}
+
+pub fn populateAntigravityModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
+    try appendDefaultModelOption(self, &self.antigravity_model_options, ANTIGRAVITY_MODEL_OPTIONS[0]);
+    for (models) |model| {
+        if (model.model_id.len == 0) continue;
+        const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+        const label = try self.allocator.dupeZ(u8, label_text);
+        errdefer self.allocator.free(label);
+        const value = try self.allocator.dupeZ(u8, model.model_id);
+        errdefer self.allocator.free(value);
+        // The daemon groups agy's folded ids per base model and lists each
+        // model's thinking tiers in the shared effort-catalog field.
+        const effort_values = try duplicateReasoningVariantKeys(self.allocator, model.grok_effort_values);
+        errdefer if (effort_values) |values| {
+            for (values) |effort_value| self.allocator.free(effort_value);
+            self.allocator.free(values);
+        };
+        try self.antigravity_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .reasoning_supported = model.reasoning_supported,
+            .grok_effort_values = effort_values,
         });
     }
 }
@@ -1873,6 +1958,7 @@ fn appendDefaultModelOption(self: anytype, list: *std.ArrayList(ModelOption), te
         .value = value,
         .description = description,
         .reasoning_supported = template.reasoning_supported,
+        .cursor_fast_supported = template.cursor_fast_supported,
     });
 }
 
@@ -1939,6 +2025,8 @@ pub fn refreshOpencodeReasoningMenu(self: anytype, thread: *const ChatThread) !v
     if (thread.provider == .claude) return self.refreshClaudeReasoningMenu(thread);
     if (thread.provider == .pi) return self.refreshPiReasoningMenu();
     if (thread.provider == .grok) return self.refreshGrokReasoningMenu(thread);
+    if (thread.provider == .antigravity) return self.refreshAntigravityReasoningMenu(thread);
+    if (thread.provider == .fx) return self.refreshFxReasoningMenu(thread);
     if (thread.provider == .muse) return self.refreshMuseReasoningMenu();
     if (thread.provider != .opencode) return;
     const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
@@ -2001,6 +2089,37 @@ pub fn refreshGrokReasoningMenu(self: anytype, thread: *const ChatThread) !void 
     }
 }
 
+/// agy's thinking tiers for the selected base model, with effort tag names as
+/// row variants (parsed back by the shared handler).
+pub fn refreshAntigravityReasoningMenu(self: anytype, thread: *const ChatThread) !void {
+    const values: ?[]const [:0]const u8 = if (self.antigravityModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
+    for (provider_models.ANTIGRAVITY_REASONING_OPTIONS) |option| {
+        if (option.value) |effort| {
+            if (!provider_models.antigravityEffortSupported(values, effort)) continue;
+        }
+        const label = try self.allocator.dupeZ(u8, option.label);
+        errdefer self.allocator.free(label);
+        const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant });
+    }
+}
+
+/// fx tiers for the selected model (all tiers until the catalog is probed),
+/// with effort tag names as row variants (parsed back by the shared handler).
+pub fn refreshFxReasoningMenu(self: anytype, thread: *const ChatThread) !void {
+    const option = self.fxModelOptionForRef(thread.model_ref);
+    if (provider_models.fxReasoningGauge(option, null) == null) return;
+    for (provider_models.FX_REASONING_OPTIONS) |entry| {
+        if (entry.value) |effort| {
+            if (!provider_models.fxEffortSupported(option, effort)) continue;
+        }
+        const label = try self.allocator.dupeZ(u8, entry.label);
+        errdefer self.allocator.free(label);
+        const variant: ?[:0]u8 = if (entry.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant });
+    }
+}
+
 pub fn refreshMuseReasoningMenu(self: anytype) !void {
     for (provider_models.MUSE_REASONING_OPTIONS) |option| {
         const label = try self.allocator.dupeZ(u8, option.label);
@@ -2050,6 +2169,19 @@ pub fn grokModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOpti
     return findModelOptionByValue(self.grokModelOptionsSnapshot(), ref);
 }
 
+/// fx picker row for a thread's model ref; a missing ref is fx's Default row.
+pub fn fxModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
+    const ref: []const u8 = model_ref orelse DEFAULT_FX_MODEL;
+    return findModelOptionByValue(self.fxModelOptionsSnapshot(), ref);
+}
+
+/// agy picker row for a thread's model ref; unknown refs map to no row, which
+/// keeps agy's usual low/medium/high tiers.
+pub fn antigravityModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
+    const ref: []const u8 = model_ref orelse return null;
+    return findModelOptionByValue(self.antigravityModelOptionsSnapshot(), ref);
+}
+
 pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
     const ref: []const u8 = model_ref orelse DEFAULT_CLAUDE_MODEL;
     const options = self.claudeModelOptionsSnapshot();
@@ -2074,6 +2206,7 @@ pub fn knownModelLabel(provider: Provider, live: []const ModelOption, ref: []con
         .grok => GROK_MODEL_OPTIONS[0..],
         .muse => MUSE_MODEL_OPTIONS[0..],
         .custom_acp => &.{},
+        .antigravity => ANTIGRAVITY_MODEL_OPTIONS[0..],
     };
     if (findModelOptionByValue(live, ref)) |option| return option.label;
     if (findModelOptionByValue(builtin_options, ref)) |option| return option.label;
@@ -2261,12 +2394,33 @@ pub fn clearDynamicFxModelOptions(self: anytype) void {
         self.allocator.free(option.label);
         if (option.value) |value| self.allocator.free(value);
         if (option.description) |description| self.allocator.free(description);
+        if (option.grok_effort_values) |values| {
+            for (values) |value| self.allocator.free(value);
+            self.allocator.free(values);
+        }
     }
     self.fx_model_options.clearRetainingCapacity();
 }
 
+pub fn clearDynamicAntigravityModelOptions(self: anytype) void {
+    for (self.antigravity_model_options.items) |option| {
+        self.allocator.free(option.label);
+        if (option.value) |value| self.allocator.free(value);
+        if (option.description) |description| self.allocator.free(description);
+        if (option.grok_effort_values) |values| {
+            for (values) |value| self.allocator.free(value);
+            self.allocator.free(values);
+        }
+    }
+    self.antigravity_model_options.clearRetainingCapacity();
+}
+
 pub fn clearFxModelOptions(self: anytype) void {
     self.clearDynamicFxModelOptions();
+}
+
+pub fn clearAntigravityModelOptions(self: anytype) void {
+    self.clearDynamicAntigravityModelOptions();
 }
 
 pub fn clearDynamicGrokModelOptions(self: anytype) void {
@@ -2523,6 +2677,31 @@ pub fn pollFxModelOptionsCache(self: anytype) void {
     }
 }
 
+pub fn pollAntigravityModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.antigravity_model_cache);
+    if (poll.status != .idle) {
+        self.finishAntigravityModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
+            self.clearAntigravityModelOptions();
+            if (models.len == 0) return;
+            self.populateAntigravityModelOptions(models) catch |err| {
+                log.warn("failed to cache antigravity models: {s}", .{@errorName(err)});
+                self.clearDynamicAntigravityModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh antigravity model cache", .{});
+        },
+        else => {},
+    }
+}
+
 pub fn pollGrokModelOptionsCache(self: anytype) void {
     const poll = takeModelCachePoll(&self.provider_controller.grok_model_cache);
     if (poll.status != .idle) {
@@ -2601,7 +2780,7 @@ pub fn pollClaudeModelOptionsCache(self: anytype) void {
 test "MCP dialog waits for an installed MCP-capable provider" {
     var snapshot: ProviderReadinessSnapshot = .{};
     try std.testing.expect(!snapshot.hasMcpCapableProviderInstalled());
-    inline for (.{ "codex", "opencode", "claude", "cursor", "pi", "fx", "grok", "muse", "custom_acp" }) |name| @field(snapshot, name) = .missing;
+    inline for (.{ "codex", "opencode", "claude", "cursor", "pi", "fx", "grok", "muse", "custom_acp", "antigravity" }) |name| @field(snapshot, name) = .missing;
     try std.testing.expect(!snapshot.hasMcpCapableProviderInstalled());
     // Muse has no MCP registration, so installing it alone is not enough.
     snapshot.muse = .ready;

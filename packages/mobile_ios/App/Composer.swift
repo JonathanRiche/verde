@@ -462,7 +462,7 @@ struct ChatComposer: View {
     }
     private func choices(_ picker: ComposerPicker) -> [ChatChoice] {
         switch picker {
-        case .provider: return ["codex", "claude", "cursor", "opencode", "pi", "fx", "grok", "muse"].map { ChatChoice(id: $0, label: $0.capitalized) }
+        case .provider: return ["codex", "claude", "cursor", "opencode", "pi", "fx", "grok", "antigravity", "muse"].map { ChatChoice(id: $0, label: $0.capitalized) }
         case .model: return model.view?.catalogs.models ?? []
         case .effort: return model.view?.catalogs.efforts ?? []
         case .access: return model.view?.catalogs.access ?? []

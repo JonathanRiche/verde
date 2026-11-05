@@ -105,6 +105,7 @@ const CURSOR_LOGO_BYTES = @embedFile("../assets/editor_logos/cursor.png");
 const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
 const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
 const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
+const ANTIGRAVITY_LOGO_BYTES = @embedFile("../assets/antigravity-logo.png");
 
 const ActiveSendRef = struct {
     project_index: usize,
@@ -162,6 +163,7 @@ fn harnessProviderForDbProvider(provider: Provider) provider_types.Provider {
         .cursor => .cursor,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -2191,10 +2193,10 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
     if (self.project_controller.projects.items.len == 0) return;
     const thread = self.currentThreadMutable();
     const kind: FollowupKind = switch (thread.provider) {
-        .codex, .claude, .pi => .steer,
+        .codex, .claude, .pi, .fx => .steer,
         .opencode => .queue,
         .cursor => .queue,
-        .fx => .queue,
+        .antigravity => .queue,
         .grok => .queue,
         .muse => .queue,
         .custom_acp => .queue,
@@ -2215,8 +2217,8 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
     if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0) return false;
 
     const kind: FollowupKind = switch (thread.provider) {
-        .codex, .claude, .pi => .steer,
-        .opencode, .cursor, .fx, .grok, .muse, .custom_acp => .queue,
+        .codex, .claude, .pi, .fx => .steer,
+        .opencode, .cursor, .antigravity, .grok, .muse, .custom_acp => .queue,
     };
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -2436,7 +2438,8 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
         .claude => "Enter to queue \u{00B7} Tab to steer",
         .cursor => "Tab to queue",
         .pi => "Enter to queue \u{00B7} Tab to steer",
-        .fx => "Tab to queue",
+        .fx => "Enter to queue \u{00B7} Tab to steer",
+        .antigravity => "Tab to queue",
         .grok => "Tab to queue",
         .muse => "Tab to queue",
         .custom_acp => "Tab to queue",
@@ -3896,7 +3899,7 @@ fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, 
 fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const u8 {
     return switch (provider) {
         .opencode, .cursor => variant,
-        .codex, .claude, .pi, .fx, .grok, .muse, .custom_acp => null,
+        .codex, .claude, .pi, .fx, .antigravity, .grok, .muse, .custom_acp => null,
     };
 }
 
@@ -5039,6 +5042,7 @@ pub fn currentThreadPendingSlashCommandLabel(self: anytype) ?[]const u8 {
         .cursor => "Running Cursor command...",
         .pi => "Running Pi command...",
         .fx => "Running FX command...",
+        .antigravity => "Running Antigravity command...",
         .grok => "Running Grok command...",
         .muse => "Running Muse command...",
         .custom_acp => "Running agent command...",
@@ -8049,7 +8053,7 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
     // ACP agents advertise their slash commands during session setup; the
     // daemon now knows this provider's latest list, so refetch it next time.
     switch (thread.provider) {
-        .cursor, .fx, .grok, .custom_acp => self.invalidateProviderSlashCatalog(),
+        .cursor, .fx, .antigravity, .grok, .custom_acp => self.invalidateProviderSlashCatalog(),
         .codex, .opencode, .claude, .pi, .muse => {},
     }
     if (self.isChatThreadFocused(project_index, thread_index)) {
@@ -8148,6 +8152,7 @@ fn fireChatNotification(self: anytype, project: anytype, thread: *ChatThread, ch
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
+        .antigravity => .{ .key = "antigravity", .png_bytes = ANTIGRAVITY_LOGO_BYTES },
         .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
         .muse, .custom_acp => null,
     };
@@ -8674,8 +8679,8 @@ pub fn issuePendingProviderSteer(
         if (pending_thread_id) |resolved_thread_id| {
             const resolved_turn_id: ?[]const u8 = switch (provider) {
                 .codex => send_state.active_turn_id,
-                .claude, .pi => if (send_state.active_turn_id) |active| active else "",
-                .opencode, .cursor, .fx, .grok, .muse, .custom_acp => null,
+                .claude, .pi, .fx => if (send_state.active_turn_id) |active| active else "",
+                .opencode, .cursor, .antigravity, .grok, .muse, .custom_acp => null,
             };
             if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
@@ -8775,6 +8780,11 @@ pub fn issuePendingProviderSteer(
         }
         self.setSidebarNotice(if (provider == .claude)
             "Claude could not steer this turn. The message was restored to the composer."
+        else if (provider == .fx)
+            (if (images.items.len > 0)
+                "FX steering accepts text only. The message was restored to the composer."
+            else
+                "FX could not steer this turn. The message was restored to the composer.")
         else switch (err) {
             error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. The message was restored to the composer.",
             else => "Failed to send Codex steer. The message was restored to the composer.",
@@ -9038,6 +9048,23 @@ pub fn finishFxModelCacheThread(self: anytype) void {
     self.provider_controller.fx_model_cache.models = null;
     self.provider_controller.fx_model_cache.status = .idle;
     self.provider_controller.fx_model_cache.mutex.unlock();
+
+    if (maybe_worker) |worker| {
+        worker.join();
+    }
+    if (maybe_models) |models| {
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
+    }
+}
+
+pub fn finishAntigravityModelCacheThread(self: anytype) void {
+    self.provider_controller.antigravity_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.antigravity_model_cache.worker;
+    self.provider_controller.antigravity_model_cache.worker = null;
+    const maybe_models = self.provider_controller.antigravity_model_cache.models;
+    self.provider_controller.antigravity_model_cache.models = null;
+    self.provider_controller.antigravity_model_cache.status = .idle;
+    self.provider_controller.antigravity_model_cache.mutex.unlock();
 
     if (maybe_worker) |worker| {
         worker.join();

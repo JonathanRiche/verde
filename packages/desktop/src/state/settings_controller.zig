@@ -27,10 +27,10 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .cursor,
     .opencode,
 };
-const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
+const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity, .muse };
 /// Settings > Providers rows, in display order: the "Connect an AI provider"
 /// dialog's order (`onboarding_modal.PROVIDERS`), so both list providers alike.
-pub const PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse };
+pub const PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .antigravity, .muse };
 const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
@@ -110,6 +110,7 @@ fn dbProviderForChatProvider(provider: app_config.ChatProvider) Provider {
         .opencode => .opencode,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -178,7 +179,7 @@ pub const Draft = struct {
     chat_link_open_override: app_config.LinkOpenOverride = .global,
     terminal_link_open_override: app_config.LinkOpenOverride = .global,
     browser_scroll_speed: f32 = app_config.DEFAULT_BROWSER_SCROLL_SPEED,
-    file_links_in_neovim_pane: bool = false,
+    file_open_target: app_config.FileOpenTarget = .verde,
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
     diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
     automatic_chat_titles_enabled: bool = true,
@@ -225,6 +226,7 @@ pub fn hookDisplayName(kind: HookKind) []const u8 {
         .codex => "Codex",
         .cursor => "Cursor",
         .grok => "Grok",
+        .antigravity => "Antigravity",
         .amp => "Amp",
         .opencode => "OpenCode",
         .pi => "Pi",
@@ -237,6 +239,7 @@ pub fn hookFailureNotice(kind: HookKind, installing: bool) []const u8 {
         .codex => if (installing) "Could not install Codex hooks." else "Could not remove Codex hooks.",
         .cursor => if (installing) "Could not install Cursor hooks." else "Could not remove Cursor hooks.",
         .grok => if (installing) "Could not install Grok hooks." else "Could not remove Grok hooks.",
+        .antigravity => if (installing) "Could not install Antigravity hooks." else "Could not remove Antigravity hooks.",
         .amp => if (installing) "Could not install Amp hooks." else "Could not remove Amp hooks.",
         .opencode => if (installing) "Could not install OpenCode hooks." else "Could not remove OpenCode hooks.",
         .pi => if (installing) "Could not install Pi hooks." else "Could not remove Pi hooks.",
@@ -249,6 +252,7 @@ pub fn hookSuccessNotice(kind: HookKind, installed: bool) []const u8 {
         .codex => if (installed) "Enabled global Codex status hooks." else "Disabled global Codex status hooks.",
         .cursor => if (installed) "Enabled global Cursor status hooks." else "Disabled global Cursor status hooks.",
         .grok => if (installed) "Enabled global Grok status hooks." else "Disabled global Grok status hooks.",
+        .antigravity => if (installed) "Enabled global Antigravity status hooks." else "Disabled global Antigravity status hooks.",
         .amp => if (installed) "Enabled global Amp status hooks." else "Disabled global Amp status hooks.",
         .opencode => if (installed) "Enabled global OpenCode status hooks." else "Disabled global OpenCode status hooks.",
         .pi => if (installed) "Enabled global Pi status hooks." else "Disabled global Pi status hooks.",
@@ -286,6 +290,7 @@ pub const State = struct {
     hook_codex_installed: bool = false,
     hook_cursor_installed: bool = false,
     hook_grok_installed: bool = false,
+    hook_antigravity_installed: bool = false,
     hook_amp_installed: bool = false,
     hook_opencode_installed: bool = false,
     hook_pi_installed: bool = false,
@@ -369,6 +374,12 @@ pub fn toggleGrokGlobalHooks(self: anytype) void {
     self.toggleProviderGlobalHooks(.grok, &self.settings_controller.hook_grok_installed);
 }
 
+/// Installs or removes Verde's named entry in Antigravity's global hooks.json,
+/// shared by the agy TUI and `agy acp`.
+pub fn toggleAntigravityGlobalHooks(self: anytype) void {
+    self.toggleProviderGlobalHooks(.antigravity, &self.settings_controller.hook_antigravity_installed);
+}
+
 /// Installs or removes the global Amp notify plugin and refreshes the
 /// settings toggle state. Acts immediately (filesystem side effect), like
 /// the Claude/Codex toggles.
@@ -450,7 +461,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .chat_link_open_override = self.app_config.chat_link_open_override,
         .terminal_link_open_override = self.app_config.terminal_link_open_override,
         .browser_scroll_speed = self.app_config.browser_scroll_speed,
-        .file_links_in_neovim_pane = self.app_config.file_links_in_neovim_pane,
+        .file_open_target = self.app_config.file_open_target,
         .tool_call_group_preference = self.app_config.tool_call_group_preference,
         .diff_layout_preference = self.app_config.diff_layout_preference,
         .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
@@ -495,7 +506,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.chat_link_open_override != self.app_config.chat_link_open_override) return true;
     if (draft.terminal_link_open_override != self.app_config.terminal_link_open_override) return true;
     if (draft.browser_scroll_speed != self.app_config.browser_scroll_speed) return true;
-    if (draft.file_links_in_neovim_pane != self.app_config.file_links_in_neovim_pane) return true;
+    if (draft.file_open_target != self.app_config.file_open_target) return true;
     if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
     if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
     if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
@@ -540,6 +551,7 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
         self.settings_controller.hook_codex_installed = integrations.hooks.codex;
         self.settings_controller.hook_cursor_installed = integrations.hooks.cursor;
         self.settings_controller.hook_grok_installed = integrations.hooks.grok;
+        self.settings_controller.hook_antigravity_installed = integrations.hooks.antigravity;
         self.settings_controller.hook_amp_installed = integrations.hooks.amp;
         self.settings_controller.hook_opencode_installed = integrations.hooks.opencode;
         self.settings_controller.hook_pi_installed = integrations.hooks.pi;
@@ -697,7 +709,7 @@ fn applySettingsDraftToConfig(self: anytype) !void {
     self.app_config.chat_link_open_override = self.settings_controller.draft.chat_link_open_override;
     self.app_config.terminal_link_open_override = self.settings_controller.draft.terminal_link_open_override;
     self.app_config.browser_scroll_speed = theme.clampf(self.settings_controller.draft.browser_scroll_speed, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED);
-    self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
+    self.app_config.file_open_target = self.settings_controller.draft.file_open_target;
     self.app_config.tool_call_group_preference = self.settings_controller.draft.tool_call_group_preference;
     self.app_config.diff_layout_preference = self.settings_controller.draft.diff_layout_preference;
     self.app_config.automatic_chat_titles_enabled = self.settings_controller.draft.automatic_chat_titles_enabled;
@@ -948,6 +960,7 @@ fn settingsChatTitleModelOptions(self: anytype) []const ModelOption {
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
         self.customAcpModelOptionsSnapshot(),
+        self.antigravityModelOptionsSnapshot(),
     );
 }
 
@@ -955,7 +968,7 @@ fn defaultChatTitleModelRef(self: anytype, provider: app_config.ChatTitleProvide
     if (provider == .codex) return app_config.DEFAULT_CHAT_TITLE_MODEL;
     return switch (dbProviderForChatTitleProvider(provider)) {
         // ChatTitleProvider deliberately excludes pi, fx, and grok.
-        .codex, .pi, .fx, .grok, .muse, .custom_acp => unreachable,
+        .codex, .pi, .fx, .antigravity, .grok, .muse, .custom_acp => unreachable,
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         // Titles use the fast tier, matching the daemon's fallback.
         .claude => app_config.DEFAULT_CLAUDE_FAST_MODEL,
@@ -1013,6 +1026,7 @@ fn settingsCommitModelOptions(self: anytype) []const ModelOption {
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
         self.customAcpModelOptionsSnapshot(),
+        self.antigravityModelOptionsSnapshot(),
     );
 }
 
@@ -1102,6 +1116,7 @@ pub fn settingsNewChatProviderLabel(self: anytype, option_index: usize) []const 
         .opencode => "OpenCode",
         .pi => "Pi",
         .fx => "FX",
+        .antigravity => "Antigravity",
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP agent",
@@ -1121,6 +1136,7 @@ fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
         self.customAcpModelOptionsSnapshot(),
+        self.antigravityModelOptionsSnapshot(),
     );
 }
 
@@ -1132,6 +1148,7 @@ fn defaultNewChatModelRef(self: anytype, provider: app_config.ChatProvider) []co
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
         .pi => provider_models.DEFAULT_PI_MODEL,
         .fx => provider_models.DEFAULT_FX_MODEL,
+        .antigravity => provider_models.DEFAULT_ANTIGRAVITY_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
         .muse => provider_models.DEFAULT_MUSE_MODEL,
         .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
@@ -1213,8 +1230,16 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
         },
         // Pi accepts every Verde effort tag as a thinking level.
         .pi => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
-        // fx exposes no reasoning-effort control.
-        .fx => false,
+        // fx tiers, narrowed to the selected model's probed catalog.
+        .fx => blk: {
+            const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
+            break :blk provider_models.fxEffortSupported(option, effort);
+        },
+        // agy thinking tiers, narrowed to the selected model's catalog.
+        .antigravity => blk: {
+            const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
+            break :blk provider_models.antigravityEffortSupported(option.grok_effort_values, effort);
+        },
         // grok accepts Verde effort tags up to xhigh (no max tier), narrowed
         // to the tiers the selected model's catalog lists.
         .grok => blk: {
@@ -1324,6 +1349,7 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
             .codex => {},
             .pi => self.startPiModelOptionsRefresh(),
             .fx => self.startFxModelOptionsRefresh(),
+            .antigravity => self.startAntigravityModelOptionsRefresh(),
             .grok => self.startGrokModelOptionsRefresh(),
             .muse => self.startMuseModelOptionsRefresh(),
             .custom_acp => {},
@@ -1381,6 +1407,7 @@ fn providerProtocol(provider: app_config.ChatProvider) headless.provider_types.P
         .opencode => .opencode,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -1395,6 +1422,7 @@ fn providerLoginTerminalLabel(provider: app_config.ChatProvider) []const u8 {
         .opencode => "Sign in to OpenCode",
         .pi => "Sign in to Pi",
         .fx => "Sign in to FX",
+        .antigravity => "Sign in to Antigravity",
         .grok => "Sign in to Grok",
         .muse => "Sign in to Muse",
         .custom_acp => "Sign in to custom ACP agents",
@@ -1409,6 +1437,7 @@ fn providerInstallTerminalLabel(provider: app_config.ChatProvider, missing: bool
         .opencode => "Install OpenCode",
         .pi => "Install Pi",
         .fx => "Install FX",
+        .antigravity => "Install Antigravity",
         .grok => "Install Grok",
         .muse => "Install Muse",
         .custom_acp => "Install custom ACP agents",
@@ -1420,6 +1449,7 @@ fn providerInstallTerminalLabel(provider: app_config.ChatProvider, missing: bool
         .opencode => "Update OpenCode",
         .pi => "Update Pi",
         .fx => "Update FX",
+        .antigravity => "Update Antigravity",
         .grok => "Update Grok",
         .muse => "Update Muse",
         .custom_acp => "Update custom ACP agents",
@@ -1972,6 +2002,7 @@ fn providerDisplayName(provider: app_config.ChatProvider) []const u8 {
         .opencode => "OpenCode",
         .pi => "Pi",
         .fx => "FX",
+        .antigravity => "Antigravity",
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP agents",

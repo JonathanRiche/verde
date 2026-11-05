@@ -72,6 +72,7 @@ pub const integration_providers = [_][]const u8{
     "opencode",
     "cursor",
     "grok",
+    "antigravity",
     "pi",
     "fx",
 };
@@ -291,6 +292,7 @@ pub const workspace_commands = [_][]const u8{
 
 pub const chat_commands = [_][]const u8{
     "open",
+    "present",
     "status",
     "transcript",
     "draft",
@@ -521,7 +523,7 @@ pub const kind_values = [_][]const u8{ "chat", "terminal" };
 pub const axis_values = [_][]const u8{ "horizontal", "vertical" };
 pub const direction_values = [_][]const u8{ "left", "right", "up", "down" };
 pub const decision_values = [_][]const u8{ "approve", "deny" };
-pub const provider_values = [_][]const u8{ "opencode", "codex", "claude", "cursor", "pi", "grok" };
+pub const provider_values = [_][]const u8{ "opencode", "codex", "claude", "cursor", "pi", "grok", "antigravity" };
 pub const reasoning_values = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
 pub const inspector_mode_values = [_][]const u8{ "point", "draw-box", "draw-freeform" };
 pub const terminal_key_values = [_][]const u8{

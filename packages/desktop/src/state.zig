@@ -2739,7 +2739,7 @@ const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
 /// `custom_acp` lists one row per configured agent and none when there are none.
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse, .custom_acp };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity, .muse, .custom_acp };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -2922,6 +2922,7 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         state.grokModelOptionsSnapshot(),
         state.museModelOptionsSnapshot(),
         state.customAcpModelOptionsSnapshot(),
+        state.antigravityModelOptionsSnapshot(),
     );
 }
 
@@ -2943,6 +2944,7 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
         .cursor => DEFAULT_CURSOR_MODEL,
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
+        .antigravity => DEFAULT_ANTIGRAVITY_MODEL,
         .grok => DEFAULT_GROK_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
         .custom_acp => customAcpDefaultModelRef(state.customAcpModelOptionsSnapshot()),
@@ -3006,7 +3008,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 return;
             }
             // Claude, Pi, and Grok menus carry effort tag names as row variants.
-            if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .muse) {
+            if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .antigravity or thread.provider == .muse or thread.provider == .fx) {
                 const rows = state.opencode_reasoning_menu.items;
                 if (index >= rows.len) return;
                 const row = rows[index];
@@ -3045,7 +3047,8 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.markDirty();
         },
         .fast_changed => |enabled| {
-            if (state.currentThread().provider != .codex and state.currentThread().provider != .cursor) return;
+            const fast_provider = state.currentThread().provider;
+            if (fast_provider != .codex and fast_provider != .cursor and fast_provider != .fx) return;
             const next: FastMode = if (enabled) .on else .off;
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
@@ -3400,6 +3403,7 @@ fn configChatProvider(provider: Provider) app_config.ChatProvider {
         .opencode => .opencode,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -3414,6 +3418,7 @@ fn providerFromConfig(provider: app_config.ChatProvider) Provider {
         .opencode => .opencode,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -3483,6 +3488,7 @@ fn drawModelPickerProviderLetter(
         .cursor => "Cu",
         .pi => "P",
         .fx => "F",
+        .antigravity => "AG",
         .grok => "G",
         .muse => "M",
         .custom_acp => "A",
@@ -4455,6 +4461,7 @@ pub const ProjectEditorTarget = state_ui_types.ProjectEditorTarget;
 /// Where a transcript file link opens when chosen from its context menu.
 pub const TranscriptFileOpenTarget = enum {
     default,
+    verde_viewer,
     neovim_pane,
     configured_editor,
     cursor,
@@ -4477,7 +4484,9 @@ pub const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 pub const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 pub const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
 pub const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
+pub const ANTIGRAVITY_MODEL_OPTIONS = provider_models.ANTIGRAVITY_MODEL_OPTIONS;
 pub const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+pub const DEFAULT_ANTIGRAVITY_MODEL = provider_models.DEFAULT_ANTIGRAVITY_MODEL;
 pub const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 pub const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 pub const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
@@ -4489,6 +4498,7 @@ pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
 pub const PI_LOGO_BYTES = @embedFile("assets/pi-logo.png");
 pub const FX_LOGO_BYTES = @embedFile("assets/fx-logo.png");
 pub const GROK_LOGO_BYTES = @embedFile("assets/grok-logo.png");
+pub const ANTIGRAVITY_LOGO_BYTES = @embedFile("assets/antigravity-logo.png");
 pub const MUSE_LOGO_BYTES = surface_controller.MUSE_LOGO_BYTES;
 pub const OPENCODE_LOGO_BYTES = surface_controller.OPENCODE_LOGO_BYTES;
 pub const CODEX_LOGO_BYTES = surface_controller.CODEX_LOGO_BYTES;
@@ -4539,6 +4549,8 @@ const codexReasoningOptions = provider_models.codexReasoningOptions;
 pub const ReasoningOption = provider_models.ReasoningOption;
 pub const PI_REASONING_OPTIONS = provider_models.PI_REASONING_OPTIONS;
 pub const GROK_REASONING_OPTIONS = provider_models.GROK_REASONING_OPTIONS;
+pub const ANTIGRAVITY_REASONING_OPTIONS = provider_models.ANTIGRAVITY_REASONING_OPTIONS;
+pub const FX_REASONING_OPTIONS = provider_models.FX_REASONING_OPTIONS;
 pub const MUSE_REASONING_OPTIONS = provider_models.MUSE_REASONING_OPTIONS;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
@@ -5077,6 +5089,7 @@ pub const AppState = struct {
     claude_model_options: std.ArrayList(ModelOption),
     pi_model_options: std.ArrayList(ModelOption),
     fx_model_options: std.ArrayList(ModelOption),
+    antigravity_model_options: std.ArrayList(ModelOption),
     grok_model_options: std.ArrayList(ModelOption),
     muse_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
@@ -5090,6 +5103,7 @@ pub const AppState = struct {
     pi_logo_texture: ?CachedImageTexture,
     fx_logo_texture: ?CachedImageTexture,
     grok_logo_texture: ?CachedImageTexture,
+    antigravity_logo_texture: ?CachedImageTexture,
     muse_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
@@ -5333,6 +5347,7 @@ pub const AppState = struct {
             .claude_model_options = .empty,
             .pi_model_options = .empty,
             .fx_model_options = .empty,
+            .antigravity_model_options = .empty,
             .grok_model_options = .empty,
             .muse_model_options = .empty,
             .cursor_model_options = .empty,
@@ -5346,6 +5361,7 @@ pub const AppState = struct {
             .pi_logo_texture = null,
             .fx_logo_texture = null,
             .grok_logo_texture = null,
+            .antigravity_logo_texture = null,
             .muse_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
@@ -5490,6 +5506,7 @@ pub const AppState = struct {
             state.pi_logo_texture = state.loadEmbeddedTexture(PI_LOGO_BYTES);
             state.fx_logo_texture = state.loadEmbeddedTexture(FX_LOGO_BYTES);
             state.grok_logo_texture = state.loadEmbeddedTexture(GROK_LOGO_BYTES);
+            state.antigravity_logo_texture = state.loadEmbeddedTexture(ANTIGRAVITY_LOGO_BYTES);
             state.muse_logo_texture = state.loadEmbeddedTexture(MUSE_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
@@ -6393,6 +6410,7 @@ pub const AppState = struct {
     pub const cursorModelOptionsSnapshot = provider_controller.cursorModelOptionsSnapshot;
     pub const piModelOptionsSnapshot = provider_controller.piModelOptionsSnapshot;
     pub const fxModelOptionsSnapshot = provider_controller.fxModelOptionsSnapshot;
+    pub const antigravityModelOptionsSnapshot = provider_controller.antigravityModelOptionsSnapshot;
     pub const grokModelOptionsSnapshot = provider_controller.grokModelOptionsSnapshot;
     pub const museModelOptionsSnapshot = provider_controller.museModelOptionsSnapshot;
     pub const customAcpModelOptionsSnapshot = provider_controller.customAcpModelOptionsSnapshot;
@@ -6403,6 +6421,7 @@ pub const AppState = struct {
     pub const startClaudeModelOptionsRefresh = provider_controller.startClaudeModelOptionsRefresh;
     pub const startPiModelOptionsRefresh = provider_controller.startPiModelOptionsRefresh;
     pub const startFxModelOptionsRefresh = provider_controller.startFxModelOptionsRefresh;
+    pub const startAntigravityModelOptionsRefresh = provider_controller.startAntigravityModelOptionsRefresh;
     pub const startGrokModelOptionsRefresh = provider_controller.startGrokModelOptionsRefresh;
     pub const startMuseModelOptionsRefresh = provider_controller.startMuseModelOptionsRefresh;
     pub const startProviderReadinessCheck = provider_controller.startProviderReadinessCheck;
@@ -6424,6 +6443,7 @@ pub const AppState = struct {
     pub const refreshClaudeModelOptionsCacheAsync = provider_controller.refreshClaudeModelOptionsCacheAsync;
     pub const refreshPiModelOptionsCacheAsync = provider_controller.refreshPiModelOptionsCacheAsync;
     pub const refreshFxModelOptionsCacheAsync = provider_controller.refreshFxModelOptionsCacheAsync;
+    pub const refreshAntigravityModelOptionsCacheAsync = provider_controller.refreshAntigravityModelOptionsCacheAsync;
     pub const refreshGrokModelOptionsCacheAsync = provider_controller.refreshGrokModelOptionsCacheAsync;
     pub const refreshMuseModelOptionsCacheAsync = provider_controller.refreshMuseModelOptionsCacheAsync;
     pub const duplicateReasoningVariantKeys = provider_controller.duplicateReasoningVariantKeys;
@@ -6435,6 +6455,7 @@ pub const AppState = struct {
     pub const populateClaudeModelOptions = provider_controller.populateClaudeModelOptions;
     pub const populatePiModelOptions = provider_controller.populatePiModelOptions;
     pub const populateFxModelOptions = provider_controller.populateFxModelOptions;
+    pub const populateAntigravityModelOptions = provider_controller.populateAntigravityModelOptions;
     pub const populateGrokModelOptions = provider_controller.populateGrokModelOptions;
     pub const populateMuseModelOptions = provider_controller.populateMuseModelOptions;
     pub const asciiCaseInsensitiveCompare = provider_controller.asciiCaseInsensitiveCompare;
@@ -6445,10 +6466,14 @@ pub const AppState = struct {
     pub const refreshClaudeReasoningMenu = provider_controller.refreshClaudeReasoningMenu;
     pub const refreshPiReasoningMenu = provider_controller.refreshPiReasoningMenu;
     pub const refreshGrokReasoningMenu = provider_controller.refreshGrokReasoningMenu;
+    pub const refreshAntigravityReasoningMenu = provider_controller.refreshAntigravityReasoningMenu;
+    pub const refreshFxReasoningMenu = provider_controller.refreshFxReasoningMenu;
     pub const refreshMuseReasoningMenu = provider_controller.refreshMuseReasoningMenu;
     pub const cursorModelOptionForRef = provider_controller.cursorModelOptionForRef;
     pub const claudeModelOptionForRef = provider_controller.claudeModelOptionForRef;
     pub const grokModelOptionForRef = provider_controller.grokModelOptionForRef;
+    pub const antigravityModelOptionForRef = provider_controller.antigravityModelOptionForRef;
+    pub const fxModelOptionForRef = provider_controller.fxModelOptionForRef;
     pub const cursorModelParamsJsonAlloc = provider_controller.cursorModelParamsJsonAlloc;
     pub const normalizeOpencodeReasoningVariant = provider_controller.normalizeOpencodeReasoningVariant;
     pub const clearDynamicOpencodeModelOptions = provider_controller.clearDynamicOpencodeModelOptions;
@@ -6461,7 +6486,9 @@ pub const AppState = struct {
     pub const clearDynamicPiModelOptions = provider_controller.clearDynamicPiModelOptions;
     pub const clearPiModelOptions = provider_controller.clearPiModelOptions;
     pub const clearDynamicFxModelOptions = provider_controller.clearDynamicFxModelOptions;
+    pub const clearDynamicAntigravityModelOptions = provider_controller.clearDynamicAntigravityModelOptions;
     pub const clearFxModelOptions = provider_controller.clearFxModelOptions;
+    pub const clearAntigravityModelOptions = provider_controller.clearAntigravityModelOptions;
     pub const clearDynamicGrokModelOptions = provider_controller.clearDynamicGrokModelOptions;
     pub const clearGrokModelOptions = provider_controller.clearGrokModelOptions;
     pub const clearDynamicMuseModelOptions = provider_controller.clearDynamicMuseModelOptions;
@@ -8576,8 +8603,17 @@ pub const AppState = struct {
                 .pi => if (parseReasoningEffort(raw)) |effort| {
                     reasoning_effort = effort;
                 },
-                // fx exposes no reasoning-effort control.
-                .fx => {},
+                // fx tiers share Verde's tag names; the probed catalog
+                // decides which the chosen model offers.
+                .fx => if (parseReasoningEffort(raw)) |effort| {
+                    if (provider_models.fxEffortSupported(self.fxModelOptionForRef(owned_model), effort)) reasoning_effort = effort;
+                },
+                // agy tiers share Verde's tag names; the model's catalog
+                // decides which it offers.
+                .antigravity => if (parseReasoningEffort(raw)) |effort| {
+                    const values: ?[]const [:0]const u8 = if (self.antigravityModelOptionForRef(owned_model)) |option| option.grok_effort_values else null;
+                    if (provider_models.antigravityEffortSupported(values, effort)) reasoning_effort = effort;
+                },
                 // grok efforts share Verde's tag names; the catalog decides
                 // which tiers the chosen model offers.
                 .grok => if (parseReasoningEffort(raw)) |effort| {
@@ -8607,6 +8643,9 @@ pub const AppState = struct {
                 .codex => thread.fast_mode = .on,
                 .cursor => if (self.cursorModelOptionForRef(thread.model_ref)) |option| {
                     if (option.cursor_fast_supported) thread.fast_mode = .on;
+                },
+                .fx => if (provider_models.fxFastSupported(self.fxModelOptionForRef(thread.model_ref))) {
+                    thread.fast_mode = .on;
                 },
                 else => {},
             };
@@ -8853,6 +8892,7 @@ pub const AppState = struct {
     pub const toggleCodexGlobalHooks = settings_controller.toggleCodexGlobalHooks;
     pub const toggleCursorGlobalHooks = settings_controller.toggleCursorGlobalHooks;
     pub const toggleGrokGlobalHooks = settings_controller.toggleGrokGlobalHooks;
+    pub const toggleAntigravityGlobalHooks = settings_controller.toggleAntigravityGlobalHooks;
     pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
     pub const toggleOpencodeGlobalHooks = settings_controller.toggleOpencodeGlobalHooks;
     pub const togglePiGlobalHooks = settings_controller.togglePiGlobalHooks;
@@ -8898,6 +8938,7 @@ pub const AppState = struct {
     pub const providerUpdatesAvailableCount = settings_controller.providerUpdatesAvailableCount;
     pub const updateAllSettingsProviders = settings_controller.updateAllSettingsProviders;
     pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
+    pub const loginProvider = settings_controller.loginProvider;
     pub const runProviderOnboardingAction = settings_controller.runProviderOnboardingAction;
 
     /// Opens `provider`'s sign-in command in a workspace terminal.
@@ -9403,8 +9444,8 @@ pub const AppState = struct {
     }
 
     /// Opens a transcript file reference with an explicit target chosen from
-    /// the link context menu. `.default` follows the configured left-click
-    /// behavior (Neovim pane when enabled, else editor, else file manager).
+    /// the link context menu. `.default` follows Settings > App > "Open files
+    /// in" (`app_config.file_open_target`).
     pub fn openTranscriptFileReferenceWith(self: *AppState, file_path: []const u8, target: TranscriptFileOpenTarget) void {
         const normalized = std.mem.trim(u8, if (std.mem.startsWith(u8, file_path, "file://localhost/"))
             file_path["file://localhost".len..]
@@ -9434,25 +9475,18 @@ pub const AppState = struct {
         defer self.allocator.free(resolved_path);
 
         switch (target) {
-            .default => {
-                if (self.app_config.file_links_in_neovim_pane and utils.configuredEditorIsNeovim()) {
-                    if (self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) return;
-                }
-
-                const result = utils.openFilePreferEditor(self.allocator, resolved_path, reference.location) catch |err| {
-                    log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
-                    self.setSidebarNotice("Failed to open file reference.");
-                    return;
-                };
-
-                switch (result) {
-                    .editor => self.setSidebarNotice("Opened file in editor."),
-                    .file_manager => self.setSidebarNotice("Opened containing folder."),
-                }
+            .default => switch (self.app_config.file_open_target) {
+                .verde => self.openTranscriptFileReferenceInViewer(resolved_path, reference.location),
+                .system_default => self.openTranscriptFileReferenceWithSystemHandler(resolved_path),
+                .neovim => if (!self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) {
+                    // No Neovim here: still open the file rather than doing nothing.
+                    self.openTranscriptFileReferenceInViewer(resolved_path, reference.location);
+                },
             },
+            .verde_viewer => self.openTranscriptFileReferenceInViewer(resolved_path, reference.location),
             .neovim_pane => {
                 if (!self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) {
-                    self.setSidebarNotice("Failed to open file in workspace Neovim pane.");
+                    self.setSidebarNotice("Neovim is not available (install nvim or set $EDITOR=nvim).");
                 }
             },
             .configured_editor, .cursor, .vscode, .zed => {
@@ -9470,14 +9504,7 @@ pub const AppState = struct {
                 };
                 self.setSidebarNotice("Opened file in editor.");
             },
-            .system_handler => {
-                utils.openPathWithSystemHandler(self.allocator, resolved_path) catch |err| {
-                    log.warn("failed to open transcript file with system handler: {s}", .{@errorName(err)});
-                    self.setSidebarNotice("Failed to open file with system default app.");
-                    return;
-                };
-                self.setSidebarNotice("Opened file with system default app.");
-            },
+            .system_handler => self.openTranscriptFileReferenceWithSystemHandler(resolved_path),
             .reveal => {
                 utils.revealFileInFileManager(self.allocator, resolved_path) catch |err| {
                     log.warn("failed to reveal transcript file: {s}", .{@errorName(err)});
@@ -9598,8 +9625,30 @@ pub const AppState = struct {
         return out.toOwnedSlice(allocator) catch null;
     }
 
+    /// Opens a file in Verde's file viewer tab, scrolled to `location`.
+    /// Folders, formats the viewer cannot show (PDF, Office, archives), and
+    /// files outside the workspace folders open with the system default app.
+    fn openTranscriptFileReferenceInViewer(self: *AppState, file_path: []const u8, location: utils.FileLocation) void {
+        if (file_viewer_controller.kindForPath(file_path) == .external or utils.directoryExistsAbsolute(file_path)) {
+            self.openTranscriptFileReferenceWithSystemHandler(file_path);
+            return;
+        }
+        file_viewer_controller.openFileLink(self, file_path, location.line);
+    }
+
+    fn openTranscriptFileReferenceWithSystemHandler(self: *AppState, file_path: []const u8) void {
+        utils.openPathWithSystemHandler(self.allocator, file_path) catch |err| {
+            log.warn("failed to open transcript file with system handler: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open file with system default app.");
+            return;
+        };
+        // The external app takes focus; don't treat that as a close request.
+        self.external_open_close_suppress_until_ms = unixTimestampMs() + EXTERNAL_OPEN_CLOSE_SUPPRESS_MS;
+        self.setSidebarNotice("Opened file with system default app.");
+    }
+
     fn openTranscriptFileReferenceInNeovimPane(self: *AppState, file_path: []const u8, location: utils.FileLocation) bool {
-        const command = utils.configuredNeovimFileCommandAlloc(self.allocator, file_path, location) catch |err| {
+        const command = utils.neovimFileCommandAlloc(self.allocator, file_path, location) catch |err| {
             log.warn("failed to build workspace Neovim file command: {s}", .{@errorName(err)});
             return false;
         } orelse return false;
@@ -10231,6 +10280,10 @@ pub const AppState = struct {
             cached.deinit();
             self.grok_logo_texture = null;
         }
+        if (self.antigravity_logo_texture) |cached| {
+            cached.deinit();
+            self.antigravity_logo_texture = null;
+        }
         if (self.muse_logo_texture) |cached| {
             cached.deinit();
             self.muse_logo_texture = null;
@@ -10476,6 +10529,7 @@ pub const AppState = struct {
             .cursor => self.cursor_logo_texture,
             .pi => self.pi_logo_texture,
             .fx => self.fx_logo_texture,
+            .antigravity => self.antigravity_logo_texture,
             .grok => self.grok_logo_texture,
             .muse => self.muse_logo_texture,
             // No bundled logo; pickers fall back to a letter badge.
@@ -10594,8 +10648,20 @@ pub const AppState = struct {
                 }
                 return .{ .index = index, .count = values.len + 1 };
             },
-            // fx exposes no reasoning levels.
-            .fx, .custom_acp => return null,
+            // fx tiers vary per model; rows mirror FX_REASONING_OPTIONS
+            // filtered to the probed catalog.
+            .fx => {
+                const gauge = provider_models.fxReasoningGauge(self.fxModelOptionForRef(thread.model_ref), thread.reasoning_effort) orelse return null;
+                return .{ .index = gauge.index, .count = gauge.count };
+            },
+            .custom_acp => return null,
+            // agy tiers vary per model; rows mirror ANTIGRAVITY_REASONING_OPTIONS
+            // filtered to the model's catalog tiers.
+            .antigravity => {
+                const values: ?[]const [:0]const u8 = if (self.antigravityModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
+                const gauge = provider_models.antigravityReasoningGauge(values, thread.reasoning_effort);
+                return .{ .index = gauge.index, .count = gauge.count };
+            },
             // grok efforts stop at xhigh and vary per model; rows mirror
             // GROK_REASONING_OPTIONS filtered to the model's catalog tiers.
             .grok => {
@@ -10623,6 +10689,7 @@ pub const AppState = struct {
     pub fn currentComposerShowsFastToggle(self: *const AppState) bool {
         const thread = self.currentThread();
         const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
+        if (thread.provider == .fx) return provider_models.fxFastSupported(self.fxModelOptionForRef(thread.model_ref));
         return thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
     }
 
@@ -12200,6 +12267,7 @@ pub const AppState = struct {
             .grok => .grok,
             .opencode => .opencode,
             .amp => .amp,
+            .antigravity => .antigravity,
             .muse, .other => return,
         };
         setProviderHooks(self.allocator, self.storage.pref_path, provider) catch |err| {
@@ -12228,6 +12296,20 @@ pub const AppState = struct {
         self.setSidebarNotice("Opened the Grok Build setup guide.");
     }
 
+    pub fn antigravityTuiInstalled() bool {
+        // Resolving PATH only: never start agy or touch its sign-in here.
+        return process_env.commandExists("agy");
+    }
+
+    pub fn openAntigravitySetupGuide(self: *AppState) void {
+        utils.openUrlInDefaultBrowser(self.allocator, "https://antigravity.google/docs/getting-started?tab=cli") catch |err| {
+            log.warn("failed to open Antigravity CLI setup guide: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not open the Antigravity CLI setup guide.");
+            return;
+        };
+        self.setSidebarNotice("Opened the Antigravity CLI setup guide.");
+    }
+
     pub fn openAgentTuiAtPlacement(
         self: *AppState,
         project_index: usize,
@@ -12241,6 +12323,10 @@ pub const AppState = struct {
         }
         if (provider == .grok and !grokTuiInstalled()) {
             self.setSidebarNotice("Grok Build is not installed. Run “Set Up Grok Build” from the command palette.");
+            return false;
+        }
+        if (provider == .antigravity and !antigravityTuiInstalled()) {
+            self.setSidebarNotice("Antigravity CLI is not installed. Run “Set Up Antigravity CLI” from the command palette.");
             return false;
         }
         const defaults = defaultAgentTui(provider) orelse return false;
@@ -12357,6 +12443,7 @@ pub const AppState = struct {
             .grok => .grok,
             .amp => .amp,
             .muse => .muse,
+            .antigravity => .antigravity,
             .other => null,
         };
     }
@@ -12701,13 +12788,14 @@ pub const AppState = struct {
                 // `/name` themselves (SDK commands, advertised commands and
                 // installed skills), so unknown names are forwarded rather
                 // than rejected.
-                if (thread.provider == .claude or thread.provider == .grok or thread.provider == .cursor or thread.provider == .custom_acp) {
+                if (thread.provider == .claude or thread.provider == .grok or thread.provider == .cursor or thread.provider == .custom_acp or thread.provider == .antigravity) {
                     const provider_label = utils.providerLabel(thread.provider);
                     const command: provider_types.ProviderSlashCommand = .{
                         .id = .custom,
                         .name = unknown.name,
                         .summary = switch (thread.provider) {
                             .grok => "Grok agent slash command.",
+                            .antigravity => "Antigravity agent slash command.",
                             .cursor => "Cursor agent slash command.",
                             .custom_acp => "Agent slash command.",
                             else => "Claude SDK slash command.",
@@ -13957,7 +14045,22 @@ pub const AppState = struct {
                 Add.level(out, &count, .{ .label = "Default" });
                 for (values) |value| Add.level(out, &count, .{ .label = cursorReasoningValueLabel(value), .variant = value });
             },
-            .fx, .custom_acp => {},
+            .antigravity => {
+                const values: ?[]const [:0]const u8 = if (self.antigravityModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
+                for (ANTIGRAVITY_REASONING_OPTIONS) |option| {
+                    if (option.value) |effort| if (!provider_models.antigravityEffortSupported(values, effort)) continue;
+                    Add.level(out, &count, .{ .label = option.label, .effort = option.value });
+                }
+            },
+            .fx => {
+                const option = self.fxModelOptionForRef(thread.model_ref);
+                if (provider_models.fxReasoningGauge(option, null) == null) return 0;
+                for (FX_REASONING_OPTIONS) |entry| {
+                    if (entry.value) |effort| if (!provider_models.fxEffortSupported(option, effort)) continue;
+                    Add.level(out, &count, .{ .label = entry.label, .effort = entry.value });
+                }
+            },
+            .custom_acp => {},
         }
         return if (count <= 1) 0 else count;
     }
@@ -16945,6 +17048,13 @@ pub const AppState = struct {
                 thread.fast_mode = .off;
             }
         }
+        if (thread.provider == .fx) {
+            const option = self.fxModelOptionForRef(thread.model_ref);
+            if (!provider_models.fxFastSupported(option)) thread.fast_mode = .off;
+            if (thread.reasoning_effort) |effort| {
+                if (!provider_models.fxEffortSupported(option, effort)) thread.reasoning_effort = null;
+            }
+        }
         self.markDirty();
     }
 
@@ -16975,7 +17085,7 @@ pub const AppState = struct {
             return composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort);
         }
         // Claude, Pi, and Grok rows carry effort tag names as variants.
-        if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .muse) {
+        if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .antigravity or thread.provider == .muse or thread.provider == .fx) {
             const rows = self.opencode_reasoning_menu.items;
             for (rows, 0..) |row, i| {
                 if (thread.reasoning_effort == null and row.variant == null) return i;
@@ -17293,6 +17403,7 @@ pub const AppState = struct {
         self.finishPiModelCacheThread();
         runtime_log.diagnostic("AppState.deinit pi model cache finished", .{});
         self.finishFxModelCacheThread();
+        self.finishAntigravityModelCacheThread();
         runtime_log.diagnostic("AppState.deinit fx model cache finished", .{});
         self.finishGrokModelCacheThread();
         runtime_log.diagnostic("AppState.deinit grok model cache finished", .{});
@@ -17381,6 +17492,7 @@ pub const AppState = struct {
         self.clearCursorModelOptions();
         self.clearPiModelOptions();
         self.clearFxModelOptions();
+        self.clearAntigravityModelOptions();
         self.clearGrokModelOptions();
         self.clearMuseModelOptions();
         self.file_viewer.deinit(self.allocator);
@@ -17390,6 +17502,7 @@ pub const AppState = struct {
         self.cursor_model_options.deinit(self.allocator);
         self.pi_model_options.deinit(self.allocator);
         self.fx_model_options.deinit(self.allocator);
+        self.antigravity_model_options.deinit(self.allocator);
         self.grok_model_options.deinit(self.allocator);
         self.muse_model_options.deinit(self.allocator);
         provider_controller.deinitCustomAcpModelOptions(&self.provider_controller, self.allocator);
@@ -17540,6 +17653,7 @@ pub const AppState = struct {
     pub const pollClaudeModelOptionsCache = provider_controller.pollClaudeModelOptionsCache;
     pub const pollPiModelOptionsCache = provider_controller.pollPiModelOptionsCache;
     pub const pollFxModelOptionsCache = provider_controller.pollFxModelOptionsCache;
+    pub const pollAntigravityModelOptionsCache = provider_controller.pollAntigravityModelOptionsCache;
     pub const pollGrokModelOptionsCache = provider_controller.pollGrokModelOptionsCache;
     pub const pollMuseModelOptionsCache = provider_controller.pollMuseModelOptionsCache;
 
@@ -18149,6 +18263,7 @@ pub const AppState = struct {
     pub const finishCursorModelCacheThread = chat_controller.finishCursorModelCacheThread;
     pub const finishPiModelCacheThread = chat_controller.finishPiModelCacheThread;
     pub const finishFxModelCacheThread = chat_controller.finishFxModelCacheThread;
+    pub const finishAntigravityModelCacheThread = chat_controller.finishAntigravityModelCacheThread;
     pub const finishGrokModelCacheThread = chat_controller.finishGrokModelCacheThread;
     pub const finishMuseModelCacheThread = chat_controller.finishMuseModelCacheThread;
     pub const finishProviderReadinessThread = chat_controller.finishProviderReadinessThread;
@@ -19135,6 +19250,12 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Grok does not support thread imports yet.",
             else => "Failed to load Grok threads.",
         },
+        .antigravity => switch (err) {
+            error.FileNotFound => "The agy executable was not found on PATH.",
+            error.AntigravitySignedOut => "Antigravity is not authenticated. Run `agy acp --login`.",
+            error.UnsupportedOperation => "Antigravity does not support thread imports yet.",
+            else => "Failed to load Antigravity conversations.",
+        },
         .muse => switch (err) {
             error.FileNotFound => "The muse executable was not found on PATH.",
             error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
@@ -19202,6 +19323,13 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.MissingSessionId => "The selected Grok thread could not be found.",
             error.UnsupportedOperation => "Grok does not support thread imports yet.",
             else => "Failed to import the selected Grok thread.",
+        },
+        .antigravity => switch (err) {
+            error.FileNotFound => "The agy executable was not found on PATH.",
+            error.AntigravitySignedOut => "Antigravity is not authenticated. Run `agy acp --login`.",
+            error.MissingSessionId => "The selected Antigravity conversation could not be found.",
+            error.UnsupportedOperation => "Antigravity does not support thread imports yet.",
+            else => "Failed to import the selected Antigravity conversation.",
         },
         .muse => switch (err) {
             error.FileNotFound => "The muse executable was not found on PATH.",
@@ -19317,6 +19445,12 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Grok does not support thread sync yet.",
             else => "Failed to sync the Grok thread.",
         },
+        .antigravity => switch (err) {
+            error.FileNotFound => "The agy executable was not found on PATH.",
+            error.AntigravitySignedOut => "Antigravity is not authenticated. Run `agy acp --login`.",
+            error.UnsupportedOperation => "Antigravity does not support thread sync yet.",
+            else => "Failed to sync the Antigravity conversation.",
+        },
         .muse => switch (err) {
             error.FileNotFound => "The muse executable was not found on PATH.",
             error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
@@ -19339,6 +19473,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
         .cursor => "Failed to store Cursor thread list.",
         .pi => "Failed to store Pi thread list.",
         .fx => "Failed to store FX thread list.",
+        .antigravity => "Failed to store Antigravity conversation list.",
         .grok => "Failed to store Grok thread list.",
         .muse => "Failed to store Muse thread list.",
         .custom_acp => "Failed to store agent thread list.",
@@ -19353,6 +19488,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
         .cursor => "No recent Cursor threads found.",
         .pi => "No recent Pi threads found.",
         .fx => "No recent FX threads found.",
+        .antigravity => "No recent Antigravity conversations found.",
         .grok => "No recent Grok threads found.",
         .muse => "No recent Muse threads found.",
         .custom_acp => "No recent agent threads found.",
@@ -19367,6 +19503,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
         .cursor => "Select a Cursor thread or paste a thread ID.",
         .pi => "Select a Pi thread or paste a thread ID.",
         .fx => "Select an FX thread or paste a thread ID.",
+        .antigravity => "Select an Antigravity conversation or paste a conversation ID.",
         .grok => "Select a Grok thread or paste a thread ID.",
         .muse => "Select a Muse thread or paste a thread ID.",
         .custom_acp => "Select a agent thread or paste a thread ID.",
@@ -19381,6 +19518,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
         .cursor => "Enter a Cursor thread ID or select one from the list.",
         .pi => "Enter a Pi thread ID or select one from the list.",
         .fx => "Enter an FX thread ID or select one from the list.",
+        .antigravity => "Enter an Antigravity conversation ID or select one from the list.",
         .grok => "Enter a Grok thread ID or select one from the list.",
         .muse => "Enter a Muse thread ID or select one from the list.",
         .custom_acp => "Enter a agent thread ID or select one from the list.",
@@ -19395,6 +19533,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
         .cursor => "Cursor thread already exists in this workspace.",
         .pi => "Pi thread already exists in this workspace.",
         .fx => "FX thread already exists in this workspace.",
+        .antigravity => "Antigravity conversation already exists in this workspace.",
         .grok => "Grok thread already exists in this workspace.",
         .muse => "Muse thread already exists in this workspace.",
         .custom_acp => "agent thread already exists in this workspace.",
@@ -19409,6 +19548,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
         .cursor => "Failed to create the imported thread.",
         .pi => "Failed to create the imported thread.",
         .fx => "Failed to create the imported thread.",
+        .antigravity => "Failed to create the imported thread.",
         .grok => "Failed to create the imported thread.",
         .muse => "Failed to create the imported thread.",
         .custom_acp => "Failed to create the imported thread.",
@@ -19423,6 +19563,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
         .cursor => "Failed to add the imported thread.",
         .pi => "Failed to add the imported thread.",
         .fx => "Failed to add the imported thread.",
+        .antigravity => "Failed to add the imported thread.",
         .grok => "Failed to add the imported thread.",
         .muse => "Failed to add the imported thread.",
         .custom_acp => "Failed to add the imported thread.",
@@ -19437,6 +19578,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
         .cursor => "Cursor thread imported.",
         .pi => "Pi thread imported.",
         .fx => "FX thread imported.",
+        .antigravity => "Antigravity conversation imported.",
         .grok => "Grok thread imported.",
         .muse => "Muse thread imported.",
         .custom_acp => "agent thread imported.",
@@ -19451,6 +19593,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
         .cursor => "Thread synced from Cursor.",
         .pi => "Thread synced from Pi.",
         .fx => "Thread synced from FX.",
+        .antigravity => "Thread synced from Antigravity.",
         .grok => "Thread synced from Grok.",
         .muse => "Thread synced from Muse.",
         .custom_acp => "Thread synced from the agent.",

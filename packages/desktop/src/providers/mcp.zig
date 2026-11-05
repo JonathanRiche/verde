@@ -58,7 +58,7 @@ pub fn loadHttpConnection(allocator: std.mem.Allocator) !?HttpConnection {
     };
 }
 
-const ALL_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .amp, .pi, .fx, .grok };
+const ALL_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .amp, .pi, .fx, .grok, .antigravity };
 
 pub const RegistrationStatus = providers_protocol.RegistrationStatus;
 pub const Summary = providers_protocol.McpSummary;
@@ -106,6 +106,14 @@ const FX_SPEC: JsonSpec = .{
     // FX rejects a literal Authorization header. It reads the raw token from
     // this variable and constructs the Bearer header itself.
     .bearer_token_env = "VERDE_MCP_TOKEN",
+};
+/// Antigravity CLI's global MCP file, shared by its TUI and `agy acp`. agy
+/// documents `url` for Streamable HTTP servers (`serverUrl` is the legacy key
+/// its `agy mcp add` still writes) and creates this file empty on first run.
+const ANTIGRAVITY_SPEC: JsonSpec = .{
+    .relative_path = ".gemini/config/mcp_config.json",
+    .section_key = "mcpServers",
+    .environment_key = "env",
 };
 
 /// Returns the current registration state for every provider installed on PATH.
@@ -166,6 +174,7 @@ fn detectedProvidersAtHome(allocator: std.mem.Allocator, home: []const u8) [ALL_
         process_env.commandExists("pi"),
         process_env.commandExists("fx"),
         process_env.commandExists("grok"),
+        process_env.commandExists("agy"),
     };
     for (ALL_PROVIDERS, 0..) |provider, index| {
         detected[index] = detected[index] or providerConfigExistsAtHome(allocator, home, provider);
@@ -193,6 +202,7 @@ fn providerConfigExistsAtHome(allocator: std.mem.Allocator, home: []const u8, pr
         .pi => ".pi/agent/extensions/verde-mcp.ts",
         .fx => FX_SPEC.relative_path,
         .grok => ".grok/config.toml",
+        .antigravity => ANTIGRAVITY_SPEC.relative_path,
     };
     const path = configPathAlloc(allocator, home, relative_path) catch return false;
     defer allocator.free(path);
@@ -244,6 +254,7 @@ fn setSummaryStatus(summary: *Summary, provider: Provider, status: RegistrationS
         .pi => summary.pi = status,
         .fx => summary.fx = status,
         .grok => summary.grok = status,
+        .antigravity => summary.antigravity = status,
     }
 }
 
@@ -257,6 +268,7 @@ fn installProviderAtHome(allocator: std.mem.Allocator, home: []const u8, endpoin
         .pi => installPiAtHome(allocator, home, endpoint),
         .fx => installFxAtHome(allocator, home, endpoint),
         .grok => installGrokAtHome(allocator, home, endpoint),
+        .antigravity => installJsonAtHome(allocator, home, endpoint, .antigravity, ANTIGRAVITY_SPEC),
     };
 }
 
@@ -270,6 +282,7 @@ fn removeProviderAtHome(allocator: std.mem.Allocator, home: []const u8, provider
         .pi => removePiAtHome(allocator, home),
         .fx => removeFxAtHome(allocator, home),
         .grok => removeGrokAtHome(allocator, home),
+        .antigravity => removeJsonAtHome(allocator, home, ANTIGRAVITY_SPEC),
     };
 }
 
@@ -283,6 +296,7 @@ fn inspectProviderAtHome(allocator: std.mem.Allocator, home: []const u8, provide
         .pi => inspectPiAtHome(allocator, home),
         .fx => inspectJsonAtHome(allocator, home, FX_SPEC),
         .grok => inspectGrokAtHome(allocator, home),
+        .antigravity => inspectJsonAtHome(allocator, home, ANTIGRAVITY_SPEC),
     };
 }
 
@@ -625,6 +639,7 @@ fn inspectJsonAtHome(allocator: std.mem.Allocator, home: []const u8, spec: JsonS
     const content = readFileIfPresent(allocator, threaded.io(), path) catch return .conflict;
     defer if (content) |bytes| allocator.free(bytes);
     const bytes = content orelse return .not_installed;
+    if (isBlankConfig(bytes)) return .not_installed;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .conflict;
     defer parsed.deinit();
     if (parsed.value != .object) return .conflict;
@@ -649,10 +664,9 @@ fn installJsonAtHome(
     const existing = try readFileIfPresent(allocator, io, path);
     defer if (existing) |bytes| allocator.free(bytes);
 
-    var parsed = if (existing) |bytes|
-        try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{})
-    else
-        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    // Some providers (Antigravity) create their config file empty.
+    const source = if (existing) |bytes| (if (isBlankConfig(bytes)) "{}" else bytes) else "{}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.ProviderConfigNotObject;
     const arena = parsed.arena.allocator();
@@ -696,6 +710,10 @@ fn removeJsonAtHome(allocator: std.mem.Allocator, home: []const u8, spec: JsonSp
     const encoded = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
     try writeFileAtomic(allocator, io, path, encoded);
+}
+
+fn isBlankConfig(bytes: []const u8) bool {
+    return std.mem.trim(u8, bytes, &std.ascii.whitespace).len == 0;
 }
 
 fn jsonEntryManaged(entry: std.json.Value, environment_key: []const u8) bool {
@@ -763,7 +781,7 @@ test "managed JSON registration preserves user servers and uninstalls only Verde
         \\{"mcp":{"user-server":{"type":"local","command":["user-command"]}}}
     );
     const endpoint = testEndpoint(47_371);
-    const detected = [ALL_PROVIDERS.len]bool{ false, true, true, true, true, false, true, false };
+    const detected = [ALL_PROVIDERS.len]bool{ false, true, true, true, true, false, true, false, false };
     const installed = try installAtHome(std.testing.allocator, home, &endpoint, detected);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.claude);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.cursor);
@@ -790,6 +808,31 @@ test "managed JSON registration preserves user servers and uninstalls only Verde
     defer std.testing.allocator.free(fx_remaining);
     try std.testing.expect(std.mem.indexOf(u8, fx_remaining, "user-server") != null);
     try std.testing.expect(std.mem.indexOf(u8, fx_remaining, "user-command") != null);
+}
+
+test "Antigravity registration accepts the empty file agy creates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    const path = try configPathAlloc(std.testing.allocator, home, ANTIGRAVITY_SPEC.relative_path);
+    defer std.testing.allocator.free(path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try writeFileAtomic(std.testing.allocator, threaded.io(), path, "");
+    try std.testing.expectEqual(RegistrationStatus.not_installed, inspectProviderAtHome(std.testing.allocator, home, .antigravity));
+
+    const endpoint = testEndpoint(47_372);
+    try installProviderAtHome(std.testing.allocator, home, &endpoint, .antigravity);
+    try std.testing.expectEqual(RegistrationStatus.installed, inspectProviderAtHome(std.testing.allocator, home, .antigravity));
+    const installed = (try readFileIfPresent(std.testing.allocator, threaded.io(), path)).?;
+    defer std.testing.allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "\"mcpServers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "\"url\": \"http://127.0.0.1:47372/mcp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "\"X-Verde-MCP-Client\": \"antigravity\"") != null);
+
+    try removeProviderAtHome(std.testing.allocator, home, .antigravity);
+    try std.testing.expectEqual(RegistrationStatus.not_installed, inspectProviderAtHome(std.testing.allocator, home, .antigravity));
 }
 
 test "Codex managed block is idempotent and preserves surrounding TOML" {

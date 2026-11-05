@@ -1582,6 +1582,289 @@ fn writeGrokHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []co
     try s.endArray();
 }
 
+// Antigravity merges every named hook in ~/.gemini/config/hooks.json; Verde
+// owns one top-level entry there and leaves the user's named hooks untouched.
+// Its payloads carry no event name, so each command passes the event as an
+// argument, and agy runs hooks synchronously expecting a JSON object on stdout.
+const ANTIGRAVITY_GLOBAL_HOOK_REL = ".gemini/config/verde-antigravity-notify-hook.sh";
+const ANTIGRAVITY_WINDOWS_GLOBAL_HOOK_REL = ".gemini/config/verde-antigravity-notify-hook.ps1";
+const ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL = ".gemini/config/hooks.json";
+const ANTIGRAVITY_HOOK_NAME = "verde-notify";
+const ANTIGRAVITY_GLOBAL_HOOK_NEEDLE = "verde-antigravity-notify-hook";
+const ANTIGRAVITY_HOOK_EVENTS = [_][]const u8{ "SessionStart", "PreInvocation", "Stop" };
+
+fn antigravityGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) ANTIGRAVITY_WINDOWS_GLOBAL_HOOK_REL else ANTIGRAVITY_GLOBAL_HOOK_REL;
+}
+
+/// True when Verde's named hook is present in Antigravity's global hooks file.
+pub fn antigravityGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
+    return antigravityGlobalHooksInstalledAt(allocator, home);
+}
+
+fn antigravityGlobalHooksInstalledAt(allocator: std.mem.Allocator, home: []const u8) bool {
+    const hooks_path = std.fs.path.join(allocator, &.{ home, ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL }) catch return false;
+    defer allocator.free(hooks_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, allocator, .limited(8 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const entry = parsed.value.object.get(ANTIGRAVITY_HOOK_NAME) orelse return false;
+    const encoded = std.json.Stringify.valueAlloc(allocator, entry, .{}) catch return false;
+    defer allocator.free(encoded);
+    return std.mem.indexOf(u8, encoded, ANTIGRAVITY_GLOBAL_HOOK_NEEDLE) != null;
+}
+
+/// Installs Antigravity's global status hook, merging Verde's named entry
+/// into ~/.gemini/config/hooks.json (shared by `agy` and `agy acp`).
+pub fn ensureAntigravityGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    try ensureAntigravityGlobalHooksAt(allocator, home);
+}
+
+fn ensureAntigravityGlobalHooksAt(allocator: std.mem.Allocator, home: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, antigravityGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{}"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    try ensureParentDir(io, hook_path);
+    try writeAntigravityHookScript(allocator, io, hook_path);
+    const merged = try mergeAntigravityHooksAlloc(allocator, existing, hook_path);
+    defer allocator.free(merged);
+    try writeFileAtomic(allocator, io, hooks_path, merged, .default_file);
+}
+
+/// Removes Verde's named hook and its script, leaving user hooks. Idempotent.
+pub fn removeAntigravityGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    try removeAntigravityGlobalHooksAt(allocator, home);
+}
+
+fn removeAntigravityGlobalHooksAt(allocator: std.mem.Allocator, home: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, antigravityGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    if (std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024))) |existing| {
+        defer allocator.free(existing);
+        if (try removeAntigravityHookEntryAlloc(allocator, existing)) |updated| {
+            defer allocator.free(updated);
+            // An empty object is what installing created; drop the file.
+            if (std.mem.eql(u8, std.mem.trim(u8, updated, &std.ascii.whitespace), "{}")) {
+                std.Io.Dir.cwd().deleteFile(io, hooks_path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+            } else {
+                try writeFileAtomic(allocator, io, hooks_path, updated, .default_file);
+            }
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+/// Shell command for one hook event. agy runs it with `sh -c` (Unix) or
+/// `cmd /c` (Windows), so the script path is quoted for that shell.
+fn antigravityHookCommandAllocForOs(
+    allocator: std.mem.Allocator,
+    comptime os_tag: std.Target.Os.Tag,
+    hook_path: []const u8,
+    event: []const u8,
+) ![]u8 {
+    if (os_tag == .windows) {
+        const base = try hookCommandAllocForOs(allocator, os_tag, hook_path);
+        defer allocator.free(base);
+        return std.fmt.allocPrint(allocator, "{s} {s}", .{ base, event });
+    }
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeByte('\'');
+    for (hook_path) |byte| {
+        if (byte == '\'') try writer.writer.writeAll("'\\''") else try writer.writer.writeByte(byte);
+    }
+    try writer.writer.writeAll("' ");
+    try writer.writer.writeAll(event);
+    return writer.toOwnedSlice();
+}
+
+fn mergeAntigravityHooksAlloc(allocator: std.mem.Allocator, existing: []const u8, hook_path: []const u8) ![]u8 {
+    const source = if (std.mem.trim(u8, existing, &std.ascii.whitespace).len == 0) "{}" else existing;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.AntigravityHooksNotObject;
+    const arena = parsed.arena.allocator();
+
+    var entry: std.json.ObjectMap = .empty;
+    for (ANTIGRAVITY_HOOK_EVENTS) |event| {
+        const command = try antigravityHookCommandAllocForOs(arena, builtin.os.tag, hook_path, event);
+        var handler: std.json.ObjectMap = .empty;
+        try handler.put(arena, "type", .{ .string = "command" });
+        try handler.put(arena, "command", .{ .string = command });
+        try handler.put(arena, "timeout", .{ .integer = 5 });
+        var handlers: std.json.Array = .init(arena);
+        try handlers.append(.{ .object = handler });
+        // SessionStart, PreInvocation, and Stop take flat handler lists.
+        try entry.put(arena, event, .{ .array = handlers });
+    }
+    try parsed.value.object.put(arena, ANTIGRAVITY_HOOK_NAME, .{ .object = entry });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+/// Returns the file without Verde's entry, or null when there is nothing of
+/// Verde's to remove (including unparsable user files, which stay untouched).
+fn removeAntigravityHookEntryAlloc(allocator: std.mem.Allocator, existing: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, existing, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const entry = parsed.value.object.get(ANTIGRAVITY_HOOK_NAME) orelse return null;
+    const encoded = try std.json.Stringify.valueAlloc(allocator, entry, .{});
+    defer allocator.free(encoded);
+    if (std.mem.indexOf(u8, encoded, ANTIGRAVITY_GLOBAL_HOOK_NEEDLE) == null) return null;
+    _ = parsed.value.object.orderedRemove(ANTIGRAVITY_HOOK_NAME);
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+fn writeAntigravityHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const script = if (builtin.os.tag == .windows) antigravityPowerShellHookScript() else
+        \\#!/bin/sh
+        \\# verde-antigravity-notify-hook
+        \\# Antigravity blocks on hooks and reads a JSON object from stdout.
+        \\printf '{}\n'
+        \\[ "${VERDE:-}" = "1" ] || exit 0
+        \\[ -n "${VERDE_SESSION_ID:-}" ] || exit 0
+        \\event="${1:-}"
+        \\
+        \\cli="${VERDE_CLI:-verde}"
+        \\case "$cli" in
+        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
+        \\esac
+        \\if ! command -v "$cli" >/dev/null 2>&1; then
+        \\  if [ -x "./zig-out/bin/verde" ]; then cli="./zig-out/bin/verde"; else cli="verde"; fi
+        \\fi
+        \\
+        \\# The payload (it carries the user's prompt) stays in memory; no temp file.
+        \\payload_json="$(cat 2>/dev/null)"
+        \\# Payload-derived titles and error details require jq. Without it,
+        \\# event argv still drives lifecycle status; never guess at JSON.
+        \\json_string() {
+        \\  command -v jq >/dev/null 2>&1 || return 0
+        \\  printf '%s' "$payload_json" | jq -r --arg field "$1" '.[$field] // empty | strings' 2>/dev/null
+        \\}
+        \\json_integer() {
+        \\  command -v jq >/dev/null 2>&1 || return 0
+        \\  printf '%s' "$payload_json" | jq -r --arg field "$1" '.[$field] // empty | numbers | floor' 2>/dev/null
+        \\}
+        \\
+    ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\activity=""
+        \\title=""
+        \\case "$event" in
+        \\  SessionStart) activity="session-start" ;;
+        \\  PreInvocation)
+        \\    activity="parent-working"
+        \\    invocation="$(json_integer invocationNum)"
+        \\    if [ -z "$invocation" ] || [ "$invocation" = "0" ]; then
+        \\      title="$(json_string lastUserInput)"
+        \\      title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    fi
+        \\    ;;
+        \\  Stop)
+        \\    case "$(json_string terminationReason)" in
+        \\      ERROR|MAX_TOKEN_BUDGET_EXCEEDED) activity="parent-error" ;;
+        \\      *) activity="parent-idle" ;;
+        \\    esac
+        \\    ;;
+        \\  *) exit 0 ;;
+        \\esac
+        \\status="$(update_agent_status antigravity "$activity" idle)"
+        \\[ -n "$status" ] || exit 0
+        \\if [ -n "$title" ]; then
+        \\  "$cli" notify --quiet --status "$status" --title "$title" --provider antigravity >/dev/null 2>&1 || true
+        \\else
+        \\  "$cli" notify --quiet --status "$status" --provider antigravity >/dev/null 2>&1 || true
+        \\fi
+        \\exit 0
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, script, hookPermissionsForOs(builtin.os.tag));
+}
+
+fn antigravityPowerShellHookScript() []const u8 {
+    return
+    \\# verde-antigravity-notify-hook
+    \\param([string]$EventName = '')
+    \\# Antigravity blocks on hooks and reads a JSON object from stdout.
+    \\[Console]::Out.WriteLine('{}')
+    \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\$payload = $null
+    \\$payloadText = ''
+    \\try {
+    \\  $payloadText = [Console]::In.ReadToEnd()
+    \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
+    \\} catch {}
+    \\
+    ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
+        \\$activity = ''
+        \\$title = ''
+        \\switch ($EventName) {
+        \\  'SessionStart' { $activity = 'session-start'; break }
+        \\  'PreInvocation' {
+        \\    $activity = 'parent-working'
+        \\    $invocation = if ($null -ne $payload -and $null -ne $payload.invocationNum) { [string]$payload.invocationNum } else { '0' }
+        \\    if ($invocation -eq '0' -and $null -ne $payload -and $null -ne $payload.lastUserInput) {
+        \\      $title = [regex]::Replace([string]$payload.lastUserInput, '\s+', ' ').Trim()
+        \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\    }
+        \\    break
+        \\  }
+        \\  'Stop' {
+        \\    $reason = if ($null -ne $payload -and $null -ne $payload.terminationReason) { [string]$payload.terminationReason } else { '' }
+        \\    $activity = if ($reason -in 'ERROR', 'MAX_TOKEN_BUDGET_EXCEEDED') { 'parent-error' } else { 'parent-idle' }
+        \\    break
+        \\  }
+        \\  default { exit 0 }
+        \\}
+        \\$status = Update-AgentStatus -Provider 'antigravity' -Activity $activity -InitialStatus 'idle' -PayloadText $payloadText
+        \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'antigravity')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+        \\try { & $cli @notifyArgs *> $null } catch {}
+        \\exit 0
+        \\
+    ;
+}
+
 /// True when our managed OpenCode plugin is present in the global plugin dir.
 pub fn opencodeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
     const home = homeDirAlloc(allocator) catch return false;
@@ -2646,4 +2929,57 @@ test "Cursor hook removal preserves unrelated configuration" {
     try std.testing.expect(std.mem.indexOf(u8, removed, "user-stop-hook") != null);
     try std.testing.expect(std.mem.indexOf(u8, removed, "userSetting") != null);
     try std.testing.expect(std.mem.indexOf(u8, removed, CURSOR_GLOBAL_HOOK_NEEDLE) == null);
+}
+
+test "Antigravity global hooks merge one named entry and remove cleanly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+
+    try tmp.dir.createDirPath(std.testing.io, ".gemini/config");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io,
+            \\{"lint-checker":{"PostToolUse":[{"matcher":"run_command","hooks":[{"command":"./lint.sh"}]}]}}
+        );
+    }
+
+    try std.testing.expect(!antigravityGlobalHooksInstalledAt(std.testing.allocator, home));
+    try ensureAntigravityGlobalHooksAt(std.testing.allocator, home);
+    try ensureAntigravityGlobalHooksAt(std.testing.allocator, home);
+    try std.testing.expect(antigravityGlobalHooksInstalledAt(std.testing.allocator, home));
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const hooks_path = try std.fs.path.join(std.testing.allocator, &.{ home, ANTIGRAVITY_GLOBAL_HOOKS_JSON_REL });
+    defer std.testing.allocator.free(hooks_path);
+    const hooks = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(hooks);
+    try std.testing.expect(std.mem.indexOf(u8, hooks, "lint-checker") != null);
+    for (ANTIGRAVITY_HOOK_EVENTS) |event| {
+        try std.testing.expect(std.mem.indexOf(u8, hooks, event) != null);
+    }
+    try std.testing.expectEqual(ANTIGRAVITY_HOOK_EVENTS.len, std.mem.count(u8, hooks, ANTIGRAVITY_GLOBAL_HOOK_NEEDLE));
+
+    const hook_path = try std.fs.path.join(std.testing.allocator, &.{ home, antigravityGlobalHookRelPathForOs(builtin.os.tag) });
+    defer std.testing.allocator.free(hook_path);
+    const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hook_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, ANTIGRAVITY_GLOBAL_HOOK_NEEDLE) != null);
+
+    try removeAntigravityGlobalHooksAt(std.testing.allocator, home);
+    try std.testing.expect(!antigravityGlobalHooksInstalledAt(std.testing.allocator, home));
+    const remaining = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(remaining);
+    try std.testing.expect(std.mem.indexOf(u8, remaining, "lint-checker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remaining, ANTIGRAVITY_HOOK_NAME) == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(threaded.io(), hook_path, .{}));
+}
+
+test "Antigravity hook commands quote the script path and pass the event" {
+    const command = try antigravityHookCommandAllocForOs(std.testing.allocator, .linux, "/home/o'neil/.gemini/config/h.sh", "Stop");
+    defer std.testing.allocator.free(command);
+    try std.testing.expectEqualStrings("'/home/o'\\''neil/.gemini/config/h.sh' Stop", command);
 }

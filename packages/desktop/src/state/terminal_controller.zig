@@ -63,6 +63,7 @@ pub const AgentTuiProvider = enum {
     grok,
     amp,
     muse,
+    antigravity,
 };
 
 /// OpenCode (2.x) ships the TUI and the shared service in one binary. Verde
@@ -84,6 +85,8 @@ pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
         // Stable Muse does not expose third-party hooks yet. Verde projects
         // lifecycle state from Muse's durable local event log instead.
         .muse => .{ .name = "muse", .command = "muse", .provider = .muse, .notify = true, .hooks = true },
+        // agy's default mode already asks before edits and commands.
+        .antigravity => .{ .name = "antigravity", .command = "agy", .provider = .antigravity, .notify = true, .hooks = true },
         .other => null,
     };
 }
@@ -101,6 +104,7 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
             std.mem.eql(u8, command, GROK_TUI_COMMAND),
         .amp => std.mem.eql(u8, command, "amp"),
         .muse => std.mem.eql(u8, command, "muse"),
+        .antigravity => std.mem.eql(u8, command, "agy"),
         .other => false,
     };
 }
@@ -114,6 +118,7 @@ pub fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
         .grok => "Grok",
         .amp => "Amp",
         .muse => "Muse",
+        .antigravity => "Antigravity",
         .other => "Agent",
     };
 }
@@ -131,6 +136,7 @@ fn agentTuiProviderFromStack(provider: stack_config.AgentProvider) ?AgentTuiProv
         .grok => .grok,
         .amp => .amp,
         .muse => .muse,
+        .antigravity => .antigravity,
         .other => null,
     };
 }
@@ -143,6 +149,7 @@ pub fn agentTuiProviderFromProcessName(name: []const u8) ?AgentTuiProvider {
     if (std.mem.eql(u8, name, "pi")) return .pi;
     if (std.mem.eql(u8, name, "fx")) return .fx;
     if (std.mem.eql(u8, name, "grok")) return .grok;
+    if (std.mem.eql(u8, name, "agy")) return .antigravity;
     if (std.mem.eql(u8, name, "amp")) return .amp;
     if (std.mem.eql(u8, name, "muse") or std.mem.startsWith(u8, name, "muse-bin-")) return .muse;
     return null;
@@ -157,6 +164,8 @@ test "agent TUI defaults stay least-privilege and legacy saved commands stay rec
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode2"));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.cursor, "agent"));
     try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
+    try std.testing.expectEqual(AgentTuiProvider.antigravity, agentTuiProviderFromProcessName("agy").?);
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.antigravity, defaultAgentTui(.antigravity).?.command));
     try std.testing.expectEqual(AgentTuiProvider.cursor, agentTuiProviderFromProcessName("cursor-agent").?);
     try std.testing.expectEqual(AgentTuiProvider.muse, agentTuiProviderFromProcessName("muse-bin-x86_64").?);
     try std.testing.expect(agentTuiProviderFromProcessName("bash") == null);

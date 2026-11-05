@@ -24,6 +24,7 @@ export function agentTuiCommand(provider: string): string | null {
     case 'muse': return 'muse'
     case 'pi': return 'pi'
     case 'fx': return 'fx'
+    case 'antigravity': return 'agy'
     default: return null
   }
 }
@@ -40,6 +41,7 @@ export function agentResumeCommand(provider: string, providerThreadId: string): 
     case 'grok': return `grok --resume ${id}`
     case 'muse': return `muse resume ${id}`
     case 'fx': return `fx --resume ${id}`
+    case 'antigravity': return `agy --conversation ${id}`
     default: return null
   }
 }
@@ -54,7 +56,7 @@ export function agentTerminalArgv(command: string): string[] {
 
 export const PROVIDER_LABELS: Record<string, string> = {
   codex: 'Codex', claude: 'Claude', opencode: 'OpenCode', cursor: 'Cursor',
-  pi: 'Pi', fx: 'FX', grok: 'Grok', muse: 'Muse', amp: 'Amp',
+  pi: 'Pi', fx: 'FX', grok: 'Grok', antigravity: 'Antigravity', muse: 'Muse', amp: 'Amp',
 }
 
 export function providerLabel(provider: string | null | undefined): string {
@@ -62,7 +64,7 @@ export function providerLabel(provider: string | null | undefined): string {
 }
 
 /** handoff_controller.zig TARGET_PROVIDERS. */
-export const HANDOFF_PROVIDERS = ['codex', 'opencode', 'claude', 'cursor', 'pi', 'fx', 'grok'] as const
+export const HANDOFF_PROVIDERS = ['codex', 'opencode', 'claude', 'cursor', 'pi', 'fx', 'grok', 'antigravity'] as const
 /** Providers the daemon's provider.threads.list can import from. */
 export const IMPORT_PROVIDERS = ['codex', 'opencode', 'claude'] as const
 /** Providers provider.title.generate accepts. */

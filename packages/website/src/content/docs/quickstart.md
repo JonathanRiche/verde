@@ -54,6 +54,7 @@ terminal-only provider before launching the app:
 | Pi          | Install [pi](https://pi.dev); ensure `pi` is on `PATH`. Pi drives Verde's native chat panes (`pi --mode rpc`) and can also launch as a terminal TUI. |
 | FX          | Install [fx](https://fx.sh) with its setup script, then run `fx login`. FX drives Verde's native chat panes (`fx acp`) and can also launch as a terminal TUI. |
 | Grok Build  | Install [Grok Build](https://docs.x.ai/build/overview#install); ensure `grok` is on `PATH`, then run `grok login`. Grok drives Verde's native chat panes and can also launch as a terminal TUI from the command palette. |
+| Antigravity | Install the [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli) (`curl -fsSL https://antigravity.google/cli/install.sh \| bash`); ensure `agy` is on `PATH`, then run `agy acp --login`. Antigravity drives native chat panes over ACP and launches as a terminal TUI from the command palette. |
 | Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |
 
 See [Provider setup](/docs/providers) for the full per-provider notes.

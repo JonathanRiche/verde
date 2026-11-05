@@ -2174,6 +2174,7 @@ fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP",
+        .antigravity => "Antigravity",
     };
 }
 
@@ -2195,6 +2196,7 @@ fn nativeProviderInstalled(provider: provider_models.Provider) bool {
         .grok => process_env.commandExists("grok"),
         .muse => process_env.commandExists("muse"),
         .custom_acp => customAcpAgentInstalled(),
+        .antigravity => process_env.commandExists("agy"),
     };
 }
 
@@ -2272,6 +2274,7 @@ fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provide
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
+        .antigravity => .antigravity,
     };
 }
 
@@ -2286,6 +2289,7 @@ fn protocolProvider(provider: provider_models.Provider) headless.provider_types.
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
+        .antigravity => .antigravity,
     };
 }
 
@@ -2301,6 +2305,7 @@ fn nativeProviderVersionExecutable(provider: provider_models.Provider) ?[]const 
         .muse => if (process_env.commandExists("muse")) "muse" else null,
         // Each custom agent has its own command; there is no one version.
         .custom_acp => null,
+        .antigravity => provider_cli_version.executableForProvider("antigravity"),
     };
 }
 
@@ -8151,7 +8156,7 @@ pub const Daemon = struct {
             }
         }
         const steer_provider = turn.request.provider;
-        if ((steer_provider != .codex and steer_provider != .claude and steer_provider != .pi) or turn.request.harness_kind != .local_cli) {
+        if ((steer_provider != .codex and steer_provider != .claude and steer_provider != .pi and steer_provider != .fx) or turn.request.harness_kind != .local_cli) {
             turn.mutex.unlock();
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider does not support daemon steering");
@@ -8225,6 +8230,7 @@ pub const Daemon = struct {
         const steer_config: harness.ProviderConfig = switch (steer_provider) {
             .codex => .{ .codex = .{ .cwd = owned_project_path, .launch_on_connect = false } },
             .pi => .{ .pi = .{ .cwd = owned_project_path } },
+            .fx => .{ .fx = .{ .cwd = owned_project_path } },
             else => .{ .claude = .{ .cwd = owned_project_path } },
         };
         // Set only when the provider provably never received the steer (no
@@ -9333,6 +9339,7 @@ pub const Daemon = struct {
             .amp = provider_hooks.ampGlobalHooksInstalled(self.allocator),
             .opencode = provider_hooks.opencodeGlobalHooksInstalled(self.allocator),
             .pi = provider_hooks.piGlobalHooksInstalled(self.allocator),
+            .antigravity = provider_hooks.antigravityGlobalHooksInstalled(self.allocator),
         };
         return try okValueResponse(self.allocator, id_value, headless.providers_protocol.IntegrationsInspectResult{
             .hooks = hooks,
@@ -9358,6 +9365,7 @@ pub const Daemon = struct {
             .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator),
             .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator),
             .pi => provider_hooks.ensurePiGlobalHooks(self.allocator),
+            .antigravity => provider_hooks.ensureAntigravityGlobalHooks(self.allocator),
         } else switch (request.provider) {
             .claude => provider_hooks.removeClaudeGlobalHooks(self.allocator),
             .codex => provider_hooks.removeCodexGlobalHooks(self.allocator),
@@ -9366,6 +9374,7 @@ pub const Daemon = struct {
             .amp => provider_hooks.removeAmpGlobalHooks(self.allocator),
             .opencode => provider_hooks.removeOpencodeGlobalHooks(self.allocator),
             .pi => provider_hooks.removePiGlobalHooks(self.allocator),
+            .antigravity => provider_hooks.removeAntigravityGlobalHooks(self.allocator),
         };
         operation catch |err| return try errorResponseAlloc(
             self.allocator,
@@ -9422,7 +9431,7 @@ pub const Daemon = struct {
         );
         switch (route.provider) {
             .codex, .claude, .cursor, .opencode => {},
-            .pi, .fx, .grok, .muse, .custom_acp => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
+            .pi, .fx, .grok, .muse, .custom_acp, .antigravity => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
         }
         const user_text = if (std.mem.trim(u8, request.user_text, &std.ascii.whitespace).len > 0)
             boundedTitleUtf8Prefix(request.user_text, 4096)
@@ -9483,7 +9492,7 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object or null");
         }
         const ProviderStatus = headless.providers_protocol.ProviderStatus;
-        var version_storage: [9][48]u8 = undefined;
+        var version_storage: [10][48]u8 = undefined;
         const statuses = [_]ProviderStatus{
             nativeProviderStatus(self.allocator, .codex, &version_storage[0]),
             nativeProviderStatus(self.allocator, .claude, &version_storage[1]),
@@ -9494,6 +9503,7 @@ pub const Daemon = struct {
             nativeProviderStatus(self.allocator, .fx, &version_storage[6]),
             nativeProviderStatus(self.allocator, .grok, &version_storage[7]),
             nativeProviderStatus(self.allocator, .muse, &version_storage[8]),
+            nativeProviderStatus(self.allocator, .antigravity, &version_storage[9]),
         };
         const result: headless.providers_protocol.StatusResult = .{
             .runtime_id = self.runtime_id,
@@ -12322,6 +12332,7 @@ fn providerNameFromCode(code: i64) []const u8 {
         6 => "grok",
         7 => "muse",
         8 => "custom_acp",
+        9 => "antigravity",
         else => "opencode",
     };
 }
@@ -12371,7 +12382,8 @@ fn accessModeNameFromCode(code: i64) []const u8 {
 }
 
 fn surfaceProviderNameFromCode(code: i64) []const u8 {
-    const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp" };
+    // Indexed by db_types.SurfaceProvider codes.
+    const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp", "pi", "fx", "muse", "antigravity" };
     if (code < 0 or code >= names.len) return "opencode";
     return names[@intCast(code)];
 }
@@ -15814,7 +15826,7 @@ const BrainSwitchJob = struct {
 };
 
 fn brainLabelAlloc(arena: std.mem.Allocator, provider: []const u8, model: ?[]const u8) ![]u8 {
-    const labels = .{ .{ "opencode", "OpenCode" }, .{ "codex", "Codex" }, .{ "cursor", "Cursor" }, .{ "claude", "Claude" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" }, .{ "custom_acp", "Custom ACP" } };
+    const labels = .{ .{ "opencode", "OpenCode" }, .{ "codex", "Codex" }, .{ "cursor", "Cursor" }, .{ "claude", "Claude" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" }, .{ "custom_acp", "Custom ACP" }, .{ "antigravity", "Antigravity" } };
     var pretty: []const u8 = provider;
     inline for (labels) |pair| if (std.mem.eql(u8, provider, pair[0])) {
         pretty = pair[1];
@@ -15999,7 +16011,7 @@ fn companionBrainSwitchResponse(daemon: *Daemon, id_value: std.json.Value, param
             .{ workspace_id, thread_id },
         ) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable)) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "companion conversation not found");
         defer row.deinit();
-        const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse", "custom_acp" };
+        const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse", "custom_acp", "antigravity" };
         const code: usize = @intCast(@max(0, row.int(0)));
         break :blk .{
             .provider = try arena.dupe(u8, if (code < names.len) names[code] else "unknown"),
@@ -19285,7 +19297,7 @@ const ChatTitleRoute = struct {
 fn titleCapableProvider(provider: harness.Provider) bool {
     return switch (provider) {
         .codex, .claude, .cursor, .opencode => true,
-        .pi, .fx, .grok, .muse, .custom_acp => false,
+        .pi, .fx, .grok, .muse, .custom_acp, .antigravity => false,
     };
 }
 
@@ -19318,7 +19330,7 @@ fn titleProviderSignedIn(allocator: std.mem.Allocator, provider: harness.Provide
         .codex => process_env.commandExists("codex") and provider_offline_auth.codex(allocator) == .signed_in,
         .opencode => process_env.commandExists("opencode") and provider_offline_auth.opencode(allocator) == .signed_in,
         .claude, .cursor => nativeProviderInstalled(nativeProviderFromHarness(provider)),
-        .pi, .fx, .grok, .muse, .custom_acp => false,
+        .pi, .fx, .grok, .muse, .custom_acp, .antigravity => false,
     };
 }
 
@@ -19391,9 +19403,10 @@ fn providerFailureReasonForError(
         error.CursorSignedOut => if (provider == .cursor) .provider_not_authenticated else null,
         error.FxSignedOut => if (provider == .fx) .provider_not_authenticated else null,
         error.GrokSignedOut => if (provider == .grok) .provider_not_authenticated else null,
+        error.AntigravitySignedOut => if (provider == .antigravity) .provider_not_authenticated else null,
         error.MuseSignedOut => if (provider == .muse) .provider_not_authenticated else null,
         error.AcpSignedOut => switch (provider) {
-            .cursor, .fx, .grok => .provider_not_authenticated,
+            .cursor, .fx, .grok, .antigravity => .provider_not_authenticated,
             else => null,
         },
         error.ProviderBridgeNotFound => if (provider == .claude) .provider_unavailable else null,

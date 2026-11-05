@@ -33,6 +33,7 @@ pub const IntegrationProvider = enum {
     pi,
     fx,
     grok,
+    antigravity,
 };
 
 pub const RegistrationStatus = enum {
@@ -52,6 +53,7 @@ pub const McpSummary = struct {
     pi: RegistrationStatus = .unavailable,
     fx: RegistrationStatus = .unavailable,
     grok: RegistrationStatus = .unavailable,
+    antigravity: RegistrationStatus = .unavailable,
 
     pub fn forProvider(self: McpSummary, provider: IntegrationProvider) RegistrationStatus {
         return switch (provider) {
@@ -63,6 +65,7 @@ pub const McpSummary = struct {
             .pi => self.pi,
             .fx => self.fx,
             .grok => self.grok,
+            .antigravity => self.antigravity,
         };
     }
 
@@ -112,6 +115,7 @@ pub const ManagedHookProvider = enum {
     amp,
     opencode,
     pi,
+    antigravity,
 };
 
 pub const ManagedHookStatus = struct {
@@ -122,6 +126,7 @@ pub const ManagedHookStatus = struct {
     amp: bool = false,
     opencode: bool = false,
     pi: bool = false,
+    antigravity: bool = false,
 
     pub fn forProvider(self: ManagedHookStatus, provider: ManagedHookProvider) bool {
         return switch (provider) {
@@ -132,6 +137,7 @@ pub const ManagedHookStatus = struct {
             .amp => self.amp,
             .opencode => self.opencode,
             .pi => self.pi,
+            .antigravity => self.antigravity,
         };
     }
 };

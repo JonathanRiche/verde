@@ -28,7 +28,7 @@ pub const QueueHit = *const fn (*runtime.AppState, palette.Rect, Action, usize) 
 
 /// Provider dialog rows in display order: every provider with an installer
 /// and sign-in command (the welcome screen lists the same set).
-pub const PROVIDERS = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse };
+pub const PROVIDERS = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .antigravity, .muse };
 
 /// Providers disabled in Settings are hidden from the model picker and new
 /// chats, so the dialog leaves their rows out too. Action indices stay

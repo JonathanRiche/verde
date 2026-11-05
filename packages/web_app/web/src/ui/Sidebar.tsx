@@ -1049,7 +1049,9 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
             ? 'FX'
             : pane.provider === 'grok'
               ? 'Grok'
-              : 'Codex'
+              : pane.provider === 'antigravity'
+                ? 'Antigravity'
+                : 'Codex'
   return ([
     paneZoomItem(pane),
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },

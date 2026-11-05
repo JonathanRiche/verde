@@ -153,6 +153,9 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.grok_tui", .title = "Start New Grok TUI", .keywords = "agent terminal workspace fresh xai grok build", .section = .workspaces, .run = runOpenGrokTui, .enabled = hasProjectsAndGrok },
     .{ .id = "workspace.muse_tui", .title = "Start New Muse TUI", .keywords = "agent terminal workspace fresh meta muse code", .section = .workspaces, .run = runOpenMuseTui, .enabled = hasProjects },
     .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
+    .{ .id = "workspace.antigravity_tui", .title = "Start New Antigravity TUI", .keywords = "agent terminal workspace fresh google gemini agy antigravity", .section = .workspaces, .run = runOpenAntigravityTui, .enabled = hasProjectsAndAntigravity },
+    .{ .id = "app.antigravity_setup", .title = "Set Up Antigravity CLI", .keywords = "install google gemini agy agent provider tui", .section = .app, .run = runAntigravitySetup, .enabled = antigravitySetupNeeded },
+    .{ .id = "app.antigravity_sign_in", .title = "Sign In to Antigravity", .keywords = "login google account gemini agy agent provider auth", .section = .app, .run = runAntigravitySignIn, .enabled = antigravityInstalled },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
@@ -1094,6 +1097,7 @@ fn agentTuiSearchLabel(provider: AgentTuiHistoryProvider) []const u8 {
         .cursor => "Cursor TUI",
         .pi => "Pi TUI",
         .fx => "FX TUI",
+        .antigravity => "Antigravity TUI",
         .grok => "Grok TUI",
         .amp => "Amp TUI",
         .muse => "Muse TUI",
@@ -1363,6 +1367,18 @@ fn grokSetupNeeded(_: *runtime.AppState) bool {
     return !native_state.AppState.grokTuiInstalled();
 }
 
+fn hasProjectsAndAntigravity(state: *runtime.AppState) bool {
+    return hasProjects(state) and native_state.AppState.antigravityTuiInstalled();
+}
+
+fn antigravityInstalled(_: *runtime.AppState) bool {
+    return native_state.AppState.antigravityTuiInstalled();
+}
+
+fn antigravitySetupNeeded(_: *runtime.AppState) bool {
+    return !native_state.AppState.antigravityTuiInstalled();
+}
+
 fn canZoomFocusedPane(state: *runtime.AppState) bool {
     return state.canToggleFocusedWorkspacePaneMaximized();
 }
@@ -1508,6 +1524,9 @@ fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8
     if (std.mem.eql(u8, id, "workspace.reopen")) return "No closed workspaces to reopen.";
     if (std.mem.eql(u8, id, "workspace.grok_tui")) return "Grok Build is not installed. Run “Set Up Grok Build” first.";
     if (std.mem.eql(u8, id, "app.grok_setup")) return "Grok Build is already installed.";
+    if (std.mem.eql(u8, id, "workspace.antigravity_tui")) return "Antigravity CLI is not installed. Run “Set Up Antigravity CLI” first.";
+    if (std.mem.eql(u8, id, "app.antigravity_setup")) return "Antigravity CLI is already installed.";
+    if (std.mem.eql(u8, id, "app.antigravity_sign_in")) return "Antigravity CLI is not installed. Run “Set Up Antigravity CLI” first.";
     if (std.mem.eql(u8, id, "workspace.herdr_focus_terminal")) return "Current workspace is not linked to Herdr.";
     if (std.mem.eql(u8, id, "workspace.herdr_unlink")) return "Current workspace is already running locally.";
     return "Command is unavailable right now.";
@@ -1777,6 +1796,20 @@ fn runOpenMuseTui(state: *runtime.AppState) void {
 
 fn runGrokSetup(state: *runtime.AppState) void {
     state.openGrokSetupGuide();
+}
+
+fn runOpenAntigravityTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .antigravity);
+}
+
+fn runAntigravitySetup(state: *runtime.AppState) void {
+    state.openAntigravitySetupGuide();
+}
+
+/// Runs `agy acp --login` in the provider dialog's setup terminal; agy owns
+/// the Google sign-in and the dialog rechecks readiness when it exits.
+fn runAntigravitySignIn(state: *runtime.AppState) void {
+    state.loginProvider(.antigravity);
 }
 
 fn runOpenAmpTui(state: *runtime.AppState) void {

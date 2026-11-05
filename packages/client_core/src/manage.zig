@@ -91,7 +91,7 @@ pub const State = struct {
 const MAX_TASKS = 16;
 const MAX_LABEL = 256;
 const tags = [_][]const u8{ "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list" };
-const providers = [_][2][]const u8{ .{ "codex", "Codex" }, .{ "claude", "Claude" }, .{ "opencode", "OpenCode" }, .{ "cursor", "Cursor" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" } };
+const providers = [_][2][]const u8{ .{ "codex", "Codex" }, .{ "claude", "Claude" }, .{ "opencode", "OpenCode" }, .{ "cursor", "Cursor" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "antigravity", "Antigravity" }, .{ "muse", "Muse" } };
 
 pub fn owns(tag: []const u8) bool {
     for (tags) |t| if (eq(t, tag)) return true;

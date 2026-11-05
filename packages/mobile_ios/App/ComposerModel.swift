@@ -21,7 +21,7 @@ func composerToken(_ text: String, caret: Int) -> ComposerToken? {
 
 /// How a message sent while a turn runs reaches the agent.
 enum FollowupKind: String, CaseIterable, Equatable {
-    /// Native daemon steering into the running reply (codex, claude, pi; text only).
+    /// Native daemon steering into the running reply (codex, claude, pi, fx; text only).
     case steer
     /// The core stops the running turn and sends this as the next turn in the same session
     /// (any provider, images allowed).
@@ -48,7 +48,7 @@ enum FollowupKind: String, CaseIterable, Equatable {
 }
 
 /// Providers whose daemon bridge steers a running reply natively.
-private let nativeSteerProviders: Set<String> = ["codex", "claude", "pi"]
+private let nativeSteerProviders: Set<String> = ["codex", "claude", "pi", "fx"]
 
 /// Whether this build's core models carry the `interrupt` follow-up (true once regenerated).
 let followupInterruptAvailable = EventFollowupSubmitKind(rawValue: FollowupKind.interrupt.rawValue) != nil

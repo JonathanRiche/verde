@@ -224,6 +224,7 @@ through the same composer / send path as the UI.
 
 ```bash
 verde live chat open --workspace <id> --provider codex [--model <id>] [--reasoning low|medium|high|xhigh] [--fast|--no-fast] [--parent-thread-id <id>] [--json]
+verde live chat present --workspace <id> --thread <thread-id> [--pane <pane-id>] [--axis horizontal|vertical] [--json]
 verde live chat status --pane <pane-id> [--json]
 verde live chat transcript --pane <pane-id> [--json]
 verde live chat draft set --pane <pane-id> --text "Reply with exactly: ok" [--json]
@@ -240,6 +241,10 @@ verde live chat approve --pane <pane-id> --decision approve|deny [--call <id>] [
 - `open --parent-thread-id <id>` links the new chat to an existing chat (for
   example a Companion delegating work), so it shows in that chat's crew and
   reports back to it, the same as MCP `open_chat` with `parent_thread_id`.
+- `present` shows an existing saved chat by its thread id, the same as MCP
+  `present_chat`. A chat that was closed or archived is reopened first with
+  its id, transcript, and settings intact. The result then has
+  `reopened: true`. It never changes desktop focus.
 - `status` returns the current draft, send state, and pending approval status.
 - `transcript` returns persisted messages for the pane's thread.
 - `draft set` replaces the current draft; `draft append` appends to it.
@@ -278,7 +283,7 @@ verde live process stop --name <name> [--project <id|index|path|current>] [--jso
 verde live process restart --name <name> [--project <id|index|path|current>] [--json]
 verde live process inspect --name <name> [--project <id|index|path|current>] [--json]
 verde live process logs --name <name> [--project <id|index|path|current>] [--json]
-verde live agent open --provider codex|claude|opencode|cursor|grok [--project <id|index|path|current>] [--json]
+verde live agent open --provider codex|claude|opencode|cursor|grok|antigravity [--project <id|index|path|current>] [--json]
 verde live stack start [--project <id|index|path|current>] [--json]
 verde live stack stop [--project <id|index|path|current>] [--json]
 verde live stack restart [--project <id|index|path|current>] [--json]
@@ -402,6 +407,10 @@ The bridge exposes the full GUI-chat surface to agents: `open_chat`,
 and `queue_chat_followup`, plus `list_workspaces` / `list_panes` for
 discovery.
 
+- `present_chat` shows a saved chat in the desktop by its thread id. A chat
+  absent from the desktop because it was closed or archived is reopened
+  durably first (`reopened: true`). Reopening keeps its id, transcript, and
+  settings.
 - `read_chat_thread` and `queue_chat_followup` are **daemon-direct**: they
   read persisted thread state through the session daemon, so they work even
   when the GUI has paged the thread out of memory.
@@ -449,9 +458,9 @@ login/auth behavior.
 ```bash
 verde integrations list [--json]
 verde integrations doctor [--json]
-verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
-verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
-verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
+verde integrations install <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx> [--global]
+verde integrations remove <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx> [--global]
+verde integrations disable <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx>
 ```
 
 - **Claude / Codex** hooks are project-local (`.claude/settings.local.json` / `.codex/hooks.json`); `--global` installs them in `~/.claude/settings.json` / `~/.codex/hooks.json` instead.
@@ -461,6 +470,9 @@ verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
 - **Grok** uses an isolated personal hook at
   `$GROK_HOME/hooks/verde-notify.json`, defaulting to
   `~/.grok/hooks/verde-notify.json`; install or remove it with `--global`.
+- **Antigravity** merges one `verde-notify` entry into
+  `~/.gemini/config/hooks.json` next to your own named hooks; install or
+  remove it with `--global`.
 - **Amp** uses a global lifecycle plugin at `~/.config/amp/plugins/verde-notify.ts` (install with `--global`). The plugin is a no-op outside Verde panes.
 - **OpenCode** uses a global lifecycle plugin at
   `~/.config/opencode/plugin/verde-notify.ts`.

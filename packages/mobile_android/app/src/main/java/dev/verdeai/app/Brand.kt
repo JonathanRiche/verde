@@ -49,6 +49,7 @@ internal fun ProviderGlyph(provider: String?, modifier: Modifier = Modifier.size
         "fx" -> R.drawable.provider_fx
         "amp" -> R.drawable.provider_amp
         "muse" -> R.drawable.provider_muse
+        "antigravity" -> R.drawable.provider_antigravity
         else -> null
     }
     val subtle = VerdeColors.Subtle

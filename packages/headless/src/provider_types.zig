@@ -13,6 +13,7 @@ pub const Provider = enum(u8) {
     muse,
     /// User-defined ACP agent; the thread model ref names which one.
     custom_acp,
+    antigravity,
 };
 
 pub const ProviderSlashCommandId = enum(u8) {

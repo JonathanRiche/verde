@@ -30,6 +30,7 @@ const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
 const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
 const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
 const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+const DEFAULT_ANTIGRAVITY_MODEL = provider_models.DEFAULT_ANTIGRAVITY_MODEL;
 const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
@@ -115,6 +116,7 @@ fn composerModelOptions(self: anytype, provider: Provider) []const ModelOption {
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
         self.customAcpModelOptionsSnapshot(),
+        self.antigravityModelOptionsSnapshot(),
     );
 }
 
@@ -126,6 +128,7 @@ fn composerDefaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .cursor => DEFAULT_CURSOR_MODEL,
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
+        .antigravity => DEFAULT_ANTIGRAVITY_MODEL,
         .grok => DEFAULT_GROK_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
         .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
@@ -2141,7 +2144,14 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
             },
             // Pi accepts every Verde effort tag as a thinking level.
             .pi => true,
-            .opencode, .cursor, .fx => false,
+            .opencode, .cursor => false,
+            // fx tiers follow the probed catalog for the model.
+            .fx => provider_models.fxEffortSupported(self.modelOptionForProvider(.fx, model_ref), effort),
+            // agy thinking tiers follow the model's catalog.
+            .antigravity => blk: {
+                const values: ?[]const [:0]const u8 = if (self.modelOptionForProvider(.antigravity, model_ref)) |option| option.grok_effort_values else null;
+                break :blk provider_models.antigravityEffortSupported(values, effort);
+            },
             // grok reasoning efforts stop at xhigh and follow the model's catalog.
             .grok => blk: {
                 const values: ?[]const [:0]const u8 = if (self.modelOptionForProvider(.grok, model_ref)) |option| option.grok_effort_values else null;
@@ -2160,7 +2170,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const values = switch (request.provider) {
             .opencode => option.reasoning_variant_keys,
             .cursor => option.cursor_reasoning_values,
-            .codex, .claude, .pi, .fx, .grok, .muse, .custom_acp => null,
+            .codex, .claude, .pi, .fx, .grok, .muse, .custom_acp, .antigravity => null,
         } orelse return error.UnsupportedReasoningVariant;
         var supported = false;
         for (values) |value| {
@@ -2176,7 +2186,8 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const supported = switch (request.provider) {
             .codex => true,
             .cursor => if (self.modelOptionForProvider(.cursor, model_ref)) |option| option.cursor_fast_supported else false,
-            .opencode, .claude, .pi, .fx, .grok, .muse, .custom_acp => false,
+            .fx => provider_models.fxFastSupported(self.modelOptionForProvider(.fx, model_ref)),
+            .opencode, .claude, .pi, .grok, .muse, .custom_acp, .antigravity => false,
         };
         if (!supported) return error.UnsupportedFastMode;
     }
@@ -2683,6 +2694,7 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
         .cursor => std.fmt.allocPrint(self.allocator, "agent --resume {s}\n", .{thread_id}),
         .pi => std.fmt.allocPrint(self.allocator, "pi --session-id {s}\n", .{thread_id}),
         .fx => std.fmt.allocPrint(self.allocator, "fx --resume {s}\n", .{thread_id}),
+        .antigravity => std.fmt.allocPrint(self.allocator, "agy --conversation {s}\n", .{thread_id}),
         .grok => std.fmt.allocPrint(self.allocator, "grok --resume {s}\n", .{thread_id}),
         .muse => std.fmt.allocPrint(self.allocator, "muse resume {s}\n", .{thread_id}),
         // Custom agents have no known TUI resume command.

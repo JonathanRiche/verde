@@ -5779,6 +5779,7 @@ fn providerCode(value: []const u8) !i64 {
     if (std.mem.eql(u8, value, "grok")) return 6;
     if (std.mem.eql(u8, value, "muse")) return 7;
     if (std.mem.eql(u8, value, "custom_acp")) return 8;
+    if (std.mem.eql(u8, value, "antigravity")) return 9;
     return error.InvalidParams;
 }
 
@@ -5831,6 +5832,8 @@ fn toolCallStatusCode(value: []const u8) !i64 {
 fn surfaceProviderCode(value: []const u8) !i64 {
     const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp", "pi", "fx" };
     for (names, 0..) |name, index| if (std.mem.eql(u8, value, name)) return @intCast(index);
+    // db_types.SurfaceProvider code; 8 (muse) reports outside this path.
+    if (std.mem.eql(u8, value, "antigravity")) return 9;
     return error.InvalidParams;
 }
 
@@ -6181,6 +6184,73 @@ test "thread close drops its panes from the stored layout and rebinds the rest" 
     try std.testing.expect(stored.rootContainsPane(c_pane));
     try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
+}
+
+test "unarchive-set reopens a closed thread by identity and restores its pane" {
+    // `verde live chat present` / MCP present_chat reopen a closed chat with
+    // this mutation, then rely on `applied` to tell a reopen from a no-op.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer allocator.free(db_path);
+    var store = try Store.init(allocator, db_path);
+    defer store.deinit();
+
+    var layout = try workspace_layout.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const b_pane = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, b_pane, .vertical, true);
+    const layout_json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_json);
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.workspace_layout_json = layout_json;
+    var b = testThread("b", "B");
+    b.provider_thread_id = "provider-session-b";
+    workspace.threads = &.{ testThread("a", "A"), b, testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+    const closed = try store.closeThread(.{ .mutation = testHeader("close-b", bootstrap.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+    try expectThreadOpenState(&store, "b", 3, false);
+
+    const reopened = try store.applyMutation(.{ .thread_archive_set = .{
+        .mutation = testHeader("reopen-b", null),
+        .workspace_id = "ws",
+        .local_thread_id = "b",
+        .archived = false,
+    } });
+    try std.testing.expect(reopened.applied);
+    try std.testing.expect(reopened.store_revision > closed.store_revision);
+    try expectThreadOpenState(&store, "b", 3, true);
+
+    var thread_row = (try store.conn.row("select archived, provider_thread_id, title from threads where local_thread_id = 'b'", .{})).?;
+    defer thread_row.deinit();
+    try std.testing.expectEqual(@as(i64, 0), thread_row.int(0));
+    try std.testing.expectEqualStrings("provider-session-b", thread_row.text(1));
+    try std.testing.expectEqualStrings("B", thread_row.text(2));
+
+    // b is last in sort order among open rows (a, c, b), so its pane is ordinal 2.
+    var row = (try store.conn.row("select workspace_layout_json from workspaces where workspace_id = 'ws'", .{})).?;
+    defer row.deinit();
+    var stored: workspace_layout.WorkspaceLayout = .{};
+    defer stored.deinit(allocator);
+    try stored.applyPersistedWorkspaceJson(allocator, row.text(0));
+    var reopened_panes: usize = 0;
+    for (stored.panes.items) |pane| switch (pane.ref) {
+        .chat => |ref| if (ref.thread_index == 2 and stored.rootContainsPane(pane.id)) {
+            reopened_panes += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), reopened_panes);
+
+    const again = try store.applyMutation(.{ .thread_archive_set = .{
+        .mutation = testHeader("reopen-b-again", null),
+        .workspace_id = "ws",
+        .local_thread_id = "b",
+        .archived = false,
+    } });
+    try std.testing.expect(!again.applied);
 }
 
 test "thread move reassigns the row, rekeys turn records, and detaches links" {

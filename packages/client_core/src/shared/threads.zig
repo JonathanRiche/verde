@@ -14,6 +14,7 @@ pub fn providerLabel(provider: anytype) [:0]const u8 {
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP",
+        .antigravity => "Antigravity",
     };
 }
 
@@ -46,6 +47,7 @@ pub fn modelOptions(
     grok_options: []const Option,
     muse_options: []const Option,
     custom_acp_options: []const Option,
+    antigravity_options: []const Option,
 ) []const Option {
     return switch (provider) {
         .opencode => opencode_options,
@@ -57,6 +59,7 @@ pub fn modelOptions(
         .grok => grok_options,
         .muse => muse_options,
         .custom_acp => custom_acp_options,
+        .antigravity => antigravity_options,
     };
 }
 
@@ -73,15 +76,16 @@ pub fn selectedModelLabel(
     grok_options: []const Option,
     muse_options: []const Option,
     custom_acp_options: []const Option,
+    antigravity_options: []const Option,
 ) [:0]const u8 {
     if (thread.model_ref) |model_ref| {
-        for (modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options, muse_options, custom_acp_options)) |option| {
+        for (modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options, muse_options, custom_acp_options, antigravity_options)) |option| {
             if (option.value) |value| {
                 if (std.mem.eql(u8, model_ref, value)) return option.label;
             }
         }
     }
-    const options = modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options, muse_options, custom_acp_options);
+    const options = modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options, muse_options, custom_acp_options, antigravity_options);
     return if (options.len > 0) options[0].label else "Model";
 }
 

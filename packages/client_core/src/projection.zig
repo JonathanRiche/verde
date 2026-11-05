@@ -228,6 +228,7 @@ fn providerFromComm(comm: []const u8) ?[]const u8 {
     if (eq(comm, "grok")) return "grok";
     if (eq(comm, "amp")) return "amp";
     if (eq(comm, "fx")) return "fx";
+    if (eq(comm, "agy")) return "antigravity";
     if (eq(comm, "muse") or std.mem.startsWith(u8, comm, "muse-bin-")) return "muse";
     return null;
 }

@@ -15,6 +15,7 @@ import piUrl from '../../../../desktop/src/assets/pi-logo.png'
 import fxUrl from '../../../../desktop/src/assets/fx-logo.png'
 import ampUrl from '../../../../desktop/src/assets/amp-logo.png'
 import museUrl from '../../../../desktop/src/assets/muse-logo.png'
+import antigravityUrl from '../../../../desktop/src/assets/antigravity-logo.png'
 
 export function VerdeLogo(props: { class?: string }) {
   return (
@@ -58,6 +59,8 @@ export function ProviderGlyph(props: { provider?: string; class?: string }) {
         return ampUrl
       case 'muse':
         return museUrl
+      case 'antigravity':
+        return antigravityUrl
       default:
         return null
     }

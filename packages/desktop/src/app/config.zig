@@ -39,6 +39,7 @@ pub const ChatProvider = enum {
     grok,
     muse,
     custom_acp,
+    antigravity,
 
     pub fn parse(value: []const u8) ?ChatProvider {
         inline for (std.meta.fields(ChatProvider)) |field| {
@@ -237,6 +238,24 @@ pub const LinkOpenOverride = enum {
     }
 };
 
+/// Where a file link (chat transcript, diff header) opens on left-click.
+pub const FileOpenTarget = enum {
+    /// Verde's built-in file viewer tab.
+    verde,
+    /// The operating system's default application for the file type.
+    system_default,
+    /// Neovim in a new Verde terminal pane.
+    neovim,
+
+    pub fn parse(value: []const u8) ?FileOpenTarget {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (std.ascii.eqlIgnoreCase(trimmed, "verde") or std.ascii.eqlIgnoreCase(trimmed, "viewer")) return .verde;
+        if (std.ascii.eqlIgnoreCase(trimmed, "system_default") or std.ascii.eqlIgnoreCase(trimmed, "system") or std.ascii.eqlIgnoreCase(trimmed, "default")) return .system_default;
+        if (std.ascii.eqlIgnoreCase(trimmed, "neovim") or std.ascii.eqlIgnoreCase(trimmed, "nvim")) return .neovim;
+        return null;
+    }
+};
+
 pub const ToolCallGroupPreference = enum {
     collapsed,
     expanded,
@@ -402,7 +421,7 @@ pub const AppConfig = struct {
     chat_link_open_override: LinkOpenOverride = .global,
     terminal_link_open_override: LinkOpenOverride = .global,
     browser_scroll_speed: f32 = DEFAULT_BROWSER_SCROLL_SPEED,
-    file_links_in_neovim_pane: bool = false,
+    file_open_target: FileOpenTarget = .verde,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
     tool_call_groups_last_expanded: bool = false,
@@ -884,7 +903,9 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     try open_object.put(allocator, "links", links_value);
     try open_object.put(allocator, "chat_links", .{ .string = @tagName(config.chat_link_open_override) });
     try open_object.put(allocator, "terminal_links", .{ .string = @tagName(config.terminal_link_open_override) });
-    try open_object.put(allocator, "file_links_in_neovim_pane", .{ .bool = config.file_links_in_neovim_pane });
+    try open_object.put(allocator, "files", .{ .string = @tagName(config.file_open_target) });
+    // Superseded by `files`; dropped so a stale `true` cannot override it.
+    _ = open_object.orderedRemove("file_links_in_neovim_pane");
 }
 
 fn writeBrowserSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -1672,12 +1693,16 @@ fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_val
             config.terminal_link_open_override = target;
         }
     }
-    if (open_value.object.get("file_links_in_neovim_pane")) |pane_value| {
-        if (pane_value == .bool) {
-            config.file_links_in_neovim_pane = pane_value.bool;
+    if (open_value.object.get("files")) |files_value| {
+        const parsed = if (files_value == .string) FileOpenTarget.parse(files_value.string) else null;
+        if (parsed) |target| {
+            config.file_open_target = target;
         } else {
-            log.warn("open.file_links_in_neovim_pane must be a boolean when provided", .{});
+            log.warn("open.files must be verde, system_default, or neovim", .{});
         }
+    } else if (open_value.object.get("file_links_in_neovim_pane")) |pane_value| {
+        // Legacy toggle: `true` meant "open file links in a Neovim pane".
+        if (pane_value == .bool and pane_value.bool) config.file_open_target = .neovim;
     }
 }
 
@@ -1956,6 +1981,44 @@ test "app config defaults snap pane scrolling only, even with a legacy false boo
     try std.testing.expect(!loaded.reduced_motion.status_pulse);
     try std.testing.expect(!loaded.reduced_motion.chat);
     try std.testing.expect(!loaded.reduced_motion.chrome);
+}
+
+test "app config file open target defaults to Verde and migrates the legacy Neovim toggle" {
+    const cases = [_]struct { json: []const u8, expected: FileOpenTarget }{
+        .{ .json = "{}", .expected = .verde },
+        .{ .json = "{\"open\":{\"file_links_in_neovim_pane\":false}}", .expected = .verde },
+        .{ .json = "{\"open\":{\"file_links_in_neovim_pane\":true}}", .expected = .neovim },
+        .{ .json = "{\"open\":{\"files\":\"system_default\",\"file_links_in_neovim_pane\":true}}", .expected = .system_default },
+        .{ .json = "{\"open\":{\"files\":\"bogus\"}}", .expected = .verde },
+    };
+    for (cases) |case| {
+        var root = try parseTestRoot(case.json);
+        defer root.deinit();
+        var loaded: AppConfig = .{};
+        defer loaded.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &loaded, root.value);
+        try std.testing.expectEqual(case.expected, loaded.file_open_target);
+    }
+}
+
+test "app config file open target round trips and drops the legacy key" {
+    var root = try parseTestRoot("{\"open\":{\"file_links_in_neovim_pane\":true}}");
+    defer root.deinit();
+    var config: AppConfig = .{ .file_open_target = .system_default };
+    defer config.deinit(std.testing.allocator);
+    try writeOpenSection(root.arena.allocator(), &root.value.object, &config);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+    defer std.testing.allocator.free(encoded);
+
+    var saved = try parseTestRoot(encoded);
+    defer saved.deinit();
+    const open = saved.value.object.get("open").?.object;
+    try std.testing.expectEqualStrings("system_default", open.get("files").?.string);
+    try std.testing.expect(open.get("file_links_in_neovim_pane") == null);
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+    try std.testing.expectEqual(FileOpenTarget.system_default, loaded.file_open_target);
 }
 
 test "app config loads and selects installed themes" {

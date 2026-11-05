@@ -34,6 +34,8 @@ pub fn executableForProvider(provider_name: []const u8) ?[]const u8 {
         "grok"
     else if (std.mem.eql(u8, provider_name, "muse"))
         "muse"
+    else if (std.mem.eql(u8, provider_name, "antigravity"))
+        "agy"
     else
         null;
     const name = executable orelse return null;
@@ -147,6 +149,10 @@ fn latestSource(provider_name: []const u8) ?LatestSource {
     }
     if (std.mem.eql(u8, provider_name, "muse")) {
         return .{ .url = "https://api.meta.ai/muse-code/channels/muse-stable", .kind = .json_version };
+    }
+    if (std.mem.eql(u8, provider_name, "antigravity")) {
+        // The installer's per-platform manifest; every platform ships the same version.
+        return .{ .url = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json", .kind = .json_version };
     }
     return null;
 }

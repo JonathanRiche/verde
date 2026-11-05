@@ -3,7 +3,7 @@ import { unwrapResult } from './live'
 import type { Attachment, FollowupKind, LivePane, PendingFollowup, RpcEnvelope } from './types'
 
 export function followupKind(provider?: string, harness = 'local_cli'): FollowupKind {
-  return harness === 'local_cli' && ['codex', 'claude', 'pi'].includes(provider ?? '') ? 'steer' : 'queue'
+  return harness === 'local_cli' && ['codex', 'claude', 'pi', 'fx'].includes(provider ?? '') ? 'steer' : 'queue'
 }
 
 export function followupKey(pane: LivePane): string {

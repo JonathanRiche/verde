@@ -840,6 +840,7 @@ fn openTuiLabel(provider: Provider) []const u8 {
         .cursor => "Open in TUI: Cursor",
         .pi => "Open in TUI: Pi",
         .fx => "Open in TUI: FX",
+        .antigravity => "Open in TUI: Antigravity",
         .grok => "Open in TUI: Grok",
         .muse => "Open in TUI: Muse",
         .custom_acp => "Open in TUI",
@@ -2762,6 +2763,7 @@ pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: nat
         .cursor => .cursor,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .amp => .amp,
         .muse => .muse,
@@ -2780,6 +2782,7 @@ const TerminalAgentProvider = enum {
     fx,
     muse,
     custom_acp,
+    antigravity,
 };
 
 fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvider {
@@ -2790,6 +2793,7 @@ fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvid
         .cursor => .cursor,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -2806,6 +2810,7 @@ fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentP
         .amp => .amp,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .muse => .muse,
     };
 }
@@ -2834,6 +2839,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .amp => state.amp_logo_texture,
         .pi => state.pi_logo_texture,
         .fx => state.fx_logo_texture,
+        .antigravity => state.antigravity_logo_texture,
         .muse => state.muse_logo_texture,
         .custom_acp => null,
     };
@@ -2854,6 +2860,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .fx => "F",
         .muse => "M",
         .custom_acp => "Ag",
+        .antigravity => "AG",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
     const color = if (provider == .amp) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE;
@@ -2876,6 +2883,7 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "grok")) return .grok;
     if (std.mem.eql(u8, comm, "amp")) return .amp;
     if (std.mem.eql(u8, comm, "fx")) return .fx;
+    if (std.mem.eql(u8, comm, "agy")) return .antigravity;
     if (std.mem.eql(u8, comm, "muse") or std.mem.startsWith(u8, comm, "muse-bin-")) return .muse;
     return null;
 }

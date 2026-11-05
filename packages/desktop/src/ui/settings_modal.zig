@@ -77,7 +77,6 @@ pub const Control = enum(u8) {
     open_vscode,
     open_zed,
     open_action_dropdown,
-    file_links_neovim_pane,
     links_verde_browser,
     links_system_browser,
     chat_links_global,
@@ -94,6 +93,7 @@ pub const Control = enum(u8) {
     hooks_cursor,
     hooks_opencode,
     hooks_grok,
+    hooks_antigravity,
     hooks_amp,
     hooks_pi,
     updates_check,
@@ -102,6 +102,9 @@ pub const Control = enum(u8) {
     updates_notes_toggle,
     updates_release_page,
     notifications_toggle,
+    files_open_verde,
+    files_open_system,
+    files_open_neovim,
     providers_recheck,
     providers_update_all,
     navigation_back_record,
@@ -116,6 +119,7 @@ pub const Control = enum(u8) {
     provider_update_4,
     provider_update_5,
     provider_update_6,
+    provider_update_7,
     provider_update_last,
     provider_row_first,
     provider_row_1,
@@ -124,6 +128,7 @@ pub const Control = enum(u8) {
     provider_row_4,
     provider_row_5,
     provider_row_6,
+    provider_row_7,
     provider_row_last,
 };
 
@@ -295,8 +300,6 @@ const SettingsLayout = struct {
     workspace_new_tab_chat: palette.Rect,
     workspace_new_tab_terminal: palette.Rect,
     workspace_new_tab_hint_y: f32,
-    file_links_neovim_pane: palette.Rect,
-    file_links_hint_y: f32,
     workspace_unzoom_on_navigation: palette.Rect,
     workspace_unzoom_on_navigation_hint_y: f32,
     navigation_card: palette.Rect,
@@ -337,6 +340,7 @@ const SettingsLayout = struct {
     hooks_cursor: palette.Rect,
     hooks_opencode: palette.Rect,
     hooks_grok: palette.Rect,
+    hooks_antigravity: palette.Rect,
     hooks_amp: palette.Rect,
     hooks_pi: palette.Rect,
     integrations_hint_y: f32,
@@ -351,6 +355,10 @@ const SettingsLayout = struct {
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
     notifications_hint_y: f32,
+    files_card: palette.Rect,
+    files_open_verde: palette.Rect,
+    files_open_system: palette.Rect,
+    files_open_neovim: palette.Rect,
     providers_card: palette.Rect,
     provider_rows: [PROVIDER_ROW_COUNT]palette.Rect,
     provider_updates: [PROVIDER_ROW_COUNT]palette.Rect,
@@ -500,8 +508,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         labeled;
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h +
         (if (auto_titles) m.row_gap + labeled else 0.0) +
-        m.row_gap + labeled +
-        m.row_gap + m.row_h;
+        m.row_gap + labeled;
     const commit_h = m.card_pad * 2.0 + m.title_h + m.row_gap + labeled + m.row_gap + labeled;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h;
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
@@ -545,7 +552,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const phone_h = if (category == .connections) phoneCard(state, .{ .x = 0, .y = 0, .w = content_w, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false, null) else 0.0;
     const runtimes_w = content_w;
     const runtimes_h = planRuntimeCard(state, 0.0, 0.0, runtimes_w, m).height;
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 8.0 + m.inner_gap * 10.0;
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 9.0 + m.inner_gap * 11.0;
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const updates_notes_w = @max(content_w - m.card_pad * 2.0, theme.scaledUi(80.0));
     const updates_notes_h = notesBlockHeight(state, updates_notes_w, m);
@@ -560,7 +567,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const chat_page_h = transcript_h + m.card_gap + chat_h + m.card_gap + commit_h;
     const navigation_h = navigationCardHeight(m);
     const workspace_page_h = workspace_h + m.card_gap + navigation_h;
-    const app_page_h = updates_h + m.card_gap + notifications_h;
+    const files_h = m.card_pad * 2.0 + m.title_h + m.row_gap + labeled;
+    const app_page_h = updates_h + m.card_gap + notifications_h + m.card_gap + files_h;
     const body_h = switch (category) {
         .appearance => appearance_page_h,
         .companion => companion_h,
@@ -691,9 +699,6 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .h = m.row_h,
     };
     const new_chat_defaults_hint_y = new_chat_defaults_y + m.row_h;
-    const file_links_y = new_chat_defaults_y + m.row_h + m.row_gap;
-    const file_links_neovim_pane: palette.Rect = .{ .x = chat_card.x + m.card_pad, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const file_links_hint_y = file_links_y + m.row_h;
 
     // "Commit messages" card follows the Chat card (title generation lives there).
     y = if (category == .chat) chat_card.y + chat_card.h + m.card_gap else offscreen_y;
@@ -897,7 +902,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const hooks_opencode: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_opencode_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_grok_y = hooks_opencode_y + m.row_h + m.inner_gap;
     const hooks_grok: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_grok_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const hooks_amp_y = hooks_grok_y + m.row_h + m.inner_gap;
+    const hooks_antigravity_y = hooks_grok_y + m.row_h + m.inner_gap;
+    const hooks_antigravity: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_antigravity_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const hooks_amp_y = hooks_antigravity_y + m.row_h + m.inner_gap;
     const hooks_amp: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_amp_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_pi_y = hooks_amp_y + m.row_h + m.inner_gap;
     const hooks_pi: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_pi_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
@@ -937,6 +944,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const notifications_toggle_y = notifications_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const notifications_toggle: palette.Rect = .{ .x = notifications_card.x + m.card_pad, .y = notifications_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const notifications_hint_y = notifications_toggle_y + m.row_h + m.inner_gap;
+
+    // "Files" card: where file links open on left-click.
+    y = if (category == .app) notifications_card.y + notifications_card.h + m.card_gap else offscreen_y;
+    const files_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = files_h };
+    const files_open_y = files_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const files_open_cell_w = (content_w - m.card_pad * 2.0) / 3.0;
+    const files_open_verde: palette.Rect = .{ .x = files_card.x + m.card_pad, .y = files_open_y, .w = files_open_cell_w, .h = m.row_h };
+    const files_open_system: palette.Rect = .{ .x = files_open_verde.x + files_open_cell_w, .y = files_open_y, .w = files_open_cell_w, .h = m.row_h };
+    const files_open_neovim: palette.Rect = .{ .x = files_open_system.x + files_open_cell_w, .y = files_open_y, .w = files_open_cell_w, .h = m.row_h };
 
     return .{
         .modal = modal,
@@ -1017,8 +1033,6 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_new_tab_terminal = workspace_new_tab_terminal,
         .workspace_new_tab_hint_y = workspace_new_tab_hint_y,
         .new_chat_replace_pane = new_chat_replace_pane,
-        .file_links_neovim_pane = file_links_neovim_pane,
-        .file_links_hint_y = file_links_hint_y,
         .workspace_unzoom_on_navigation = workspace_unzoom_on_navigation,
         .workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_hint_y,
         .navigation_card = navigation.card,
@@ -1059,6 +1073,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .hooks_cursor = hooks_cursor,
         .hooks_opencode = hooks_opencode,
         .hooks_grok = hooks_grok,
+        .hooks_antigravity = hooks_antigravity,
         .hooks_amp = hooks_amp,
         .hooks_pi = hooks_pi,
         .integrations_hint_y = integrations_hint_y,
@@ -1073,6 +1088,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
         .notifications_hint_y = notifications_hint_y,
+        .files_card = files_card,
+        .files_open_verde = files_open_verde,
+        .files_open_system = files_open_system,
+        .files_open_neovim = files_open_neovim,
         .providers_card = providers_card,
         .provider_rows = provider_rows,
         .provider_updates = provider_updates,
@@ -1629,7 +1648,6 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.new_chat_provider_dropdown, layout.body_clip, .new_chat_provider_dropdown, queue_hit);
         queueControlHit(state, layout.new_chat_model_dropdown, layout.body_clip, .new_chat_model_dropdown, queue_hit);
         queueControlHit(state, layout.new_chat_reasoning_dropdown, layout.body_clip, .new_chat_reasoning_dropdown, queue_hit);
-        queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
         queueControlHit(state, layout.commit_provider_dropdown, layout.body_clip, .commit_provider_dropdown, queue_hit);
         queueControlHit(state, layout.commit_model_dropdown, layout.body_clip, .commit_model_dropdown, queue_hit);
         queueControlHit(state, layout.commit_action_commit, layout.body_clip, .commit_action_commit, queue_hit);
@@ -1682,6 +1700,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.hooks_cursor, layout.body_clip, .hooks_cursor, queue_hit);
         queueControlHit(state, layout.hooks_opencode, layout.body_clip, .hooks_opencode, queue_hit);
         queueControlHit(state, layout.hooks_grok, layout.body_clip, .hooks_grok, queue_hit);
+        queueControlHit(state, layout.hooks_antigravity, layout.body_clip, .hooks_antigravity, queue_hit);
         queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
         queueControlHit(state, layout.hooks_pi, layout.body_clip, .hooks_pi, queue_hit);
     }
@@ -1698,6 +1717,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         }
         queueControlHit(state, layout.updates_release_page, layout.body_clip, .updates_release_page, queue_hit);
         queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
+        queueControlHit(state, layout.files_open_verde, layout.body_clip, .files_open_verde, queue_hit);
+        queueControlHit(state, layout.files_open_system, layout.body_clip, .files_open_system, queue_hit);
+        queueControlHit(state, layout.files_open_neovim, layout.body_clip, .files_open_neovim, queue_hit);
     }
     if (category == .connections) {
         _ = phoneCard(state, layout.phone_card, layout.body_clip, false, queue_hit);
@@ -1894,7 +1916,6 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawChatTitleDropdown(state, layout.new_chat_provider_dropdown, state.settingsNewChatProviderLabel(state.settingsNewChatProviderSelectedIndex()), .new_chat_provider_dropdown, state.settings_controller.new_chat_provider_dropdown_open, layout.body_clip);
         drawChatTitleDropdown(state, layout.new_chat_model_dropdown, state.settingsNewChatModelSelectedLabel(), .new_chat_model_dropdown, state.settings_controller.new_chat_model_dropdown_open, layout.body_clip);
         drawChatTitleDropdown(state, layout.new_chat_reasoning_dropdown, state.settingsNewChatReasoningSelectedLabel(), .new_chat_reasoning_dropdown, state.settings_controller.new_chat_reasoning_dropdown_open, layout.body_clip);
-        drawSwitchRow(state, layout.file_links_neovim_pane, "File links in Neovim", state.settings_controller.draft.file_links_in_neovim_pane, isControlHovered(state, .file_links_neovim_pane), layout.body_clip);
         drawCommitCard(state, layout, m);
     } else if (category == .terminal) {
         drawCard(state, layout.terminal_card, layout.body_clip);
@@ -1965,6 +1986,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawSwitchRow(state, layout.hooks_cursor, "Cursor", state.settings_controller.hook_cursor_installed, isControlHovered(state, .hooks_cursor), layout.body_clip);
         drawSwitchRow(state, layout.hooks_opencode, "OpenCode", state.settings_controller.hook_opencode_installed, isControlHovered(state, .hooks_opencode), layout.body_clip);
         drawSwitchRow(state, layout.hooks_grok, "Grok", state.settings_controller.hook_grok_installed, isControlHovered(state, .hooks_grok), layout.body_clip);
+        drawSwitchRow(state, layout.hooks_antigravity, "Antigravity", state.settings_controller.hook_antigravity_installed, isControlHovered(state, .hooks_antigravity), layout.body_clip);
         drawSwitchRow(state, layout.hooks_amp, "Amp", state.settings_controller.hook_amp_installed, isControlHovered(state, .hooks_amp), layout.body_clip);
         drawSwitchRow(state, layout.hooks_pi, "Pi", state.settings_controller.hook_pi_installed, isControlHovered(state, .hooks_pi), layout.body_clip);
     } else if (category == .app) {
@@ -2051,6 +2073,11 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawCard(state, layout.notifications_card, layout.body_clip);
         drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
         drawSwitchRow(state, layout.notifications_toggle, "Agent status", state.settings_controller.draft.notifications_enabled, isControlHovered(state, .notifications_toggle), layout.body_clip);
+
+        drawCard(state, layout.files_card, layout.body_clip);
+        drawCardTitle(state, layout.files_card, "Files", layout.body_clip);
+        queueText(state, .{ .x = layout.files_open_verde.x, .y = layout.files_open_verde.y - m.inner_gap - m.label_h, .w = layout.files_open_verde.w * 3.0, .h = m.label_h }, "Open file links in", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+        drawSegmentedTriple(state, layout.files_open_verde, layout.files_open_system, layout.files_open_neovim, .{ "Verde", "System Default", "Neovim (Terminal)" }, @intFromEnum(state.settings_controller.draft.file_open_target), .{ isControlHovered(state, .files_open_verde), isControlHovered(state, .files_open_system), isControlHovered(state, .files_open_neovim) }, layout.body_clip);
     }
 
     drawBodyScrollbar(state, layout);
@@ -2431,7 +2458,6 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             state.markDirty();
             return;
         },
-        .file_links_neovim_pane => state.settings_controller.draft.file_links_in_neovim_pane = !state.settings_controller.draft.file_links_in_neovim_pane,
         .workspace_unzoom_on_navigation => state.settings_controller.draft.unzoom_on_pane_navigation = !state.settings_controller.draft.unzoom_on_pane_navigation,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
@@ -2477,6 +2503,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             state.toggleGrokGlobalHooks();
             return;
         },
+        .hooks_antigravity => {
+            state.toggleAntigravityGlobalHooks();
+            return;
+        },
         .hooks_amp => {
             state.toggleAmpGlobalHooks();
             return;
@@ -2507,6 +2537,9 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         // Draft toggle: persisted to verde.json on Save, like the other fields.
         .notifications_toggle => state.settings_controller.draft.notifications_enabled = !state.settings_controller.draft.notifications_enabled,
+        .files_open_verde => state.settings_controller.draft.file_open_target = .verde,
+        .files_open_system => state.settings_controller.draft.file_open_target = .system_default,
+        .files_open_neovim => state.settings_controller.draft.file_open_target = .neovim,
         // Handled by `applyNavigationControl`; they write keybinds, not the draft.
         .navigation_back_record, .navigation_back_reset, .navigation_forward_record, .navigation_forward_reset => return,
         .providers_recheck => {
@@ -2518,7 +2551,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             state.updateAllSettingsProviders();
             return;
         },
-        .provider_update_first, .provider_update_1, .provider_update_2, .provider_update_3, .provider_update_4, .provider_update_5, .provider_update_6, .provider_update_last => {
+        .provider_update_first, .provider_update_1, .provider_update_2, .provider_update_3, .provider_update_4, .provider_update_5, .provider_update_6, .provider_update_7, .provider_update_last => {
             const row = providerUpdateRowForControl(control).?;
             const provider = settings_controller.settingsProviderForRow(row);
             const provider_snapshot = state.providerReadinessSnapshot();
@@ -2530,7 +2563,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             }
             return;
         },
-        .provider_row_first, .provider_row_1, .provider_row_2, .provider_row_3, .provider_row_4, .provider_row_5, .provider_row_6, .provider_row_last => {
+        .provider_row_first, .provider_row_1, .provider_row_2, .provider_row_3, .provider_row_4, .provider_row_5, .provider_row_6, .provider_row_7, .provider_row_last => {
             // Commits on its own; it may also move the new-chat default.
             state.toggleSettingsProviderEnabled(providerRowForControl(control).?);
             return;
@@ -3259,6 +3292,7 @@ fn providerDisplayName(provider: runtime.Provider) []const u8 {
         .cursor => "Cursor",
         .pi => "Pi",
         .fx => "FX",
+        .antigravity => "Antigravity",
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP agents",
@@ -3294,6 +3328,7 @@ fn mcpProviderName(comptime field_name: []const u8) []const u8 {
         .{ "pi", "Pi" },
         .{ "fx", "FX" },
         .{ "grok", "Grok" },
+        .{ "antigravity", "Antigravity" },
     };
     inline for (names) |pair| {
         if (comptime std.mem.eql(u8, pair[0], field_name)) return pair[1];
@@ -3846,7 +3881,7 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
         }
         out.push(.heading, "Providers", .{});
         const snapshot = state.provider_controller.readiness.snapshot;
-        inline for (.{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok }) |provider| {
+        inline for (.{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity }) |provider| {
             const readiness = snapshot.forProvider(provider);
             // Green only when usable; a missing CLI is neutral, only a
             // needed sign-in is a problem.

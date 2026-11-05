@@ -211,7 +211,7 @@ generation failure leaves Verde's prompt-derived fallback title unchanged.
 
 New GUI chats start with `chat.default_provider`, `chat.default_model`, and
 `chat.default_reasoning`. Providers accept `codex`, `claude`, `cursor`,
-`opencode`, `pi`, `fx`, or `grok`; reasoning accepts `default`, `low`,
+`opencode`, `pi`, `fx`, `grok`, or `antigravity`; reasoning accepts `default`, `low`,
 `medium`, `high`, `xhigh`, or `max` when the chosen model supports it. These
 values are also available under **Settings → Chat → New chat defaults**.
 
@@ -263,7 +263,7 @@ last-expanded state for the next group. See [Chat, models & runs](/docs/chat).
 Project stack config is loaded from `verde.toml` in the workspace
 root. `[processes.<name>]` and `[agents.<name>]` entries both run in terminal docks; agent
 entries may also declare `provider` (`codex`, `claude`, `opencode`, `cursor`,
-`grok`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
+`grok`, `antigravity`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
 metadata defaults to disabled unless explicitly set.
 
 ```toml

@@ -80,7 +80,7 @@ internal fun composerAction(draft: String): ComposerAction {
 }
 
 /** Providers the daemon can steer natively mid-turn (`chat.turn.steer`). */
-internal val NATIVE_STEER_PROVIDERS = setOf("codex", "claude", "pi")
+internal val NATIVE_STEER_PROVIDERS = setOf("codex", "claude", "pi", "fx")
 
 /**
  * Default for a message sent while a turn runs: a native steer where the provider supports it
@@ -110,7 +110,7 @@ internal enum class ComposerPicker { Provider, Model, Effort, Access, Speed }
 
 /** Web `PROVIDER_OPTIONS`, in desktop order. */
 internal val PROVIDERS = listOf("codex" to "Codex", "claude" to "Claude", "cursor" to "Cursor", "opencode" to "OpenCode",
-    "pi" to "Pi", "fx" to "FX", "grok" to "Grok", "muse" to "Muse")
+    "pi" to "Pi", "fx" to "FX", "grok" to "Grok", "antigravity" to "Antigravity", "muse" to "Muse")
 
 /** One image ready for the core: already downscaled and re-encoded by [ImageAttachments]. */
 internal class PickedImage(val name: String, val mime: String, val bytes: ByteArray)

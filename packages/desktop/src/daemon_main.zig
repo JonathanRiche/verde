@@ -473,7 +473,7 @@ fn validNotifyStatus(value: []const u8) bool {
 }
 
 fn validNotifyProvider(value: []const u8) bool {
-    return stringIn(value, &.{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok" });
+    return stringIn(value, &.{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok", "antigravity" });
 }
 
 fn stringIn(value: []const u8, candidates: []const []const u8) bool {
@@ -1812,7 +1812,7 @@ fn printNotifyHelp(io: std.Io) !void {
         \\  --json                  Print a JSON mutation receipt
         \\  --title TEXT            Record the provider event title
         \\  --body TEXT             Record the provider event body
-        \\  --provider NAME         codex|claude|cursor|opencode|amp|pi|fx|grok
+        \\  --provider NAME         codex|claude|cursor|opencode|amp|pi|fx|grok|antigravity
         \\  --session ID            Override VERDE_SESSION_ID
         \\  --workspace ID          Override VERDE_WORKSPACE_ID
         \\  --dock ID               Override VERDE_DOCK_ID
@@ -2138,6 +2138,8 @@ test {
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/fx.zig");
     _ = @import("providers/grok.zig");
+    _ = @import("providers/antigravity.zig");
+    _ = @import("providers/hooks.zig");
     _ = @import("providers/custom_acp.zig");
     _ = @import("app/custom_acp_agents.zig");
     _ = @import("providers/muse.zig");

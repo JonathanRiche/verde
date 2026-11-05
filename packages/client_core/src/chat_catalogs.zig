@@ -43,7 +43,24 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     for (p.rows(p.get(selected, key))) |v| if (v == .string) {
         try append([]const u8, a, &effort_values, v.string);
     };
-    if (effort_values.len > 0) {
+    if (eq(provider, "antigravity")) {
+        // agy lists each model's thinking tiers; "Default" keeps agy's own.
+        var tiers: []const []const u8 = &.{""};
+        for (p.rows(p.get(selected, "grok_effort_values"))) |v| if (v == .string) {
+            try append([]const u8, a, &tiers, v.string);
+        };
+        out.efforts = try choices(a, if (tiers.len > 1) tiers else &.{ "", "low", "medium", "high" });
+    } else if (eq(provider, "fx")) {
+        // fx's daemon-probed tiers per model; unprobed rows offer every Verde
+        // tier (the daemon skips unsupported ones). "Default" keeps fx's own.
+        if (!(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) {
+            var tiers: []const []const u8 = &.{""};
+            for (p.rows(p.get(selected, "grok_effort_values"))) |v| if (v == .string) {
+                try append([]const u8, a, &tiers, v.string);
+            };
+            out.efforts = try choices(a, if (tiers.len > 1) tiers else &.{ "", "low", "medium", "high", "xhigh", "max" });
+        }
+    } else if (effort_values.len > 0) {
         out.efforts = try choices(a, effort_values);
     } else if ((eq(provider, "codex") or eq(provider, "claude") or eq(provider, "pi") or eq(provider, "grok") or eq(provider, "muse")) and !(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) {
         out.efforts = try choices(a, if (eq(provider, "grok") or eq(model, "gpt-5.5")) &.{ "", "low", "medium", "high", "xhigh" } else &.{ "", "low", "medium", "high", "xhigh", "max" });
@@ -54,7 +71,7 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     }
     if (eq(provider, "claude") and selected != .null and effort_values.len == 0 and !(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) out.efforts = try choices(a, &.{ "", "low", "medium", "high" });
     out.access = try choices(a, &.{ "supervised", "full_access" });
-    out.speeds = try choices(a, if (eq(provider, "codex") or (eq(provider, "cursor") and (p.yes(p.get(selected, "cursor_fast_supported")) or (selected == .null and (std.mem.startsWith(u8, model, "gpt-") or eq(model, "grok-4.7-medium") or eq(model, "composer-2.5") or eq(model, "cursor-grok-4.5-high") or eq(model, "claude-opus-4-8-thinking-high")))))) &.{ "off", "on" } else &.{"off"});
+    out.speeds = try choices(a, if (eq(provider, "codex") or (eq(provider, "fx") and (selected == .null or p.yes(p.get(selected, "cursor_fast_supported")))) or (eq(provider, "cursor") and (p.yes(p.get(selected, "cursor_fast_supported")) or (selected == .null and (std.mem.startsWith(u8, model, "gpt-") or eq(model, "grok-4.7-medium") or eq(model, "composer-2.5") or eq(model, "cursor-grok-4.5-high") or eq(model, "claude-opus-4-8-thinking-high")))))) &.{ "off", "on" } else &.{"off"});
     for (p.rows(p.get(slash, "commands"))) |row| {
         const availability = p.s(row, "availability");
         try append(m.Choice, a, &out.slash, .{ .id = p.s(row, "id"), .label = p.s(row, "name"), .enabled = availability.len == 0 or eq(availability, "available"), .reason = if (availability.len > 0 and !eq(availability, "available")) availability else null });
@@ -78,6 +95,7 @@ fn fallback(provider: []const u8) []const []const u8 {
     if (eq(provider, "claude")) return &.{ "default", "opus[1m]", "fable[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
+    if (eq(provider, "antigravity")) return &.{ "default", "gemini-3.8-flash" };
     if (eq(provider, "muse")) return &.{ "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
     if (eq(provider, "pi")) return &.{"default"};
     if (eq(provider, "fx")) return &.{ "default", "openai/gpt-5.2", "openai/gpt-5.4-mini", "openai/gpt-5.1-codex", "anthropic/claude-sonnet-5" };
@@ -158,6 +176,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "openai/gpt-5.4-mini")) return "GPT-5.4 Mini";
     if (eq(id, "openai/gpt-5.1-codex")) return "GPT-5.1 Codex";
     if (eq(id, "anthropic/claude-sonnet-5")) return "Claude Sonnet 5";
+    if (eq(id, "gemini-3.8-flash")) return "Gemini 3.8 Flash";
     if (eq(id, "grok-4.7")) return "Grok 4.7";
     if (eq(id, "grok-4.6")) return "Grok 4.6";
     if (eq(id, "grok-4.5")) return "Grok 4.5";

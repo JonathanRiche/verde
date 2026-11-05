@@ -176,7 +176,7 @@ pub fn reportAlloc(
     return writer.toOwnedSlice();
 }
 
-const CLIENT_NAMES = [_][]const u8{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok", "stdio", "unknown" };
+const CLIENT_NAMES = [_][]const u8{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok", "antigravity", "stdio", "unknown" };
 
 const ClientCount = struct {
     calls: usize = 0,

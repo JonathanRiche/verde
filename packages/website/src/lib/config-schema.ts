@@ -95,6 +95,7 @@ export const OPEN_KEYS = [
   'links',
   'chat_links',
   'terminal_links',
+  'files',
   'file_links_in_neovim_pane',
 ] as const
 
@@ -311,6 +312,7 @@ export const CHAT_PROVIDERS = [
   'pi',
   'fx',
   'grok',
+  'antigravity',
 ] as const
 
 export const CHAT_TITLE_PROVIDERS = ['codex', 'claude', 'cursor', 'opencode'] as const
@@ -610,7 +612,16 @@ const openSchema = closedObject(
       enum: ['global', 'verde_browser', 'system_browser'],
       description: 'Override `open.links` for terminal links.',
     },
-    file_links_in_neovim_pane: { type: 'boolean' },
+    files: {
+      type: 'string',
+      enum: ['verde', 'system_default', 'neovim'],
+      description:
+        'Where file links open on click: the Verde file viewer, the system default app, or Neovim in a Verde terminal pane.',
+    },
+    file_links_in_neovim_pane: {
+      type: 'boolean',
+      description: 'Deprecated; use `open.files`. `true` reads as `neovim` when `files` is unset.',
+    },
   },
   'How project files, folders, and links open.',
 )

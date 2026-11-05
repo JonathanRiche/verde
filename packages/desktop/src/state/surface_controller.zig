@@ -16,6 +16,7 @@ pub const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png"
 pub const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
 pub const CURSOR_LOGO_BYTES = @embedFile("../assets/editor_logos/cursor.png");
 pub const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
+pub const ANTIGRAVITY_LOGO_BYTES = @embedFile("../assets/antigravity-logo.png");
 pub const AMP_LOGO_BYTES = @embedFile("../assets/amp-logo.png");
 pub const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
 pub const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
@@ -472,6 +473,7 @@ fn completionNotificationIcon(provider: SurfaceProvider) ?notifier.Icon {
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
         .muse => .{ .key = "muse", .png_bytes = MUSE_LOGO_BYTES },
+        .antigravity => .{ .key = "antigravity", .png_bytes = ANTIGRAVITY_LOGO_BYTES },
     };
 }
 
@@ -516,6 +518,7 @@ fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
         .pi => "Pi",
         .fx => "FX",
         .muse => "Muse",
+        .antigravity => "Antigravity",
     };
 }
 

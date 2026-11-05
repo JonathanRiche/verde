@@ -408,6 +408,7 @@ fn mainInner(init: std.process.Init) !void {
     // process each), so discover them once in the background at launch.
     state.startPiModelOptionsRefresh();
     state.startFxModelOptionsRefresh();
+    state.startAntigravityModelOptionsRefresh();
     state.startGrokModelOptionsRefresh();
     state.startMuseModelOptionsRefresh();
     state.startAutomaticUpdateCheck();
@@ -506,6 +507,7 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollCursorModelOptionsCache();
                 app_state.pollPiModelOptionsCache();
                 app_state.pollFxModelOptionsCache();
+                app_state.pollAntigravityModelOptionsCache();
                 app_state.pollGrokModelOptionsCache();
                 app_state.pollMuseModelOptionsCache();
                 app_state.pollProviderReadiness();

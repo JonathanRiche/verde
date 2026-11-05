@@ -19,6 +19,7 @@ fn defaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
         .pi => provider_models.DEFAULT_PI_MODEL,
         .fx => provider_models.DEFAULT_FX_MODEL,
+        .antigravity => provider_models.DEFAULT_ANTIGRAVITY_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
         .muse => provider_models.DEFAULT_MUSE_MODEL,
         .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
@@ -27,7 +28,7 @@ fn defaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
 
 /// Providers offered as handoff targets, in menu order. The default target
 /// is the entry after the source so a handoff never lands on the same agent.
-pub const TARGET_PROVIDERS = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
+pub const TARGET_PROVIDERS = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .antigravity };
 
 pub fn defaultTargetProvider(source: Provider) Provider {
     for (TARGET_PROVIDERS, 0..) |candidate, index| {
@@ -110,6 +111,7 @@ fn chatProviderForSurface(provider: db_types.SurfaceProvider) ?Provider {
         .claude => .claude,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .amp => null,
@@ -377,6 +379,7 @@ fn prepareTuiHandoffTarget(self: anytype, preview: []const u8) !WorkspacePaneId 
         .pi, .fx, .custom_acp => return error.UnsupportedOperation,
         .grok => .grok,
         .muse => .muse,
+        .antigravity => .antigravity,
     };
     if (!try self.openAgentTuiAtPlacement(
         self.handoff_controller.project_index,

@@ -465,7 +465,7 @@ pub fn wash(color: [4]f32, alpha: u8) [4]f32 {
 /// colour so they stay visible on light themes; logos with their own brand
 /// colours, and OpenCode's two-tone mark, are drawn untinted.
 pub fn providerLogoTint(provider_tag: []const u8) [4]f32 {
-    const branded = [_][]const u8{ "claude", "amp", "muse", "opencode" };
+    const branded = [_][]const u8{ "claude", "amp", "muse", "opencode", "antigravity" };
     for (branded) |name| {
         if (std.mem.eql(u8, provider_tag, name)) return .{ 1.0, 1.0, 1.0, 1.0 };
     }

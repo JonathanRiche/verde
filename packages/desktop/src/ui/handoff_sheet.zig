@@ -768,6 +768,7 @@ fn providerLabel(provider: runtime.Provider) []const u8 {
         .cursor => "Cursor",
         .pi => "Pi",
         .fx => "FX",
+        .antigravity => "Antigravity",
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom agent",

@@ -242,24 +242,47 @@ pub fn configuredEditorTerminalCommandAlloc(allocator: std.mem.Allocator) !?[]u8
     return try std.fmt.allocPrint(allocator, "exec ${s}\n", .{editor.name});
 }
 
-pub fn configuredNeovimFileCommandAlloc(
+/// True when a terminal pane can run Neovim: `$VISUAL`/`$EDITOR` names it,
+/// or `nvim` is on `PATH`.
+pub fn neovimAvailable() bool {
+    return configuredEditorIsNeovim() or commandExists("nvim");
+}
+
+/// Shell line that replaces a terminal pane's shell with Neovim on
+/// `file_path`. Uses `$VISUAL`/`$EDITOR` when it names Neovim (keeping the
+/// user's flags), else plain `nvim`; null when neither is available.
+pub fn neovimFileCommandAlloc(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     location: FileLocation,
 ) !?[]u8 {
-    const editor = preferredEditorEnv() orelse return null;
-    const executable = commandExecutableName(editor.value);
-    if (!std.ascii.eqlIgnoreCase(executable, "nvim")) return null;
+    const invocation: []const u8 = blk: {
+        if (preferredEditorEnv()) |editor| {
+            if (std.ascii.eqlIgnoreCase(commandExecutableName(editor.value), "nvim")) {
+                break :blk if (std.mem.eql(u8, editor.name, "VISUAL")) "$VISUAL" else "$EDITOR";
+            }
+        }
+        if (!commandExists("nvim")) return null;
+        break :blk "nvim";
+    };
+    return try neovimFileCommandForInvocationAlloc(allocator, invocation, file_path, location);
+}
 
+fn neovimFileCommandForInvocationAlloc(
+    allocator: std.mem.Allocator,
+    invocation: []const u8,
+    file_path: []const u8,
+    location: FileLocation,
+) std.mem.Allocator.Error![]u8 {
     const escaped_path = try shellSingleQuoteEscape(allocator, file_path);
     defer allocator.free(escaped_path);
-    const location_arg = try vimLocationArgumentAlloc(allocator, executable, location);
+    const location_arg = try vimLocationArgumentAlloc(allocator, "nvim", location);
     defer if (location_arg) |arg| allocator.free(arg);
 
     return if (location_arg) |arg|
-        try std.fmt.allocPrint(allocator, "exec ${s} '{s}' -- '{s}'\n", .{ editor.name, arg, escaped_path })
+        try std.fmt.allocPrint(allocator, "exec {s} '{s}' -- '{s}'\n", .{ invocation, arg, escaped_path })
     else
-        try std.fmt.allocPrint(allocator, "exec ${s} -- '{s}'\n", .{ editor.name, escaped_path });
+        try std.fmt.allocPrint(allocator, "exec {s} -- '{s}'\n", .{ invocation, escaped_path });
 }
 
 pub fn executableNameForCommand(command: []const u8) []const u8 {
@@ -1260,7 +1283,7 @@ fn macApplicationExists(app_name: []const u8) bool {
     return directoryExistsAbsolute(user_path);
 }
 
-fn directoryExistsAbsolute(path: []const u8) bool {
+pub fn directoryExistsAbsolute(path: []const u8) bool {
     var threaded = std.Io.Threaded.init_single_threaded;
     var dir = std.Io.Dir.openDirAbsolute(threaded.io(), path, .{}) catch return false;
     defer dir.close(threaded.io());
@@ -2572,6 +2595,21 @@ pub fn extensionForImageMime(mime: []const u8) []const u8 {
     if (std.mem.eql(u8, mime, "image/gif")) return "gif";
     if (std.mem.eql(u8, mime, "image/bmp")) return "bmp";
     return "img";
+}
+
+test "neovim file command quotes the path and jumps to the location" {
+    const allocator = std.testing.allocator;
+    const plain = try neovimFileCommandForInvocationAlloc(allocator, "nvim", "/tmp/it's here.zig", .{});
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("exec nvim -- '/tmp/it'\\''s here.zig'\n", plain);
+
+    const line = try neovimFileCommandForInvocationAlloc(allocator, "$EDITOR", "/a/b.zig", .{ .line = 12 });
+    defer allocator.free(line);
+    try std.testing.expectEqualStrings("exec $EDITOR '+12' -- '/a/b.zig'\n", line);
+
+    const column = try neovimFileCommandForInvocationAlloc(allocator, "nvim", "/a/b.zig", .{ .line = 3, .column = 7 });
+    defer allocator.free(column);
+    try std.testing.expectEqualStrings("exec nvim '+call cursor(3,7)' -- '/a/b.zig'\n", column);
 }
 
 test "configured editor parsing preserves Windows paths and quoted arguments" {

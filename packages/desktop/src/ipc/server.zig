@@ -2288,12 +2288,17 @@ fn agentCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, 
             .cursor
         else if (std.mem.eql(u8, provider_name, "grok"))
             .grok
+        else if (std.mem.eql(u8, provider_name, "antigravity"))
+            .antigravity
         else
-            return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "agent.open provider must be one of: codex, claude, opencode, cursor, grok");
+            return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "agent.open provider must be one of: codex, claude, opencode, cursor, grok, antigravity");
         const changed = try state.openAgentTui(project_index, provider);
         if (!changed) {
             if (provider == .grok and !app_state.AppState.grokTuiInstalled()) {
                 return try errorResponseAlloc(allocator, id_value, "provider_not_installed", "Grok Build is not installed; see https://docs.x.ai/build/overview#install");
+            }
+            if (provider == .antigravity and !app_state.AppState.antigravityTuiInstalled()) {
+                return try errorResponseAlloc(allocator, id_value, "provider_not_installed", "Antigravity CLI is not installed; see https://antigravity.google/docs/getting-started?tab=cli");
             }
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         }
@@ -4366,6 +4371,7 @@ fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Agent",
+        .antigravity => "Antigravity",
     };
 }
 

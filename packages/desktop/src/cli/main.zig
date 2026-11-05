@@ -242,9 +242,9 @@ fn printHelp(out: output.Output) !void {
         \\Integration commands:
         \\  list [--json]
         \\  doctor [--json]
-        \\  install <claude|codex|amp|opencode|cursor|grok>
-        \\  remove <claude|codex|amp|opencode|cursor|grok>
-        \\  disable <claude|codex|amp|opencode|cursor|grok>
+        \\  install <claude|codex|amp|opencode|cursor|grok|antigravity>
+        \\  remove <claude|codex|amp|opencode|cursor|grok|antigravity>
+        \\  disable <claude|codex|amp|opencode|cursor|grok|antigravity>
         \\
         \\Theme commands:
         \\  import <file-or-url> [--dry-run] [--json]
@@ -2077,6 +2077,7 @@ fn liveFlagAllowed(argv: []const []const u8, flag: []const u8) bool {
         if (std.mem.eql(u8, subcommand, "stop")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--turn" });
         if (std.mem.eql(u8, subcommand, "tail")) return flagIn(flag, &.{ "--turn", "--after" });
         if (std.mem.eql(u8, subcommand, "read")) return flagIn(flag, &.{ "--workspace", "--project", "--thread" });
+        if (std.mem.eql(u8, subcommand, "present")) return flagIn(flag, &.{ "--workspace", "--project", "--thread", "--pane", "--axis" });
         if (std.mem.eql(u8, subcommand, "status") or std.mem.eql(u8, subcommand, "transcript")) return flagIn(flag, &pane_flags);
         return false;
     }
@@ -2358,6 +2359,7 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "opencode", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "OpenCode lifecycle events are supported through a global ~/.config/opencode/plugin/verde-notify.ts plugin." },
     .{ .name = "cursor", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Cursor Agent uses the same .cursor/hooks.json format in its terminal and desktop UI; Verde status updates require inherited Verde pane identity." },
     .{ .name = "grok", .hook_state = "global", .installable = true, .installed = false, .reason = "Grok Build personal hooks report lifecycle status from ~/.grok/hooks/verde-notify.json without requiring project trust." },
+    .{ .name = "antigravity", .hook_state = "global", .installable = true, .installed = false, .reason = "Antigravity CLI global hooks report lifecycle status from a Verde-named entry in ~/.gemini/config/hooks.json, shared by agy and agy acp." },
     .{ .name = "pi", .hook_state = "global-extension", .installable = true, .installed = false, .reason = "Pi lifecycle and session-title events are supported through ~/.pi/agent/extensions/verde-notify.ts." },
     .{ .name = "fx", .hook_state = "built-in", .installable = true, .installed = false, .reason = "FX reports lifecycle natively to Verde and supplies its session title through terminal OSC metadata." },
     .{ .name = "muse", .hook_state = "native-log", .installable = true, .installed = false, .reason = "Verde reads Muse's durable local session events for lifecycle and title reporting; stable Muse does not expose third-party hooks yet." },
@@ -2369,11 +2371,11 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx|muse> [--global]
-            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx|muse> [--global]
-            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx|muse>
+            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx|muse> [--global]
+            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx|muse> [--global]
+            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok|antigravity|pi|fx|muse>
             \\
-            \\  --global installs Claude/Codex/Cursor/Grok hooks in their user config files,
+            \\  --global installs Claude/Codex/Cursor/Grok/Antigravity hooks in their user config files,
             \\  plus Amp/OpenCode/Pi plugins in their global plugin directories
             \\  (no-op outside Verde panes); otherwise supported hooks are project-local
             \\  where the provider supports that.
@@ -2486,6 +2488,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} grok --global: removed global Grok hooks from ~/.grok/hooks/verde-notify.json\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "antigravity")) {
+            provider_hooks.removeAntigravityGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} antigravity --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} antigravity --global: removed global Antigravity hooks from ~/.gemini/config/hooks.json\n", .{command});
+            return;
+        }
         if (global and std.mem.eql(u8, provider.name, "amp")) {
             provider_hooks.removeAmpGlobalHooks(allocator) catch |err| {
                 try out.stderr("verde integrations {s} amp --global: {s}\n", .{ command, @errorName(err) });
@@ -2573,6 +2594,8 @@ fn integrationProvidersWithInstalledState(allocator: std.mem.Allocator) [integra
             provider_hooks.cursorGlobalHooksInstalled(allocator)
         else if (std.mem.eql(u8, provider.name, "grok"))
             provider_hooks.grokGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "antigravity"))
+            provider_hooks.antigravityGlobalHooksInstalled(allocator)
         else if (std.mem.eql(u8, provider.name, "pi"))
             provider_hooks.piGlobalHooksInstalled(allocator)
         else if (std.mem.eql(u8, provider.name, "fx"))
@@ -2618,7 +2641,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = providers[0..],
-            .summary = "Claude/Codex/Cursor/Grok hooks, Amp/OpenCode/Pi global plugins, FX native lifecycle, and Muse local-event lifecycle reporting are available.",
+            .summary = "Claude/Codex/Cursor/Grok/Antigravity hooks, Amp/OpenCode/Pi global plugins, FX native lifecycle, and Muse local-event lifecycle reporting are available.",
         });
         return;
     }
@@ -2626,7 +2649,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode/pi global plugins; fx built-in; muse native-log
+        \\  hook installers: claude, codex, cursor project-local/global; grok/antigravity global; amp/opencode/pi global plugins; fx built-in; muse native-log
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -2851,6 +2874,37 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install grok --global: installed global Grok hooks in ~/.grok/hooks/verde-notify.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "antigravity") and global) {
+        provider_hooks.ensureAntigravityGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install antigravity --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.gemini/config/hooks.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install antigravity --global: merged global Antigravity hooks into ~/.gemini/config/hooks.json\n", .{});
         return;
     }
 
@@ -3410,6 +3464,35 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
         exitIfResponseFailed(response);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "present")) {
+        // Same path as MCP present_chat: show a stored chat by identity,
+        // reopening it durably when it was closed or archived.
+        const workspace_id = workspaceOption(argv) orelse {
+            try out.stderr("verde live chat present requires --workspace\n", .{});
+            std.process.exit(2);
+        };
+        const local_thread_id = args.optionValue(argv, "--thread") orelse {
+            try out.stderr("verde live chat present requires --thread\n", .{});
+            std.process.exit(2);
+        };
+        const target_pane_id = if (args.optionValue(argv, "--pane")) |value|
+            std.fmt.parseInt(u32, value, 10) catch {
+                try out.stderr("invalid --pane value: {s}\n", .{value});
+                std.process.exit(2);
+            }
+        else
+            null;
+        const outcome = chatPresentStoredThreadAlloc(allocator, io, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .target_pane_id = target_pane_id,
+            .axis = args.optionValue(argv, "--axis") orelse "horizontal",
+        }) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(outcome.envelope);
+        try out.stdout("{s}\n", .{outcome.envelope});
+        exitIfResponseFailed(outcome.envelope);
         return;
     }
     if (std.mem.eql(u8, subcommand, "read")) {
@@ -6048,72 +6131,18 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "present_chat axis must be a string");
         }
 
-        // Presentation only needs existence and the store revision.
-        const thread_response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+        const outcome = chatPresentStoredThreadAlloc(allocator, io, .{
             .workspace_id = workspace_id,
             .local_thread_id = local_thread_id,
-            .message_limit = @as(u32, 0),
-        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
-        defer allocator.free(thread_response);
-        var thread_parsed = std.json.parseFromSlice(std.json.Value, allocator, thread_response, .{}) catch |err|
-            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-        defer thread_parsed.deinit();
-        const thread_ok = if (thread_parsed.value == .object)
-            jsonBool(thread_parsed.value.object.get("ok") orelse .null)
-        else
-            null;
-        if (!(thread_ok orelse false)) {
-            return try mcpToolTextResult(allocator, out, id_value, thread_response, tool_name);
-        }
-        const store_revision = chatThreadEnvelopeStoreRevision(thread_parsed.value) orelse
-            return try mcpError(allocator, out, id_value, -32000, "chat.thread.get response omitted store_revision");
-
-        var presentation_ambiguous = false;
-        const presentation_deadline_ms = daemon_client.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
-        while (presentationRemainingMs(presentation_deadline_ms)) |remaining_ms| {
-            const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
-                .workspace_id = workspace_id,
-                .local_thread_id = local_thread_id,
-                .store_revision = store_revision,
-                .target_pane_id = target_pane_id,
-                .axis = axis orelse "horizontal",
-                .focus = false,
-            }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
-                presentation_ambiguous = true;
-                sleepChatPresentationRetry(io, presentation_deadline_ms);
-                continue;
-            };
-            defer allocator.free(present);
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, present, .{}) catch {
-                presentation_ambiguous = true;
-                sleepChatPresentationRetry(io, presentation_deadline_ms);
-                continue;
-            };
-            defer parsed.deinit();
-            if (parseChatOpenPresentation(parsed.value, workspace_id, local_thread_id, store_revision) != null) {
-                return try mcpToolLiveTextResult(allocator, out, id_value, present, tool_name);
-            }
-            const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
-                presentation_ambiguous = true;
-                sleepChatPresentationRetry(io, presentation_deadline_ms);
-                continue;
-            };
-            if (!std.mem.eql(u8, error_code, "projection_pending") and
-                !std.mem.eql(u8, error_code, "projection_revision_pending"))
-            {
-                return try mcpToolLiveTextResult(allocator, out, id_value, present, tool_name);
-            }
-            sleepChatPresentationRetry(io, presentation_deadline_ms);
-        }
-        const deferred = try composeChatPresentDeferredAlloc(
-            allocator,
-            workspace_id,
-            local_thread_id,
-            store_revision,
-            presentation_ambiguous,
-        );
-        defer allocator.free(deferred);
-        return try mcpToolTextResult(allocator, out, id_value, deferred, tool_name);
+            .target_pane_id = target_pane_id,
+            .axis = axis orelse "horizontal",
+        }) catch |err| switch (err) {
+            error.InvalidChatPresentResponse => return try mcpError(allocator, out, id_value, -32000, "chat.thread.get response omitted store_revision"),
+            else => return try mcpChatDaemonError(allocator, out, id_value, err),
+        };
+        defer allocator.free(outcome.envelope);
+        if (outcome.live) return try mcpToolLiveTextResult(allocator, out, id_value, outcome.envelope, tool_name);
+        return try mcpToolTextResult(allocator, out, id_value, outcome.envelope, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "wait_for_process")) {
         const process_id = mcpArgString(arguments, "process_id") orelse
@@ -7219,12 +7248,225 @@ fn chatThreadEnvelopeStoreRevision(value: std.json.Value) ?i64 {
     return nonNegativeJsonInteger(result.object.get("store_revision") orelse .null);
 }
 
+const ChatPresentArgs = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    target_pane_id: ?u32 = null,
+    axis: []const u8 = "horizontal",
+};
+
+/// One `present_chat` reply envelope, owned by the caller. `live` marks GUI
+/// replies, which MCP maps through Live capability errors; daemon errors and
+/// deferred results are plain text.
+const ChatPresentOutcome = struct {
+    envelope: []u8,
+    live: bool,
+};
+
+/// Present an existing durable thread in the desktop GUI, reopening it first
+/// when the GUI projection cannot contain it. The projection ships only open,
+/// unarchived threads, so a chat whose last pane was closed (or that was
+/// archived) never appears there no matter how long the caller waits. The
+/// daemon reopen keeps the thread's identity, transcript, and settings, flips
+/// its open bit, and restores a chat pane in the stored layout. History and
+/// remote sends reopen chats the same way.
+fn chatPresentStoredThreadAlloc(allocator: std.mem.Allocator, io: std.Io, request: ChatPresentArgs) !ChatPresentOutcome {
+    // Presentation only needs existence, the archive bit, and the store revision.
+    const thread_response = try chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+        .workspace_id = request.workspace_id,
+        .local_thread_id = request.local_thread_id,
+        .message_limit = @as(u32, 0),
+    });
+    defer allocator.free(thread_response);
+    var thread_parsed = try std.json.parseFromSlice(std.json.Value, allocator, thread_response, .{});
+    defer thread_parsed.deinit();
+    const thread_ok = if (thread_parsed.value == .object)
+        jsonBool(thread_parsed.value.object.get("ok") orelse .null)
+    else
+        null;
+    if (!(thread_ok orelse false)) return .{ .envelope = try allocator.dupe(u8, thread_response), .live = false };
+    var store_revision = chatThreadEnvelopeStoreRevision(thread_parsed.value) orelse
+        return error.InvalidChatPresentResponse;
+
+    var reopen_attempted = false;
+    var reopened = false;
+    if (chatThreadEnvelopeArchived(thread_parsed.value)) {
+        reopen_attempted = true;
+        switch (try chatDaemonReopenThreadAlloc(allocator, io, request.workspace_id, request.local_thread_id)) {
+            .failed => |envelope| return .{ .envelope = envelope, .live = false },
+            .written => |write| {
+                reopened = write.applied;
+                store_revision = std.math.cast(i64, write.store_revision) orelse return error.InvalidChatPresentResponse;
+            },
+        }
+    }
+
+    var ambiguous = false;
+    var deadline_ms = daemon_client.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+    while (presentationRemainingMs(deadline_ms)) |remaining_ms| {
+        const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
+            .workspace_id = request.workspace_id,
+            .local_thread_id = request.local_thread_id,
+            .store_revision = store_revision,
+            .target_pane_id = request.target_pane_id,
+            .axis = request.axis,
+            .focus = false,
+        }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
+        defer allocator.free(present);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, present, .{}) catch {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
+        defer parsed.deinit();
+        if (parseChatOpenPresentation(parsed.value, request.workspace_id, request.local_thread_id, store_revision) != null) {
+            const envelope = if (reopened)
+                try chatPresentReopenedEnvelopeAlloc(allocator, parsed.value)
+            else
+                try allocator.dupe(u8, present);
+            return .{ .envelope = envelope, .live = true };
+        }
+        const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
+        if (std.mem.eql(u8, error_code, "projection_pending") or
+            std.mem.eql(u8, error_code, "projection_revision_pending"))
+        {
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        }
+        if (std.mem.eql(u8, error_code, "projection_identity_missing") and !reopen_attempted) {
+            reopen_attempted = true;
+            switch (try chatDaemonReopenThreadAlloc(allocator, io, request.workspace_id, request.local_thread_id)) {
+                .failed => |envelope| return .{ .envelope = envelope, .live = false },
+                .written => |write| {
+                    // Already open in the daemon: the GUI's gap is its own
+                    // (for example an unflushed close), not a closed row.
+                    if (!write.applied) return .{ .envelope = try allocator.dupe(u8, present), .live = true };
+                    reopened = true;
+                    store_revision = std.math.cast(i64, write.store_revision) orelse return error.InvalidChatPresentResponse;
+                    // The GUI must apply the reopen revision before it can
+                    // present; give that its own full window.
+                    deadline_ms = daemon_client.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+                    continue;
+                },
+            }
+        }
+        return .{ .envelope = try allocator.dupe(u8, present), .live = true };
+    }
+    return .{
+        .envelope = try composeChatPresentDeferredAlloc(
+            allocator,
+            request.workspace_id,
+            request.local_thread_id,
+            store_revision,
+            ambiguous,
+            reopened,
+        ),
+        .live = false,
+    };
+}
+
+const ChatDaemonReopen = union(enum) {
+    written: headless.store.WriteResult,
+    /// Daemon error envelope, owned by the caller.
+    failed: []u8,
+};
+
+/// Durably reopen one closed or archived thread with
+/// `chat.thread.archive.set {archived: false}`: the row keeps its id,
+/// transcript, and settings, and the daemon restores its chat pane in the
+/// stored layout. A thread that is already open reports `applied: false`.
+fn chatDaemonReopenThreadAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+) !ChatDaemonReopen {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = daemon_client.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    if (registered.response.err != null) return error.SessionDaemonUnavailable;
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+    const request_key = try std.fmt.allocPrint(arena, "cli:chat.reopen:{s}:{s}:{d}", .{ workspace_id, local_thread_id, unixTimestampMs() });
+
+    var written = try client.call(headless.store.METHOD_CHAT_THREAD_ARCHIVE_SET, headless.store.ThreadArchiveSetRequest{
+        .mutation = .{
+            .request_key = request_key,
+            .client_id = client_id,
+        },
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .archived = false,
+    });
+    defer written.deinit();
+    if (!written.response.isOk()) return .{ .failed = try daemonResponseEnvelopeAlloc(allocator, &written) };
+    return .{ .written = try client.decodeWriteResult(&written) };
+}
+
+fn chatThreadEnvelopeArchived(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const result = value.object.get("result") orelse return false;
+    if (result != .object) return false;
+    const thread = result.object.get("thread") orelse return false;
+    if (thread != .object) return false;
+    return jsonBool(thread.object.get("archived") orelse .null) orelse false;
+}
+
+/// Re-encode a successful `chat.present` envelope with `reopened: true` so
+/// callers can tell a restored chat from one that was already open.
+fn chatPresentReopenedEnvelopeAlloc(allocator: std.mem.Allocator, envelope: std.json.Value) ![]u8 {
+    const result = envelope.object.get("result") orelse return error.InvalidChatPresentResponse;
+    if (result != .object) return error.InvalidChatPresentResponse;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    var fields = result.object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "reopened")) continue;
+        try s.objectField(field.key_ptr.*);
+        try s.write(field.value_ptr.*);
+    }
+    try s.objectField("reopened");
+    try s.write(true);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn composeChatPresentDeferredAlloc(
     allocator: std.mem.Allocator,
     workspace_id: []const u8,
     local_thread_id: []const u8,
     store_revision: i64,
     ambiguous: bool,
+    reopened: bool,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -7250,6 +7492,11 @@ fn composeChatPresentDeferredAlloc(
     try s.write(true);
     try s.objectField("retry_tool");
     try s.write("present_chat");
+    if (reopened) {
+        // Durable reopen already happened; the GUI shows it once it catches up.
+        try s.objectField("reopened");
+        try s.write(true);
+    }
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -9428,6 +9675,59 @@ test "daemon-first chat presentation validates identity and preserves durable re
         defer parsed.deinit();
         try std.testing.expect(parseChatOpenPresentation(parsed.value, "ws-1", "thread-1", 17) == null);
     }
+}
+
+test "stored chat presentation marks reopened results and reads the archive bit" {
+    const allocator = std.testing.allocator;
+    const thread_cases = [_]struct { payload: []const u8, archived: bool }{
+        .{ .payload = "{\"ok\":true,\"result\":{\"store_revision\":4,\"thread\":{\"local_thread_id\":\"t\",\"archived\":true}}}", .archived = true },
+        .{ .payload = "{\"ok\":true,\"result\":{\"store_revision\":4,\"thread\":{\"local_thread_id\":\"t\",\"archived\":false}}}", .archived = false },
+        .{ .payload = "{\"ok\":true,\"result\":{\"store_revision\":4,\"thread\":{\"local_thread_id\":\"t\"}}}", .archived = false },
+        .{ .payload = "{\"ok\":true,\"result\":{\"store_revision\":4}}", .archived = false },
+    };
+    for (thread_cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.payload, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.archived, chatThreadEnvelopeArchived(parsed.value));
+    }
+
+    var live = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"workspace_index\":0,\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"pane_id\":5,\"thread_index\":2,\"focused\":false,\"presented\":true,\"presentation\":\"existing\",\"projected_store_revision\":30}}",
+        .{},
+    );
+    defer live.deinit();
+    const annotated = try chatPresentReopenedEnvelopeAlloc(allocator, live.value);
+    defer allocator.free(annotated);
+    var annotated_parsed = try std.json.parseFromSlice(std.json.Value, allocator, annotated, .{});
+    defer annotated_parsed.deinit();
+    // The annotation must keep the presentation contract callers validate.
+    try std.testing.expect(parseChatOpenPresentation(annotated_parsed.value, "ws-1", "thread-1", 30) != null);
+    const result = annotated_parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(result.get("reopened").?).?);
+    try std.testing.expectEqual(@as(i64, 5), jsonInt(result.get("pane_id").?).?);
+
+    const deferred = try composeChatPresentDeferredAlloc(allocator, "ws-1", "thread-1", 30, false, true);
+    defer allocator.free(deferred);
+    var deferred_parsed = try std.json.parseFromSlice(std.json.Value, allocator, deferred, .{});
+    defer deferred_parsed.deinit();
+    const deferred_result = deferred_parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(deferred_result.get("reopened").?).?);
+    try std.testing.expectEqualStrings("present_chat", jsonString(deferred_result.get("retry_tool").?).?);
+
+    const plain = try composeChatPresentDeferredAlloc(allocator, "ws-1", "thread-1", 30, true, false);
+    defer allocator.free(plain);
+    var plain_parsed = try std.json.parseFromSlice(std.json.Value, allocator, plain, .{});
+    defer plain_parsed.deinit();
+    try std.testing.expect(plain_parsed.value.object.get("result").?.object.get("reopened") == null);
+}
+
+test "live chat present accepts only its thread-addressed flags" {
+    const argv = [_][]const u8{ "chat", "present", "--workspace", "ws", "--thread", "t", "--pane", "3", "--axis", "vertical", "--json" };
+    try std.testing.expect(unknownLiveFlag(&argv) == null);
+    const bad = [_][]const u8{ "chat", "present", "--workspace", "ws", "--thread", "t", "--provider", "codex" };
+    try std.testing.expectEqualStrings("--provider", unknownLiveFlag(&bad).?);
 }
 
 test "stale GUI validation falls back only for unsupported methods" {

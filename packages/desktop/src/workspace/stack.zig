@@ -35,6 +35,7 @@ pub const AgentProvider = enum {
     grok,
     amp,
     muse,
+    antigravity,
     other,
 };
 

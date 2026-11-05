@@ -49,6 +49,8 @@ const log = std.log.scoped(.file_viewer);
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
 pub const Root = proto.Root;
 pub const ContentKind = proto.ContentKind;
+/// Kind implied by the file name; `.external` files have no in-app view.
+pub const kindForPath = proto.kindForPath;
 
 const ROOTS_TIMEOUT_MS: u32 = 10_000;
 const LIST_TIMEOUT_MS: u32 = 10_000;
@@ -579,6 +581,8 @@ pub const State = struct {
     calls: std.ArrayList(*Call) = .empty,
     /// Side panel explorers, one per workspace seen.
     explorers: std.ArrayList(*file_explorer.Explorer) = .empty,
+    /// File link clicked before its workspace's roots arrived (`openFileLink`).
+    pending_link: ?PendingLink = null,
 
     /// Joins every worker (bounded by request timeouts) and frees all data.
     /// Textures are left to the GPU teardown.
@@ -597,6 +601,20 @@ pub const State = struct {
         self.documents.deinit(page);
         for (self.explorers.items) |explorer| explorer.destroy();
         self.explorers.deinit(page);
+        if (self.pending_link) |*link| link.deinit();
+        self.pending_link = null;
+    }
+};
+
+pub const PendingLink = struct {
+    /// Both page-owned.
+    workspace_id: []u8,
+    path: []u8,
+    line: ?usize,
+
+    fn deinit(self: *PendingLink) void {
+        page.free(self.workspace_id);
+        page.free(self.path);
     }
 };
 
@@ -701,8 +719,102 @@ pub fn openFileInSidePanel(self: anytype, abs_path: []const u8) void {
 /// Opens `abs_path` in a file tab of the selected workspace, or focuses the
 /// tab already showing it.
 pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
-    const project_index = selectedProjectIndex(self) orelse return;
-    const normalized = viewablePath(self, project_index, abs_path) orelse return;
+    _ = openFileViewerTab(self, abs_path);
+}
+
+/// `openFileInViewer`, then scrolls to and selects 1-based `line` (when
+/// given) so a `file.zig:42` link lands on line 42. False when no tab
+/// opened (no workspace, or the file is outside its folders).
+fn openFileInViewerAt(self: anytype, abs_path: []const u8, line: ?usize) bool {
+    const pane_id = openFileViewerTab(self, abs_path) orelse return false;
+    const target = line orelse return true;
+    // Only the text view has source lines (markdown renders, images draw).
+    if (target == 0 or proto.kindForPath(abs_path) != .text) return true;
+    const index: u32 = @intCast(@min(target - 1, std.math.maxInt(u32)));
+    if (filePaneRef(self, pane_id)) |ref| {
+        // A few lines of context above; the renderer clamps past the end.
+        const context_lines: f32 = 3.0;
+        ref.scroll_y = @max(@as(f32, @floatFromInt(index)) - context_lines, 0.0) * CODE_LINE_CSS;
+    }
+    if (fileViewerDocument(self, pane_id)) |doc| doc.selection = .{ .anchor = index, .head = index };
+    self.markDirty();
+    return true;
+}
+
+/// Opens a clicked file link: a viewer tab (at 1-based `line`) when the file
+/// is inside the selected workspace's folders, else the system default app,
+/// since the daemon only serves files inside them. Until the workspace's
+/// roots arrive the choice waits (`resolvePendingLink`); a newer click
+/// replaces a waiting one.
+pub fn openFileLink(self: anytype, abs_path: []const u8, line: ?usize) void {
+    const project_index = selectedProjectIndex(self) orelse return openPathExternally(self, abs_path);
+    const workspace_id = self.project_controller.projects.items[project_index].id;
+    if (rootsEntry(self, workspace_id)) |entry| {
+        if (entry.status == .ready) return openFileLinkWithRoots(self, entry.roots, abs_path, line);
+    }
+    clearPendingLink(self);
+    const owned_id = page.dupe(u8, workspace_id) catch return openPathExternally(self, abs_path);
+    const owned_path = page.dupe(u8, abs_path) catch {
+        page.free(owned_id);
+        return openPathExternally(self, abs_path);
+    };
+    self.file_viewer.pending_link = .{ .workspace_id = owned_id, .path = owned_path, .line = line };
+    refreshRoots(self, workspace_id);
+    // The fetch could not even start: decide now rather than never.
+    if (rootsEntry(self, workspace_id)) |entry| {
+        if (entry.status == .failed) resolvePendingLink(self, workspace_id);
+    }
+}
+
+fn openFileLinkWithRoots(self: anytype, roots: []const Root, abs_path: []const u8, line: ?usize) void {
+    const normalized = std.fs.path.resolve(self.allocator, &.{abs_path}) catch return openPathExternally(self, abs_path);
+    defer self.allocator.free(normalized);
+    if (locate(roots, normalized) == null or !openFileInViewerAt(self, normalized, line)) {
+        openPathExternally(self, normalized);
+    }
+}
+
+/// Settles a link that waited for `workspace_id`'s roots.
+fn resolvePendingLink(self: anytype, workspace_id: []const u8) void {
+    const link = self.file_viewer.pending_link orelse return;
+    if (!std.mem.eql(u8, link.workspace_id, workspace_id)) return;
+    self.file_viewer.pending_link = null;
+    var owned = link;
+    defer owned.deinit();
+    const entry = rootsEntry(self, workspace_id);
+    const project_index = selectedProjectIndex(self);
+    const still_selected = if (project_index) |index| std.mem.eql(u8, self.project_controller.projects.items[index].id, workspace_id) else false;
+    if (entry != null and entry.?.status == .ready and still_selected) {
+        openFileLinkWithRoots(self, entry.?.roots, owned.path, owned.line);
+    } else {
+        // Roots failed, or the user switched workspaces while they loaded.
+        openPathExternally(self, owned.path);
+    }
+}
+
+fn clearPendingLink(self: anytype) void {
+    if (self.file_viewer.pending_link) |*link| link.deinit();
+    self.file_viewer.pending_link = null;
+}
+
+/// Opens `path` with the system default application.
+fn openPathExternally(self: anytype, path: []const u8) void {
+    utils.openPathWithSystemHandler(self.allocator, path) catch |err| {
+        log.warn("failed to open file externally: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Failed to open file with the system default app.");
+        return;
+    };
+    // The external app takes focus; don't treat that as a close request.
+    self.external_open_close_suppress_until_ms = platform_runtime.unixTimestampMs() + EXTERNAL_OPEN_CLOSE_SUPPRESS_MS;
+    self.setSidebarNotice("Opened file with the system default app.");
+}
+
+/// Line height of the text view in CSS px; matches `ui/file_viewer.zig`.
+const CODE_LINE_CSS: f32 = 20.0;
+
+fn openFileViewerTab(self: anytype, abs_path: []const u8) ?WorkspacePaneId {
+    const project_index = selectedProjectIndex(self) orelse return null;
+    const normalized = viewablePath(self, project_index, abs_path) orelse return null;
     defer self.allocator.free(normalized);
     const project = &self.project_controller.projects.items[project_index];
 
@@ -710,11 +822,11 @@ pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
     if (layout.filePaneIdForPath(normalized)) |pane_id| {
         self.focusWorkspaceOpenPaneFromSidebar(project_index, pane_id);
         self.markDirty();
-        return;
+        return pane_id;
     }
     const pane_id = layout.createFilePane(self.allocator, normalized) catch {
         self.setSidebarNotice("Failed to open the file viewer.");
-        return;
+        return null;
     };
     const placed = if (layout.root == null or layout.visiblePaneCount() == 0) blk: {
         layout.replaceRootWithLeaf(self.allocator, pane_id) catch break :blk false;
@@ -734,7 +846,7 @@ pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
             workspace_layout.deinitWorkspacePaneRef(&ref, self.allocator);
         }
         self.setSidebarNotice("Failed to open the file viewer.");
-        return;
+        return null;
     }
     // Tab order is persisted pane order: new tabs go last.
     _ = layout.movePaneBefore(pane_id, layout.panes.items.len);
@@ -742,6 +854,7 @@ pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
     focusFilePane(self);
     self.markWorkspaceDirty(project_index);
     self.markDirty();
+    return pane_id;
 }
 
 /// Keyboard ownership for a focused file tab: nothing else keeps a caret.
@@ -945,6 +1058,7 @@ fn applyCall(self: anytype, call: *Call) void {
                 entry.message = "";
             }
             if (findExplorer(self, call.workspace_id)) |explorer| explorer.rows_dirty = true;
+            resolvePendingLink(self, call.workspace_id);
             // Documents that waited for these roots start now.
             for (self.file_viewer.documents.items) |doc| {
                 if (!std.mem.eql(u8, doc.workspace_id, call.workspace_id)) continue;

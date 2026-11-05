@@ -32,9 +32,11 @@ class ComposerParsingTest {
         assertEquals(ComposerAction.Literal("/path is literal"), composerAction("//path is literal"))
         assertEquals(ComposerAction.Prompt, composerAction("hello /there"))
         assertEquals(EventFollowupSubmitKind.steer, followupKind("claude", images=false))
-        // Native steer only for codex/claude/pi without images; everything else interrupts and continues.
+        // Native steer only for codex/claude/pi/fx without images; everything else interrupts and continues.
         assertEquals(EventFollowupSubmitKind.steer, followupKind("codex", images=false))
         assertEquals(EventFollowupSubmitKind.steer, followupKind("pi", images=false))
+        assertEquals(EventFollowupSubmitKind.steer, followupKind("fx", images=false))
+        assertEquals(EventFollowupSubmitKind.interrupt, followupKind("fx", images=true))
         assertEquals(EventFollowupSubmitKind.interrupt, followupKind("claude", images=true))
         assertEquals(EventFollowupSubmitKind.interrupt, followupKind("cursor", images=false))
         assertEquals(EventFollowupSubmitKind.interrupt, followupKind("opencode", images=true))

@@ -66,7 +66,7 @@ struct ProviderGlyph: View {
     let provider: String?
     var body: some View {
         let name = provider == "codex" ? "openai" : provider ?? ""
-        if ["openai", "claude", "cursor", "opencode", "pi", "fx", "grok", "muse", "amp"].contains(name) {
+        if ["openai", "claude", "cursor", "opencode", "pi", "fx", "grok", "muse", "amp", "antigravity"].contains(name) {
             Image(uiImage: UIImage(named: "provider_" + name) ?? UIImage()).resizable()
                 .renderingMode(["openai", "cursor", "fx", "grok", "pi"].contains(name) ? .template : .original)
                 .scaledToFit().frame(width: 18, height: 18).foregroundStyle(VerdeTheme.text).accessibilityHidden(true)

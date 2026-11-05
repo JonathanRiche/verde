@@ -21,6 +21,7 @@ pub fn installShell(provider: provider_types.Provider) []const u8 {
         .fx => "curl -fsSL https://fx.sh/setup.sh | bash",
         .grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
         .muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
+        .antigravity => "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         // User-defined agents bring their own command; nothing to install.
         .custom_acp => "echo " ++ CUSTOM_ACP_HINT,
     };
@@ -37,6 +38,7 @@ pub fn installShellWindows(provider: provider_types.Provider) ?[]const u8 {
         .opencode => "npm install -g opencode-ai",
         .pi => "irm https://pi.dev/install.ps1 | iex",
         .grok => "irm https://x.ai/cli/install.ps1 | iex",
+        .antigravity => "irm https://antigravity.google/cli/install.ps1 | iex",
         .fx, .muse, .custom_acp => null,
     };
 }
@@ -54,6 +56,7 @@ pub fn installArgv(provider: provider_types.Provider) []const []const u8 {
         .fx => comptime &.{installShell(.fx)},
         .grok => comptime &.{installShell(.grok)},
         .muse => comptime &.{installShell(.muse)},
+        .antigravity => comptime &.{installShell(.antigravity)},
         .custom_acp => comptime &.{installShell(.custom_acp)},
     };
 }
@@ -71,6 +74,8 @@ pub fn loginArgv(provider: provider_types.Provider) []const []const u8 {
         .fx => comptime &.{ "fx", "login" },
         .grok => comptime &.{ "grok", "login" },
         .muse => comptime &.{ "muse", "login" },
+        // Interactive Google sign-in that exits once credentials are cached.
+        .antigravity => comptime &.{ "agy", "acp", "--login" },
         .custom_acp => comptime &.{ "echo", CUSTOM_ACP_HINT },
     };
 }
@@ -86,6 +91,7 @@ pub fn loginShell(provider: provider_types.Provider) []const u8 {
         .fx => "fx login",
         .grok => "grok login",
         .muse => "muse login",
+        .antigravity => "agy acp --login",
         .custom_acp => "echo " ++ CUSTOM_ACP_HINT,
     };
 }

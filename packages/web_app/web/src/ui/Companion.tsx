@@ -17,7 +17,7 @@ import { CompanionAvatar } from './CompanionAvatar'
 import { Icon, Spinner } from './Icons'
 import { containModalFocus } from './Overlays'
 
-const BRAIN_PROVIDERS = ['codex', 'claude', 'cursor', 'opencode', 'pi', 'fx', 'grok', 'muse'] as const
+const BRAIN_PROVIDERS = ['codex', 'claude', 'cursor', 'opencode', 'pi', 'fx', 'grok', 'antigravity', 'muse'] as const
 /// Roster polling: often while the panel is open, slowly for the dock.
 const POLL_MS = 5000
 const DOCK_POLL_EVERY = 6

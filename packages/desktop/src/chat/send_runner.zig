@@ -79,6 +79,7 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .pi => harness.ProviderConfig{ .pi = .{ .cwd = request_cwd } },
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = request_cwd, .model = request.model_ref } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = request_cwd, .model = request.model_ref } },
+        .antigravity => harness.ProviderConfig{ .antigravity = .{ .cwd = request_cwd, .model = request.model_ref } },
         .muse => harness.ProviderConfig{ .muse = .{ .cwd = request_cwd, .model = request.model_ref } },
         .custom_acp => harness.ProviderConfig{ .custom_acp = .{ .cwd = request_cwd, .model = request.model_ref } },
     };
@@ -149,6 +150,7 @@ pub fn listModels(
         .pi => harness.ProviderConfig{ .pi = .{ .cwd = project_path } },
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = project_path } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = project_path } },
+        .antigravity => harness.ProviderConfig{ .antigravity = .{ .cwd = project_path } },
         .muse => harness.ProviderConfig{ .muse = .{ .cwd = project_path } },
         .custom_acp => harness.ProviderConfig{ .custom_acp = .{ .cwd = project_path } },
     };
@@ -184,6 +186,7 @@ pub fn connectProvider(
         .pi => .{ .pi = .{ .cwd = cwd } },
         .fx => .{ .fx = .{ .cwd = cwd } },
         .grok => .{ .grok = .{ .cwd = cwd } },
+        .antigravity => .{ .antigravity = .{ .cwd = cwd } },
         .muse => .{ .muse = .{ .cwd = cwd } },
         .custom_acp => .{ .custom_acp = .{ .cwd = cwd } },
     };
@@ -198,7 +201,7 @@ fn approvalPolicyForMode(mode: AccessMode) ?harness.ApprovalPolicy {
 }
 
 fn serviceTierForMode(provider: harness.Provider, fast_mode: FastMode) ?harness.ServiceTier {
-    if (provider != .codex) return null;
+    if (provider != .codex and provider != .fx) return null;
     return switch (fast_mode) {
         .on => .fast,
         .off => null,

@@ -10641,6 +10641,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
             .cursor => "R",
             .pi => "P",
             .fx => "F",
+            .antigravity => "AG",
             .grok => "G",
             .muse => "M",
             .custom_acp => "Ag",

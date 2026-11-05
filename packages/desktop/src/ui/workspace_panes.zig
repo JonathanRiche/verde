@@ -122,6 +122,7 @@ const WorkspacePaneAction = enum {
     split_terminal_up,
     split_terminal_down,
     close,
+    open_link_verde_viewer,
     open_link_nvim_pane,
     open_link_editor,
     open_link_cursor,
@@ -1297,7 +1298,7 @@ fn renderNoWorkspaces(state: *runtime.AppState, rect: palette.Rect) void {
 
 const WELCOME_SUGGESTION_ROW_H: f32 = 48.0;
 const WELCOME_PROVIDER_CELL_H: f32 = 28.0;
-const WELCOME_PROVIDERS = [_]runtime.Provider{ .claude, .codex, .opencode, .cursor, .pi, .fx, .grok, .muse };
+const WELCOME_PROVIDERS = [_]runtime.Provider{ .claude, .codex, .opencode, .cursor, .pi, .fx, .grok, .antigravity, .muse };
 
 const WelcomeProviders = struct {
     items: [WELCOME_PROVIDERS.len]runtime.Provider = undefined,
@@ -1333,6 +1334,7 @@ fn welcomeProviderName(provider: runtime.Provider) []const u8 {
         .cursor => "Cursor",
         .pi => "Pi",
         .fx => "FX",
+        .antigravity => "Antigravity",
         .grok => "Grok",
         .muse => "Muse",
         .custom_acp => "Custom ACP agent",
@@ -1687,6 +1689,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 state.attachBrowserToTab(hit.pane_id);
                 split_menu_open_for = null;
             },
+            .open_link_verde_viewer => {
+                state.openTranscriptFileReferenceWith(contextLink(), .verde_viewer);
+                split_menu_open_for = null;
+            },
             .open_link_nvim_pane => {
                 state.openTranscriptFileReferenceWith(contextLink(), .neovim_pane);
                 split_menu_open_for = null;
@@ -1842,7 +1848,7 @@ fn captureContextLink(state: *runtime.AppState, x: f32, y: f32) void {
     split_menu_link_kind = chat_panel.transcriptLinkKind(trimmed);
     if (split_menu_link_kind != .file) return;
 
-    split_menu_link_nvim_pane = utils.configuredEditorIsNeovim();
+    split_menu_link_nvim_pane = utils.neovimAvailable();
     split_menu_link_editors = .{
         utils.editorTargetAvailable(.configured),
         utils.editorTargetAvailable(.cursor),
@@ -1874,13 +1880,15 @@ const ContextLinkRow = struct {
 /// "Open in ..." rows for the captured link. File links list every editor
 /// that can launch plus the system handler and file manager; web links choose
 /// between the Verde and system browsers. Anything else can only be copied.
-fn contextLinkRows(rows: *[8]ContextLinkRow) usize {
+fn contextLinkRows(rows: *[9]ContextLinkRow) usize {
     if (split_menu_link_len == 0) return 0;
     var count: usize = 0;
     switch (split_menu_link_kind) {
         .file => {
+            rows[count] = .{ .action = .open_link_verde_viewer, .label = "Open in Verde" };
+            count += 1;
             if (split_menu_link_nvim_pane) {
-                rows[count] = .{ .action = .open_link_nvim_pane, .label = "Open in Neovim Pane" };
+                rows[count] = .{ .action = .open_link_nvim_pane, .label = "Open in Neovim (Verde Terminal)" };
                 count += 1;
             }
             if (split_menu_link_editors[0]) {
@@ -3744,7 +3752,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const copy_count: usize = if (is_chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
     const paste_count: usize = if (is_chat_context and split_menu_show_paste) 1 else 0;
     const chat_command_count: usize = if (is_chat_context) copy_count + paste_count + 2 else 0;
-    var link_rows: [8]ContextLinkRow = undefined;
+    var link_rows: [9]ContextLinkRow = undefined;
     const link_row_count: usize = if (is_chat_context) contextLinkRows(&link_rows) else 0;
     // A thin rule separates link targets from the pane commands below them.
     const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI) else 0.0;
@@ -4236,6 +4244,40 @@ test "scrolling strip reveals every group beyond the visible rect budget" {
             const available = scrollingEdgeAvailability(index, count);
             try std.testing.expectEqual(index > 0, available.previous);
             try std.testing.expectEqual(index + 1 < count, available.next);
+        }
+    }
+}
+
+test "fresh install first frames render with no workspaces and onboarding open" {
+    const ui_layout = @import("layout.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    // Empty store: no workspace exists yet and the provider dialog is up.
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.projects.items.len);
+    state.settings_controller.provider_onboarding_visible = true;
+    // Main-loop order: modal hits, then layout/render, over several frames
+    // and window sizes (including a minimized 0x0 framebuffer).
+    const sizes = [_][2]f32{ .{ 1280.0, 800.0 }, .{ 640.0, 480.0 }, .{ 0.0, 0.0 } };
+    for (sizes) |size| {
+        for (0..3) |_| {
+            ui_layout.refreshPaletteModalHits(&state, size[0], size[1]);
+            state.palette_overlay_batch.clear();
+            state.palette_frame_text.clearRetainingCapacity();
+            _ = state.palette_frame_text_arena.reset(.retain_capacity);
+            ui_layout.renderRoot(&state, size[0], size[1]);
         }
     }
 }

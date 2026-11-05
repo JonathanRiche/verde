@@ -37,6 +37,8 @@ export interface DynamicModelRow {
   claude_effort_values?: string[] | null
   cursor_fast_supported?: boolean
   cursor_reasoning_values?: string[] | null
+  /// Per-model effort tiers (grok, and agy's thinking levels for Antigravity).
+  grok_effort_values?: string[] | null
 }
 
 /// Convert a daemon catalog into picker options, mirroring how the desktop
@@ -91,6 +93,27 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
       // Grok Build reports its catalog over ACP; every model accepts a
       // reasoning effort (low..xhigh), and `max` is not offered.
       options.push({ label, value: row.model_id, efforts: GROK_EFFORTS })
+    } else if (provider === 'antigravity') {
+      // agy folds its thinking level into model ids; the daemon groups them
+      // per base model and lists that model's tiers.
+      const tiers = row.grok_effort_values?.length ? row.grok_effort_values : []
+      options.push({
+        label,
+        value: row.model_id,
+        ...(tiers.length ? { efforts: [DEFAULT_EFFORT, ...tiers.map((value) => ({ label: effortLabel(value), value }))] } : {}),
+      })
+    } else if (provider === 'fx') {
+      // The daemon probes each fx model's reasoning tiers and Fast lane over
+      // ACP; "Default" keeps fx's own tier.
+      const tiers = row.reasoning_supported === false
+        ? []
+        : row.grok_effort_values?.length ? row.grok_effort_values : FX_EFFORT_VALUES
+      options.push({
+        label,
+        value: row.model_id,
+        ...(tiers.length ? { efforts: [DEFAULT_EFFORT, ...tiers.map((value) => ({ label: effortLabel(value), value }))] } : {}),
+        ...(row.cursor_fast_supported ? { fast_supported: true } : {}),
+      })
     } else if (provider === 'muse') {
       options.push({
         label,
@@ -169,14 +192,18 @@ const PI_MODELS: ModelOption[] = [
   { label: 'Default (pi config)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
 ]
 
-/// Mirror of the desktop FX_MODEL_OPTIONS fallback; fx ACP exposes no
-/// effort control today, so no efforts are offered.
+/// FX_REASONING_OPTIONS: fx tiers that share Verde's names (fx's `ultra`
+/// has no Verde equivalent). Unprobed rows offer all of them; the daemon
+/// skips any the session's model does not support.
+const FX_EFFORT_VALUES = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/// Mirror of the desktop FX_MODEL_OPTIONS fallback.
 const FX_MODELS: ModelOption[] = [
-  { label: 'Default (fx config)', value: 'default' },
-  { label: 'GPT-5.2', value: 'openai/gpt-5.2' },
-  { label: 'GPT-5.4 Mini', value: 'openai/gpt-5.4-mini' },
-  { label: 'GPT-5.1 Codex', value: 'openai/gpt-5.1-codex' },
-  { label: 'Claude Sonnet 5', value: 'anthropic/claude-sonnet-5' },
+  { label: 'Default (fx config)', value: 'default', efforts: CLAUDE_FULL_EFFORTS, fast_supported: true },
+  { label: 'GPT-5.2', value: 'openai/gpt-5.2', efforts: CLAUDE_FULL_EFFORTS },
+  { label: 'GPT-5.4 Mini', value: 'openai/gpt-5.4-mini', efforts: CLAUDE_FULL_EFFORTS },
+  { label: 'GPT-5.1 Codex', value: 'openai/gpt-5.1-codex', efforts: CLAUDE_FULL_EFFORTS },
+  { label: 'Claude Sonnet 5', value: 'anthropic/claude-sonnet-5', efforts: CLAUDE_FULL_EFFORTS },
 ]
 
 /// GROK_REASONING_OPTIONS: grok efforts stop at xhigh.
@@ -186,6 +213,19 @@ const GROK_EFFORTS: EffortOption[] = [
   { label: 'Medium', value: 'medium' },
   { label: 'High', value: 'high' },
   { label: 'Extra high', value: 'xhigh' },
+]
+
+/// Mirror of the desktop ANTIGRAVITY_MODEL_OPTIONS fallback: base models plus
+/// agy's thinking tiers as a separate effort menu.
+const ANTIGRAVITY_EFFORTS: EffortOption[] = [
+  DEFAULT_EFFORT,
+  { label: 'Low', value: 'low' },
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+]
+const ANTIGRAVITY_MODELS: ModelOption[] = [
+  { label: 'Default (agy config)', value: 'default', efforts: ANTIGRAVITY_EFFORTS },
+  { label: 'Gemini 3.8 Flash', value: 'gemini-3.8-flash', efforts: ANTIGRAVITY_EFFORTS },
 ]
 
 /// Grok's static fallback mirrors GROK_MODEL_OPTIONS: "default" defers to the
@@ -278,6 +318,8 @@ export function modelOptionsFor(provider: string | null | undefined): ModelOptio
       return FX_MODELS
     case 'grok':
       return GROK_MODELS
+    case 'antigravity':
+      return ANTIGRAVITY_MODELS
     case 'muse':
       return MUSE_MODELS
     default:
@@ -286,7 +328,7 @@ export function modelOptionsFor(provider: string | null | undefined): ModelOptio
 }
 
 export function modelSupportsFast(provider: string | null | undefined, option: ModelOption | undefined): boolean {
-  return provider === 'codex' || (provider === 'cursor' && option?.fast_supported === true)
+  return provider === 'codex' || ((provider === 'cursor' || provider === 'fx') && option?.fast_supported === true)
 }
 
 /// Effort menu for the current model within an option list; empty hides the chip.

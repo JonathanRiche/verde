@@ -21,6 +21,7 @@ pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "auto";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_GROK_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_ANTIGRAVITY_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "muse-wonder-1.0";
 
 pub const ModelOption = struct {
@@ -32,6 +33,7 @@ pub const ModelOption = struct {
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
     reasoning_variant_keys: ?[][:0]const u8 = null,
+    /// Cursor and fx: the model offers a Fast lane.
     cursor_fast_supported: bool = false,
     cursor_reasoning_param_id: ?[:0]const u8 = null,
     cursor_reasoning_values: ?[]const [:0]const u8 = null,
@@ -205,17 +207,115 @@ pub const PI_MODEL_OPTIONS = [_]ModelOption{
 /// tier is offered; "Default" leaves pi's configured thinking level untouched.
 /// Static fallback shown until the async `fx acp` catalog discovery completes.
 /// "default" defers to the model persisted inside fx itself (`fx acp` without
-/// a --model override).
+/// a --model override). Rows without a probed catalog (`grok_effort_values`
+/// null) offer every tier, and the Default row offers Fast: the fx harness
+/// skips whatever the session's model turns out not to support.
 pub const FX_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (fx config)", .value = DEFAULT_FX_MODEL, .reasoning_supported = false },
+    .{ .label = "Default (fx config)", .value = DEFAULT_FX_MODEL, .reasoning_supported = true, .cursor_fast_supported = true },
     // fx's default provider is the Vercel AI Gateway, whose ids are
     // "<vendor>/<model>"; bare Codex-subscription ids (gpt-5.6-sol, ...) get
     // HTTP 403 from the gateway and surface only as "HTTP error".
-    .{ .label = "GPT-5.2", .value = "openai/gpt-5.2", .reasoning_supported = false },
-    .{ .label = "GPT-5.4 Mini", .value = "openai/gpt-5.4-mini", .reasoning_supported = false },
-    .{ .label = "GPT-5.1 Codex", .value = "openai/gpt-5.1-codex", .reasoning_supported = false },
-    .{ .label = "Claude Sonnet 5", .value = "anthropic/claude-sonnet-5", .reasoning_supported = false },
+    .{ .label = "GPT-5.2", .value = "openai/gpt-5.2", .reasoning_supported = true },
+    .{ .label = "GPT-5.4 Mini", .value = "openai/gpt-5.4-mini", .reasoning_supported = true },
+    .{ .label = "GPT-5.1 Codex", .value = "openai/gpt-5.1-codex", .reasoning_supported = true },
+    .{ .label = "Claude Sonnet 5", .value = "anthropic/claude-sonnet-5", .reasoning_supported = true },
 };
+
+/// fx reasoning tiers that share Verde's tag names. fx's own `auto` (model
+/// default) is the "Default" row; its `ultra` tier has no Verde equivalent.
+pub const FX_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
+    .{ .label = "Max", .value = .max },
+};
+
+/// True when an fx model accepts `effort`. `option` is the thread's picker
+/// row (null for unknown refs): a probed catalog lists the model's tiers, an
+/// unprobed row offers every tier, and models without reasoning offer none.
+pub fn fxEffortSupported(option: ?ModelOption, effort: ReasoningEffort) bool {
+    const row = option orelse return true;
+    if (!row.reasoning_supported) return false;
+    const list = row.grok_effort_values orelse return true;
+    for (list) |value| {
+        if (parseReasoningEffort(value) == effort) return true;
+    }
+    return false;
+}
+
+/// Selected-row index and row count for the fx reasoning gauge: the
+/// "Default" row plus each FX_REASONING_OPTIONS tier the model supports.
+/// Null when the model has no reasoning control.
+pub fn fxReasoningGauge(option: ?ModelOption, selected: ?ReasoningEffort) ?struct { index: usize, count: usize } {
+    if (option) |row| if (!row.reasoning_supported) return null;
+    var index: usize = 0;
+    var count: usize = 0;
+    for (FX_REASONING_OPTIONS) |entry| {
+        if (entry.value) |effort| {
+            if (!fxEffortSupported(option, effort)) continue;
+            if (selected != null and selected.? == effort) index = count;
+        }
+        count += 1;
+    }
+    if (count <= 1) return null;
+    return .{ .index = index, .count = count };
+}
+
+/// fx offers Fast per model; the Default row always shows the toggle.
+pub fn fxFastSupported(option: ?ModelOption) bool {
+    const row = option orelse return false;
+    return row.cursor_fast_supported;
+}
+
+/// Static fallback shown until the async `agy acp` session catalog arrives.
+/// "default" defers to the model agy persisted for the conversation; agy
+/// folds its thinking level into the model id, so there is no effort menu.
+pub const ANTIGRAVITY_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (agy config)", .value = DEFAULT_ANTIGRAVITY_MODEL, .reasoning_supported = true },
+    .{ .label = "Gemini 3.8 Flash", .value = "gemini-3.8-flash", .reasoning_supported = true, .grok_effort_values = ANTIGRAVITY_DEFAULT_EFFORT_VALUES[0..] },
+};
+
+/// agy's thinking tiers when a model row carries no catalog of its own (the
+/// "Default" row, or before discovery completes).
+const ANTIGRAVITY_DEFAULT_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
+
+/// agy folds a thinking level into each model id (`gemini-3.8-flash-high`);
+/// Verde lists the base model and offers the tiers the catalog reports for
+/// it here. "Default" keeps agy's current tier for the conversation.
+pub const ANTIGRAVITY_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
+    .{ .label = "Max", .value = .max },
+};
+
+/// True when an agy model row offers `effort`: its catalog tiers, else agy's
+/// usual low/medium/high.
+pub fn antigravityEffortSupported(values: ?[]const [:0]const u8, effort: ReasoningEffort) bool {
+    const list = values orelse ANTIGRAVITY_DEFAULT_EFFORT_VALUES[0..];
+    for (list) |value| {
+        if (parseReasoningEffort(value) == effort) return true;
+    }
+    return false;
+}
+
+/// Selected-row index and row count for the agy reasoning gauge.
+pub fn antigravityReasoningGauge(values: ?[]const [:0]const u8, selected: ?ReasoningEffort) struct { index: usize, count: usize } {
+    var index: usize = 0;
+    var count: usize = 0;
+    for (ANTIGRAVITY_REASONING_OPTIONS) |option| {
+        if (option.value) |effort| {
+            if (!antigravityEffortSupported(values, effort)) continue;
+            if (selected != null and selected.? == effort) index = count;
+        }
+        count += 1;
+    }
+    return .{ .index = index, .count = count };
+}
 
 /// Static fallback shown until the async `grok agent stdio` initialize
 /// handshake reports the live catalog. "default" defers to the model persisted

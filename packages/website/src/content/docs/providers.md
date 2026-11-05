@@ -1,6 +1,6 @@
 ---
 title: Provider setup
-description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok, and Amp.
+description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok, Antigravity, and Amp.
 section: Get started
 order: 2
 slug: providers
@@ -26,6 +26,7 @@ machine, and supports each agent in one or both of two modes:
 | Pi          | ✓        | ✓            | Drives `pi --mode rpc` (JSONL over stdio), one process per turn |
 | FX          | ✓        | ✓            | Speaks ACP to the `fx` CLI (`fx acp`), one process per turn     |
 | Grok Build  | ✓        | ✓            | Speaks ACP to the `grok` CLI (`grok agent stdio`), one process per turn |
+| Antigravity | ✓        | ✓            | Speaks ACP to Google's Antigravity CLI (`agy acp`), one process per turn |
 | Amp         | –        | ✓            | TUI-only — launches the `amp` CLI in a terminal pane            |
 
 All of them run against the project directory you imported into Verde. Tokens,
@@ -134,13 +135,20 @@ fx login
 Verify `fx` is on `PATH` from a normal shell. Desktop launches often miss the
 installer location, so Verde also looks for `~/.local/bin/fx`. Verde drives fx
 through its Agent Client Protocol server (`fx acp`), starting one process per
-turn. The readiness check reports **Sign-in needed** until `fx login` has
-cached a usable Vercel AI Gateway credential.
+turn. The readiness check reports **Sign-in needed** until fx has a usable
+credential for its active provider: `fx login` (Vercel AI Gateway),
+`fx login codex` (ChatGPT subscription), or `fx login grok`.
 
 The default model entry, **Default (fx config)**, defers to the model
 persisted inside fx itself; the model picker also lists every model fx
-reports through ACP `configOptions`. FX has no reasoning-effort or speed-tier
-controls, so those rows are hidden. Image attachments are forwarded when the
+reports through ACP `configOptions` for its active provider. With current fx
+(tested with 0.0.16), Verde reads each model's reasoning tiers (Low through Max) and Fast
+lane from the same options, shows the effort and **Fast** controls only where
+the model offers them, and applies them to the fx session before each turn.
+**Default** leaves fx's own reasoning effort unchanged; fx's `ultra` tier is
+not offered. fx's permission modes (Auto, Ask, Full access) are left as you
+set them in fx, because switching them over ACP also changes fx's saved
+setting. Image attachments are forwarded when the
 ACP session advertises image support; fx 0.0.8 and later advertise it and
 reject any single image above 3.75 MiB, which Verde reports as the failed
 turn's message. FX does not use Verde's slash-command surface yet, and
@@ -203,6 +211,61 @@ activity to the pane and sidebar. After a session completes, Verde also
 best-effort synchronizes Grok's generated session title when its summary file
 becomes available.
 
+## Antigravity
+
+Install Google's Antigravity CLI with its
+[official installer](https://antigravity.google/docs/getting-started?tab=cli)
+(`curl -fsSL https://antigravity.google/cli/install.sh | bash`; it places `agy`
+in `~/.local/bin`), then sign in once: run **Sign In to Antigravity** from
+`Ctrl+Shift+P` (it runs `agy acp --login` in Verde's provider setup terminal),
+use the provider's **Sign in** action in Settings, or run `agy acp --login`
+yourself. Verde drives Antigravity through its Agent Client Protocol server
+(`agy acp`), starting one process per turn and resuming the same conversation
+for follow-up turns. ACP session ids are Antigravity conversation ids, so
+**Open Current Thread in TUI** runs `agy --conversation <id>` on the same
+conversation. Existing agy conversations cannot be imported as Verde threads
+yet.
+
+The default model entry, **Default (agy config)**, defers to the model agy
+saved for the conversation; the picker also lists every base model agy
+reports (for example Gemini 3.8 Flash). Each model's thinking levels (Low,
+Medium, High) appear in the separate **Reasoning** row, and **Default** keeps
+agy's current level. agy itself serves a model and level as one id
+(`gemini-3.8-flash-low`), so Verde switches with ACP `session/set_model` to the
+matching id, and only to one agy currently lists. Antigravity has no speed
+tier, so the **Speed** row is hidden. Image attachments are forwarded. **Full access** threads
+start `agy acp --dangerously-skip-permissions`; supervised threads route each
+tool permission request to Verde's approval card. If agy reports that the
+signed-in Google account has no Antigravity license (`#3501`), Verde shows that
+as an error message instead of a reply. Sign in with an eligible account and
+retry.
+
+Antigravity's slash commands (`/goal`, `/compact`, `/schedule`, `/browser`,
+`/plan`, installed skills, …) come from the list agy advertises over ACP. Verde
+sends the `/name args` text as a prompt turn and agy resolves it.
+
+Turning on Verde MCP adds a `verde` entry to Antigravity's global
+`~/.gemini/config/mcp_config.json`, which both `agy` and `agy acp` read.
+To use the interactive TUI, run **Start New Antigravity TUI** (or **Set Up
+Antigravity CLI** when `agy` is missing) from `Ctrl+Shift+P`, or:
+
+```bash
+verde live agent open --provider antigravity
+```
+
+A managed launch also installs Verde's status hook. You can manage it in
+**Settings → Status pip hooks** or from the CLI:
+
+```bash
+verde integrations install antigravity --global
+verde integrations remove antigravity --global
+```
+
+The hook is a single `verde-notify` entry in `~/.gemini/config/hooks.json`,
+merged next to your own named hooks. It runs only when agy inherited a Verde
+terminal identity, and reports working (`PreInvocation`), done (`Stop`), and
+error (a `Stop` with an `ERROR` reason) to the pane and sidebar.
+
 ## Amp
 
 Install [Amp](https://ampcode.com) and make sure `amp` is on your `PATH`. Amp
@@ -227,7 +290,7 @@ it from the settings modal under **Status pip hooks**, and remove it with
 
 The searchable model picker groups models by provider, marks defaults, and
 supports `Ctrl+1` through `Ctrl+9` for its visible results. OpenCode, Claude
-Code, Cursor, Pi, FX, and Grok model lists are loaded from the installed provider; Codex
+Code, Cursor, Pi, FX, Grok, and Antigravity model lists are loaded from the installed provider; Codex
 uses Verde's supported model list.
 
 Before a new thread sends its first message, choosing a model can also switch
@@ -246,8 +309,8 @@ provider, model, and transcript; the layout is shared.
 You can also launch any provider's TUI directly inside a terminal pane — useful
 when you want the agent's native UI rather than Verde's chat surface. The
 command palette (`Ctrl+Shift+P`) has a **Start New … TUI** entry for each of
-Codex, Claude, OpenCode, Cursor, Grok, and Amp, plus **Open Current Thread in TUI**
-entries that promote a running GUI chat thread — including Pi, FX, and Grok —
+Codex, Claude, OpenCode, Cursor, Grok, Antigravity, and Amp, plus **Open Current Thread in TUI**
+entries that promote a running GUI chat thread — including Pi, FX, Grok, and Antigravity —
 into that provider's terminal TUI. Launch `pi` in a terminal pane for a fresh
 Pi TUI. Right-clicking inside a terminal offers configured custom launch profiles
 and pane actions; use the palette or CLI for built-in provider TUI actions.
@@ -271,8 +334,8 @@ stack schema and the [CLI reference](/docs/cli) for the full command surface.
 
 If prompt sending fails, check in this order:
 
-1. **Is the provider installed?** `which codex`, `which opencode`, `which agent`, `which pi`, `which fx`, `which grok`, etc., from the shell Verde was launched in. GUI launches on some platforms inherit a different `PATH` than a terminal — relaunch Verde from a terminal if you suspect this.
-2. **Is the provider authenticated?** Re-run the provider's login command (`codex login`, `agent login`, `fx login`, `grok login`, `pi login`, etc.) and confirm credentials are still valid.
+1. **Is the provider installed?** `which codex`, `which opencode`, `which agent`, `which pi`, `which fx`, `which grok`, `which agy`, etc., from the shell Verde was launched in. GUI launches on some platforms inherit a different `PATH` than a terminal — relaunch Verde from a terminal if you suspect this.
+2. **Is the provider authenticated?** Re-run the provider's login command (`codex login`, `agent login`, `fx login`, `grok login`, `agy acp --login`, `pi login`, etc.) and confirm credentials are still valid.
 3. **Is the project imported?** Verde runs the provider against the imported project directory. A provider CLI in a different working directory will not see the same files.
 4. **Check the logs.** Provider helper stderr is written to the runtime log alongside Zig panics. On Linux:
    ```bash

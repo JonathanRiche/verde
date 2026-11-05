@@ -9,6 +9,7 @@ const cursor = @import("cursor.zig");
 const pi = @import("pi.zig");
 const fx = @import("fx.zig");
 const grok = @import("grok.zig");
+const antigravity = @import("antigravity.zig");
 const muse = @import("muse.zig");
 const custom_acp = @import("custom_acp.zig");
 const acp = @import("acp.zig");
@@ -56,6 +57,7 @@ pub const ProviderConfig = union(Provider) {
     grok: grok.Config,
     muse: muse.Config,
     custom_acp: custom_acp.Config,
+    antigravity: antigravity.Config,
 };
 
 pub const ProviderClient = union(Provider) {
@@ -68,6 +70,7 @@ pub const ProviderClient = union(Provider) {
     grok: grok.Client,
     muse: muse.Client,
     custom_acp: custom_acp.Client,
+    antigravity: antigravity.Client,
 
     pub fn deinit(self: *ProviderClient) void {
         switch (self.*) {
@@ -78,6 +81,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.deinit(),
             .fx => |*client| client.deinit(),
             .grok => |*client| client.deinit(),
+            .antigravity => |*client| client.deinit(),
             .muse => |*client| client.deinit(),
             .custom_acp => |*client| client.deinit(),
         }
@@ -92,6 +96,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.authState(),
             .fx => |*client| client.authState(),
             .grok => |*client| client.authState(),
+            .antigravity => |*client| client.authState(),
             .muse => |*client| client.authState(),
             .custom_acp => |*client| client.authState(),
         };
@@ -106,6 +111,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.listThreads(allocator),
             .fx => |*client| client.listThreads(allocator),
             .grok => |*client| client.listThreads(allocator),
+            .antigravity => |*client| client.listThreads(allocator),
             .muse => |*client| client.listThreads(allocator),
             .custom_acp => |*client| client.listThreads(allocator),
         };
@@ -120,6 +126,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.listModels(allocator),
             .fx => |*client| client.listModels(allocator),
             .grok => |*client| client.listModels(allocator),
+            .antigravity => |*client| client.listModels(allocator),
             .muse => |*client| client.listModels(allocator),
             .custom_acp => |*client| client.listModels(allocator),
         };
@@ -134,6 +141,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.readThread(allocator, thread_id),
             .fx => |*client| client.readThread(allocator, thread_id),
             .grok => |*client| client.readThread(allocator, thread_id),
+            .antigravity => |*client| client.readThread(allocator, thread_id),
             .muse => |*client| client.readThread(allocator, thread_id),
             .custom_acp => |*client| client.readThread(allocator, thread_id),
         };
@@ -148,6 +156,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.sendPrompt(allocator, request),
             .fx => |*client| client.sendPrompt(allocator, request),
             .grok => |*client| client.sendPrompt(allocator, request),
+            .antigravity => |*client| client.sendPrompt(allocator, request),
             .muse => |*client| client.sendPrompt(allocator, request),
             .custom_acp => |*client| client.sendPrompt(allocator, request),
         };
@@ -162,6 +171,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.slashCommands(),
             .fx => |*client| client.slashCommands(),
             .grok => |*client| client.slashCommands(),
+            .antigravity => |*client| client.slashCommands(),
             .muse => |*client| client.slashCommands(),
             .custom_acp => |*client| client.slashCommands(),
         };
@@ -176,6 +186,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.runSlashCommand(allocator, request),
             .fx => |*client| client.runSlashCommand(allocator, request),
             .grok => |*client| client.runSlashCommand(allocator, request),
+            .antigravity => |*client| client.runSlashCommand(allocator, request),
             .muse => |*client| client.runSlashCommand(allocator, request),
             .custom_acp => |*client| client.runSlashCommand(allocator, request),
         };
@@ -190,6 +201,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.interruptThread(request),
             .fx => |*client| client.interruptThread(request),
             .grok => |*client| client.interruptThread(request),
+            .antigravity => |*client| client.interruptThread(request),
             .muse => |*client| client.interruptThread(request),
             .custom_acp => |*client| client.interruptThread(request),
         };
@@ -218,6 +230,7 @@ pub const ProviderClient = union(Provider) {
             .pi => |*client| client.steerThread(request),
             .fx => |*client| client.steerThread(request),
             .grok => |*client| client.steerThread(request),
+            .antigravity => |*client| client.steerThread(request),
             .muse => |*client| client.steerThread(request),
             .custom_acp => |*client| client.steerThread(request),
         };
@@ -233,6 +246,7 @@ pub fn slashCommandsForProvider(provider: Provider) []const ProviderSlashCommand
         .pi => pi.providerSlashCommands(),
         .fx => fx.providerSlashCommands(),
         .grok => grok.providerSlashCommands(),
+        .antigravity => antigravity.providerSlashCommands(),
         .muse => muse.providerSlashCommands(),
         .custom_acp => custom_acp.providerSlashCommands(),
     };
@@ -245,6 +259,7 @@ pub fn slashCommandsForProviderAlloc(allocator: std.mem.Allocator, provider: Pro
         .cursor => .cursor_acp,
         .fx => .fx_acp,
         .grok => .grok_acp,
+        .antigravity => .antigravity_acp,
         .custom_acp => .custom_acp,
         .opencode, .codex, .claude, .pi, .muse => null,
     };
@@ -265,6 +280,7 @@ pub fn connect(
         .pi => |config| .{ .pi = try pi.Client.init(allocator, config) },
         .fx => |config| .{ .fx = try fx.Client.init(allocator, config) },
         .grok => |config| .{ .grok = try grok.Client.init(allocator, config) },
+        .antigravity => |config| .{ .antigravity = try antigravity.Client.init(allocator, config) },
         .muse => |config| .{ .muse = try muse.Client.init(allocator, config) },
         .custom_acp => |config| .{ .custom_acp = try custom_acp.Client.init(allocator, config) },
     };
@@ -289,8 +305,11 @@ pub fn shutdownOwnedProviderProcesses() void {
     fx.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done fx", .{});
     runtime_log.diagnostic("provider shutdown begin grok", .{});
+    runtime_log.diagnostic("provider shutdown begin antigravity", .{});
     grok.shutdownOwnedServer();
+    antigravity.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done grok", .{});
+    runtime_log.diagnostic("provider shutdown done antigravity", .{});
     runtime_log.diagnostic("provider shutdown begin muse", .{});
     muse.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done muse", .{});

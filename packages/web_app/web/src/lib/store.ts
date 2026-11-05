@@ -2776,6 +2776,8 @@ export function createAppStore() {
         return 'FX'
       case 'grok':
         return 'Grok'
+      case 'antigravity':
+        return 'Antigravity'
       case 'muse':
         return 'Muse'
       default:

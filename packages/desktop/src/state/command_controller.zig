@@ -190,6 +190,7 @@ fn providerProtocolTag(provider: Provider) provider_types.Provider {
         .cursor => .cursor,
         .pi => .pi,
         .fx => .fx,
+        .antigravity => .antigravity,
         .grok => .grok,
         .muse => .muse,
         .custom_acp => .custom_acp,
@@ -230,6 +231,10 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
         .grok => switch (err) {
             error.UnsupportedOperation => "Grok does not support this slash command yet.",
             else => "Grok slash command failed.",
+        },
+        .antigravity => switch (err) {
+            error.UnsupportedOperation => "Antigravity does not support this slash command yet.",
+            else => "Antigravity slash command failed.",
         },
         .muse => switch (err) {
             error.UnsupportedOperation => "Muse does not support this slash command yet.",
