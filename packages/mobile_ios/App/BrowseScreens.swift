@@ -99,6 +99,16 @@ struct AttentionBadge: View {
 enum RowState: Equatable {
     case working, attention, failed
 
+    /// The core's chat state (C11): needs you amber, running accent, failed red; unread and idle none.
+    init?(_ state: AttentionChatState) {
+        switch state {
+        case .needs_you: self = .attention
+        case .running: self = .working
+        case .failed: self = .failed
+        case .unread, .idle: return nil
+        }
+    }
+
     init?(status: String, attention: Bool = false) {
         if status == "failed" { self = .failed }
         else if attention || ["waiting_approval", "waiting", "blocked"].contains(status) { self = .attention }
@@ -188,11 +198,17 @@ private struct PaneItem: View {
     let pane: Pane
     let now: Int64
     var body: some View {
-        MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
-                                    dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.needs_you), label: paneLabel(pane)),
+        // S39: a chat pane reads the core's state; a terminal its own process status.
+        let chat = pane.kind != "terminal"
+        let state = coreChatState(pane.state)
+        let rowState = chat ? RowState(state) : RowState(status: pane.status)
+        let label = chat ? (state.label(status: pane.status) ?? "Idle") : paneLabel(pane)
+        let timer = pane.can_stop ? pane.started_at_ms.map { elapsedLabel($0, now) } : nil
+        let detail = rowSubtitle([pane.kind == "terminal" ? "Terminal" : "Chat", rowState == nil && chat ? nil : label, timer])
+        MenuRow(content: RowContent(title: pane.title, detail: detail,
+                                    dot: Dot(color: rowState?.color ?? VerdeTheme.subtle, label: rowState == nil ? "Idle" : label),
                                     provider: pane.kind == "terminal" ? pane.provider : nil,
-                                    badge: pane.attention_kind == "unread" ? nil : attentionLabel(pane.attention_kind),
-                                    state: RowState(status: pane.status, attention: pane.needs_you), stateText: paneLabel(pane)),
+                                    state: rowState, stateText: label, unread: chat && state == .unread),
                 destination: route(pane), copies: [("Copy title", pane.title)])
             .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }
     }
@@ -205,16 +221,20 @@ private struct ThreadItem: View {
     var workspaceLabel: String?
     /// A finished chat not yet read: a neutral dot, never amber (S26).
     var unread = false
+    /// A running turn's start, for its elapsed time.
+    var startedAt: Int64? = nil
     var body: some View {
-        let state = RowState(status: thread.status)
-        let stateText = state == nil ? nil : statusLabel(thread.status)
+        // S39: the core's state (C11), never the app's reading of the turn status.
+        let core = coreChatState(thread.state)
+        let state = RowState(core)
+        let stateText = core.label(status: thread.status)
         // A live state replaces the age: "Needs approval · 11 h ago" read as stale (I6-9).
         let age = state == nil ? thread.last_activity_at_ms.map { agoLabel($0, now) } : nil
-        let detail = rowSubtitle([workspaceLabel, stateText, age])
+        let elapsed = core == .running ? startedAt.map { elapsedLabel($0, now) } : nil
+        let detail = rowSubtitle([workspaceLabel, stateText, elapsed ?? age])
         MenuRow(content: RowContent(title: thread.title, detail: detail,
-                                    dot: Dot(color: VerdeTheme.status(thread.status, attention: thread.status == "waiting_approval"),
-                                             label: statusLabel(thread.status)), provider: thread.provider,
-                                    state: state, stateText: stateText, unread: unread),
+                                    dot: Dot(color: state?.color ?? VerdeTheme.subtle, label: stateText ?? "Idle"), provider: thread.provider,
+                                    state: state, stateText: stateText, unread: unread || core == .unread),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
             .overlay(alignment: .topTrailing) { GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id).padding(8) }
@@ -360,27 +380,28 @@ struct HomeScreen: View {
         let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
         BrowseFrame(title: "Home", model: model, actions: actions,
                     ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }) { state, now in
-            // "Needs you" is the core's set (C8); unread completions stay with the rest.
-            let attention = panes.filter(\.needs_you)
-            // Only live turns and running processes are "Running" (I8-5); a finished, unread chat is not.
-            let running = panes.filter { !$0.needs_you && (activeTurn($0.status) || $0.can_stop) }
-            if !attention.isEmpty {
-                TitledSection("Needs you") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
-            }
-            if !running.isEmpty {
-                TitledSection("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
-            }
-            if attention.isEmpty && running.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
+            // S39: every section is the core's classification (C11); a chat appears in one only.
+            let sections = homeSections(state, limit: adaptive.tier.wide ? 5 : 8, hidden: hidden)
             let workspaces = state.workspaces?.items ?? []
             let labels = Dictionary(workspaces.map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
-            // S26: "Needs you" / "Running" / "Recent"; wide windows keep five recents beside the sidebar.
-            let recent = recentThreads(state.workspaces, limit: adaptive.tier.wide ? 5 : 8, hidden: hidden)
-            let unread = Set(panes.filter { $0.attention_kind == "unread" }.compactMap(\.thread_id))
-            if !recent.isEmpty {
-                TitledSection("Recent") {
-                    ForEach(recent, id: \.thread_id) {
-                        ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id], unread: unread.contains($0.thread_id))
+            // Terminals running a process stand beside running chats (the classifier covers chats).
+            let terminals = panes.filter { $0.kind == "terminal" && $0.can_stop }
+            if !sections.needs.isEmpty {
+                TitledSection("Needs you") { ForEach(sections.needs, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) } }
+            }
+            if !sections.running.isEmpty || !terminals.isEmpty {
+                TitledSection("Running") {
+                    ForEach(sections.running, id: \.thread_id) { thread in
+                        ThreadItem(browse: model, thread: thread, now: now, workspaceLabel: labels[thread.workspace_id],
+                                   startedAt: panes.first { $0.thread_id == thread.thread_id }?.started_at_ms)
                     }
+                    ForEach(terminals, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
+                }
+            }
+            if sections.needs.isEmpty && sections.running.isEmpty && terminals.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
+            if !sections.recent.isEmpty {
+                TitledSection("Recent") {
+                    ForEach(sections.recent, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
                 }
             }
             let open = workspaces.filter(\.open)

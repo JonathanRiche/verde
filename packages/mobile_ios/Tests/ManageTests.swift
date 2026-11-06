@@ -94,12 +94,22 @@ final class ManageTests: XCTestCase {
     }
 
     func testDrawerActiveIsRunningOrNeedsYou() {
-        var pane = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate")
-        XCTAssertFalse(drawerRowActive(threadStatus: "failed", pane: pane), "an acknowledged failure is not Active")
-        pane.needs_you = true
-        XCTAssertTrue(drawerRowActive(threadStatus: "failed", pane: pane))
-        XCTAssertTrue(drawerRowActive(threadStatus: "working", pane: nil))
-        XCTAssertFalse(drawerRowActive(threadStatus: "idle", pane: nil))
+        func thread(_ state: String?) -> ThreadSummary {
+            var t = ThreadSummary(workspace_id: "w", thread_id: "t", title: "T", provider: "codex", model: nil, cwd: nil,
+                                  open: true, archived: false, last_activity_at_ms: nil, status: "failed", history_bucket: "")
+            t.state = state
+            return t
+        }
+        // S39: the core's state alone (C11); the turn status is never read.
+        XCTAssertFalse(drawerRowActive(thread: thread("idle"), pane: nil), "an acknowledged failure is idle")
+        XCTAssertTrue(drawerRowActive(thread: thread("failed"), pane: nil))
+        XCTAssertTrue(drawerRowActive(thread: thread("needs_you"), pane: nil))
+        XCTAssertTrue(drawerRowActive(thread: thread("running"), pane: nil))
+        XCTAssertFalse(drawerRowActive(thread: thread("unread"), pane: nil))
+        XCTAssertFalse(drawerRowActive(thread: thread(nil), pane: nil))
+        var terminal = Pane(id: "p", workspace_id: "w", kind: "terminal", title: "bash")
+        terminal.can_stop = true
+        XCTAssertTrue(drawerRowActive(thread: nil, pane: terminal))
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: nil), .home)
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .workspaces, "the current screen, as on Android")
         XCTAssertEqual(drawerFooterDestination(tab: .workspaces, route: .thread(workspace: "w", thread: "t")), .workspaces)

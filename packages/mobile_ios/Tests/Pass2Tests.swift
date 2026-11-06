@@ -36,31 +36,38 @@ final class Pass2Tests: XCTestCase {
         XCTAssertEqual(relativeTimeRefresh, 30)
     }
 
-    /// One "needs you" set (C8): the core's `attention.needs` drives every badge and list.
+    /// One status truth (C11, S39): the core's lists drive every badge, list and section.
     func testNeedsYouIsTheCoreSet() {
-        let needs = [AttentionNeed(workspace_id: "w", thread_id: "t", kind: .needs_approval, title: "Rotate", deep_link: "verde://t"),
-                     AttentionNeed(workspace_id: "w", thread_id: "u", kind: .failed, title: "", deep_link: "verde://u")]
-        let attention = AttentionView(items: [], count: 3, loading: false, needs: needs, needs_you: 2, unread: 1)
-        // An unread pane flagged `attention` is not "needs you".
-        let unread = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Done", thread_id: "x", attention: true, attention_kind: "unread")
-        let home = HomeView(items: [unread], loading: false, stale: false, incomplete_scopes: [], error: nil)
-        let items = needsYouItems(attention: attention, home: home, workspaces: nil)
-        XCTAssertEqual(items.map(\.reason), ["Needs approval", "Failed"])
+        let needs = [AttentionNeed(workspace_id: "w", thread_id: "t", kind: .needs_approval, title: "Rotate", deep_link: "verde://t")]
+        let failed = [AttentionChat(workspace_id: "w", thread_id: "u", title: "", deep_link: "verde://u", state: .failed, status: "failed")]
+        let attention = AttentionView(items: [], count: 2, loading: false, needs: needs, needs_you: 1, unread: 0, failed: failed, failed_count: 1)
+        let items = needsYouItems(attention: attention, home: nil, workspaces: nil)
+        XCTAssertEqual(items.map(\.reason), ["Needs approval", "Failed"], "failures are listed beside what needs you")
         XCTAssertEqual(items[1].title, "Untitled chat")
-        XCTAssertEqual(needsYouBadge(attention: attention, items: items), 2)
-        let resolved = AttentionView(items: [], count: 1, loading: false, needs: [], needs_you: 0, unread: 1)
-        XCTAssertEqual(needsYouBadge(attention: resolved, items: needsYouItems(attention: resolved, home: home, workspaces: nil)), 0)
+        XCTAssertEqual(needsYouBadge(attention: attention, items: items), 1, "and never counted in the badge")
+        // No app-side stand-in before the core's view arrives.
+        XCTAssertTrue(needsYouItems(attention: nil, home: nil, workspaces: nil).isEmpty)
+        XCTAssertEqual(needsYouBadge(attention: nil, items: []), 0)
     }
 
-    /// Before the core's view arrives (warm-start cache), panes' own `needs_you` flags stand in.
-    func testNeedsYouFallsBackToPaneFlags() {
-        let waiting = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate", thread_id: "t",
-                           status: "waiting_approval", attention: true, attention_kind: "needs_approval", needs_you: true)
-        let unread = Pane(id: "q", workspace_id: "w", kind: "chat", title: "Done", thread_id: "u", attention: true, attention_kind: "unread")
-        let home = HomeView(items: [waiting, unread], loading: false, stale: false, incomplete_scopes: [], error: nil)
-        let items = needsYouItems(attention: nil, home: home, workspaces: nil)
-        XCTAssertEqual(items.map(\.threadID), ["t"])
-        XCTAssertEqual(needsYouBadge(attention: nil, items: items), 1)
+    func testHomeSectionsAreTheCoresAndNeverRepeat() {
+        let thread = ThreadSummary(workspace_id: "w", thread_id: "r", title: "Rotate", provider: "codex", model: nil, cwd: nil,
+                                   open: true, archived: false, last_activity_at_ms: 5, status: "working", history_bucket: "Today")
+        var state = BrowseState()
+        state.workspaces = WorkspacesView(items: [Workspace(workspace_id: "w", label: "infra", path: "/w", open: true, panes: [], threads: [thread])],
+                                          loading: false, stale: false, error: nil,
+                                          history: HistoryView(query: "", items: [], next_cursor: nil, loading: false, error: nil))
+        state.attention = AttentionView(items: [], count: 0, loading: false,
+            needs: [AttentionNeed(workspace_id: "w", thread_id: "n", kind: .blocked, title: "Ask", deep_link: "")],
+            running: [AttentionChat(workspace_id: "w", thread_id: "r", title: "Rotate", deep_link: "", state: .running, status: "working")],
+            recent: [AttentionChat(workspace_id: "w", thread_id: "i", title: "Idle", deep_link: "", state: .idle, status: "")])
+        let sections = homeSections(state, limit: 8, hidden: [])
+        XCTAssertEqual(sections.needs.map(\.thread_id), ["n"])
+        XCTAssertEqual(sections.running.map(\.thread_id), ["r"])
+        XCTAssertEqual(sections.running.first?.provider, "codex", "the catalog's thread fills the row")
+        XCTAssertEqual(sections.recent.map(\.thread_id), ["i"])
+        XCTAssertEqual(coreChatState(sections.needs.first?.state).label(status: sections.needs.first?.status ?? ""), "Needs input")
+        XCTAssertTrue(homeSections(state, limit: 8, hidden: ["r"]).running.isEmpty, "companion chats stay out")
     }
 }
 

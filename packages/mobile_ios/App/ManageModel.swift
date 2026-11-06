@@ -90,7 +90,8 @@ func withLiveActivity(_ thread: ThreadSummary, _ live: [String: Int64]) -> Threa
 
 /// "demo-app · Working · 2 h ago": only the parts that exist, so no separator dangles.
 func historySubtitle(_ thread: ThreadSummary, workspace: String?, now: Int64) -> String {
-    [workspace, thread.status == "idle" || thread.status.isEmpty ? nil : statusLabel(thread.status),
+    // S39: the core's state (C11) names what the chat is doing; idle and unread say nothing.
+    [workspace, coreChatState(thread.state).label(status: thread.status),
      thread.archived ? "Archived" : nil, thread.last_activity_at_ms.map { agoLabel($0, now) }]
         .compactMap { $0?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " · ")
 }

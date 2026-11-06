@@ -166,6 +166,28 @@ struct Banner: Equatable {
     var busy = false
 }
 
+// MARK: - C11: the core's one chat state
+
+/// A chat's state as the core classified it (C11); a chat it hasn't classified yet reads idle.
+/// Every surface uses this, never its own reading of the turn status (S39).
+func coreChatState(_ raw: String?) -> AttentionChatState { raw.flatMap(AttentionChatState.init(rawValue:)) ?? .idle }
+
+extension AttentionChatState {
+    /// Listed above Recent on Home and under Active in the drawer.
+    var isActive: Bool { self == .needs_you || self == .running || self == .failed }
+
+    /// The words a row shows for the state; nil for unread and idle (a neutral dot or nothing).
+    /// `status` only picks the wording of "needs you" (approval or input), never the state.
+    func label(status: String = "") -> String? {
+        switch self {
+        case .needs_you: return status == "blocked" ? "Needs input" : status == "waiting_approval" ? "Needs approval" : "Needs you"
+        case .running: return "Working"
+        case .failed: return "Failed"
+        case .unread, .idle: return nil
+        }
+    }
+}
+
 func statusLabel(_ status: String) -> String {
     switch status {
     case "waiting_approval": return "Needs approval"
@@ -227,6 +249,31 @@ func isSubagent(_ thread: ThreadSummary) -> Bool { thread.thread_id.hasPrefix("s
 /// Chat lists match the desktop sidebar: a draft that never sent a message stays hidden unless a turn is live.
 func listed(_ thread: ThreadSummary) -> Bool { !isSubagent(thread) && (thread.committed || activeTurn(thread.status)) }
 
+/// Home's sections straight from the core's attention view (C11, S39): Needs you (needs, then the
+/// unseen failures listed beside them), Running, and Recent (idle and unread, newest first). Rows
+/// carry the catalog's thread (provider, activity, state) when it is known.
+func homeSections(_ state: BrowseState, limit: Int, hidden: Set<String>) -> (needs: [ThreadSummary], running: [ThreadSummary], recent: [ThreadSummary]) {
+    let catalog = Dictionary((state.workspaces?.items ?? []).flatMap(\.threads).map { ($0.workspace_id + "/" + $0.thread_id, $0) },
+                             uniquingKeysWith: { a, _ in a })
+    func thread(_ workspace: String, _ id: String, _ title: String, _ chatState: AttentionChatState, _ status: String, _ activity: Int64?) -> ThreadSummary? {
+        guard !hidden.contains(id) else { return nil }
+        if var known = catalog[workspace + "/" + id] {
+            known.state = chatState.rawValue
+            return known
+        }
+        var made = ThreadSummary(workspace_id: workspace, thread_id: id, title: title, provider: "", model: nil, cwd: nil,
+                                 open: true, archived: false, last_activity_at_ms: activity, status: status, history_bucket: "")
+        made.state = chatState.rawValue
+        return made
+    }
+    guard let attention = state.attention else { return ([], [], []) }
+    let needs = attention.needs.compactMap { thread($0.workspace_id, $0.thread_id, $0.title, .needs_you, $0.kind == .blocked ? "blocked" : "waiting_approval", nil) }
+        + attention.failed.compactMap { thread($0.workspace_id, $0.thread_id, $0.title, .failed, $0.status, $0.last_activity_at_ms) }
+    let running = attention.running.compactMap { thread($0.workspace_id, $0.thread_id, $0.title, .running, $0.status, $0.last_activity_at_ms) }
+    let recent = attention.recent.compactMap { thread($0.workspace_id, $0.thread_id, $0.title, $0.state, $0.status, $0.last_activity_at_ms) }
+    return (needs, running, Array(recent.prefix(max(0, limit))))
+}
+
 /// History is independently filtered and paged; Home uses the live workspace catalog.
 func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8, hidden: Set<String> = []) -> [ThreadSummary] {
     // Only open workspaces: a closed workspace's chats aren't "recent" (S14).
@@ -266,9 +313,9 @@ func workspaceSummary(_ workspace: Workspace, hidden: Set<String> = []) -> (summ
     let chats = workspace.threads.filter { listed($0) && !$0.archived && !hidden.contains($0.thread_id) }.count
     let panes = visiblePanes(workspace.panes, hidden: hidden)
     let terminals = panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.count
-    let active = panes.filter { $0.attention || $0.can_stop || $0.status == "working" }.count
-    // The core's "needs you" flag (C8); unread completions don't count.
-    let flagged = panes.filter(\.needs_you).count
+    // S39: chats by the core's state (C11), terminals by a running process.
+    let active = panes.filter { $0.kind == "terminal" ? $0.can_stop : coreChatState($0.state).isActive }.count
+    let flagged = panes.filter { $0.kind != "terminal" && coreChatState($0.state) == .needs_you }.count
     var parts = ["\(chats) chat\(chats == 1 ? "" : "s")"]
     if terminals > 0 { parts.append("\(terminals) terminal\(terminals == 1 ? "" : "s")") }
     if active > 0 { parts.append("\(active) active") }

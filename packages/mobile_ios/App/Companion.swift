@@ -555,18 +555,15 @@ func needsYouItems(attention: AttentionView?, home: HomeView?, workspaces: Works
         NeedsYouItem(workspaceID: workspace, threadID: thread, title: title.isEmpty ? "Untitled chat" : title,
                      workspaceLabel: labels[workspace], reason: reason)
     }
-    if let attention {
-        return attention.needs.map { item($0.workspace_id, $0.thread_id, $0.title, needReason($0.kind)) }
-    }
-    return (home?.items ?? []).compactMap { pane in
-        guard pane.needs_you, let thread = pane.thread_id else { return nil }
-        return item(pane.workspace_id, thread, pane.title, pane.attention_kind == "blocked" ? "Needs input" : pane.attention_kind == "failed" ? "Failed" : "Needs approval")
-    }
+    // S39: the core's lists only (C11): what needs you, then the unseen failures listed beside it.
+    guard let attention else { return [] }
+    return attention.needs.map { item($0.workspace_id, $0.thread_id, $0.title, needReason($0.kind)) }
+        + attention.failed.map { item($0.workspace_id, $0.thread_id, $0.title, "Failed") }
 }
 
-/// The badge count: the core's `needs_you`, else the stand-in rows.
+/// The badge count: the core's `needs_you` (failures are listed, never counted).
 func needsYouBadge(attention: AttentionView?, items: [NeedsYouItem]) -> Int {
-    attention.map { Int($0.needs_you) } ?? items.count
+    attention.map { Int($0.needs_you) } ?? 0
 }
 
 func needReason(_ kind: AttentionKind) -> String {
@@ -606,13 +603,9 @@ func activityItems(crew: [CrewLink], home: HomeView?, workspaces: WorkspacesView
                                   attention: attention, crew: crew))
     }
     for link in crew { add(link.workspace_id, link.local_thread_id, link.displayTitle, link.attention, crew: true) }
-    for pane in home?.items ?? [] where pane.kind == "chat" && !pane.needs_you && pane.attention_kind == nil {
-        guard let thread = pane.thread_id, pane.can_stop || activeTurn(pane.status) else { continue }
-        add(pane.workspace_id, thread, pane.title, .running, crew: false)
-    }
+    // S39: running chats are the core's (C11), the same set Home lists under Running.
     for workspace in workspaces?.items ?? [] {
-        for thread in workspace.threads where activeTurn(thread.status) && thread.status != "waiting_approval"
-            && !thread.archived && !isSubagent(thread) {
+        for thread in workspace.threads where coreChatState(thread.state) == .running && !thread.archived && !isSubagent(thread) {
             add(thread.workspace_id, thread.thread_id, thread.title, .running, crew: false)
         }
     }

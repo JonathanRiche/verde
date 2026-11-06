@@ -32,7 +32,7 @@ struct DrawerItem: Identifiable {
     var title: String { thread.map { $0.title.isEmpty ? "New chat" : $0.title } ?? pane?.title ?? "" }
     /// One rule with Home (I10-3): running (a live turn or process) or needing you per the core.
     /// A failed chat counts only while unacknowledged, which the core's `needs_you` already says.
-    var active: Bool { drawerRowActive(threadStatus: thread?.status, pane: pane) }
+    var active: Bool { drawerRowActive(thread: thread, pane: pane) }
     /// A chat's last activity; terminals carry no synced status-change time yet.
     var activityMs: Int64? { thread?.last_activity_at_ms }
 }
@@ -49,11 +49,11 @@ func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
     }
 }
 
-/// Active = running or needs_you, the same rule as Home's "Needs you" and "Running" sections.
-func drawerRowActive(threadStatus: String?, pane: Pane?) -> Bool {
-    if pane?.needs_you == true { return true }
-    if let threadStatus { return activeTurn(threadStatus) || pane?.can_stop == true }
-    return pane.map { activeTurn($0.status) } ?? false
+/// Active = what Home lists above Recent (S39): a chat the core classes needs you, running or
+/// failed (C11); a terminal running a process.
+func drawerRowActive(thread: ThreadSummary?, pane: Pane?) -> Bool {
+    if let thread { return coreChatState(thread.state ?? pane?.state).isActive }
+    return pane?.can_stop == true
 }
 
 /// Flat Active/Open rows by workspace recency. Both follow the scope (nil = All Workspaces):
@@ -381,9 +381,10 @@ struct WorkspaceDrawer: View {
                 Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(2)
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
-                // S32: a dot only with state (running, waiting, failed), as on Android.
-                if activeTurn(thread.status) || thread.status == "failed" {
-                    StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")
+                // S32/S40: a dot only with state (the core's, C11), as on Android; never a grey idle dot.
+                let state = coreChatState(thread.state)
+                if state.isActive {
+                    StatusPip(active: state == .running, attention: state == .needs_you, failed: state == .failed)
                 }
             }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
