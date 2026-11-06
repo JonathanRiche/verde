@@ -682,6 +682,14 @@ private struct PatchLines: View {
                             .accessibilityIdentifier("patch-line")
                     }
                 }
+                // S30: the diff says where it ends.
+                HStack(spacing: 8) {
+                    Rectangle().fill(VerdeTheme.border).frame(width: 24, height: 1)
+                    Text("End of changes").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.subtle)
+                    Rectangle().fill(VerdeTheme.border).frame(width: 24, height: 1)
+                }
+                .padding(.vertical, 12).padding(.horizontal, 16)
+                .accessibilityElement(children: .combine)
             }
             .frame(minWidth: wrap ? nil : contentWidth, alignment: .leading)
         }

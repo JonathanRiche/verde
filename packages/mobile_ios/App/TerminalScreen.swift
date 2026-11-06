@@ -554,6 +554,7 @@ struct TerminalScreen: View {
     @State private var model: TerminalModel?
     @State private var hostID: String?
     @State private var created: String?
+    @Environment(\.openRoute) private var relaunch
     @State private var selection: GridSelection?
     @State private var handle = TerminalHandle()
     @AppStorage("terminal.fontSize") private var fontSize: Double = 14
@@ -614,6 +615,15 @@ struct TerminalScreen: View {
                     }
                     Text(notice).font(.footnote)
                     if notice == replayGapNotice { Button("Dismiss") { model.dismissGap() }.font(.footnote.bold()) }
+                    // S30: an ended session offers a new shell in the same workspace.
+                    if model.view?.session_status == "exited" {
+                        Button {
+                            relaunch(.newTerminal(workspace: workspaceID, request: UUID()))
+                        } label: {
+                            Text("Relaunch").font(.footnote.bold()).frame(minHeight: 44).contentShape(Rectangle())
+                        }
+                        .accessibilityIdentifier("terminal-relaunch")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)

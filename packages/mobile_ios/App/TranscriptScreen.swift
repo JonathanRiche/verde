@@ -554,7 +554,9 @@ private struct PageHeader: View {
                     ProgressView().controlSize(.small)
                     Text("Loading earlier messages…") .font(VerdeTheme.ui(13)).foregroundStyle(.secondary)
                 } else if page.has_older {
-                    Button("Load earlier messages", action: loadOlder) .font(VerdeTheme.ui(13))
+                    Button(action: loadOlder) {
+                        Text("Load earlier messages").font(VerdeTheme.ui(13, bold: true)).frame(minHeight: 44).contentShape(Rectangle())
+                    }
                 } else {
                     Text("Start of conversation") .font(VerdeTheme.ui(12)).foregroundStyle(.tertiary)
                 }
