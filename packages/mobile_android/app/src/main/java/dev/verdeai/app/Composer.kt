@@ -336,7 +336,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 }
                 sendButton(canSubmit)
             }
-            if (running && view?.followup == null) Text(followupHint(null, kind),
+            // A2-10: while the field is empty its placeholder already says this; say it once.
+            if (running && view?.followup == null && text.isNotEmpty()) Text(followupHint(null, kind),
                 color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.testTag("composer-action-hint"))
             }
