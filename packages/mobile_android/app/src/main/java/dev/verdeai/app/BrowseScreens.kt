@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.*
@@ -105,8 +106,6 @@ internal fun paneLine(pane: Pane, nowMs: Long): String {
     return "$kind · ${paneLabel(pane)}$timer"
 }
 
-/** S26: a pane is "Running" while its turn or process is live (not merely open, done or unread). */
-internal fun homeRunning(pane: Pane): Boolean = activeStatus(pane.status) || (pane.kind == "terminal" && pane.status in setOf("working", "running"))
 
 internal fun subagent(thread: ThreadSummary) = thread.thread_id.startsWith("subagent:")
 
@@ -246,6 +245,8 @@ private fun MenuRow(
     leading: (@Composable () -> Unit)? = null,
     badge: String? = null,
     styledSupporting: AnnotatedString? = null,
+    /** C11: the row's state mark, drawn trailing (instead of a badge). */
+    mark: ChatState? = null,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
@@ -254,7 +255,8 @@ private fun MenuRow(
             headlineContent = { Text(headline, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_TITLE) },
             supportingContent = (styledSupporting ?: supporting?.let(::AnnotatedString))?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_SUBTITLE) } },
             leadingContent = leading,
-            trailingContent = badge?.let { { if (it == UNREAD) UnreadDot() else AttentionBadge(it) } },
+            trailingContent = mark?.takeIf { it != ChatState.Idle }?.let { { StateMark(it) } }
+                ?: badge?.let { { if (it == UNREAD) UnreadDot() else AttentionBadge(it) } },
             // S4: one TalkBack stop that reads "title, subtitle".
             modifier = Modifier.fillMaxWidth().combinedClickable(
                 enabled = enabled || menu.isNotEmpty(),
@@ -263,7 +265,8 @@ private fun MenuRow(
                 onLongClick = { if (menu.isNotEmpty()) expanded = true })
                 // V: the badge isn't repeated when the subtitle already says it ("Failed").
                 .nameOnly(listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '),
-                    badge?.takeIf { b -> (styledSupporting?.text ?: supporting)?.contains(b, ignoreCase = true) != true }).joinToString(", ")),
+                    badge?.takeIf { b -> (styledSupporting?.text ?: supporting)?.contains(b, ignoreCase = true) != true },
+                    UNREAD.takeIf { mark == ChatState.Unread }).joinToString(", ")),
         )
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             LiveOverMenu()
@@ -278,7 +281,7 @@ internal const val UNREAD = "Unread"
 
 /** S21: an unread finished chat is just a dot (TalkBack: "Unread"), never an amber "needs you". */
 @Composable
-private fun UnreadDot() {
+internal fun UnreadDot() {
     Box(Modifier.size(8.dp).background(VerdeColors.Muted, CircleShape))
 }
 
@@ -301,6 +304,49 @@ private fun paneProvider(state: BrowseState, pane: Pane): String? =
 private val HOME_LEADING_WIDTH = 34.dp
 private val ROW_TITLE = androidx.compose.ui.text.TextStyle(fontFamily = VerdeSans, fontSize = 16.sp, lineHeight = 22.sp)
 private val ROW_SUBTITLE = androidx.compose.ui.text.TextStyle(fontFamily = VerdeSans, fontSize = 13.sp, lineHeight = 18.sp)
+
+/**
+ * C11: the core's one chat state (needs_you > running > failed > unread > idle), on every thread,
+ * pane and History item. Every surface draws it from here and never derives its own.
+ */
+internal enum class ChatState { NeedsYou, Running, Failed, Unread, Idle }
+
+internal fun chatState(state: String?): ChatState = when (state) {
+    "needs_you" -> ChatState.NeedsYou
+    "running" -> ChatState.Running
+    "failed" -> ChatState.Failed
+    "unread" -> ChatState.Unread
+    else -> ChatState.Idle
+}
+
+internal fun chatState(state: dev.verdeai.core.AttentionChatState): ChatState = chatState(state.name)
+
+internal fun ChatState.rowState(): RowState = when (this) {
+    ChatState.NeedsYou -> RowState.NeedsYou
+    ChatState.Running -> RowState.Working
+    ChatState.Failed -> RowState.Failed
+    else -> RowState.Quiet
+}
+
+/** The state's words in a row's subtitle: the core status for needs-you / running ("Needs approval", "Working"), "Failed". */
+internal fun chatStateLabel(state: ChatState, status: String): String? = when (state) {
+    ChatState.NeedsYou -> statusLabel(status).takeIf { status !in setOf("", "idle", "completed") } ?: "Needs you"
+    ChatState.Running -> statusLabel(status).takeIf { status !in setOf("", "idle", "completed") } ?: "Working"
+    ChatState.Failed -> "Failed"
+    else -> null
+}
+
+/** The state's mark: amber dot (needs you), pulsing 8dp accent dot (running), red ✕ (failed), neutral dot (unread). */
+@Composable
+internal fun StateMark(state: ChatState) {
+    when (state) {
+        ChatState.NeedsYou -> Box(Modifier.size(8.dp).background(VerdeColors.Warning, CircleShape))
+        ChatState.Running -> RunningDot(MaterialTheme.colorScheme.primary)
+        ChatState.Failed -> Icon(Icons.Filled.Close, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(14.dp))
+        ChatState.Unread -> UnreadDot()
+        ChatState.Idle -> Unit
+    }
+}
 
 /** S7 state colour: working = accent, needs you / waiting = amber, failed = error; done and idle say nothing. */
 internal enum class RowState { Working, NeedsYou, Failed, Quiet }
@@ -335,30 +381,35 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
         if (canOpen) add("Open" to { onOpen(pane) })
         add("Copy title" to { clipboard.setText(AnnotatedString(pane.title)) })
     }
-    // A5-9: "needs you" is the core's call (C8); an unread finished chat just gets its Unread badge.
-    val kind = rowState(pane.status, pane.needs_you)
+    // C11: the core's state for chats; a terminal's own status otherwise.
+    val chat = pane.state?.let(::chatState)
+    val kind = chat?.rowState() ?: rowState(pane.status, pane.needs_you)
     val kindLabel = when (pane.kind) { "terminal" -> "Terminal"; "browser" -> "Browser"; else -> "Chat" }
     val timer = pane.started_at_ms?.takeIf { pane.can_stop }?.let { elapsedLabel(it, now) }
+    val label = chat?.let { chatStateLabel(it, pane.status) } ?: paneLabel(pane)
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
-        styledSupporting = stateLine(listOf(kindLabel, paneLabel(pane), timer), paneLabel(pane), kind),
+        styledSupporting = stateLine(listOf(kindLabel, label, timer), label, kind),
+        mark = chat,
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             val glyph = Modifier.size(20.dp)
             if (pane.kind == "chat") ProviderGlyph(provider, glyph) else if (pane.provider != null) ProviderGlyph(pane.provider, glyph)
             else Spacer(glyph)
         } },
-        badge = attentionLabel(pane.attention_kind))
+        badge = attentionLabel(pane.attention_kind).takeIf { chat == null })
 }
 
 @Composable
-private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?, onOpen: (ThreadSummary) -> Unit, unread: Boolean = false) {
+private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?, onOpen: (ThreadSummary) -> Unit,
+    chat: ChatState = chatState(thread.state)) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    val kind = rowState(thread.status, false)
-    val state = statusLabel(thread.status).takeIf { thread.status !in setOf("idle", "completed") }
+    // C11: the core's state decides the words, the colour and the mark.
+    val kind = chat.rowState()
+    val state = chatStateLabel(chat, thread.status)
     val parts = listOf(workspaceLabel, state, thread.last_activity_at_ms?.let { agoLabel(it, now) })
     MenuRow(thread.title, parts.filterNotNull().joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
         styledSupporting = stateLine(parts, state, kind).takeIf { it.isNotEmpty() },
-        badge = UNREAD.takeIf { unread },
+        mark = chat,
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProviderGlyph(thread.provider, Modifier.size(20.dp))
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
@@ -518,37 +569,51 @@ internal fun HomeScreen(
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
-            // S26: three sections from the core's state. "Needs you" is its needs_you; "Running" is a
-            // live turn or process; finished chats sit in "Recent", an unread one with a neutral dot.
-            val attention = panes.filter { it.needs_you }
-            val running = panes.filter { !it.needs_you && !hiddenPane(it, hidden) && homeRunning(it) }
-            if (attention.isNotEmpty()) {
-                header("Needs you")
-                items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
-            }
-            // F2: one "running" rule everywhere (a live turn or process): chats whose turn is live count
-            // even without an open pane, and a chat in Needs you or Running isn't repeated in Recent.
+            // C11: the sections are the core's attention lists, never Android's own rules: Needs you
+            // (`needs`, then `failed` labelled "Failed"), Running (`running`), Recent (`recent`, idle
+            // and unread, never repeating a chat above).
             val labels = workspaceLabels(state.workspaces?.items.orEmpty())
-            val shown = (attention + running).mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
-            val runningThreads = state.workspaces?.items.orEmpty().filter { it.open }.flatMap { it.threads }
-                .filter { activeStatus(it.status) && listed(it) && it.thread_id !in hidden && (it.workspace_id to it.thread_id) !in shown }
-            if (running.isNotEmpty() || runningThreads.isNotEmpty()) {
-                header("Running")
-                items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
-                items(runningThreads, key = { "running-thread:${it.workspace_id}:${it.thread_id}" }) {
-                    ThreadItem(it, now, labels[it.workspace_id], onOpenThread)
+            val threads = state.workspaces?.items.orEmpty().flatMap { it.threads }.associateBy { it.workspace_id to it.thread_id }
+            fun summary(ws: String, id: String, title: String, status: String, at: Long?, chat: ChatState): ThreadSummary =
+                (threads[ws to id] ?: ThreadSummary(ws, id, title, "", null, null, open = true, archived = false,
+                    last_activity_at_ms = at, status = status, history_bucket = "")).let { t ->
+                    t.copy(title = title.ifBlank { t.title }, status = status.ifEmpty { t.status }, last_activity_at_ms = at ?: t.last_activity_at_ms)
                 }
+            val attention = state.attention
+            if (attention != null) {
+                val needs = attention.needs.filter { it.thread_id !in hidden }
+                val failed = attention.failed.filter { it.thread_id !in hidden }
+                val running = attention.running.filter { it.thread_id !in hidden }
+                if (needs.isNotEmpty() || failed.isNotEmpty()) {
+                    header("Needs you")
+                    items(needs, key = { "needs:${it.workspace_id}:${it.thread_id}" }) { need ->
+                        val known = threads[need.workspace_id to need.thread_id]
+                        ThreadItem(summary(need.workspace_id, need.thread_id, need.title, known?.status ?: "", known?.last_activity_at_ms, ChatState.NeedsYou),
+                            now, labels[need.workspace_id], onOpenThread, ChatState.NeedsYou)
+                    }
+                    items(failed, key = { "failed:${it.workspace_id}:${it.thread_id}" }) { chat ->
+                        ThreadItem(summary(chat.workspace_id, chat.thread_id, chat.title, chat.status, chat.last_activity_at_ms, ChatState.Failed),
+                            now, labels[chat.workspace_id], onOpenThread, ChatState.Failed)
+                    }
+                }
+                if (running.isNotEmpty()) {
+                    header("Running")
+                    items(running, key = { "running:${it.workspace_id}:${it.thread_id}" }) { chat ->
+                        ThreadItem(summary(chat.workspace_id, chat.thread_id, chat.title, chat.status, chat.last_activity_at_ms, ChatState.Running),
+                            now, labels[chat.workspace_id], onOpenThread, ChatState.Running)
+                    }
+                }
+                if (needs.isEmpty() && failed.isEmpty() && running.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             }
-            if (attention.isEmpty() && running.isEmpty() && runningThreads.isEmpty()) note("idle", "Nothing is running or waiting on you.")
-            val unread = panes.filter { it.attention_kind == "unread" && it.thread_id != null }.map { it.workspace_id to it.thread_id!! }.toSet()
-            val current = shown + runningThreads.map { it.workspace_id to it.thread_id }
             // Beside the docked sidebar (foldable, tablet) Home keeps a short Recent (S26).
-            val recent = recentThreads(state.workspaces, limit = (if (docked) 5 else 8) + current.size, hidden = hidden)
-                .filter { (it.workspace_id to it.thread_id) !in current }.take(if (docked) 5 else 8)
+            val limit = if (docked) 5 else 8
+            val recent = attention?.recent?.filter { it.thread_id !in hidden }?.take(limit)?.map { chat ->
+                summary(chat.workspace_id, chat.thread_id, chat.title, chat.status, chat.last_activity_at_ms, chatState(chat.state)) to chatState(chat.state)
+            } ?: recentThreads(state.workspaces, limit = limit, hidden = hidden).map { it to chatState(it.state) }
             if (recent.isNotEmpty()) {
                 header("Recent")
-                items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) {
-                    ThreadItem(it, now, labels[it.workspace_id], onOpenThread, unread = (it.workspace_id to it.thread_id) in unread)
+                items(recent, key = { (t, _) -> "recent:${t.workspace_id}:${t.thread_id}" }) { (t, chat) ->
+                    ThreadItem(t, now, labels[t.workspace_id], onOpenThread, chat)
                 }
                 if (onHistory != null) item(key = "history") {
                     NamedButton("All chats", onHistory, Modifier.padding(horizontal = 8.dp))

@@ -63,9 +63,8 @@ internal fun historySections(items: List<ThreadSummary>, live: Map<Pair<String, 
     for (raw in items.filterNot(::subagent)) {
         // A11-3: the same live last activity Home and the drawer show, so a workspace filter can't
         // show older ages or another order than All.
-        // F2: and the live status, so a running chat reads "Working" here too.
         val now = live[raw.workspace_id to raw.thread_id]
-        val item = if (now == null) raw else raw.copy(status = now.status,
+        val item = if (now == null) raw else raw.copy(
             last_activity_at_ms = maxOf(now.last_activity_at_ms ?: 0L, raw.last_activity_at_ms ?: 0L).takeIf { it > 0L })
         if (out.lastOrNull()?.first != item.history_bucket) out += item.history_bucket to mutableListOf()
         out.last().second += item
@@ -193,16 +192,19 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
         for ((bucket, threads) in sections) {
             section(bucket)
             items(threads, key = { "history:${it.workspace_id}:${it.thread_id}" }) { thread ->
-                val state = statusLabel(thread.status).takeIf { thread.status !in setOf("idle", "completed") }
+                // C11: the History item's own state from the core.
+                val chat = chatState(thread.state)
+                val state = chatStateLabel(chat, thread.status)
                 val parts = listOfNotNull(labels[thread.workspace_id].takeIf { filter == null },
                     state, "Archived".takeIf { thread.archived },
                     thread.last_activity_at_ms?.let { agoLabel(it, now) })
                 VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     leadingContent = { ProviderGlyph(thread.provider) },
                     // F2: the state reads as on Home (coloured "Working", amber waiting, red failed).
-                    supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(stateLine(it, state, rowState(thread.status, false)), maxLines = 1) } },
+                    supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(stateLine(it, state, chat.rowState()), maxLines = 1) } },
+                    trailingContent = chat.takeIf { it != ChatState.Idle }?.let { { StateMark(it) } },
                     modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open") { onOpenThread(thread) }
-                        .nameOnly(listOf(thread.title).plus(parts).joinToString(", ")))
+                        .nameOnly((listOf(thread.title) + parts + listOfNotNull("Unread".takeIf { chat == ChatState.Unread })).joinToString(", ")))
             }
         }
         history.error?.let { line("history-error", "Couldn't load chats. ${it.message}".trim(), error = true) }

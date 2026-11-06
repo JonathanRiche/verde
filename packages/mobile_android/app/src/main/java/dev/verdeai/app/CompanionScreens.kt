@@ -112,14 +112,14 @@ internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): Co
     val attention = browse.attention
     val keys = attention?.needs?.map { chatKey(it.workspace_id, it.thread_id) }?.toCollection(LinkedHashSet())
         ?: bubbleNeedKeys(needs, crew, thread)
-    val liveThreads = browse.workspaces?.items.orEmpty().filter { it.open }.flatMap { it.threads }
-    val pulse = companionPulse(panes, crew, hidden, liveThreads).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
-    val asking = attention?.needs?.any { it.kind != dev.verdeai.core.AttentionKind.failed }
+    // C11: counts and lists are the core's: the badge is `needs_you`, the running list `running`.
+    val pulse = companionPulse(panes, crew, hidden, attention?.running).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
+    val asking = attention?.let { it.needs_you > 0 }
         ?: (needs.any { it.status != "failed" && it.attention_kind != "failed" } ||
             crew.any { crewStatus(it).needsYou && crewStatus(it) != ChildStatus.Failed } || thread?.status == "waiting_approval")
     return CompanionSnapshot(active, needs, crew, pulse,
         keys, crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
-        companionActivity(panes, crew, hidden, liveThreads), asking = asking)
+        companionActivity(panes, crew, hidden, attention?.running), asking = asking)
 }
 
 /**
@@ -200,7 +200,7 @@ internal fun CompanionSheet(
             val shownStrip = shownPanel(strip, snapshot)
             // S32: the pills under the header carry the counts; the header doesn't repeat them.
             val pillsShown = snapshot.needKeys.isNotEmpty() || activitySummary(snapshot.activity.map { it.status }) != null
-            CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running).takeIf { !pillsShown },
+            CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.pulse.needsYou, snapshot.pulse.running).takeIf { !pillsShown },
                 enabled = state.view?.can_edit == true && !state.saving,
                 // The status count toggles the panel it summarizes.
                 onSuffix = if (handoff == null) headerPanel(snapshot)?.let { panel -> { strip = if (shownStrip != null) null else panel } } else null,
@@ -433,7 +433,7 @@ private enum class StripTone { Attention, Failed, Running, Quiet }
 @Composable
 private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace>, open: StripPanel?, onToggle: (StripPanel?) -> Unit,
     onOpenPane: (Pane) -> Unit, onOpenChat: (String, String) -> Unit) {
-    val needsCount = snapshot.needKeys.size
+    val needsCount = snapshot.pulse.needsYou
     val crewLabel = activitySummary(snapshot.activity.map { it.status })
     if (needsCount == 0 && crewLabel == null) return
     fun label(ws: String) = workspaces.find { it.workspace_id == ws }?.label

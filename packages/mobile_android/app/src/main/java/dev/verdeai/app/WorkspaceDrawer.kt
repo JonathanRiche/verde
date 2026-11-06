@@ -64,8 +64,10 @@ internal fun fuzzyMatches(query: String, value: String): Boolean {
 
 internal data class DrawerItem(val workspace: Workspace, val thread: ThreadSummary?, val pane: Pane?) {
     val key get() = "${workspace.workspace_id}:${thread?.thread_id ?: pane?.terminal_id}"
-    /** A8-5: Home's rule in every scope: the core's needs_you, or a live turn or process (homeRunning). */
-    val active get() = pane != null && (pane.needs_you || homeRunning(pane))
+    /** C11: the core's state: Active holds the chats that need you, run or failed (Home's sections). */
+    val state get() = chatState(thread?.state ?: pane?.state)
+    val active get() = state == ChatState.NeedsYou || state == ChatState.Running || state == ChatState.Failed ||
+        (thread == null && pane != null && pane.kind == "terminal" && activeStatus(pane.status))
     val title get() = thread?.title ?: pane?.title.orEmpty()
     /** A chat's last activity; terminals carry no synced status-change time yet. */
     val activityMs get() = thread?.last_activity_at_ms
@@ -313,10 +315,8 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
             // A8-5: one dot rule in every scope (Home's): amber when it needs you, pulsing green while
             // running, red when failed; done and idle chats carry none.
-            drawerDot(thread, pane)?.let { (color, label, live) ->
-                if (label == "Failed") Icon(Icons.Filled.Close, contentDescription = null, tint = color, modifier = Modifier.size(14.dp))
-                else StatusPip(color, label, active = live)
-            }
+            // C11: the core's state, the same mark as Home.
+            StateMark(chatState(thread.state ?: pane?.state))
         } },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
@@ -332,7 +332,8 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
                 }
             }
             .combinedClickable(onClick = onClick, onLongClickLabel = "Chat actions", onLongClick = { menu = true })
-            .nameOnly(listOfNotNull(chip?.label, thread.title, drawerDot(thread, pane)?.second).joinToString(", "), selected = active))
+            .nameOnly(listOfNotNull(chip?.label, thread.title, chatState(thread.state ?: pane?.state).let { st ->
+                chatStateLabel(st, thread.status) ?: "Unread".takeIf { st == ChatState.Unread } }).joinToString(", "), selected = active))
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             LiveOverMenu()
             DropdownMenuItem(text = { Text("Open chat") }, onClick = { menu = false; onClick() })
@@ -346,18 +347,6 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
                 onClick = { menu = false; onAction(thread, "close") })
         }
     }
-}
-
-/** A8-5: a drawer chat's dot (colour, label, pulsing), the same in every scope and matching Home. */
-@Composable
-private fun drawerDot(thread: ThreadSummary, pane: Pane?): Triple<androidx.compose.ui.graphics.Color, String, Boolean>? = when {
-    // P: failed is red "Failed" everywhere (as on Home), even when it also needs you; amber only
-    // for an approval or input.
-    thread.status == "failed" || pane?.status == "failed" || pane?.attention_kind == "failed" ->
-        Triple(MaterialTheme.colorScheme.error, "Failed", false)
-    pane?.needs_you == true -> Triple(VerdeColors.Warning, "Needs you", false)
-    pane != null && homeRunning(pane) || activeStatus(thread.status) -> Triple(MaterialTheme.colorScheme.primary, statusLabel(thread.status), true)
-    else -> null
 }
 
 /** Terminal row: an agent TUI shows its provider glyph and a live status pip, like the desktop/web rail. */

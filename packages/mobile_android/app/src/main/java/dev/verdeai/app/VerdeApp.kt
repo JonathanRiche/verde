@@ -344,10 +344,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         companionNow.companionThread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
         { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk,
         quietKeys = openChatKey?.let(::setOf).orEmpty())
-    val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
+    val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
-    val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
+    val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
     // A6-2: when no control has focus (a tap on the transcript, a closed dialog), the shell itself
@@ -408,7 +408,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         }
     }
     if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
-        companionNow.needKeys.size, companionNow.crewRunning, bubbleTalk, bubbleLive,
+        companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive,
         onOpen = { companionSettings = false; companionOpen = true })
     // Last, so it floats above every screen, the drawer and the bubble.
     if (callUp) LiveShellBar(liveBar, statusTop)

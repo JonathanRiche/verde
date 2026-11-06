@@ -142,8 +142,10 @@ private fun runningChatPane(pane: Pane) = pane.kind == "chat" && !pane.needs_you
  * user. [hidden] (companion conversations) never appear. Needs-you first, then running.
  */
 internal fun companionActivity(panes: List<Pane>, crew: List<CompanionLink>, hidden: Set<String> = emptySet(),
-    threads: List<ThreadSummary> = emptyList()): List<CompanionActivity> {
-    val running = panes.filter(::runningChatPane).associateBy { it.workspace_id to it.thread_id!! }
+    attentionRunning: List<dev.verdeai.core.AttentionChat>? = null): List<CompanionActivity> {
+    // C11: the core's `running` list when the host has it; open panes only on older hosts.
+    val running: Map<Pair<String, String>, String> = attentionRunning?.associate { (it.workspace_id to it.thread_id) to it.title }
+        ?: panes.filter(::runningChatPane).associate { (it.workspace_id to it.thread_id!!) to it.title }
     val seen = HashSet<Pair<String, String>>()
     val rows = ArrayList<CompanionActivity>()
     crew.forEach { link ->
@@ -152,15 +154,9 @@ internal fun companionActivity(panes: List<Pane>, crew: List<CompanionLink>, hid
         val status = crewStatus(link).let { if (!it.needsYou && chat in running) ChildStatus.Running else it }
         rows += CompanionActivity(link.workspace_id, link.local_thread_id, childTitle(link.local_thread_id, link.title), status, link.link_id)
     }
-    running.forEach { (chat, pane) ->
+    running.forEach { (chat, title) ->
         if (chat.second in hidden || !seen.add(chat)) return@forEach
-        rows += CompanionActivity(chat.first, chat.second, pane.title.ifBlank { "Chat" }, ChildStatus.Running)
-    }
-    // F2: a chat whose turn is live counts even without an open pane (Home's Running rule).
-    threads.filter { activeStatus(it.status) && !subagent(it) }.forEach { thread ->
-        val chat = thread.workspace_id to thread.thread_id
-        if (thread.thread_id in hidden || !seen.add(chat)) return@forEach
-        rows += CompanionActivity(chat.first, chat.second, thread.title.ifBlank { "Chat" }, ChildStatus.Running)
+        rows += CompanionActivity(chat.first, chat.second, title.ifBlank { "Chat" }, ChildStatus.Running)
     }
     return rows.sortedWith(compareByDescending<CompanionActivity> { it.status.needsYou }.thenByDescending { it.status.running })
 }
@@ -171,12 +167,12 @@ internal fun companionActivity(panes: List<Pane>, crew: List<CompanionLink>, hid
  * running count always matches the activity panel.
  */
 internal fun companionPulse(panes: List<Pane>, crew: List<CompanionLink>, hidden: Set<String> = emptySet(),
-    threads: List<ThreadSummary> = emptyList()): CompanionPulse {
+    attentionRunning: List<dev.verdeai.core.AttentionChat>? = null): CompanionPulse {
     // Without the core's attention view (older hosts' first frames): panes the core marks needs_you.
     val flagged = panes.filter { it.needs_you }
     val flaggedChats = flagged.mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
     val needs = flagged.size + crew.count { crewStatus(it).needsYou && (it.workspace_id to it.local_thread_id) !in flaggedChats }
-    return CompanionPulse(needs, companionActivity(panes, crew, hidden, threads).count { it.status.running })
+    return CompanionPulse(needs, companionActivity(panes, crew, hidden, attentionRunning).count { it.status.running })
 }
 
 /** "1 needs you" / "3 need you". */
