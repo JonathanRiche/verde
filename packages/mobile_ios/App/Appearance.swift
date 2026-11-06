@@ -108,6 +108,32 @@ struct HostPalette: Decodable {
     }
 }
 
+/// The Theme row's helper: what the current choice does.
+func themeHelpText(_ mode: AppearanceMode) -> String {
+    switch mode {
+    case .system: return "System follows your phone's Light or Dark appearance automatically."
+    case .light: return "Light keeps verde light, whatever your phone's appearance."
+    case .dark: return "Dark keeps verde dark, whatever your phone's appearance."
+    case .host: return "Host theme uses the theme set in verde on your computer."
+    default: return "\(mode.label) is a fixed theme; it doesn't follow your phone's Light or Dark appearance."
+    }
+}
+
+/// "0.1.0 (1)" from the bundle.
+func appVersionLabel(_ info: [String: Any]?) -> String {
+    let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+    guard let build = info?["CFBundleVersion"] as? String, !build.isEmpty else { return version }
+    return "\(version) (\(build))"
+}
+
+/// Licence texts shipped with the app (fonts and glyphs), by display name.
+private let bundledLicences: [(String, String)] = [
+    ("Noto Sans", "NotoSans-OFL-1.1"), ("Cal Sans", "CalSans-OFL"),
+    ("JetBrains Mono Nerd Font", "JetBrainsMonoNerdFont-OFL"), ("Symbols Nerd Font", "SymbolsNerdFont-LICENSE"),
+]
+
+/// Settings (S8): Appearance, Notifications, Security, Companion, Hosts, then About, in the same
+/// order as Android. Commit messages (read-only, set on the computer) sit after Companion.
 struct AppSettings: View {
     let lock: AppLock
     let browse: BrowseModel
@@ -118,30 +144,96 @@ struct AppSettings: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Appearance") {
+                Section {
                     Picker("Theme", selection: $appearance.mode) {
                         ForEach(AppearanceMode.allCases, id: \.self) { mode in
                             Text(mode.label).tag(mode)
                         }
                     }.pickerStyle(.navigationLink)
-                    Text("System follows your phone’s Light or Dark appearance automatically.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                     if appearance.mode == .host {
                         Button("Reload host theme") { Task { await appearance.refresh(browse) } }
                         if let notice = appearance.notice { Text(notice).font(VerdeTheme.ui(13)) }
                     }
-                    Text("Animations follow Reduce Motion in iOS Accessibility settings and the host theme when supplied.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+                } header: { SectionTitle("Appearance") } footer: {
+                    Text(themeHelpText(appearance.mode) + " Animations follow Reduce Motion in iOS Accessibility settings.")
+                        .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                 }
-                Section {
-                    Toggle("Companion bubble", isOn: Binding(get: { !companionBubbleHidden }, set: { companionBubbleHidden = !$0 }))
-                } header: { Text("Companion") } footer: {
-                    Text("A floating shortcut to your companion on every screen, on hosts that support it.")
-                }
-                CommitSettingsSection(browse: browse)
                 NotificationSettingsSection(registry: push)
                 SecuritySettings(lock: lock)
-            }.scrollContentBackground(.hidden).background(VerdeTheme.background)
+                Section {
+                    Toggle("Companion bubble", isOn: Binding(get: { !companionBubbleHidden }, set: { companionBubbleHidden = !$0 }))
+                } header: { SectionTitle("Companion") } footer: {
+                    Text("A shortcut to your companion: floating on Home and Workspaces, in the top bar elsewhere, on hosts that support it.")
+                        .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+                }
+                CommitSettingsSection(browse: browse)
+                hostsSection
+                aboutSection
+            }
+            // Section headers keep the case they're written in (S7), including the shared sections.
+            .textCase(nil)
+            .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("Done") { dismiss() } }
         }.preferredColorScheme(appearance.scheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
+    }
+
+    /// Paired hosts with their status; tapping one makes it the active host.
+    private var hostsSection: some View {
+        let hosts = browse.hosts
+        return Section {
+            if hosts.rows.isEmpty { Text("No hosts yet. Add one from Hosts in the drawer.").foregroundStyle(VerdeTheme.muted) }
+            ForEach(hosts.rows, id: \.saved.id) { row in
+                let status = hostStatus(row)
+                let current = hosts.active == row.saved.id
+                Button { _ = hosts.select(row.saved.id) } label: {
+                    HStack(spacing: 10) {
+                        Circle().fill(hostDotColor(row)).frame(width: 8, height: 8).accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(row.saved.label).foregroundStyle(VerdeTheme.text)
+                            Text(status).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                        }
+                        Spacer(minLength: 8)
+                        if current { Image(systemName: "checkmark").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true) }
+                    }
+                    .frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(row.saved.label), \(status)")
+                .accessibilityAddTraits(current ? [.isButton, .isSelected] : .isButton)
+                .accessibilityHint(current ? "" : "Switches to this host.")
+            }
+        } header: { SectionTitle("Hosts") } footer: {
+            Text("Add, rename or sign out of hosts from Hosts in the drawer.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+        }
+    }
+
+    private var aboutSection: some View {
+        Section {
+            LabeledContent("Version", value: appVersionLabel(Bundle.main.infoDictionary))
+            LabeledContent("Client core", value: ClientCore.version)
+            NavigationLink("Open-source licences") { LicencesPage() }
+            Link(destination: URL(string: "https://github.com/JonathanRiche/verde")!) {
+                HStack { Text("Source code").foregroundStyle(VerdeTheme.text); Spacer(); Image(systemName: "arrow.up.right").foregroundStyle(VerdeTheme.subtle) }
+            }
+        } header: { SectionTitle("About") }
+        .accessibilityIdentifier("settings-about")
+    }
+}
+
+private struct LicencesPage: View {
+    var body: some View {
+        List {
+            ForEach(bundledLicences, id: \.1) { licence in
+                if let url = Bundle.main.url(forResource: licence.1, withExtension: "txt"), let text = try? String(contentsOf: url, encoding: .utf8) {
+                    Section {
+                        Text(text).font(VerdeTheme.mono(11)).textSelection(.enabled)
+                    } header: { SectionTitle(licence.0) }
+                }
+            }
+        }
+        .scrollContentBackground(.hidden).background(VerdeTheme.background)
+        .navigationTitle("Licences").navigationBarTitleDisplayMode(.inline)
     }
 }
