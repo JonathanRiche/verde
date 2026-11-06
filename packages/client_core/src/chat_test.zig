@@ -510,3 +510,22 @@ test "slash choices list each command once and keep a runnable copy" {
     try eql("other", out.slash[2].id);
     try eql("another", out.slash[3].id);
 }
+
+test "transcript images are named by their file name and keep the host path as reference" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage(null, false);
+    try f.recorded("chat.message.list",
+        \\{"messages":[{"sort_index":1,"message_id":"img-1","role":"user","author":"You","body":"see","images":[{"path":"/home/u/.local/share/verde/attachments/shot 1.png","mime":"image/png","byte_size":3},{"path":"C:\\Users\\u\\pic.jpg","mime":"image/jpeg","byte_size":4}],"image":null,"tool_call_id":null,"tool_call_kind":null,"tool_call_status":null,"created_at_ms":null,"updated_at_ms":null}],"next_cursor":null,"store_revision":2}
+    );
+    var row: ?m.Row = null;
+    for (f.host.state.chat.threads[0].rows) |r| if (h.eq(r.id, "img-1")) {
+        row = r;
+    };
+    const images = row.?.attachments;
+    try expect(images.len == 2);
+    try eql("shot 1.png", images[0].name);
+    try eql("/home/u/.local/share/verde/attachments/shot 1.png", images[0].reference.?);
+    try eql("pic.jpg", images[1].name);
+}

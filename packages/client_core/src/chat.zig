@@ -710,11 +710,17 @@ fn summary(a: A, t: *const Thread, wall: i64) E!p.ThreadSummary {
 fn messageRow(a: A, message: store.Message, fallback: []const u8, delivery: []const u8) E!m.Row {
     var images: []const m.Attachment = &.{};
     // `index` follows the daemon's order for `chat.attachment.read`: image_path first, then the extra images.
-    for (message.images, 0..) |image, index| try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = @intCast(index) });
+    for (message.images, 0..) |image, index| try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = baseName(image.path), .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = @intCast(index) });
     if (message.image) |image| if (images.len == 0) {
-        try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = 0 });
+        try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = baseName(image.path), .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = 0 });
     };
     return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| try toolView(a, id, message) else null };
+}
+/// The file name of a host path (POSIX or Windows separators); the full path stays in `reference`.
+fn baseName(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/\\");
+    const cut = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return if (trimmed.len > 0) trimmed else path;
+    return if (cut + 1 < trimmed.len) trimmed[cut + 1 ..] else path;
 }
 fn toolView(a: A, id: []const u8, message: store.Message) E!m.Tool {
     const kind = message.tool_call_kind orelse "unknown";
