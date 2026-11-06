@@ -115,7 +115,8 @@ func isImageAttachment(_ attachment: ChatAttachment) -> Bool { attachment.mime.l
 final class LocalAttachmentPreviews: @unchecked Sendable {
     static let shared = LocalAttachmentPreviews()
     private let cache = NSCache<NSString, NSData>()
-    init() { cache.totalCostLimit = 8 * 1024 * 1024 }
+    // A full 16-image message (16 x 700 KB) shows its own previews while it sends.
+    init() { cache.totalCostLimit = 16 * 1024 * 1024 }
     func put(_ id: String, _ bytes: Data) { cache.setObject(bytes as NSData, forKey: id as NSString, cost: bytes.count) }
     func get(_ id: String) -> Data? { cache.object(forKey: id as NSString) as Data? }
 }
