@@ -12,9 +12,13 @@ args=(-project Verde.xcodeproj -scheme Verde -configuration Debug
 if [[ $mode == build ]]; then
     # Ad-hoc sign ("-", no team) so the built app keeps its Keychain entitlement and
     # actually runs in a simulator; an unsigned app fails every Keychain call.
+    # The Keychain access groups are $(AppIdentifierPrefix)dev.verdeai.app; without a team
+    # Xcode fills that prefix from whichever account it resolves, so a new Xcode account
+    # silently moved the app's default group and the simulator lost its pairing. Pin it to
+    # the release team so simulator builds keep the same group as TestFlight builds.
     xcodebuild "${args[@]}" -destination 'generic/platform=iOS Simulator' \
         CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
-        DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= build
+        DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= AppIdentifierPrefix=38GQPVTPNT. build
 else
     # Own a disposable device: never boot, erase or shut down a user's simulator.
     runtime=$(xcrun simctl list runtimes --json | python3 -c '
