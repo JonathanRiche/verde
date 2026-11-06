@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -156,6 +157,15 @@ internal fun workspaceLabels(items: List<Workspace>): Map<String, String> {
 internal val LocalWorkspaceLabels = compositionLocalOf<Map<String, String>> { emptyMap() }
 
 /** The workspace's name as lists show it ([workspaceLabels]); its own label outside a list. */
+/** S34: the folder that tells each workspace apart: its parent's name, more of it only when labels collide. */
+internal fun workspaceParents(items: List<Workspace>): Map<String, String> {
+    val labels = workspaceLabels(items)
+    return items.associate { ws ->
+        val named = labels[ws.workspace_id]?.takeIf { it != ws.label }?.substringAfter(" \u00b7 ", "")
+        ws.workspace_id to (named?.takeIf { it.isNotEmpty() } ?: basename(ws.path.trimEnd('/').substringBeforeLast('/', "")))
+    }
+}
+
 @Composable
 internal fun workspaceName(ws: Workspace): String = LocalWorkspaceLabels.current[ws.workspace_id] ?: ws.label
 
@@ -375,8 +385,11 @@ private fun BrowseFrame(
     onRefresh: () -> Unit,
     onHosts: () -> Unit,
     onBack: (() -> Unit)? = null,
+    /** r5: an opaque band at the bottom holds the New chat button and the resting bubble, so they never cover row text. */
+    band: Boolean = onBack == null && LocalBubbleReserve.current > 0.dp,
     content: LazyListScope.() -> Unit,
 ) {
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         if (onBack != null) {
             VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -385,7 +398,7 @@ private fun BrowseFrame(
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
             // Top-level lists keep their last rows clear of the New chat button and the companion bubble (S1).
             LazyColumn(Modifier.fillMaxSize().testTag(BROWSE_LIST),
-                contentPadding = PaddingValues(bottom = if (onBack == null) LocalBubbleReserve.current + 80.dp else 16.dp)) {
+                contentPadding = PaddingValues(bottom = if (band) BOTTOM_BAND + 8.dp else 16.dp)) {
                 if (onBack == null) item(key = "title") {
                     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp)) {
                         Text(title, style = MaterialTheme.typography.titleLarge)
@@ -420,7 +433,22 @@ private fun BrowseFrame(
             }
         }
     }
+    if (band) BottomBand(Modifier.align(Alignment.BottomCenter))
+    }
 }
+
+/** r5 (iOS parity): the bottom band's height: the 56dp New chat button / bubble with 16dp around them. */
+internal val BOTTOM_BAND = 88.dp
+
+/** An opaque strip under the floating controls: rows scroll beneath it, never beneath the controls. */
+@Composable
+internal fun BottomBand(modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxWidth().height(BOTTOM_BAND).background(MaterialTheme.colorScheme.background).testTag(BOTTOM_BAND_TAG)) {
+        HorizontalDivider(color = VerdeColors.Border.copy(alpha = .5f))
+    }
+}
+
+internal const val BOTTOM_BAND_TAG = "bottom-band"
 
 /** Shared host-level gates; returns true when the caller should render its own content. */
 private fun LazyListScope.gate(state: BrowseState, onPair: () -> Unit): Boolean {
@@ -466,7 +494,7 @@ internal fun HomeScreen(
     val now = rememberListNow(panes.any { it.can_stop && it.started_at_ms != null })
     val docked = LocalWindowTier.current.docked
     Box(Modifier.fillMaxSize()) {
-        BrowseFrame("Home", state, now, model::refresh, onHosts) {
+        BrowseFrame("Home", state, now, model::refresh, onHosts, band = onNewChat != null || LocalBubbleReserve.current > 0.dp) {
             if (!gate(state, onPair)) return@BrowseFrame
             // S26: three sections from the core's state. "Needs you" is its needs_you; "Running" is a
             // live turn or process; finished chats sit in "Recent", an unread one with a neutral dot.
@@ -497,12 +525,16 @@ internal fun HomeScreen(
             val open = state.workspaces?.items.orEmpty().filter { it.open }
             if (open.isNotEmpty()) {
                 header("Workspaces")
-                items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
+                val parents = workspaceParents(state.workspaces?.items.orEmpty())
+                items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace, parents[it.workspace_id]) }
             } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces menu.")
         }
         if (onNewChat != null && hasContent(state) && !needsPairing(state) && state.workspaces?.items.orEmpty().any { it.open }) {
             // S29: the FAB's own node is named "New chat" (a Material FAB names only its child text).
-            NamedButton("New chat", onNewChat, Modifier.align(androidx.compose.ui.Alignment.BottomEnd).padding(16.dp).heightIn(min = 56.dp),
+            // In the band beside the resting bubble (its side's 56dp + margins), like iOS.
+            val bubbleRight = LocalBubbleReserve.current > 0.dp && BubblePrefs.of(LocalContext.current).placement.edge == BubbleEdge.Right
+            NamedButton("New chat", onNewChat, Modifier.align(androidx.compose.ui.Alignment.BottomEnd)
+                .padding(start = 16.dp, top = 16.dp, bottom = 16.dp, end = if (bubbleRight) 80.dp else 16.dp).heightIn(min = 56.dp),
                 container = MaterialTheme.colorScheme.primaryContainer, content = MaterialTheme.colorScheme.onPrimaryContainer,
                 shape = RoundedCornerShape(16.dp), padding = PaddingValues(horizontal = 20.dp), shadow = 6.dp)
         }
@@ -510,7 +542,7 @@ internal fun HomeScreen(
 }
 
 @Composable
-private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
+private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit, parent: String? = null) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val chats = workspace.threads.count { listed(it) && !it.archived }
     val terminals = workspace.panes.count { it.kind == "terminal" && it.terminal_id != null }
@@ -523,7 +555,9 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
         "closed".takeIf { !workspace.open },
     ).joinToString(" · ")
     // S21: closed workspaces show their name and state, not a stale (often doubled) path.
-    MenuRow(workspaceName(workspace), listOf(summary, workspace.path.takeIf { workspace.open }.orEmpty()).filter { it.isNotEmpty() }.joinToString("\n"), true,
+    // S34: the title is the label; the subtitle the one folder that tells it apart, then its counts.
+    // The full path stays on the workspace's own screen.
+    MenuRow(workspace.label, listOfNotNull(parent?.takeIf { it.isNotEmpty() }, summary).joinToString(" \u00b7 "), true,
         { onOpen(workspace.workspace_id) },
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
         // S27: list rows like iOS and Hosts: the workspace's own icon leads.
@@ -553,11 +587,12 @@ internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> U
         header("Open")
         val open = all.filter { it.open }
         if (open.isEmpty()) note("noopen", "No open workspaces.")
-        items(open, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
+        val parents = workspaceParents(all)
+        items(open, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace, parents[it.workspace_id]) }
         val closed = all.filterNot { it.open }
         if (closed.isNotEmpty()) {
             header("Closed")
-            items(closed, key = { "closed:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
+            items(closed, key = { "closed:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace, parents[it.workspace_id]) }
         }
     }
 }

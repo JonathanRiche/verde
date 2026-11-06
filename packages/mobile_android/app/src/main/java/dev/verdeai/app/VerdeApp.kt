@@ -74,11 +74,15 @@ private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
  * Settings for settings, Workspaces for anything inside a workspace (chats, terminals, files,
  * changes), Home for history and new chat.
  */
-internal fun footerTab(route: String?): String = when (route) {
+internal fun footerTab(route: String?, stack: List<String> = emptyList()): String = when (route) {
     null -> ""
     Routes.HOME, Routes.WORKSPACES, Routes.HOSTS, Routes.SECURITY -> route
-    ManageRoutes.HISTORY, ManageRoutes.NEW_CHAT, ManageRoutes.NEW_CHAT_IN -> Routes.HOME
-    else -> Routes.WORKSPACES
+    // r5 (iOS rule): a screen belongs to the tab it was opened from: a chat opened from Home marks
+    // Home, Files reached through Workspaces marks Workspaces.
+    else -> stack.lastOrNull { it in setOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS, Routes.SECURITY) } ?: when (route) {
+        ManageRoutes.HISTORY, ManageRoutes.NEW_CHAT, ManageRoutes.NEW_CHAT_IN -> Routes.HOME
+        else -> Routes.WORKSPACES
+    }
 }
 
 /** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
@@ -109,7 +113,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Terminals keep the full height and their own back bar.
     val immersive = route == Routes.TERMINAL || route == Routes.NEW_TERMINAL
     // Highlight only actual root destinations; detail routes select their own row.
-    val currentTab = footerTab(route)
+    @android.annotation.SuppressLint("RestrictedApi")
+    val stack by nav.currentBackStack.collectAsState()
+    val currentTab = footerTab(route, stack.mapNotNull { it.destination.route })
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val browseState by browse.state.collectAsState()

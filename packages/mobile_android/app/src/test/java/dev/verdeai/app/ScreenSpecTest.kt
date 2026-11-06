@@ -43,6 +43,15 @@ class ScreenSpecTest {
         assertEquals(paths.size, labels.values.distinct().size)
     }
 
+    @Test fun workspaceRowsNameTheirParentFolderOnly() {
+        fun ws(id: String, label: String, path: String) = dev.verdeai.core.Workspace(id, label, path, open = true, panes = emptyList(), threads = emptyList())
+        val parents = workspaceParents(listOf(ws("a", "scripts", "/tmp/x/demo/scripts"), ws("b", "scripts", "/tmp/y/nope/scripts"),
+            ws("d", "web", "/srv/site/web")))
+        assertEquals("demo", parents["a"])
+        assertEquals("nope", parents["b"])
+        assertEquals("site", parents["d"])
+    }
+
     @Test fun sharedWorkspaceNamesGetTheirParentFolder() {
         fun ws(id: String, label: String, path: String) = dev.verdeai.core.Workspace(id, label, path, open = false, panes = emptyList(), threads = emptyList())
         val labels = workspaceLabels(listOf(ws("a", "scripts", "/tmp/x/demo/scripts"), ws("b", "scripts", "/tmp/y/nope/scripts"),
@@ -108,5 +117,8 @@ class ScreenSpecTest {
         assertEquals(Routes.WORKSPACES, footerTab(Routes.THREAD))
         assertEquals(Routes.HOME, footerTab(ManageRoutes.HISTORY))
         assertEquals(Routes.HOSTS, footerTab(Routes.HOSTS))
+        // r5: the tab a screen was opened from: a chat from Home marks Home.
+        assertEquals(Routes.HOME, footerTab(Routes.THREAD, listOf(Routes.HOME, Routes.THREAD)))
+        assertEquals(Routes.WORKSPACES, footerTab(Routes.THREAD, listOf(Routes.HOME, Routes.WORKSPACES, Routes.WORKSPACE, Routes.THREAD)))
     }
 }

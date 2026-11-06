@@ -164,6 +164,10 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                             if (query.isEmpty()) Text("Search chats", color = VerdeColors.Subtle)
                             field()
                         }
+                        // S38: a full 48dp Clear search target.
+                        if (query.isNotEmpty()) IconButton(onClick = { query = "" }, modifier = Modifier.named("Clear search")) {
+                            Icon(Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Muted)
+                        }
                     }
                 })
         }
@@ -298,13 +302,14 @@ internal fun NewChatScreen(
             }
         }
         if (catalogs.efforts.isNotEmpty()) item(key = "effort") {
-            val efforts = catalogs.efforts.map { if (isDefaultChoice(it.id)) it.copy(label = "Auto \u00b7 provider default") else it }
+            val efforts = catalogs.efforts.map { it.copy(label = pickerRowLabel(ComposerPicker.Effort, it, catalogs)) }
             Picker("Effort", effortValueLabel(catalogs, selection), efforts, chat != null && !busy) {
                 manage.select(ws, selection.copy(effort=it))
             }
         }
         if (catalogs.access.isNotEmpty()) item(key = "access") {
-            Picker("Access", accessChipLabel(catalogs.access, selection.access), catalogs.access, chat != null && !busy) {
+            Picker("Access", accessChipLabel(catalogs.access, selection.access),
+                catalogs.access.map { it.copy(label = pickerRowLabel(ComposerPicker.Access, it, catalogs)) }, chat != null && !busy) {
                 manage.select(ws, selection.copy(access=it))
             }
         }
@@ -365,7 +370,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
                 enabled = path.isNotBlank() && view?.can_manage_workspaces == true && !busy,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { Text(if (busy) "Adding…" else "Add workspace") }
         }
-        section("Browse folders")
+        // S34: "Recent folders" and "Contents of <folder>" below, as two sections.
         if (directory == null) return@ManageFrame
         if (!directory.supported) {
             line("browse-unsupported", "Update verde on the computer to browse folders. You can still type a path.")
@@ -373,7 +378,9 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         }
         // A5-8: no stale suggestions from closed workspaces (their folders may be gone).
         val suggestions = freshFolderSuggestions(directory.suggestions, state.workspaces?.items.orEmpty())
+        // S34: recent folders are their own section, apart from what's in the folder being browsed.
         if (suggestions.isNotEmpty()) {
+            section("Recent folders")
             // S15: suggested folders as list rows: a name that tells them apart, the full path under it.
             val labels = folderChipLabels(suggestions)
             items(suggestions, key = { "suggestion:$it" }) { root ->
@@ -381,14 +388,16 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
                     supportingContent = { Text(root, maxLines = 1, overflow = TextOverflow.MiddleEllipsis) },
                     leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
                     trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
-                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }
-                        .semantics { contentDescription = "Browse $root" })
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }.nameOnly("Browse $root"))
             }
         }
-        if (directory.path.isNotEmpty()) item(key = "current") {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(directory.path, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                TextButton(onClick = { path = directory.path }, enabled = directory.error == null && !directory.loading) { Text("Use this folder") }
+        if (directory.path.isNotEmpty()) {
+            section("Contents of ${basename(directory.path)}")
+            item(key = "current") {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(directory.path, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    NamedButton("Use this folder", { path = directory.path }, enabled = directory.error == null && !directory.loading)
+                }
             }
         }
         directory.error?.let { line("browse-error", it.message, error = true) }
@@ -396,12 +405,15 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         directory.parent?.let { parent ->
             item(key = "parent") {
                 VerdeListRow(headlineContent = { Text("..") }, supportingContent = { Text("Up one folder") },
-                    modifier = Modifier.fillMaxWidth().clickable { manage.listDirectory(parent) })
+                    leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(parent) }.nameOnly("Up one folder"))
             }
         }
         items(directory.entries, key = { "dir:" + it.path }) { entry ->
             VerdeListRow(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                modifier = Modifier.fillMaxWidth().clickable(onClickLabel = "Browse") { manage.listDirectory(entry.path) })
+                leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
+                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
+                modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Browse") { manage.listDirectory(entry.path) }.nameOnly(entry.name))
         }
         if (!directory.loading && directory.error == null && directory.entries.isEmpty() && directory.path.isNotEmpty()) line("browse-empty", "No folders here.")
     }

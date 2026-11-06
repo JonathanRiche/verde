@@ -73,8 +73,9 @@ private fun BackgroundLine(row: ChatRow, task: ChatBackground, now: Long) {
             .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(painterResource(R.drawable.ic_tool_terminal), contentDescription = null, tint = colors.onSurfaceVariant,
                 modifier = Modifier.size(16.dp))
-            Text(task.label, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium.copy(fontFamily = VerdeMono),
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // S36: up to two lines before the ellipsis, like iOS.
+            Text(task.label, Modifier.weight(1f).padding(vertical = 6.dp), style = MaterialTheme.typography.labelMedium.copy(fontFamily = VerdeMono),
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
             StatusGlyph(task.status, tint)
             Text(status, style = MaterialTheme.typography.labelSmall, color = tint, maxLines = 1)
             age?.let { Text("· $it", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle, maxLines = 1) }
