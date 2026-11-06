@@ -84,6 +84,16 @@ enum ComposerPicker: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Android's wording when a pick goes over the per-message limit.
+let composerImageLimitNotice = "Up to \(ComposerModel.maxImages) images per message."
+
+/// How many of `picked` images fit beside `existing` ones, and whether some were left out.
+func composerImagesThatFit(picked: Int, existing: Int, max: Int = ComposerModel.maxImages) -> (take: Int, overLimit: Bool) {
+    let room = Swift.max(0, max - existing)
+    let take = Swift.min(picked, room)
+    return (take, picked > take)
+}
+
 /// The core owns persisted drafts and submission state. One ordered lane prevents a late
 /// debounce from overwriting a newer draft or overtaking a send.
 @MainActor @Observable
@@ -92,6 +102,7 @@ final class ComposerModel {
     /// ones go by reference), so this keeps that event's base64 inside the core's 1 MiB input.
     static let maxImageBytes = 700 * 1024
     static let maxImages = 4
+
     let chat: TranscriptModel
     private(set) var text = ""
     private(set) var selection = NSRange(location: 0, length: 0)
@@ -351,18 +362,39 @@ final class ComposerModel {
         }
     }
 
-    func attach(_ bytes: Data) {
+    func attach(_ bytes: Data) { attachAll([bytes]) }
+
+    /// Images already on the draft, for the pickers' selection limit.
+    var attachedImageCount: Int { view?.draft.attachments.count ?? 0 }
+
+    /// Several images at once, in the order picked (multi-select Photos and Files). What fits under
+    /// the limit is attached; the rest gets Android's notice. An over-size image gets its own
+    /// notice and doesn't block the others.
+    /// `skipped` is the notice for picked items that couldn't be read; it shows unless a limit
+    /// notice takes its place.
+    func attachAll(_ images: [Data], skipped: String? = nil) {
+        guard !images.isEmpty else { if let skipped { notice = skipped }; return }
         action { [self] in
             guard await flush() else { return }
             let existing = references()
-            guard existing.count < Self.maxImages else { notice = "Up to four images per message."; return }
-            guard bytes.count <= Self.maxImageBytes else { notice = "This image is too large to attach."; return }
-            let id = "img-" + UUID().uuidString
-            if await setDraft(text, existing + [AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString())]) {
-                previews[id] = bytes
-                // The sent row shows these bytes right away (keyed by the draft's local id).
-                LocalAttachmentPreviews.shared.put(id, bytes)
+            let fit = composerImagesThatFit(picked: images.count, existing: existing.count)
+            let usable = images.prefix(fit.take).filter { $0.count <= Self.maxImageBytes }
+            let tooLarge = fit.take - usable.count
+            var added: [(AttachmentInput, Data)] = []
+            for bytes in usable {
+                let id = "img-" + UUID().uuidString
+                added.append((AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString()), bytes))
             }
+            if !added.isEmpty, await setDraft(text, existing + added.map(\.0)) {
+                for (input, bytes) in added {
+                    previews[input.local_id] = bytes
+                    // The sent row shows these bytes right away (keyed by the draft's local id).
+                    LocalAttachmentPreviews.shared.put(input.local_id, bytes)
+                }
+            }
+            if fit.overLimit { notice = composerImageLimitNotice }
+            else if tooLarge > 0 { notice = "This image is too large to attach." }
+            else if let skipped { notice = skipped }
         }
     }
 

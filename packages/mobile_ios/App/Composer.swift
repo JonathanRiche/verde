@@ -356,7 +356,7 @@ struct ChatComposer: View {
     @State private var anchored: ComposerPicker?
     @State private var popoverRowsHeight: CGFloat = 0
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @State private var photo: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     /// The library picker is presented from the composer, not embedded in the attach menu: a
     /// `PhotosPicker` inside a `Menu` is torn down when the menu closes, so it never appears.
     @State private var photos = false
@@ -403,22 +403,18 @@ struct ChatComposer: View {
                 }.presentationDetents([.medium])
             }
         }
-        .photosPicker(isPresented: $photos, selection: $photo, matching: .images)
-        .onChange(of: photo) { _, item in
-            Task {
-                guard let item else { return }
-                defer { photo = nil }
-                guard let data = try? await item.loadTransferable(type: Data.self), data.count <= 24 * 1024 * 1024, let image = UIImage(data: data) else { model.notice = "This image couldn't be opened."; return }
-                prepare(image)
-            }
+        // Several at once, in the order picked, up to the room left on the draft.
+        .photosPicker(isPresented: $photos, selection: $photoItems,
+                      maxSelectionCount: max(1, ComposerModel.maxImages - model.attachedImageCount),
+                      selectionBehavior: .ordered, matching: .images)
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty else { return }
+            photoItems = []
+            Task { await preparePhotos(items) }
         }
-        .fileImporter(isPresented: $files, allowedContentTypes: [.item]) { result in
-            guard case .success(let url) = result else { return }
-            let access = url.startAccessingSecurityScopedResource()
-            defer { if access { url.stopAccessingSecurityScopedResource() } }
-            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 24 * 1024 * 1024,
-                  let data = try? Data(contentsOf: url), let image = UIImage(data: data) else { model.notice = "Only images can be attached from the phone."; return }
-            prepare(image)
+        .fileImporter(isPresented: $files, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            guard case .success(let urls) = result else { return }
+            prepareFiles(urls)
         }
     }
 
@@ -942,6 +938,40 @@ struct ChatComposer: View {
     private func prepare(_ image: UIImage) {
         guard let bytes = composerImage(image) else { model.notice = "This image is too large to attach."; return }
         model.attach(bytes)
+    }
+
+    /// Loads the picked photos concurrently, keeps their order, and attaches the readable ones in
+    /// one step; an unreadable one gets the per-item notice without blocking the rest.
+    @MainActor private func preparePhotos(_ items: [PhotosPickerItem]) async {
+        let loaded = await withTaskGroup(of: (Int, Data?).self) { group in
+            for (index, item) in items.enumerated() {
+                group.addTask { (index, try? await item.loadTransferable(type: Data.self)) }
+            }
+            var out = [Data?](repeating: nil, count: items.count)
+            for await (index, data) in group { out[index] = data }
+            return out
+        }
+        var images: [Data] = []
+        var unreadable = false
+        for data in loaded {
+            guard let data, data.count <= 24 * 1024 * 1024, let image = UIImage(data: data), let bytes = composerImage(image) else { unreadable = true; continue }
+            images.append(bytes)
+        }
+        model.attachAll(images, skipped: unreadable ? "This image couldn't be opened." : nil)
+    }
+
+    /// Picked files, in order, with the same size and type checks as one.
+    @MainActor private func prepareFiles(_ urls: [URL]) {
+        var images: [Data] = []
+        var rejected = false
+        for url in urls {
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 24 * 1024 * 1024,
+                  let data = try? Data(contentsOf: url), let image = UIImage(data: data), let bytes = composerImage(image) else { rejected = true; continue }
+            images.append(bytes)
+        }
+        model.attachAll(images, skipped: rejected ? "Only images can be attached from the phone." : nil)
     }
 }
 

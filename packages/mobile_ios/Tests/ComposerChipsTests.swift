@@ -162,3 +162,16 @@ final class ComposerChipPlanTests: XCTestCase {
         XCTAssertEqual(composerShortLabel(.access, id: "full_access", label: "Full access"), "Full")
     }
 }
+
+/// Multi-select attach: what fits under the per-message limit, and Android's notice for the rest.
+final class ComposerImageLimitTests: XCTestCase {
+    func testPicksFillTheRoomLeftAndFlagTheRest() {
+        XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 0) == (3, false))
+        XCTAssertTrue(composerImagesThatFit(picked: 4, existing: 0) == (4, false))
+        XCTAssertTrue(composerImagesThatFit(picked: 6, existing: 0) == (4, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 2) == (2, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 1, existing: 4) == (0, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 0, existing: 1) == (0, false))
+        XCTAssertEqual(composerImageLimitNotice, "Up to 4 images per message.")
+    }
+}
