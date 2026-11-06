@@ -333,9 +333,11 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         }
         if (directory.suggestions.isNotEmpty()) item(key = "suggestions") {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val labels = folderChipLabels(directory.suggestions)
                 items(directory.suggestions, key = { it }) { root ->
-                    // Short names keep every chip whole; the row scrolls, and TalkBack reads the full path.
-                    AssistChip(onClick = { manage.listDirectory(root) }, label = { Text(basename(root).ifEmpty { root }, maxLines = 1) },
+                    // A3-4: each chip names its folder by the shortest path tail no other chip shares;
+                    // the row scrolls, and TalkBack reads the full path.
+                    AssistChip(onClick = { manage.listDirectory(root) }, label = { Text(labels[root] ?: root, maxLines = 1) },
                         modifier = Modifier.semantics { contentDescription = root })
                 }
             }
@@ -485,5 +487,21 @@ internal fun colorName(color: Color): String {
     return when {
         h < 15f -> "Red"; h < 45f -> "Orange"; h < 70f -> "Yellow"; h < 100f -> "Lime"; h < 160f -> "Green"
         h < 200f -> "Teal"; h < 250f -> "Blue"; h < 290f -> "Violet"; h < 335f -> "Pink"; else -> "Red"
+    }
+}
+
+/**
+ * Chip labels for folder paths: the last segment, or as many trailing segments as it takes to tell
+ * a path from every other one ("…/scripts/demo"), so two folders never read the same.
+ */
+internal fun folderChipLabels(paths: List<String>): Map<String, String> {
+    val parts = paths.associateWith { p -> p.trimEnd('/').split('/').filter { it.isNotEmpty() } }
+    fun tail(p: String, k: Int) = parts.getValue(p).takeLast(k).joinToString("/")
+    return paths.associateWith { p ->
+        val segments = parts.getValue(p)
+        if (segments.isEmpty()) return@associateWith p.ifEmpty { "/" }
+        var k = 1
+        while (k < segments.size && paths.any { o -> o != p && tail(o, k) == tail(p, k) }) k++
+        if (k >= segments.size) p.trimEnd('/').ifEmpty { "/" } else (if (k > 1) "…/" else "") + tail(p, k)
     }
 }

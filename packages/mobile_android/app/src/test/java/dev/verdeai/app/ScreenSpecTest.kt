@@ -30,4 +30,15 @@ class ScreenSpecTest {
     @Test fun versionLabelNamesBuild() {
         assertEquals("0.1.0 (7)", appVersionLabel("0.1.0", 7))
     }
+
+    @Test fun folderChipsNeverReadTheSame() {
+        val paths = listOf("/tmp/r/demo", "/tmp/r/demo/project", "/tmp/r/x/scripts/demo", "/tmp/r/y/scripts/demo", "/")
+        val labels = folderChipLabels(paths)
+        assertEquals("…/r/demo", labels["/tmp/r/demo"])
+        assertEquals("project", labels["/tmp/r/demo/project"])
+        assertEquals("…/x/scripts/demo", labels["/tmp/r/x/scripts/demo"])
+        assertEquals("…/y/scripts/demo", labels["/tmp/r/y/scripts/demo"])
+        assertEquals("/", labels["/"])
+        assertEquals(paths.size, labels.values.distinct().size)
+    }
 }
