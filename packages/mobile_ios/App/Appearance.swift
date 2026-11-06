@@ -71,6 +71,13 @@ struct HostPalette: Decodable {
         default: return activePalette?.dark == false ? .light : .dark
         }
     }
+    /// `scheme` with System resolved to the phone's current appearance. A sheet that was given a
+    /// forced scheme keeps it when handed nil, so sheets open while the theme changes use this (I6-5).
+    var resolvedScheme: ColorScheme {
+        if let scheme { return scheme }
+        let style = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.traitCollection.userInterfaceStyle
+        return style == .dark ? .dark : .light
+    }
     var activePalette: HostPalette? { mode == .host ? palette : mode.preset?.palette }
     var reducedMotion: Bool { mode == .host && palette?.reduced_motion == true }
     @MainActor func refresh(_ browse: BrowseModel) async {
@@ -175,7 +182,7 @@ struct AppSettings: View {
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("Done") { dismiss() } }
-        }.preferredColorScheme(appearance.scheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
+        }.preferredColorScheme(appearance.resolvedScheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
     }
 
     /// Paired hosts with their status; tapping one makes it the active host.
@@ -264,13 +271,31 @@ private struct LicenceText: View {
     }
 }
 
+/// One blank-line block: rulers ("-----") are dropped, and an all-caps heading line ("PREAMBLE")
+/// stands as its own paragraph instead of running into the text after it (I6-9).
+func licenceBlockParagraphs(_ block: String) -> [String] {
+    var out: [String] = []
+    var current: [String] = []
+    func flush() { if !current.isEmpty { out.append(current.joined(separator: " ")); current = [] } }
+    for raw in block.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty { continue }
+        if line.allSatisfy({ $0 == "-" || $0 == "=" || $0 == "_" }) { flush(); continue }
+        let letters = line.filter(\.isLetter)
+        // A heading opens its block, is short, all caps and has no closing full stop.
+        if current.isEmpty, !letters.isEmpty, letters == letters.uppercased(), line.count <= 40, !line.hasSuffix(".") {
+            out.append(line); continue
+        }
+        current.append(line)
+    }
+    flush()
+    return out
+}
+
 /// Hard-wrapped licence text as paragraphs: blank lines separate them, the lines within one join.
 func licenceParagraphs(_ text: String) -> [String] {
     text.replacingOccurrences(of: "\r\n", with: "\n")
         .components(separatedBy: "\n\n")
-        .map { (block: String) -> String in
-            let lines: [String] = block.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-            return lines.filter { !$0.isEmpty }.joined(separator: " ")
-        }
+        .flatMap(licenceBlockParagraphs)
         .filter { !$0.isEmpty }
 }

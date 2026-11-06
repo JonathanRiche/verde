@@ -176,7 +176,7 @@ private struct HostCard: View {
             Button("Remove from hosts") { model.remove(id) }
             Button("Pair again") { model.showPairing(id) }
         } else {
-            if row.view?.auth_state == "paired" && row.view?.trust_proposal == nil {
+            if row.view?.auth_state == "paired" && row.view?.trust_proposal == nil && model.active != id {
                 Button("Use \(row.saved.label)") { if model.select(id) { onUse() } }
                     .modifier(PrimaryRow()).disabled(pending || row.fatal)
             } else if row.view?.auth_state != "signing_out" {

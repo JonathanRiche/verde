@@ -88,6 +88,8 @@ final class LicenceTextTests: XCTestCase {
     func testHardWrappedLinesJoinIntoParagraphs() {
         XCTAssertEqual(licenceParagraphs("Copyright 2022 A\n\nThis Font Software is\nlicensed under\r\nthe OFL.\n\n\n"),
                        ["Copyright 2022 A", "This Font Software is licensed under the OFL."])
+        XCTAssertEqual(licenceParagraphs("-----\nSIL OPEN FONT LICENSE Version 1.1 - 26 February 2007\n-----\n\nPREAMBLE\nThe goals of the\nOFL are"),
+                       ["SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007", "PREAMBLE", "The goals of the OFL are"])
     }
 }
 

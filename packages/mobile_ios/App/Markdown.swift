@@ -435,12 +435,22 @@ struct OverflowScroll<Content: View>: View {
     @State private var edges = OverflowEdges()
 
     var body: some View {
-        ScrollView(.horizontal) { content() }
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(spacing: 0) {
+                    content()
+                    Color.clear.frame(width: 1, height: 1).id(overflowEndID)
+                }
+            }
             .modifier(OverflowTracker(edges: $edges))
             .mask(OverflowFade(leading: edges.leading, trailing: edges.trailing))
             .overlay(alignment: .trailing) {
-                if let moreLabel, edges.trailing { MoreBadge(label: moreLabel) }
+                // Tapping the hint scrolls to the last columns (I6-8).
+                if let moreLabel, edges.trailing {
+                    MoreBadge(label: moreLabel) { withAnimation { proxy.scrollTo(overflowEndID, anchor: .trailing) } }
+                }
             }
+        }
     }
 }
 
@@ -477,19 +487,26 @@ private struct OverflowFade: View {
 }
 
 /// "More columns": a chevron on the faded edge that says the content scrolls on.
+private let overflowEndID = "overflow-end"
+
 private struct MoreBadge: View {
     let label: String
+    let action: () -> Void
 
     var body: some View {
-        Image(systemName: "chevron.right")
-            .font(.system(size: 11, weight: .bold))
-            .foregroundStyle(VerdeTheme.muted)
-            .frame(width: 22, height: 22)
-            .background(VerdeTheme.panel, in: Circle())
-            .overlay(Circle().stroke(VerdeTheme.border))
-            .padding(.trailing, 4)
-            .allowsHitTesting(false)
-            .accessibilityLabel(label)
+        Button(action: action) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(VerdeTheme.muted)
+                .frame(width: 22, height: 22)
+                .background(VerdeTheme.panel, in: Circle())
+                .overlay(Circle().stroke(VerdeTheme.border))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityHint("Scrolls the table to its last columns.")
     }
 }
 

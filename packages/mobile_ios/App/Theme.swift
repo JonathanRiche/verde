@@ -209,7 +209,12 @@ struct BubbleReserve: ViewModifier {
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom, spacing: 0) {
             // Opaque, so rows never scroll beneath the bubble resting there (I3-7).
-            if shown && enabled { VerdeTheme.background.frame(height: bubbleListReserve).accessibilityHidden(true) }
+            if shown && enabled {
+                // Down through the home-indicator area too, so no row shows below the band (I6-9).
+                VerdeTheme.background.frame(height: bubbleListReserve)
+                    .background(VerdeTheme.background.ignoresSafeArea(edges: .bottom))
+                    .accessibilityHidden(true)
+            }
         }
     }
 }

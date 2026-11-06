@@ -176,7 +176,9 @@ private struct ThreadItem: View {
     var body: some View {
         let state = RowState(status: thread.status)
         let stateText = state == nil ? nil : statusLabel(thread.status)
-        let detail = rowSubtitle([workspaceLabel, stateText, thread.last_activity_at_ms.map { agoLabel($0, now) }])
+        // A live state replaces the age: "Needs approval · 11 h ago" read as stale (I6-9).
+        let age = state == nil ? thread.last_activity_at_ms.map { agoLabel($0, now) } : nil
+        let detail = rowSubtitle([workspaceLabel, stateText, age])
         MenuRow(content: RowContent(title: thread.title, detail: detail,
                                     dot: Dot(color: VerdeTheme.status(thread.status, attention: thread.status == "waiting_approval"),
                                              label: statusLabel(thread.status)), provider: thread.provider,
@@ -354,7 +356,7 @@ struct HomeScreen: View {
                 .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 16)
                 // The band is opaque so rows never sit under New chat or the bubble beside it.
                 .frame(maxWidth: .infinity, alignment: .trailing)
-                .background(VerdeTheme.background)
+                .background(VerdeTheme.background.ignoresSafeArea(edges: .bottom))
             }
         }
     }
