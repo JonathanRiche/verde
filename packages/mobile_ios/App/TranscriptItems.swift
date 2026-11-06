@@ -279,6 +279,13 @@ private func coreToolParts(_ row: ChatRow, _ fallback: ToolParts) -> ToolParts {
 /// The text Copy puts on the pasteboard: the whole tool body.
 func toolCopyText(_ row: ChatRow) -> String { row.body }
 
+/// A Read's output is the file's text: highlight it by the path's extension (S13).
+func toolOutputLanguage(_ parts: ToolParts) -> String? {
+    guard parts.kind == "read" else { return nil }
+    let ext = (parts.summary as NSString).pathExtension.lowercased()
+    return ext.isEmpty || ext.count > 10 ? nil : ext
+}
+
 /// One diff line's role in an Edit's unified-diff output.
 enum ToolDiffLine: Equatable { case hunk, add, delete, context }
 

@@ -540,9 +540,9 @@ private struct TranscriptRow: View {
     var body: some View {
         switch item {
         case .message(let row): MessageRow(row: row, model: model)
-        case .tool(let row): ToolCard(row: row, child: false, disclosure: model.disclosure)
+        case .tool(let row): ToolCard(row: row, child: false, disclosure: model.disclosure, source: model)
         case .toolGroup(let rows, let subagent):
-            ToolGroupCard(id: item.id, rows: rows, subagent: subagent, turnStartedAt: turnStartedAt, disclosure: model.disclosure)
+            ToolGroupCard(id: item.id, rows: rows, subagent: subagent, turnStartedAt: turnStartedAt, disclosure: model.disclosure, source: model)
         case .think(let row): ThinkCard(row: row, model: model)
         case .diff(let row): DiffCard(id: row.id, text: row.body, source: model, disclosure: model.disclosure)
         case .notice(let row):
@@ -927,9 +927,10 @@ private struct WorkingRow: View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             HStack(spacing: 8) {
                 StatusPip(active: !waitingApproval, attention: waitingApproval)
+                // S13: waiting on you is amber (dot and text); working is the accent.
                 Text(workingLabel(turn, waitingApproval: waitingApproval,
                                   elapsed: turn.started_at_ms.map { elapsedLabel($0, nowMs(context.date)) }))
-                    .font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
+                    .font(.caption.weight(.medium)).foregroundStyle(waitingApproval ? VerdeTheme.warning : VerdeTheme.accent)
             }
             .padding(.horizontal, 4).padding(.vertical, 4)
         }

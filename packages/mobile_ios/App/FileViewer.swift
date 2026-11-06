@@ -122,6 +122,9 @@ final class FileViewerModel: HighlightSource {
     var blocks: [MdBlock]?
     var image: UIImage?
     var pdf: PDFDocument?
+    /// Syntax ranges over `text` (UTF-16), when the host highlighted it.
+    var syntax: [DiffRange]?
+    @ObservationIgnored private var cachedLines: (FileSplit, [AttributedString])?
     private(set) var bytes: Data?
     /// False when `bytes` are a converted preview (office → PDF), not the original file.
     private(set) var original = false
@@ -130,7 +133,16 @@ final class FileViewerModel: HighlightSource {
     private var host: CoreHost?
     private var highlights = RenderLRU<RenderResult<[RenderSpan]>>(32)
     @ObservationIgnored private var cachedSplit: FileSplit?
-    func clear() { bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
+    /// `split()`'s lines in the syntax palette (nil when not highlighted).
+    func styledLines() -> [AttributedString]? {
+        guard let syntax, let split = split() else { return nil }
+        if let cachedLines, cachedLines.0 === split { return cachedLines.1 }
+        let lines = fileStyledLines(split, syntax)
+        cachedLines = (split, lines)
+        return lines
+    }
+    private func language(_ path: String) -> String { (path as NSString).pathExtension.lowercased() }
+    func clear() { syntax = nil; cachedLines = nil; bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
     /// `text` split into display lines once, for the line-selectable viewer.
     func split() -> FileSplit? {
         guard let text else { return nil }
@@ -179,6 +191,12 @@ final class FileViewerModel: HighlightSource {
             case .text, .markdown:
                 guard !data.contains(0), let decoded = String(data: data, encoding: .utf8) else { throw FileProblem.binary }
                 text = decoded
+                // S13: plain-text files are highlighted with the shared syntax palette.
+                if kind == .text, !language(path).isEmpty, decoded.utf8.count <= 64 * 1024 {
+                    let spans = await highlight(decoded, language: language(path))
+                    try Task.checkCancellation()
+                    if let value = spans.value, text == decoded { syntax = highlightRanges(decoded, value) }
+                }
                 if kind == .markdown, decoded.utf8.count <= 64 * 1024,
                    let data = await utility("markdown", decoded), let parsed = try? JSONDecoder().decode(MarkdownQuery.self, from: data).data {
                     blocks = markdownBlocks(parsed.nodes)
@@ -265,8 +283,8 @@ struct FileViewer: View {
             else if let image = model.image { ZoomImage(image: image) }
             else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
             else if let blocks = model.blocks, !source { ScrollView { MarkdownBlocks(blocks: blocks, source: model).padding() } }
-            else if lineSelection != nil, let split = model.split() { SelectableFileText(split: split, target: citeLines) }
-            else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
+            else if lineSelection != nil, let split = model.split() { SelectableFileText(split: split, target: citeLines, styled: model.styledLines()) }
+            else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line), syntax: model.syntax) }
             // Before the first load starts nothing above applies. An empty Group would drop this
             // page's title and `.task`, so a pushed viewer stayed blank and never loaded.
             else { ProgressView("Loading file…") }
@@ -366,9 +384,52 @@ private struct SVGPreview: UIViewRepresentable {
 private struct FileText: UIViewRepresentable {
     let text: String
     let target: NSRange?
+    var syntax: [DiffRange]? = nil
+    final class Coordinator { var shown: String?; var styled = false }
+    func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> UITextView { let v = UITextView(); v.isEditable = false; v.font = UIFont(name: "JetBrainsMonoNF-Regular", size: 13); v.backgroundColor = UIColor(VerdeTheme.background); v.textColor = UIColor(VerdeTheme.text); v.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12); return v }
     func updateUIView(_ view: UITextView, context: Context) {
-        if view.text != text { view.text = text; if let target { view.selectedRange = target; DispatchQueue.main.async { view.scrollRangeToVisible(target) } } }
+        let styled = syntax != nil
+        guard context.coordinator.shown != text || context.coordinator.styled != styled else { return }
+        let first = context.coordinator.shown != text
+        context.coordinator.shown = text
+        context.coordinator.styled = styled
+        view.attributedText = fileAttributedText(text, syntax: syntax ?? [], font: view.font ?? .monospacedSystemFont(ofSize: 13, weight: .regular))
+        if first, let target { view.selectedRange = target; DispatchQueue.main.async { view.scrollRangeToVisible(target) } }
+    }
+}
+
+/// The file in the syntax palette as UIKit text.
+func fileAttributedText(_ text: String, syntax: [DiffRange], font: UIFont) -> NSAttributedString {
+    let out = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: UIColor(VerdeTheme.text)])
+    let length = out.length
+    for range in syntax where range.end <= length {
+        if let color = tokenColor(range.kind) {
+            out.addAttribute(.foregroundColor, value: UIColor(color), range: NSRange(location: range.start, length: range.end - range.start))
+        }
+    }
+    return out
+}
+
+/// Each line of `split` in the syntax palette; `ranges` are UTF-16 offsets into the whole text and
+/// may span lines.
+func fileStyledLines(_ split: FileSplit, _ ranges: [DiffRange]) -> [AttributedString] {
+    let sorted = ranges.sorted { $0.start < $1.start }
+    var next = 0
+    return split.lines.enumerated().map { index, line in
+        let start = split.starts[index]
+        let end = start + (line as NSString).length
+        while next < sorted.count && sorted[next].end <= start { next += 1 }
+        var local: [StyledRange] = []
+        var j = next
+        while j < sorted.count && sorted[j].start < end {
+            let r = sorted[j]
+            if let attributes = tokenAttributes(r.kind) {
+                local.append(StyledRange(start: max(r.start, start) - start, end: min(r.end, end) - start, attributes: attributes))
+            }
+            j += 1
+        }
+        return styledText(line, local)
     }
 }
 private struct ZoomImage: UIViewRepresentable {

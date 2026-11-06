@@ -62,6 +62,8 @@ struct ToolCard: View {
     let row: ChatRow
     let child: Bool
     let disclosure: DisclosureStore
+    /// Highlights a Read's file output in the shared syntax palette (S13).
+    var source: HighlightSource? = nil
     @Environment(\.compactChat) private var compact
 
     var body: some View {
@@ -73,7 +75,7 @@ struct ToolCard: View {
             ToolHeader(parts: parts, failed: failed, running: commandRunning(row), expanded: expanded, compact: compact,
                        toggle: { disclosure.toggle(key, failed) }, copy: { toolCopyText(row) })
             if expanded {
-                ToolDetails(parts: parts, rowID: row.id, disclosure: disclosure)
+                ToolDetails(parts: parts, rowID: row.id, disclosure: disclosure, source: source)
                     .padding(.horizontal, compact ? 2 : 12).padding(.bottom, 10)
             }
         }
@@ -149,11 +151,12 @@ private struct ToolDetails: View {
     let parts: ToolParts
     let rowID: String
     let disclosure: DisclosureStore
+    let source: HighlightSource?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let input = parts.input { section("Input", input, key: "input") }
-            if let output = parts.output { section("Output", output, key: "output", diff: toolOutputIsDiff(parts)) }
+            if let output = parts.output { section("Output", output, key: "output", diff: toolOutputIsDiff(parts), language: toolOutputLanguage(parts)) }
             if let error = parts.error { section("Error", error, key: "error", error: true) }
             if parts.input == nil && parts.output == nil && parts.error == nil {
                 Text("No output").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
@@ -161,14 +164,14 @@ private struct ToolDetails: View {
         }
     }
 
-    private func section(_ title: String, _ text: String, key: String, diff: Bool = false, error: Bool = false) -> some View {
+    private func section(_ title: String, _ text: String, key: String, diff: Bool = false, error: Bool = false, language: String? = nil) -> some View {
         let flag = "\(rowID):tool:\(key):all"
         let all = disclosure.flag(flag)
         let cut = all ? (text, false) : leadingLines(text, toolPreviewLines)
         return VStack(alignment: .leading, spacing: 4) {
             Text(title).font(VerdeTheme.ui(11, bold: true)).foregroundStyle(error ? VerdeTheme.danger : VerdeTheme.muted)
                 .accessibilityAddTraits(.isHeader)
-            ToolText(text: cut.0, diff: diff, error: error)
+            ToolText(text: cut.0, diff: diff, error: error, language: language, source: source)
             if cut.1 {
                 Button("Show all \(countLines(text)) lines") { disclosure.setFlag(flag, true) }
                     .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.accent)
@@ -183,6 +186,9 @@ private struct ToolText: View {
     let text: String
     let diff: Bool
     let error: Bool
+    var language: String? = nil
+    var source: HighlightSource? = nil
+    @State private var spans: RenderResult<[RenderSpan]>?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -194,10 +200,20 @@ private struct ToolText: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
+        .task(id: (language ?? "") + "\u{0}" + text) {
+            guard let language, let source, !diff, !error else { return }
+            spans = await source.highlight(text, language: language)
+        }
+    }
+
+    private var current: [RenderSpan]? {
+        guard let language, let source else { return nil }
+        return (source.cachedHighlight(text, language: language) ?? spans)?.value
     }
 
     @ViewBuilder private var content: some View {
         if diff { Text(toolDiffText(text)) }
+        else if !error, let current { Text(highlighted(text, current)).foregroundStyle(VerdeTheme.text) }
         else { Text(text).foregroundStyle(error ? VerdeTheme.danger : VerdeTheme.text) }
     }
 }
@@ -233,6 +249,7 @@ struct ToolGroupCard: View {
     let subagent: Bool
     let turnStartedAt: Int64?
     let disclosure: DisclosureStore
+    var source: HighlightSource? = nil
     @Environment(\.compactChat) private var compact
 
     var body: some View {
@@ -258,7 +275,7 @@ struct ToolGroupCard: View {
         VStack(spacing: 0) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                 if index > 0 { Divider().overlay(VerdeTheme.border.opacity(0.6)).padding(.leading, compact ? 0 : 42) }
-                ToolCard(row: row, child: true, disclosure: disclosure)
+                ToolCard(row: row, child: true, disclosure: disclosure, source: source)
             }
         }
         .padding(.leading, compact ? 12 : 0).padding(.bottom, compact ? 2 : 4)

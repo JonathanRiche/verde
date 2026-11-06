@@ -244,21 +244,28 @@ func styledText(_ text: String, _ ranges: [StyledRange]) -> AttributedString {
     return out
 }
 
-/// Syntax colours for K-11 token kinds (nil: unstyled).
-func tokenAttributes(_ kind: String) -> AttributeContainer? {
-    var c = AttributeContainer()
-    func color(_ value: Color) { c[SwiftUIKeys.ForegroundColorAttribute.self] = value }
+/// The one syntax palette (S13), from theme tokens and the same as Android's: code blocks, tool
+/// output, diffs and the file viewer all use it.
+func tokenColor(_ kind: String) -> Color? {
     switch kind {
-    case "keyword": color(.accentColor); c[FoundationKeys.InlinePresentationIntentAttribute.self] = .stronglyEmphasized
-    case "string": color(Color(uiColor: .systemGreen))
-    case "number", "constant_name": color(Color(uiColor: .systemOrange))
-    case "comment": color(.secondary); c[FoundationKeys.InlinePresentationIntentAttribute.self] = .emphasized
-    case "type_name": color(Color(uiColor: .systemPurple))
-    case "function_name": color(Color(uiColor: .systemBlue))
-    case "property_name": color(Color(uiColor: .systemIndigo))
-    case "operator", "punctuation": color(.secondary)
+    case "keyword", "number", "constant_name": return VerdeTheme.heading1
+    case "string": return VerdeTheme.diffAdd
+    case "comment": return VerdeTheme.subtle
+    case "type_name": return VerdeTheme.warning
+    case "function_name": return VerdeTheme.accent
+    case "property_name": return VerdeTheme.heading3
+    case "operator", "punctuation": return VerdeTheme.muted
     default: return nil
     }
+}
+
+/// Syntax colours for K-11 token kinds (nil: unstyled).
+func tokenAttributes(_ kind: String) -> AttributeContainer? {
+    guard let value = tokenColor(kind) else { return nil }
+    var c = AttributeContainer()
+    c[SwiftUIKeys.ForegroundColorAttribute.self] = value
+    if kind == "keyword" { c[FoundationKeys.InlinePresentationIntentAttribute.self] = .stronglyEmphasized }
+    if kind == "comment" { c[FoundationKeys.InlinePresentationIntentAttribute.self] = .emphasized }
     return c
 }
 

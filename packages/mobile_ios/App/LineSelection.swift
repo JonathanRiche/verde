@@ -192,6 +192,8 @@ struct SelectableFileText: View {
     let split: FileSplit
     /// Lines a citation points at; highlighted and scrolled to.
     let target: ClosedRange<Int>?
+    /// The lines in the syntax palette, when highlighted.
+    var styled: [AttributedString]? = nil
     @Environment(\.lineSelection) private var selection
 
     var body: some View {
@@ -205,7 +207,7 @@ struct SelectableFileText: View {
                         HStack(alignment: .firstTextBaseline, spacing: 0) {
                             Text(String(number)).foregroundStyle(VerdeTheme.subtle)
                                 .frame(width: gutter - 12, alignment: .trailing).padding(.trailing, 12)
-                            Text(split.lines[index].isEmpty ? " " : split.lines[index]).foregroundStyle(VerdeTheme.text)
+                            Text(lineText(index)).foregroundStyle(VerdeTheme.text)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .font(selectableLineFont)
@@ -226,6 +228,12 @@ struct SelectableFileText: View {
             .onChange(of: ObjectIdentifier(split)) { bind() }
             .onDisappear { selection?.source = nil }
         }
+    }
+
+    private func lineText(_ index: Int) -> AttributedString {
+        if split.lines[index].isEmpty { return AttributedString(" ") }
+        if let styled, index < styled.count { return styled[index] }
+        return AttributedString(split.lines[index])
     }
 
     private func bind() {

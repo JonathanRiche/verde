@@ -73,3 +73,26 @@ final class LicenceTextTests: XCTestCase {
                        ["Copyright 2022 A", "This Font Software is licensed under the OFL."])
     }
 }
+
+/// Pass 4: one syntax palette and highlighted Read output / file lines.
+final class SyntaxPaletteTests: XCTestCase {
+    func testReadOutputIsHighlightedByExtension() {
+        let read = ToolParts(kind: "read", title: "Read", summary: "src/reconnect.ts", input: nil, output: "x", error: nil)
+        XCTAssertEqual(toolOutputLanguage(read), "ts")
+        var other = read; other.kind = "execute"
+        XCTAssertNil(toolOutputLanguage(other))
+        var bare = read; bare.summary = "Makefile"
+        XCTAssertNil(toolOutputLanguage(bare))
+    }
+
+    func testFileLinesKeepRangesThatSpanLines() {
+        let split = FileSplit("let a\n/* x\ny */ b")
+        // "let" keyword on line 1; a comment from line 2 into line 3.
+        let lines = fileStyledLines(split, [DiffRange(start: 0, end: 3, kind: "keyword"), DiffRange(start: 6, end: 15, kind: "comment")])
+        XCTAssertEqual(lines.map { String($0.characters) }, ["let a", "/* x", "y */ b"])
+        XCTAssertEqual(lines[0].runs.count, 2)
+        XCTAssertEqual(lines[2].runs.count, 2)
+        XCTAssertNotNil(tokenColor("keyword"))
+        XCTAssertNil(tokenColor("unknown"))
+    }
+}
