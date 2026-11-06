@@ -87,6 +87,9 @@ enum ComposerPicker: String, CaseIterable, Identifiable {
 /// A draft image's name in the strip, the same as Android: "Photo" alone, else "Photo 3".
 func composerImageName(index: Int, of count: Int) -> String { count > 1 ? "Photo \(index + 1)" : "Photo" }
 
+/// What VoiceOver reads for a draft image (S44): "Photo 3 of 16", or "Photo" alone.
+func composerImageSpokenName(index: Int, of count: Int) -> String { count > 1 ? "Photo \(index + 1) of \(count)" : "Photo" }
+
 /// "16 photos" above the strip.
 func composerImageCount(_ count: Int) -> String { count == 1 ? "1 photo" : "\(count) photos" }
 

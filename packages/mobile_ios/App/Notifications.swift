@@ -198,10 +198,13 @@ struct NotificationSettingsSection: View {
     @Environment(\.openURL) private var openURL
 
     var body: some View {
+        // S50: no section at all when this build can't do push (nothing to act on).
+        if registry.available { section }
+    }
+
+    private var section: some View {
         TitledSection("Notifications") {
-            if !registry.available {
-                Text("Push notifications aren't available in this build.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
-            } else {
+            do {
                 switch registry.authorization {
                 case .authorized:
                     LabeledContent("Notifications", value: "On")

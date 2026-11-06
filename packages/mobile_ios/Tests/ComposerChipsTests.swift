@@ -47,10 +47,14 @@ final class ComposerChipsTests: XCTestCase {
         let withDefault = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
         XCTAssertEqual(composerModelLabel(withDefault, value: nil, defaultLabel: "Opus 5.5"), "Opus 5.5")
         XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Auto")
-        XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: "Opus 5.5"), "Default (Opus 5.5)")
+        // S45: one "Opus 5.5 (default)" row; the default entry folds into it.
+        XCTAssertEqual(composerPickerLabel(.model, withDefault[1], defaultModel: "Opus 5.5"), "Opus 5.5 (default)")
         XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: nil), "Default")
-        XCTAssertEqual(composerPickerLabel(.model, withDefault[1], defaultModel: "Opus 5.5"), "Opus 5.5")
-        XCTAssertEqual(newChatMenuLabel("Model", withDefault[0], defaultModel: "Opus 5.5"), "Default (Opus 5.5)")
+        let folded = modelPickerRows(withDefault, current: "default", defaultModel: "Opus 5.5")
+        XCTAssertEqual(folded.rows.map(\.id), ["opus"])
+        XCTAssertEqual(folded.current, "opus", "nothing chosen: the default model's row is current")
+        XCTAssertEqual(modelPickerRows(withDefault, current: "default", defaultModel: nil).rows.count, 2, "unnamed: the default row stays")
+        XCTAssertEqual(newChatMenuLabel("Model", withDefault[1], defaultModel: "Opus 5.5"), "Opus 5.5 (default)")
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "off", label: "Normal")), "Standard (default)")
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "on", label: "Fast")), "Fast")
         XCTAssertEqual(composerPickerLabel(.access, access[1]), "Full access (default)")
@@ -182,5 +186,6 @@ final class ComposerImageLimitTests: XCTestCase {
         XCTAssertEqual(composerImageName(index: 0, of: 1), "Photo")
         XCTAssertEqual(composerImageName(index: 15, of: 16), "Photo 16")
         XCTAssertEqual(composerImageCount(16), "16 photos")
+        XCTAssertEqual(composerImageSpokenName(index: 2, of: 16), "Photo 3 of 16")
     }
 }

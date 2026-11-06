@@ -454,7 +454,7 @@ struct WorkspaceScreen: View {
                     large: false, isRoot: false) { _, now in
             if let workspace {
                 ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
-                if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
+                // S49: no raw path on the screen; Copy path stays in the workspace's menu.
                 ExplorerLinks(onChanges: { openRoute(.changes(workspaceID)) }, onFiles: { openRoute(.files(workspaceID)) })
                 TitledSection("Panes") {
                     let panes = visiblePanes(workspace.panes, hidden: hidden)

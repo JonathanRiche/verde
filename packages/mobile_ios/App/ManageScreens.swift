@@ -184,9 +184,13 @@ struct NewChatScreen: View {
             let catalogs = manage.view?.new_chat.catalogs
             let resolved = label == "Model" ? catalogs?.default_model_label : label == "Effort" ? catalogs?.default_effort_label : nil
             let shown = newChatChoiceLabel(label, value: value, choices: choices, defaultLabel: resolved)
+            // S45: the model's default row folds into the model it runs.
+            let folded = label == "Model" ? modelPickerRows(choices, current: value?.isEmpty == false ? value! : "default",
+                                                            defaultModel: catalogs?.default_model_label) : (choices, "")
             Menu {
-                ForEach(choices, id: \.id) { item in
-                    let current = newChatIsCurrent(label, item: item, value: value, choices: choices)
+                ForEach(folded.0, id: \.id) { item in
+                    let current = label == "Model" && folded.0.count < choices.count ? item.id == folded.1
+                        : newChatIsCurrent(label, item: item, value: value, choices: choices)
                     // S35: the default row reads "<value> (default)" in every menu and picker.
                     let title = newChatMenuLabel(label, item, defaultModel: catalogs?.default_model_label) + (item.favorite ? " ★" : "")
                     Button { Task { await manage.select(workspace, update(item.id)) } } label: {

@@ -92,16 +92,16 @@ struct LiveSetupCard: View {
             Text(liveSetupTitle).font(VerdeTheme.ui(15, bold: true)).accessibilityAddTraits(.isHeader)
             Text(liveSetupBody).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.text)
                 .fixedSize(horizontal: false, vertical: true)
+            // S46: a tonal "Not now" and a filled primary, one height (as on Android).
             HStack(spacing: 8) {
                 Spacer(minLength: 0)
                 Button("Not now", action: close)
-                    .font(VerdeTheme.ui(14, bold: true)).foregroundStyle(VerdeTheme.accent)
-                    .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
-                    .buttonStyle(.plain)
-                Button("Open Companion settings", action: setup)
                     .buttonStyle(TonalButtonStyle(fullWidth: false))
+                Button("Open Companion settings", action: setup)
+                    .buttonStyle(PrimaryButtonStyle(fullWidth: false))
                     .accessibilityHint("Add a live voice provider key.")
             }
+            .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
         .frame(maxWidth: 420, alignment: .leading)

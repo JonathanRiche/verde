@@ -58,6 +58,7 @@ final class LiveVoice {
     }
 
     var active: Bool { phase == .connecting || phase == .live }
+    @ObservationIgnored private var starting = false
     var failure: String? { if case .failed(let message) = phase { return message }; return nil }
     /// The failure is fixed in Companion settings (no voice key, or a rejected one), not by retrying.
     private(set) var failureNeedsSetup = false
@@ -107,10 +108,27 @@ final class LiveVoice {
 
     // MARK: Lifecycle
 
-    func toggle() { if active { end() } else { Task { await start() } } }
+    /// S46: Connecting shows in the same transaction as the tap, and a stale dictation notice
+    /// ("Didn't catch that") goes with it.
+    func toggle() {
+        if active { end(); return }
+        speech.notice = nil
+        connectingNow()
+        Task { await start() }
+    }
+
+    /// Shows Connecting at once; `start` then runs from that state.
+    private func connectingNow() {
+        guard phase != .connecting else { return }
+        phase = .connecting
+        notice = nil
+    }
 
     func start() async {
-        guard !active else { return }
+        // `toggle` may already show Connecting; only a start in progress or a live call stops this one.
+        guard !starting && phase != .live else { return }
+        starting = true
+        defer { starting = false }
         // Suspended first: push-to-talk and reading aloud stop without deactivating the session on
         // the main thread, since Live takes it over.
         speech.suspended = true

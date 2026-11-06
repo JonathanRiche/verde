@@ -19,8 +19,9 @@ func composerDefaultMarked(_ label: String) -> String { label + " (default)" }
 let defaultAccessID = "full_access"
 
 /// The empty field's placeholder: while a reply runs it says what Send does instead.
-func composerPlaceholder(_ kind: FollowupKind?) -> String {
-    kind.map { $0.hint + "…" } ?? "Ask anything, or use / for commands and @ to search files."
+func composerPlaceholder(_ kind: FollowupKind?, short: Bool = false) -> String {
+    // S49: at the accessibility sizes the long hint can't fit; "Ask anything" does.
+    kind.map { $0.hint + "…" } ?? (short ? "Ask anything" : "Ask anything, or use / for commands and @ to search files.")
 }
 
 /// The line under the controls while a reply runs. The empty field's placeholder already says
@@ -211,18 +212,28 @@ func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
 func composerPickerLabel(_ kind: ComposerPicker, _ choice: ChatChoice, defaultModel: String? = nil) -> String {
     switch kind {
     case .effort: return isDefaultChoice(choice.id) ? composerDefaultMarked("Auto") : choice.label
-    // The model's default row reads like desktop and Android: "Default (Opus 5.5)", or "Default"
-    // when the host doesn't name it; the explicit "Opus 5.5" row stays its own entry.
+    // S45: one row for the default model, "Opus 5.5 (default)"; the default entry folds into the
+    // model it runs (`modelPickerRows`), so "Opus 5.5" is never listed twice. Unnamed: "Default".
     case .model:
-        guard isDefaultChoice(choice.id) else { return choice.label }
-        guard let defaultModel, !defaultModel.isEmpty else { return "Default" }
-        return "Default (\(defaultModel))"
+        guard let defaultModel, !defaultModel.isEmpty else { return isDefaultChoice(choice.id) ? "Default" : choice.label }
+        if isDefaultChoice(choice.id) || choice.label == defaultModel { return composerDefaultMarked(defaultModel) }
+        return choice.label
     case .speed:
         guard choice.id == "off" || choice.id == "on" else { return choice.label }
         return choice.id == "off" ? composerDefaultMarked(composerSpeedLabel(choice.id)) : composerSpeedLabel(choice.id)
     case .access: return choice.id == defaultAccessID ? composerDefaultMarked(choice.label) : choice.label
     case .provider: return choice.label
     }
+}
+
+/// S45: the model picker's rows and current row. When the catalog lists the model the default
+/// runs, the default entry folds into it: one "Opus 5.5 (default)" row, current while nothing is
+/// chosen (choosing it picks that model). Otherwise the default entry stays.
+func modelPickerRows(_ choices: [ChatChoice], current: String, defaultModel: String?) -> (rows: [ChatChoice], current: String) {
+    guard let defaultModel, !defaultModel.isEmpty,
+          let named = choices.first(where: { !isDefaultChoice($0.id) && $0.label == defaultModel }) else { return (choices, current) }
+    let rows = choices.filter { !isDefaultChoice($0.id) }
+    return (rows, isDefaultChoice(current) ? named.id : current)
 }
 
 /// The option a picker marks as current: the selection, else what an unset value means.
@@ -387,8 +398,8 @@ struct ChatComposer: View {
         .onDisappear { model.flushNow() }
         .sheet(item: $picker) { kind in
             NavigationStack {
-                let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
-                List(sortedChoices(kind), id: \.id) { choice in
+                let (rows, current) = pickerRows(kind)
+                List(rows, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: { pickerRow(kind, choice, current: current) }
                         .disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { BarButton("Done", bold: true) { picker = nil } }
@@ -469,11 +480,14 @@ struct ChatComposer: View {
                                     Image(uiImage: image).resizable().scaledToFit().frame(width: 44, height: 44).accessibilityHidden(true)
                                 }
                                 Text(name).font(VerdeTheme.ui(12))
+                                    .accessibilityLabel(composerImageSpokenName(index: index, of: attachments.count))
                                 Button { model.detach(item.local_id) } label: {
                                     Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.muted).minTarget()
                                 }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Remove \(name)").disabled(model.busy || model.pending)
+                                // S44: "Remove photo 3 of 16".
+                                .accessibilityLabel("Remove " + composerImageSpokenName(index: index, of: attachments.count).lowercased())
+                                .disabled(model.busy || model.pending)
                             }
                         }
                     }
@@ -504,7 +518,7 @@ struct ChatComposer: View {
                 .frame(height: promptHeight)
                 .overlay(alignment: .topLeading) {
                     if model.text.isEmpty {
-                        Text(composerPlaceholder(followupKind))
+                        Text(composerPlaceholder(followupKind, short: dynamicTypeSize.isAccessibilitySize))
                             .font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.subtle).allowsHitTesting(false).accessibilityHidden(true)
                     }
                 }
@@ -794,6 +808,13 @@ struct ChatComposer: View {
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
     private func sortedChoices(_ kind: ComposerPicker) -> [ChatChoice] { choices(kind).sorted { $0.favorite && !$1.favorite } }
 
+    /// The rows a picker lists and the current one (S45 folds the model's default row).
+    private func pickerRows(_ kind: ComposerPicker) -> (rows: [ChatChoice], current: String) {
+        let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
+        guard kind == .model else { return (sortedChoices(kind), current) }
+        return modelPickerRows(sortedChoices(kind), current: current, defaultModel: model.view?.catalogs.default_model_label)
+    }
+
     private func pickerRow(_ kind: ComposerPicker, _ choice: ChatChoice, current: String) -> some View {
         PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: pickerChoice(kind, choice), selected: choice.id == current,
                   subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
@@ -802,7 +823,7 @@ struct ChatComposer: View {
     /// I11-4: on regular widths a picker is a popover on its chip, as tall as its rows (up to a
     /// cap, then it scrolls, its indicator flashing so more rows read as more).
     private func pickerPopover(_ kind: ComposerPicker) -> some View {
-        let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
+        let (rows, current) = pickerRows(kind)
         return VStack(spacing: 0) {
             HStack {
                 Text(kind.rawValue.capitalized).font(VerdeTheme.ui(15, bold: true)).accessibilityAddTraits(.isHeader)
@@ -812,7 +833,7 @@ struct ChatComposer: View {
             Divider().overlay(VerdeTheme.border)
             ScrollView {
                 VStack(spacing: 0) {
-                    ForEach(sortedChoices(kind), id: \.id) { choice in
+                    ForEach(rows, id: \.id) { choice in
                         Button { model.select(kind, choice.id); anchored = nil } label: {
                             pickerRow(kind, choice, current: current).padding(.horizontal, 16).padding(.vertical, 4)
                         }.buttonStyle(.plain).disabled(!choice.enabled)
