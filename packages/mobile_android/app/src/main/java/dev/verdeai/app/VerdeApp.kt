@@ -122,7 +122,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val companion: CompanionModel = viewModel(key = "companion", factory = viewModelFactory { initializer { CompanionModel(hosts, browse.state) } })
     var threadAction by remember { mutableStateOf<Pair<ThreadSummary, String>?>(null) }
     fun open(route: String, tab: Boolean = false) {
-        if (tab) nav.tab(route) else nav.navigate(route) { launchSingleTop = true }
+        // F4: a drawer jump goes on top of Home, never on a tab visited long before, so Back from
+        // the chat it opened lands on Home (the navigation path), not a stale Settings or Hosts.
+        if (tab) nav.tab(route) else nav.navigate(route) {
+            popUpTo(nav.graph.findStartDestination().id) { saveState = false }
+            launchSingleTop = true
+        }
         scope.launch { drawer.close() }
     }
     // D-14: a notification opens its thread once its host is the selected one.
@@ -366,7 +371,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         AdaptiveShellFrame(panes,
             sidebar = { workspaceDrawer(true, true, { sidebarCollapsed = true }, dockState?.let { { CompanionDock(it) } }) },
             rail = { SidebarRail(onExpand = { sidebarCollapsed = false }, onNewChat = { open(ManageRoutes.newChat(null)) },
-                dock = dockState?.let { { CompanionRailDock(it) } }) },
+                dock = dockState?.let { { CompanionRailDock(it) } }, currentTab = currentTab, onTab = { open(it, tab = true) },
+                onSettings = LocalAppLockControls.current?.let { { open(Routes.SECURITY) } }) },
             moss = { companionPanel(panes.moss) }) {
         Scaffold(
             contentWindowInsets = contentWindowInsets(tier, panes),

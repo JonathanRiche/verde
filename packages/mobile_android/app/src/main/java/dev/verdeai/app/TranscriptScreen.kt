@@ -41,6 +41,9 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.semantics
@@ -200,8 +203,10 @@ internal fun TranscriptScreen(
     val jump = remember { TranscriptJump() }
     // A8-6: where Shift+Tab lands when it leaves the top of the transcript (the header's last control).
     val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val tabletop = rememberTabletopHinge()
+    val columnBounds = remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Box(Modifier.fillMaxSize()) {
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().then(if (tabletop != null) Modifier.onGloballyPositioned { columnBounds.value = it.boundsInWindow() } else Modifier)) {
         VerdeTopBar(
             title = {
                 // S10: [back] [drawer] title over the provider's name … [companion] [⋯], the same on every launch.
@@ -209,7 +214,8 @@ internal fun TranscriptScreen(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ProviderGlyph(provider)
                     Column {
-                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = 1,
+                        // F6: on narrow screens (the Fold's cover screen) a long title takes a second line.
+                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = if (tier.wide) 1 else 2,
                             overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
                         provider?.let { id -> Text(PROVIDERS.find { it.first == id }?.second ?: id.replaceFirstChar { it.uppercase() }, maxLines = 1,
                             style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted) }
@@ -296,6 +302,16 @@ internal fun TranscriptScreen(
         // message (not the oldest one on screen); within the composer it moves back as usual.
         val backScope = rememberCoroutineScope()
         var composerFocused by remember { mutableStateOf(false) }
+        // F7: half-opened with a horizontal fold (tabletop), the transcript ends at the hinge and the
+        // composer and its controls sit below it; nothing crosses the fold.
+        val lower = tabletop?.let { (hingeTop, hingeBottom) ->
+            val density = LocalDensity.current
+            val bottom = columnBounds.value?.bottom ?: return@let null
+            if (hingeTop <= (columnBounds.value?.top ?: 0f) || hingeBottom >= bottom) return@let null
+            with(density) { (hingeBottom - hingeTop).toDp() to (bottom - hingeBottom).toDp() }
+        }
+        if (lower != null) Spacer(Modifier.height(lower.first))
+        Column(if (lower != null) Modifier.fillMaxWidth().height(lower.second) else Modifier.fillMaxWidth()) {
         // U1: running background commands stay in view above the composer.
         state.thread?.background_tasks?.takeIf { it.isNotEmpty() }?.let { tasks -> RunningTasksBar(tasks) { jump.target = it } }
         Box(Modifier.fillMaxWidth().onFocusChanged { composerFocused = it.hasFocus }.onPreviewKeyEvent { event ->
@@ -312,6 +328,7 @@ internal fun TranscriptScreen(
             back
         }.focusGroup()) {
             CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
+        }
         }
     }
     gitChanges?.let { GitChangesLayer(it) }
@@ -376,6 +393,26 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     }
     val newest = reversed.firstOrNull()?.key
     LaunchedEffect(newest, reversed.size) { if (follow && reversed.isNotEmpty()) list.scrollToItem(0) }
+    // F3: across a fold/unfold (activity recreation) the list comes back on the same row and offset,
+    // found by the row's key: the restored index alone drifted a row toward older content.
+    var anchorKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var anchorOffset by rememberSaveable { mutableIntStateOf(0) }
+    val currentItems by rememberUpdatedState(reversed)
+    var anchored by remember { mutableStateOf(false) }
+    LaunchedEffect(list) {
+        snapshotFlow { Triple(anchored, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset) }.collect { (ready, index, offset) ->
+            // Only after the restore below, so the restored (drifted) index can't overwrite the anchor.
+            if (ready) currentItems.getOrNull(index)?.key?.let { anchorKey = it; anchorOffset = offset }
+        }
+    }
+    LaunchedEffect(reversed.isNotEmpty()) {
+        if (anchored || reversed.isEmpty()) return@LaunchedEffect
+        anchored = true
+        val key = anchorKey ?: return@LaunchedEffect
+        if (follow) return@LaunchedEffect
+        val index = reversed.indexOfFirst { it.key == key }
+        if (index >= 0 && (index != list.firstVisibleItemIndex || anchorOffset != list.firstVisibleItemScrollOffset)) list.scrollToItem(index, anchorOffset)
+    }
     // U1: the running-tasks bar scrolls to a task's row.
     LaunchedEffect(jump?.target) {
         val id = jump?.target ?: return@LaunchedEffect

@@ -419,7 +419,8 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 ProviderGlyph(provider, Modifier.size(14.dp))
-                Text(label, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.MiddleEllipsis)
+                // F6: a long brain name wraps rather than losing its middle.
+                Text(label, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
         return
@@ -668,7 +669,9 @@ internal fun chipShort(picker: ComposerPicker, value: String): String = when (pi
  */
 internal fun pickerRowLabel(kind: ComposerPicker, choice: ChatChoice, c: ChatCatalogs? = null): String = when (kind) {
     ComposerPicker.Effort -> if (isDefaultChoice(choice.id)) defaultMarked("Auto") else choice.label
-    ComposerPicker.Model -> if (isDefaultChoice(choice.id)) defaultMarked(c?.default_model_label?.takeIf { it.isNotBlank() } ?: "Auto") else choice.label
+    // F5: the desktop's wording for the default model row: "Default (Opus 5.5)", so it doesn't read as
+    // a duplicate of the explicit "Opus 5.5" row below it.
+    ComposerPicker.Model -> if (isDefaultChoice(choice.id)) c?.default_model_label?.takeIf { it.isNotBlank() }?.let { "Default ($it)" } ?: "Default" else choice.label
     ComposerPicker.Speed -> when (choice.id) { "off" -> defaultMarked("Standard"); "on" -> "Fast"; else -> choice.label }
     ComposerPicker.Access -> if (choice.id == DEFAULT_ACCESS) defaultMarked(choice.label) else choice.label
     else -> choice.label
@@ -862,11 +865,31 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         ComposerPicker.Access -> Triple("Access", c.access, effectiveAccess(s.access))
         ComposerPicker.Speed -> Triple("Speed", c.speeds, s.speed ?: c.speeds.firstOrNull()?.id)
     }
-    ModalBottomSheet(onDismissRequest = onDismiss, modifier = Modifier.testTag(COMPOSER_PICKER)) {
+    // F5: on wide windows (the unfolded Fold, tablets) the choices open as a menu over the composer,
+    // inside the chat pane, instead of a sheet centred across the whole window over the sidebar.
+    if (LocalWindowTier.current.wide) {
+        DropdownMenu(expanded = true, onDismissRequest = onDismiss,
+            modifier = Modifier.widthIn(min = 280.dp, max = 380.dp).heightIn(max = 480.dp).testTag(COMPOSER_PICKER)) {
+            LiveOverMenu()
+            Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            Column(Modifier.selectableGroup()) { PickerRows(kind, choices, current, c, provider, onPick) }
+        }
+        return
+    }
+    // The list scrolls inside a fully expanded sheet, so the last choice is never cut off.
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        modifier = Modifier.testTag(COMPOSER_PICKER)) {
         LiveOverModal()
         Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-        LazyColumn(Modifier.fillMaxWidth().padding(bottom = 16.dp).selectableGroup()) {
-            items(choices, key = { it.id }) { choice ->
+        Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(bottom = 16.dp).selectableGroup()) {
+            PickerRows(kind, choices, current, c, provider, onPick)
+        }
+    }
+}
+
+@Composable
+private fun PickerRows(kind: ComposerPicker, choices: List<ChatChoice>, current: String?, c: ChatCatalogs, provider: String?, onPick: (String) -> Unit) {
+        choices.forEach { choice -> key(choice.id) {
                 val selected = choice.id == current
                 // The Default row names what it resolves to, when the core knows (iOS wording).
                 val subtitle = when {
@@ -902,7 +925,6 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                 )
             }
         }
-    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

@@ -5,11 +5,17 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -151,7 +157,8 @@ internal fun contentWindowInsets(tier: WindowTier, panes: ShellPanes): WindowIns
 
 /** The collapsed sidebar: expand, new chat and Moss stay reachable while content gets nearly the full width. */
 @Composable
-internal fun SidebarRail(onExpand: () -> Unit, onNewChat: () -> Unit, dock: (@Composable ColumnScope.() -> Unit)?) {
+internal fun SidebarRail(onExpand: () -> Unit, onNewChat: () -> Unit, dock: (@Composable ColumnScope.() -> Unit)?,
+    currentTab: String = "", onTab: (String) -> Unit = {}, onSettings: (() -> Unit)? = null) {
     Column(Modifier.fillMaxHeight().background(VerdeColors.Panel)
         .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Start + WindowInsetsSides.Vertical))
         .width(SIDEBAR_RAIL_WIDTH), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -159,6 +166,17 @@ internal fun SidebarRail(onExpand: () -> Unit, onNewChat: () -> Unit, dock: (@Co
         IconButton(onClick = onNewChat, modifier = Modifier.named("New chat")) { Icon(Icons.Filled.Add, null) }
         Spacer(Modifier.weight(1f))
         dock?.invoke(this)
+        // F8: the collapsed rail keeps the four destinations (icons only), so they stay one tap away.
+        @Composable fun tab(label: String, icon: androidx.compose.ui.graphics.painter.Painter, active: Boolean, go: () -> Unit) {
+            IconButton(onClick = go, modifier = Modifier.background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                .named(label).semantics { selected = active }) {
+                Icon(icon, contentDescription = null, tint = if (active) VerdeColors.AccentHi else VerdeColors.Muted)
+            }
+        }
+        tab("Home", androidx.compose.ui.graphics.vector.rememberVectorPainter(Icons.Filled.Home), currentTab == Routes.HOME) { onTab(Routes.HOME) }
+        tab("Workspaces", androidx.compose.ui.res.painterResource(R.drawable.ic_folder), currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
+        tab("Hosts", androidx.compose.ui.res.painterResource(R.drawable.host_machine), currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
+        onSettings?.let { tab("Settings", androidx.compose.ui.res.painterResource(R.drawable.ic_settings), currentTab == Routes.SECURITY, it) }
     }
 }
 
@@ -175,3 +193,25 @@ internal fun TranscriptItemFrame(item: TranscriptItem, content: @Composable () -
 }
 
 internal fun transcriptItemGoesWide(item: TranscriptItem): Boolean = item is TranscriptItem.Diff
+
+/**
+ * F7: the hinge (top, bottom in window px) while the device is half-opened with a horizontal fold
+ * (tabletop); null otherwise, or where Jetpack WindowManager reports no folding feature.
+ */
+@Composable
+internal fun rememberTabletopHinge(): Pair<Float, Float>? {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val activity = remember(context) {
+        generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull()
+    } ?: return null
+    val layouts = remember(activity) {
+        runCatching { androidx.window.layout.WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity) }
+            .getOrElse { kotlinx.coroutines.flow.emptyFlow() }
+    }
+    val info by layouts.collectAsState(initial = null)
+    val fold = info?.displayFeatures?.filterIsInstance<androidx.window.layout.FoldingFeature>()?.firstOrNull {
+        it.state == androidx.window.layout.FoldingFeature.State.HALF_OPENED &&
+            it.orientation == androidx.window.layout.FoldingFeature.Orientation.HORIZONTAL
+    } ?: return null
+    return fold.bounds.top.toFloat() to fold.bounds.bottom.toFloat()
+}

@@ -67,8 +67,9 @@ class ComposerLabelsTest {
         assertEquals("GPT-6.1 Sol", chipShort(ComposerPicker.Model, "GPT-6.1 Sol"))
         // S35: one wording on both platforms: "<value> (default)", never a bare "Default".
         assertEquals("Auto (default)", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
-        assertEquals("Opus 5.5 (default)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
-        assertEquals("Auto (default)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
+        // F5: the model's default row uses the desktop wording.
+        assertEquals("Default (Opus 5.5)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
+        assertEquals("Default", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
         assertEquals("Standard (default)", pickerRowLabel(ComposerPicker.Speed, ChatChoice("off", "Normal")))
         assertEquals("Fast", pickerRowLabel(ComposerPicker.Speed, ChatChoice("on", "Fast")))
         assertEquals("Full access (default)", pickerRowLabel(ComposerPicker.Access, ChatChoice("full_access", "Full access")))

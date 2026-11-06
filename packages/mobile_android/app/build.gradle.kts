@@ -132,6 +132,8 @@ dependencies {
     implementation(libs.navigation.compose)
     implementation(libs.coroutines)
     implementation(libs.datastore)
+    // F7: folding features (tabletop posture) on foldables.
+    implementation(libs.window)
     implementation(libs.okhttp)
     // Messaging only (D-14): no Analytics or Crashlytics. FirebaseApp is initialized manually.
     implementation(platform(libs.firebase.bom))
