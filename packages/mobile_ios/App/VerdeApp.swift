@@ -209,7 +209,9 @@ struct RootView: View {
 
     private func panesFor(width: CGFloat) -> AdaptivePanes {
         AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek,
-                      sidebarWidth: adaptiveSidebarWidth(dynamicTypeSize, window: width))
+                      sidebarWidth: adaptiveSidebarWidth(dynamicTypeSize, window: width),
+                      // Moss's header and chips need more room at the accessibility sizes.
+                      mossPaneWidth: dynamicTypeSize.isAccessibilitySize ? 400 : AdaptivePanes.mossPaneWidth)
     }
     private var currentPanes: AdaptivePanes { panesFor(width: windowWidth) }
 

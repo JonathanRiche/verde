@@ -172,6 +172,12 @@ private struct CompanionHeader: View {
     let showScheduled: () -> Void
     let openSettings: () -> Void
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    /// Name and status side by side; stacked at the accessibility sizes so neither truncates.
+    private var nameLayout: AnyLayout {
+        dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+    }
 
     var body: some View {
         let presence = model.presence
@@ -189,7 +195,7 @@ private struct CompanionHeader: View {
         let companions = model.roster?.companions ?? []
         HStack(spacing: 8) {
             CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
-            HStack(spacing: 0) {
+            nameLayout {
                 Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1)
                     .accessibilityLabel("\(entry.name), \(presence.status)")
                     .accessibilityAddTraits(.isHeader)

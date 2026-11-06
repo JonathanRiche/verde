@@ -77,7 +77,8 @@ struct AdaptivePanes: Equatable {
     ///   - sidebarCollapsed: the user hid the sidebar for a full-width diff or terminal.
     ///   - mossOpen: the user opened Moss; nothing else may set this.
     ///   - chatsPeek: the chat list is showing over Moss in the sidebar slot.
-    init(width: CGFloat, sidebarCollapsed: Bool, mossOpen: Bool, chatsPeek: Bool, sidebarWidth: CGFloat = AdaptivePanes.sidebarWidth) {
+    init(width: CGFloat, sidebarCollapsed: Bool, mossOpen: Bool, chatsPeek: Bool, sidebarWidth: CGFloat = AdaptivePanes.sidebarWidth,
+         mossPaneWidth: CGFloat = AdaptivePanes.mossPaneWidth) {
         let tier = AdaptiveTier(width: width)
         let moss = tier.docked && mossOpen
         let third = tier == .triple && moss
@@ -88,10 +89,10 @@ struct AdaptivePanes: Equatable {
         mossVisible = moss
         mossInSlot = false
         mossOverlay = moss && !third
-        mossWidth = Self.mossPaneWidth
-        mossLeading = moss ? max(0, width - Self.mossPaneWidth) : 0
+        mossWidth = mossPaneWidth
+        mossLeading = moss ? max(0, width - mossPaneWidth) : 0
         contentLeading = showsChats ? sidebarWidth : 0
-        contentTrailing = third ? Self.mossPaneWidth : 0
+        contentTrailing = third ? mossPaneWidth : 0
     }
 }
 
