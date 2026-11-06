@@ -16,6 +16,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -138,7 +140,8 @@ internal fun CompanionSheet(
     val state by companion.state.collectAsState()
     val browseState by browse.state.collectAsState()
     var settings by rememberSaveable { mutableStateOf(settingsRequested) }
-    LaunchedEffect(liveSettings) { if (liveSettings) { settings = true; onLiveSettingsShown() } }
+    var settingsForLive by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(liveSettings) { if (liveSettings) { settingsForLive = true; settings = true; onLiveSettingsShown() } }
     var brainOnly by rememberSaveable { mutableStateOf(false) }
     var confirmNew by rememberSaveable { mutableStateOf(false) }
     var conversations by rememberSaveable { mutableStateOf(false) }
@@ -187,7 +190,7 @@ internal fun CompanionSheet(
             SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
             // S9: a failed call explains itself here and offers its repair; it goes away with the sheet.
             if (live != null && liveUi?.phase == LivePhase.Failed) LiveFailureCard(liveUi,
-                onSettings = { live.dismissError(); settings = true }, onRetry = onLive, onClose = live::dismissError)
+                onSettings = { live.dismissError(); settingsForLive = true; settings = true }, onRetry = onLive, onClose = live::dismissError)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 val liveName = active.name.ifBlank { "your companion" }
@@ -231,7 +234,8 @@ internal fun CompanionSheet(
         LiveOverModal()
         Column(Modifier.fillMaxWidth().fillMaxHeight(.92f), content = panel)
     }
-    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript) { settings = false }
+    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript,
+        focusLive = settingsForLive) { settings = false; settingsForLive = false }
     // The current conversation's history title: its own title unless generic, else the first thing the user said.
     val currentTitle = active?.let { a ->
         val summary = workspaces.find { it.workspace_id == a.home_workspace_id }?.threads?.find { it.thread_id == a.thread_id }
@@ -614,8 +618,24 @@ private fun Suggestions(name: String, onPick: (String) -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, voice: CompanionVoice? = null,
-    live: LiveVoice? = null, transcript: TranscriptModel? = null, startOnBrain: Boolean = false, onDismiss: () -> Unit) {
+    live: LiveVoice? = null, transcript: TranscriptModel? = null, startOnBrain: Boolean = false,
+    /** A2-8: opened to repair live voice: scroll to its API keys and highlight them. */
+    focusLive: Boolean = false, onDismiss: () -> Unit) {
     var brain by remember { mutableStateOf(startOnBrain) }
+    val sheetScroll = rememberScrollState()
+    var liveTop by remember { mutableStateOf<Int?>(null) }
+    var liveHighlight by remember { mutableStateOf(focusLive) }
+    val liveMargin = with(androidx.compose.ui.platform.LocalDensity.current) { 12.dp.roundToPx() }
+    LaunchedEffect(focusLive, liveTop != null) {
+        if (!focusLive || liveTop == null) return@LaunchedEffect
+        // Let the sheet open and its sections load, then scroll the live-voice keys to the top (the
+        // newest position: sections above can still grow) and fade the highlight after a moment.
+        kotlinx.coroutines.delay(600)
+        val top = liveTop ?: return@LaunchedEffect
+        sheetScroll.animateScrollTo((top - liveMargin).coerceAtLeast(0))
+        kotlinx.coroutines.delay(2_500)
+        liveHighlight = false
+    }
     if (brain) {
         CompanionBrainSheet(companion, manage, browse, transcript) { brain = false; if (startOnBrain) onDismiss() }
         return
@@ -629,7 +649,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SETTINGS)) {
         LiveOverModal()
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
             VerdeSection("Companions")
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -653,7 +673,11 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
             }
             if (live != null) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
-                LiveVoiceSettings(live)
+                Box(Modifier.fillMaxWidth().onGloballyPositioned { liveTop = it.positionInParent().y.toInt() }
+                    .then(if (liveHighlight) Modifier.padding(horizontal = 4.dp)
+                        .border(2.dp, VerdeColors.Accent, RoundedCornerShape(12.dp)) else Modifier)) {
+                    Column { LiveVoiceSettings(live) }
+                }
             }
         }
     }
