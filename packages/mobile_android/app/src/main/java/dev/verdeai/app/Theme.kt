@@ -189,6 +189,8 @@ internal fun KeyboardFocusRing(color: Color, content: @Composable () -> Unit) {
     var moved by remember { mutableIntStateOf(0) }
     var root by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val keyboard = LocalInputModeManager.current.inputMode == InputMode.Keyboard
+    val owned = remember { FocusRingOwners() }
+    CompositionLocalProvider(LocalFocusRingOwners provides owned) {
     Box(Modifier.onGloballyPositioned { root = it; moved++ }
         .onFocusedBoundsChanged { focused = it; moved++ }
         .drawWithContent {
@@ -199,12 +201,29 @@ internal fun KeyboardFocusRing(color: Color, content: @Composable () -> Unit) {
             if (!keyboard) return@drawWithContent
             val box = host.localBoundingBoxOf(target, clipBounds = false)
             if (box.width <= 0f || box.height <= 0f) return@drawWithContent
+            // A container that shows its own focus (the composer card) owns whatever focuses inside it.
+            if (owned.areas.values.any { area -> area.isAttached && host.localBoundingBoxOf(area, clipBounds = false).let {
+                    it.left <= box.left + 1f && it.top <= box.top + 1f && it.right >= box.right - 1f && it.bottom >= box.bottom - 1f } }) return@drawWithContent
             val stroke = 2.dp.toPx()
             val square = kotlin.math.abs(box.width - box.height) < 4.dp.toPx()
             val radius = if (square) box.width / 2f else 8.dp.toPx()
             drawRoundRect(color, topLeft = Offset(box.left + stroke / 2, box.top + stroke / 2),
                 size = Size(box.width - stroke, box.height - stroke), cornerRadius = CornerRadius(radius), style = Stroke(stroke))
         }) { content() }
+    }
+}
+
+/** Containers that draw their own keyboard focus; the shared ring skips anything inside them. */
+internal class FocusRingOwners { val areas = androidx.compose.runtime.snapshots.SnapshotStateMap<Any, LayoutCoordinates>() }
+internal val LocalFocusRingOwners = staticCompositionLocalOf<FocusRingOwners?> { null }
+
+/** Marks an element whose keyboard focus its container shows (A3-1: the composer card shows the text field's). */
+@Composable
+internal fun Modifier.ownsFocusRing(): Modifier {
+    val owners = LocalFocusRingOwners.current ?: return this
+    val key = remember { Any() }
+    DisposableEffect(owners, key) { onDispose { owners.areas.remove(key) } }
+    return this.onGloballyPositioned { owners.areas[key] = it }
 }
 
 internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null }

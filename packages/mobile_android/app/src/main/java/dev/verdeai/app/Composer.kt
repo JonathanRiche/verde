@@ -206,8 +206,10 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     // Wide windows: one row of controls under a short field, lined up with the capped transcript.
     val wideRow = !compact && LocalWindowTier.current.wide
     val dense = compact || wideRow
+    // A3-1: the card is the focus indication (2dp from a keyboard), never a ring round the text field.
+    val keyboardMode = androidx.compose.ui.platform.LocalInputModeManager.current.inputMode == androidx.compose.ui.input.InputMode.Keyboard
     Surface(color = VerdeColors.Panel, shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(if (composerFocused) 1.5.dp else 1.dp,
+        border = BorderStroke(if (composerFocused) (if (keyboardMode) 2.dp else 1.5.dp) else 1.dp,
             if (composerFocused) VerdeColors.Accent else VerdeColors.PanelMuted),
         modifier = Modifier.fillMaxWidth().imePadding()
             .then(if (wideRow) Modifier.wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH + 16.dp).fillMaxWidth() else Modifier)
@@ -246,7 +248,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 BasicTextField(
                     value = composer.field,
                     onValueChange = { if (!sendPending) composer.edit(it) },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).focusRequester(fieldFocus).ownsFocusRing().testTag(COMPOSER_FIELD),
                     readOnly = sendPending,
                     decorationBox = { innerTextField ->
                         Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
@@ -308,7 +310,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                     .then(resizedHeight?.let { Modifier.height(it.dp.coerceIn(56.dp, maxFieldHeight)) }
                         ?: Modifier.heightIn(min = 56.dp))
                     .onSizeChanged { measuredHeight = it.height / density.density }
-                    .focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                    .focusRequester(fieldFocus).ownsFocusRing().testTag(COMPOSER_FIELD),
                 readOnly = sendPending,
                 decorationBox = { innerTextField ->
                     Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
