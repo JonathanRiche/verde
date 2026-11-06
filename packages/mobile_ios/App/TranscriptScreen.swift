@@ -238,12 +238,27 @@ private struct TranscriptList: View {
     }
 
     var body: some View {
-        GeometryReader { outer in
-            ScrollViewReader { proxy in
+        ScrollViewReader { proxy in
+            VStack(spacing: 0) {
+                GeometryReader { outer in list(proxy: proxy, outer: outer) }
+                // Its own strip under the transcript, so it never covers text or code (I2-1).
+                if !atBottom && !follow && !model.items.isEmpty {
+                    LatestStrip { jumpToLatest(proxy) }
+                }
+            }
+        }
+    }
+
+    private func jumpToLatest(_ proxy: ScrollViewProxy) {
+        follow = true
+        withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
+    }
+
+    private func list(proxy: ScrollViewProxy, outer: GeometryProxy) -> some View {
                 // Observe rows inside the deferred content instead of capturing
                 // a snapshot that can stay on the optimistic Sending row.
                 let items = model.items
-                ZStack(alignment: .top) {
+                return ZStack(alignment: .top) {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) {
                             PageHeader(page: page, loadOlder: { model.loadOlder(force: true) }).id(headerID)
@@ -307,28 +322,31 @@ private struct TranscriptList: View {
                         withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("approval:\(approval.turn_id):\(approval.call_id)", anchor: .center) }
                     }
 
-                    if !atBottom && !follow && !items.isEmpty {
-                        VStack {
-                            Spacer()
-                            HStack {
-                                Spacer()
-                                Button {
-                                    follow = true
-                                    withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
-                                } label: {
-                                    Image(systemName: "arrow.down").font(.body.weight(.semibold)).padding(12)
-                                        .background(.regularMaterial, in: Circle()).shadow(radius: 2)
-                                }
-                                .accessibilityLabel("Jump to latest")
-                                .padding(16)
-                            }
-                        }
-                    }
                 }
-            }
             .onAppear { viewport = outer.size.height }
             .onChange(of: outer.size.height) { _, height in viewport = height }
+    }
+}
+
+/// "Latest" under the transcript while the reader is scrolled up; a tap follows the newest output.
+private struct LatestStrip: View {
+    let jump: () -> Void
+
+    var body: some View {
+        Button(action: jump) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.down").font(.system(size: 12, weight: .semibold))
+                Text("Latest").font(VerdeTheme.ui(13, bold: true))
+            }
+            .foregroundStyle(VerdeTheme.accent)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .background(VerdeTheme.panel)
+        .overlay(alignment: .top) { Rectangle().fill(VerdeTheme.border).frame(height: 1) }
+        .accessibilityLabel("Jump to latest")
+        .accessibilityIdentifier("transcript-latest")
     }
 }
 
@@ -500,6 +518,7 @@ private struct MessageRow: View {
     let row: ChatRow
     let model: TranscriptModel
     @Environment(\.compactChat) private var compact
+    @State private var selecting = false
 
     var body: some View {
         let mine = row.role == "user"
@@ -535,9 +554,8 @@ private struct MessageRow: View {
                     AttachmentStrip(browse: model.browse, workspaceID: model.workspaceID, threadID: model.threadID, row: row, longest: 160)
                 }
                 if !shown.isEmpty {
-                    // User text is verbatim (web parity); assistant output goes through the core AST.
-                    if mine { Text(shown) .font(VerdeTheme.ui(15)).textSelection(.enabled) }
-                    else { MarkdownText(text: streamTail(row), model: model) }
+                    // Prompts and replies both go through the core's markdown AST (desktop parity).
+                    MarkdownText(text: mine ? shown : streamTail(row), model: model)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
@@ -547,9 +565,29 @@ private struct MessageRow: View {
             .overlay {
                 if steer != nil { RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.accent.opacity(0.5)) }
             }
-            .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
+            .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
         }
         .accessibilityIdentifier("message-row")
+        .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
+    }
+}
+
+/// A message's rendered text: the core's markdown as plain text, else the source.
+@MainActor func renderedPlainText(_ text: String, model: TranscriptModel) -> String {
+    guard let blocks = model.cachedMarkdown(text)?.value else { return text }
+    return markdownPlainText(blocks)
+}
+
+/// Long-press on a message: copy it, or select part of its rendered text.
+private struct MessageMenu: View {
+    let text: String
+    let model: TranscriptModel
+    @Binding var selecting: Bool
+
+    var body: some View {
+        Button { UIPasteboard.general.string = renderedPlainText(text, model: model) } label: { Label("Copy text", systemImage: "doc.on.doc") }
+        Button { UIPasteboard.general.string = text } label: { Label("Copy as Markdown", systemImage: "chevron.left.forwardslash.chevron.right") }
+        Button { selecting = true } label: { Label("Select text", systemImage: "selection.pin.in.out") }
     }
 }
 
@@ -618,6 +656,7 @@ private struct CompactMessageRow: View {
     let model: TranscriptModel
     let mine: Bool
     let shown: String
+    @State private var selecting = false
 
     var body: some View {
         let delivery = deliveryLabel(row.delivery)
@@ -630,7 +669,7 @@ private struct CompactMessageRow: View {
                 }
                 if !shown.isEmpty {
                     if mine {
-                        Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                        MarkdownText(text: shown, model: model)
                             .padding(.horizontal, 10).padding(.vertical, 8)
                             .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
                     } else {
@@ -642,7 +681,8 @@ private struct CompactMessageRow: View {
                 }
             }
             .frame(maxWidth: mine ? nil : .infinity, alignment: mine ? .trailing : .leading)
-            .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
+            .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
+            .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)

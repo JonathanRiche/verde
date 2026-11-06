@@ -376,7 +376,7 @@ private struct MarkdownTable: View {
     var body: some View {
         let columns = rows.map(\.count).max() ?? 0
         let widths = (0..<columns).map(width)
-        OverflowScroll {
+        OverflowScroll(moreLabel: "More columns") {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
                     MarkdownTableRow(cells: row, widths: widths, header: index == 0)
@@ -415,9 +415,13 @@ private struct OverflowFrameKey: PreferenceKey {
 
 /// Sideways-scrolling content with a fade on each edge that hides more of it (S3).
 struct OverflowScroll<Content: View>: View {
+    /// Shown as a small chevron badge on the trailing edge while more is off screen (tables).
+    var moreLabel: String? = nil
     @ViewBuilder let content: () -> Content
     @State private var frame: CGRect = .zero
     @State private var visible: CGFloat = 0
+
+    private var moreTrailing: Bool { overflowsTrailing(contentMaxX: frame.maxX, visible: visible) }
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -431,7 +435,30 @@ struct OverflowScroll<Content: View>: View {
         .background(GeometryReader { g in
             Color.clear.onAppear { visible = g.size.width }.onChange(of: g.size.width) { _, width in visible = width }
         })
-        .mask(OverflowFade(leading: frame.minX < -1, trailing: frame.maxX > visible + 1))
+        .mask(OverflowFade(leading: frame.minX < -1, trailing: moreTrailing))
+        .overlay(alignment: .trailing) {
+            if let moreLabel, moreTrailing { MoreBadge(label: moreLabel) }
+        }
+    }
+}
+
+/// Content runs past the visible trailing edge.
+func overflowsTrailing(contentMaxX: CGFloat, visible: CGFloat) -> Bool { visible > 0 && contentMaxX > visible + 1 }
+
+/// "More columns": a chevron on the faded edge that says the content scrolls on.
+private struct MoreBadge: View {
+    let label: String
+
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(VerdeTheme.muted)
+            .frame(width: 22, height: 22)
+            .background(VerdeTheme.panel, in: Circle())
+            .overlay(Circle().stroke(VerdeTheme.border))
+            .padding(.trailing, 4)
+            .allowsHitTesting(false)
+            .accessibilityLabel(label)
     }
 }
 
@@ -485,5 +512,69 @@ struct CodeBlock: View {
             guard let language else { return }
             spans = await source.highlight(code, language: language)
         }
+    }
+}
+
+// MARK: - Plain text
+
+/// Rendered blocks as plain text (no markdown syntax): what Select text and Copy text show.
+func markdownPlainText(_ blocks: [MdBlock]) -> String {
+    blocks.map(plainBlock).filter { !$0.isEmpty }.joined(separator: "\n\n")
+}
+
+private func plainBlock(_ block: MdBlock) -> String {
+    switch block {
+    case .paragraph(let text), .heading(_, let text): return String(text.characters)
+    case .bullets(let ordered, let items):
+        return items.enumerated().map { index, item in
+            (ordered ? "\(index + 1). " : "• ") + markdownPlainText(item).replacingOccurrences(of: "\n\n", with: "\n")
+        }.joined(separator: "\n")
+    case .quote(let blocks): return markdownPlainText(blocks)
+    case .code(let code, _): return code.hasSuffix("\n") ? String(code.dropLast()) : code
+    case .rule: return ""
+    case .table(let rows): return rows.map { $0.map { String($0.characters) }.joined(separator: "\t") }.joined(separator: "\n")
+    }
+}
+
+/// A sheet with a message's rendered text, freely selectable, plus Copy all.
+struct SelectTextSheet: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            SelectableText(text: text)
+                .background(VerdeTheme.background)
+                .navigationTitle("Select text")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                    ToolbarItem(placement: .primaryAction) { Button("Copy all") { UIPasteboard.general.string = text } }
+                }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+/// Read-only, selectable text (drag handles, Copy, Select All) in the app's body font.
+private struct SelectableText: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.backgroundColor = .clear
+        view.adjustsFontForContentSizeCategory = true
+        view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 16) ?? .systemFont(ofSize: 16))
+        view.textColor = UIColor(VerdeTheme.text)
+        view.tintColor = UIColor(VerdeTheme.accent)
+        view.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 16, right: 12)
+        view.accessibilityIdentifier = "select-text"
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        if view.text != text { view.text = text }
     }
 }
