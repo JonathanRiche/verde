@@ -107,7 +107,8 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     val hidden = LocalHiddenThreads.current
     val scoped = all.find { it.workspace_id == scope }
     // Under All Workspaces new work goes to the most recently used workspace.
-    val target = scoped?.takeIf { it.open } ?: mostRecentOpenWorkspace(all)
+    // A5-4: the open chat's (or screen's) workspace first, then the most recent one.
+    val target = scoped?.takeIf { it.open } ?: all.find { it.workspace_id == selectedWorkspace && it.open } ?: mostRecentOpenWorkspace(all)
     val filter = query.trim()
     fun matches(value: String) = filter.isEmpty() || value.contains(filter, ignoreCase = true)
     ModalDrawerSheet(drawerContainerColor = VerdeColors.Panel, drawerShape = RoundedCornerShape(0.dp),
@@ -191,24 +192,36 @@ internal const val SIDEBAR_NEW_CHAT = "sidebar-new-chat"
  * The drawer's destinations, the same four on both platforms: Home, Workspaces, Hosts, Settings.
  * Content-sized, so "Workspaces" never truncates; two per row when the drawer is narrow.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DrawerFooter(currentTab: String, onTab: (String) -> Unit, onSettings: (() -> Unit)?) {
-    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-        SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
-        SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
-        SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
-        onSettings?.let { open -> SidebarTab("Settings", false, open) }
+    val tabs = buildList<Triple<String, Boolean, () -> Unit>> {
+        add(Triple("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) })
+        add(Triple("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) })
+        add(Triple("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) })
+        onSettings?.let { add(Triple("Settings", false, it)) }
+    }
+    // A5-6: one row when the labels fit; otherwise a 2×2 grid of equal cells, never a lone wrapped tab.
+    BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+        val perRow = if (maxWidth >= 360.dp || tabs.size <= 2) tabs.size else 2
+        Column {
+            tabs.chunked(perRow).forEach { row ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    row.forEach { (label, active, onClick) -> SidebarTab(label, active, Modifier.weight(1f), onClick) }
+                    repeat(perRow - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun SidebarTab(label: String, active: Boolean, onClick: () -> Unit) {
-    Text(label, Modifier.padding(vertical = 4.dp).clip(RoundedCornerShape(7.dp))
+private fun SidebarTab(label: String, active: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Text(label, modifier.padding(vertical = 2.dp).clip(RoundedCornerShape(7.dp))
         .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
         .semantics { selected = active }.clickable(role = Role.Tab, onClick = onClick)
-        .heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 12.dp),
-        color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.bodyMedium, maxLines = 1, softWrap = false)
+        .heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 6.dp),
+        color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.bodyMedium, maxLines = 1, softWrap = false,
+        textAlign = androidx.compose.ui.text.style.TextAlign.Center, overflow = TextOverflow.Ellipsis)
 }
 
 /** Full-width scope trigger plus its context-menu popover (spec "Switcher popover"). */
