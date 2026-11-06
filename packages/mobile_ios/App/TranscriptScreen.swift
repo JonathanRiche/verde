@@ -306,7 +306,7 @@ private struct TranscriptList: View {
         let key = backgroundHighlightKey(task.row_id)
         model.disclosure.setFlag(key, true)
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(1600))
+            try? await Task.sleep(for: .milliseconds(2500))
             model.disclosure.setFlag(key, false)
         }
     }
