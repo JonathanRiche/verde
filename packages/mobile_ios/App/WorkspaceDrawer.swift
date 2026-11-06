@@ -7,7 +7,7 @@ func drawerThreads(_ workspace: Workspace, hidden: Set<String> = []) -> [ThreadS
 
 /// Switcher order: the core's recency rank (focus/activity newest first, closed untimed last).
 func switcherWorkspaces(_ items: [Workspace]) -> [Workspace] {
-    items.enumerated().sorted { ($0.element.recency_rank, $0.offset) < ($1.element.recency_rank, $1.offset) }.map(\.element)
+    dedupedWorkspaces(items).enumerated().sorted { ($0.element.recency_rank, $0.offset) < ($1.element.recency_rank, $1.offset) }.map(\.element)
 }
 
 /// Target for new chats/terminals under All Workspaces.
@@ -84,8 +84,10 @@ struct WorkspaceDrawer: View {
     var body: some View {
         let all = browse.state.workspaces?.items ?? []
         let scoped = all.first { $0.workspace_id == scope }
-        // Under All Workspaces new work goes to the most recently used workspace.
-        let target = scoped.flatMap { $0.open ? $0 : nil } ?? mostRecentOpenWorkspace(all)
+        // Under All Workspaces new work (and Changes / Files) goes to the open chat's workspace,
+        // else the most recently used one (S21).
+        let current = routeWorkspaceID(selected).flatMap { id in all.first { $0.workspace_id == id && $0.open } }
+        let target = scoped.flatMap { $0.open ? $0 : nil } ?? current ?? mostRecentOpenWorkspace(all)
         VStack(spacing: 0) {
             HStack {
                 VerdeWordmark(); Spacer()
@@ -138,16 +140,18 @@ struct WorkspaceDrawer: View {
                 HStack(spacing: 0) {
                     footerIcon("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
                     footerIcon("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                    footerIcon("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
                     footerIcon("Settings", icon: "gearshape", selected: false, action: settings)
-                    footerIcon(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
                 }.padding(.horizontal, 8)
             } else {
-                HStack {
-                    row("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
-                    row("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
-                }.padding(.horizontal, 8)
-                row("Settings", icon: "gearshape", action: settings).padding(.horizontal, 8)
-                row(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }.accessibilityIdentifier("drawer-hosts").padding(8)
+                // S22: the same four destinations as Android, in the same order.
+                HStack(spacing: 4) {
+                    footerTab("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
+                    footerTab("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                    footerTab("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
+                        .accessibilityIdentifier("drawer-hosts")
+                    footerTab("Settings", icon: "gearshape", selected: false, action: settings)
+                }.padding(.horizontal, 8).padding(.vertical, 6)
             }
         }
         .background(VerdeTheme.panel).foregroundStyle(VerdeTheme.text)
@@ -285,6 +289,24 @@ struct WorkspaceDrawer: View {
                 .background(selected ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
         }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
     }
+    /// A labelled footer destination: icon over a short name, 48 points tall.
+    private func footerTab(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                Image(systemName: icon).font(.system(size: 16))
+                Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .background(selected ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
     private func footerIcon(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon).frame(maxWidth: .infinity, minHeight: 44).contentShape(Rectangle())

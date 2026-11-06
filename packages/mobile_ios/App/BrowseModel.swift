@@ -318,6 +318,14 @@ func browseBanner(_ state: BrowseState, _ nowMs: Int64) -> Banner? {
     return nil
 }
 
+/// One row per folder (S21): the same folder closed several times shows once, open first.
+func dedupedWorkspaces(_ list: [Workspace]) -> [Workspace] {
+    var seen = Set<String>()
+    let ordered = list.filter(\.open) + list.filter { !$0.open }
+    let kept = Set(ordered.filter { seen.insert($0.path.isEmpty ? $0.workspace_id : $0.path).inserted }.map(\.workspace_id))
+    return list.filter { kept.contains($0.workspace_id) }
+}
+
 /// A workspace's name, told apart from others with the same name by its parent folder
 /// ("scripts · demo"), so identical rows never appear (S14).
 func workspaceDisplayLabel(_ workspace: Workspace, among all: [Workspace]) -> String {

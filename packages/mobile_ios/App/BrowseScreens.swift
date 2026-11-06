@@ -19,6 +19,17 @@ enum BrowseRoute: Hashable {
     case workspaceFile(workspace: String, root: String, path: String, absolute: String)
 }
 
+/// The workspace a screen belongs to, if any.
+func routeWorkspaceID(_ route: BrowseRoute?) -> String? {
+    switch route {
+    case .workspace(let id)?, .changes(let id)?, .files(let id)?: return id
+    case .thread(let workspace, _)?, .terminal(let workspace, _)?, .newTerminal(let workspace, _)?: return workspace
+    case .patch(let workspace, _, _)?, .workspaceFile(let workspace, _, _, _)?: return workspace
+    case .newChat(let id)?: return id
+    default: return nil
+    }
+}
+
 func route(_ pane: Pane) -> BrowseRoute? {
     guard openable(pane) else { return nil }
     if pane.kind == "terminal", let id = pane.terminal_id { return .terminal(workspace: pane.workspace_id, terminal: id) }
@@ -368,7 +379,7 @@ struct WorkspacesScreen: View {
     var body: some View {
         let hidden = model.companionThreads
         BrowseFrame(title: "Workspaces", model: model, actions: actions) { state, _ in
-            let all = state.workspaces?.items ?? []
+            let all = dedupedWorkspaces(state.workspaces?.items ?? [])
             if all.isEmpty {
                 NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace)
             } else {

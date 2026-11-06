@@ -131,23 +131,48 @@ private struct HostCard: View {
     @State private var renaming = false
     @State private var nickname = ""
 
+    /// Paired with nothing to review: a tap uses it.
+    private var usable: Bool { row.view?.auth_state == "paired" && row.view?.trust_proposal == nil }
+
+    private func open(_ id: String) {
+        guard usable else { model.showPairing(id); return }
+        if model.active == id || model.select(id) { onUse() }
+    }
+
     var body: some View {
         let id = row.saved.id
         let pending = row.busy || row.operation?.state == "pending"
         let failure = row.operation?.error ?? row.view?.error
         let status = hostStatus(row)
-        HStack(spacing: 8) {
-            Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityHidden(true)
-            // The status is part of the row's text, never the dot's colour alone.
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.saved.label) .font(VerdeTheme.ui(15, bold: true))
-                Text(model.active == id ? "\(status) · Selected" : status).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
-                    .accessibilityIdentifier("hostStatus")
+        // S22: a list row: tap to use the host (or review its pairing); actions in the row menu.
+        HStack(spacing: 4) {
+            Button { open(id) } label: {
+                HStack(spacing: 10) {
+                    Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityHidden(true)
+                    // The status is part of the row's text, never the dot's colour alone.
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(row.saved.label).font(VerdeTheme.ui(16, bold: true))
+                        Text(model.active == id ? "\(status) · Selected" : status).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                            .accessibilityIdentifier("hostStatus")
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: model.active == id ? "checkmark" : "chevron.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(model.active == id ? VerdeTheme.accent : VerdeTheme.subtle)
+                        .accessibilityHidden(true)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .disabled(pending || row.fatal)
             .accessibilityElement(children: .combine)
-            Spacer()
+            .accessibilityHint(usable ? (model.active == id ? "Opens Home" : "Uses this host") : "Reviews the pairing")
+            .accessibilityIdentifier("host-row-\(id)")
             Menu {
                 Button("Rename machine") { nickname = row.saved.label; renaming = true }
+                if !usable && row.view?.auth_state != "signing_out" { Button("Pair / review host") { model.showPairing(id) } }
+                if failure?.retryable == true { Button("Retry connection") { model.retry(id) } }
                 if let view = row.view, !["loading", "signed_out", "signing_out"].contains(view.auth_state) {
                     Button("Sign out", role: .destructive) { confirm(Confirmation(id: id, name: row.saved.label, forget: false)) }
                 }
@@ -175,15 +200,8 @@ private struct HostCard: View {
             Text("Local credential and host trust have been removed.")
             Button("Remove from hosts") { model.remove(id) }
             Button("Pair again") { model.showPairing(id) }
-        } else {
-            if row.view?.auth_state == "paired" && row.view?.trust_proposal == nil && model.active != id {
-                Button("Use \(row.saved.label)") { if model.select(id) { onUse() } }
-                    .modifier(PrimaryRow()).disabled(pending || row.fatal)
-            } else if row.view?.auth_state != "signing_out" {
-                Button("Pair / review host") { model.showPairing(id) }
-                    .modifier(PrimaryRow()).disabled(pending || row.fatal)
-            }
-            if failure?.retryable == true { Button("Retry connection") { model.retry(id) }.disabled(pending) }
+        } else if failure?.retryable == true {
+            Button("Retry connection") { model.retry(id) }.disabled(pending).frame(minHeight: 44)
         }
         if pending {
             VStack(alignment: .leading) {

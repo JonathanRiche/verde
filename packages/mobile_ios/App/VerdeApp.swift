@@ -149,10 +149,10 @@ struct RootView: View {
                             companionScreen(docked: false)
                             .presentationDetents([.medium, .large])
                             .presentationDragIndicator(.visible)
-                            .preferredColorScheme(appearance.scheme)
+                            .preferredColorScheme(appearance.resolvedScheme)
                         }
                         .sheet(isPresented: $companionSettings) {
-                            CompanionSettings(model: companion, browse: browse, focusLiveVoice: companionSettingsLive).preferredColorScheme(appearance.scheme)
+                            CompanionSettings(model: companion, browse: browse, focusLiveVoice: companionSettingsLive).preferredColorScheme(appearance.resolvedScheme)
                         }
                 }
             }

@@ -132,3 +132,15 @@ final class WorkspaceLabelTests: XCTestCase {
         XCTAssertTrue(workspaceDisplayLabel(same, among: [a, same]).hasPrefix("scripts · "))
     }
 }
+
+final class TruthfulListTests: XCTestCase {
+    func testTheSameFolderShowsOnce() {
+        let a = Workspace(workspace_id: "a", label: "scripts", path: "/tmp/demo/scripts", open: false, panes: [], threads: [])
+        let b = Workspace(workspace_id: "b", label: "scripts", path: "/tmp/demo/scripts", open: false, panes: [], threads: [])
+        let c = Workspace(workspace_id: "c", label: "scripts", path: "/tmp/demo/scripts", open: true, panes: [], threads: [])
+        let d = Workspace(workspace_id: "d", label: "infra", path: "/srv/infra", open: false, panes: [], threads: [])
+        XCTAssertEqual(dedupedWorkspaces([a, b, c, d]).map(\.workspace_id), ["c", "d"])
+        XCTAssertEqual(routeWorkspaceID(.thread(workspace: "w", thread: "t")), "w")
+        XCTAssertNil(routeWorkspaceID(.history))
+    }
+}
