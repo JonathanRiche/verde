@@ -334,7 +334,9 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         if (directory.suggestions.isNotEmpty()) item(key = "suggestions") {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(directory.suggestions, key = { it }) { root ->
-                    AssistChip(onClick = { manage.listDirectory(root) }, label = { Text(root, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    // Short names keep every chip whole; the row scrolls, and TalkBack reads the full path.
+                    AssistChip(onClick = { manage.listDirectory(root) }, label = { Text(basename(root).ifEmpty { root }, maxLines = 1) },
+                        modifier = Modifier.semantics { contentDescription = root })
                 }
             }
         }
@@ -363,6 +365,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
 // ---- Workspace actions ----
 
 /** New chat, rename and close/reopen for one workspace, with the latest result under the buttons. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace: Workspace, onNewChat: () -> Unit) {
     val manageState by manage.state.collectAsState()
@@ -374,11 +377,13 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
     val busy = result == JobOutcome.Pending
     val canManage = manageState.view?.can_manage_workspaces == true && !busy
     Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (workspace.open) TextButton(onClick = onNewChat, enabled = manageState.view?.can_create_threads == true) { Text("New chat") }
-            TextButton(onClick = { renaming = true }, enabled = canManage) { Text("Rename") }
-            TextButton(onClick = { styling = true }, enabled = canManage) { Text("Icon") }
-            if (workspace.open) TextButton(onClick = { closing = true }, enabled = canManage) { Text("Close") }
+        // S6: the screen's primary action is filled; the rest are secondary; closing is destructive.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(horizontal = 8.dp)) {
+            if (workspace.open) Button(onClick = onNewChat, enabled = manageState.view?.can_create_threads == true, shape = MaterialTheme.shapes.small) { Text("New chat") }
+            OutlinedButton(onClick = { renaming = true }, enabled = canManage, shape = MaterialTheme.shapes.small) { Text("Rename") }
+            OutlinedButton(onClick = { styling = true }, enabled = canManage, shape = MaterialTheme.shapes.small) { Text("Icon and color") }
+            if (workspace.open) TextButton(onClick = { closing = true }, enabled = canManage,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Close workspace") }
             else TextButton(onClick = { intent = manage.setArchived(workspace.workspace_id, false) }, enabled = canManage) { Text("Reopen") }
         }
         if (renaming) {
@@ -401,7 +406,8 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
     if (closing) {
         AlertDialog(onDismissRequest = { closing = false }, title = { LiveOverModal(); Text("Close ${workspace.label}?") },
             text = { Text("verde stops this workspace's terminals and moves it to Closed. Its chats stay in history, and you can reopen it later.") },
-            confirmButton = { TextButton(onClick = { closing = false; intent = manage.close(workspace.workspace_id) }) { Text("Close workspace") } },
+            confirmButton = { TextButton(onClick = { closing = false; intent = manage.close(workspace.workspace_id) },
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Close workspace") } },
             dismissButton = { TextButton(onClick = { closing = false }) { Text("Cancel") } })
     }
     if (styling) WorkspaceIdentityDialog(workspace, onDismiss = { styling = false }) { icon, color ->
@@ -445,18 +451,39 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
                     Text("Color", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
                     FilterChip(selected = color == null, onClick = { color = null }, label = { Text("Automatic") })
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (k in 0 until 8) {
+                // Two rows of four: every swatch keeps a 48dp target, and each has a colour name.
+                for (row in 0 until 2) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (col in 0 until 4) {
+                        val k = row * 4 + col
                         val selected = color == k
-                        Box(Modifier.weight(1f).aspectRatio(1f).testTag(IDENTITY_COLOR + k)
-                            .then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                            .padding(4.dp).background(workspaceColor(k, VerdeColors.Accent, VerdeColors.dark), CircleShape)
+                        val swatch = workspaceColor(k, VerdeColors.Accent, VerdeColors.dark)
+                        Box(Modifier.weight(1f).heightIn(min = 48.dp).testTag(IDENTITY_COLOR + k)
                             .selectable(selected = selected, role = Role.RadioButton) { color = k }
-                            .semantics { contentDescription = "Color ${k + 1}" })
+                            .semantics { contentDescription = colorName(swatch) }, contentAlignment = Alignment.Center) {
+                            Box(Modifier.size(40.dp)
+                                .then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
+                                .padding(4.dp).background(swatch, CircleShape))
+                        }
                     }
                 }
             }
         },
         confirmButton = { TextButton(onClick = { onSave(icon, color) }, enabled = changed) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
+}
+
+/** A spoken name for a workspace colour swatch ("Teal"), from its hue. */
+internal fun colorName(color: Color): String {
+    val r = color.red; val g = color.green; val b = color.blue
+    val max = maxOf(r, g, b); val min = minOf(r, g, b); val d = max - min
+    if (d < .05f) return if (max > .5f) "Grey" else "Charcoal"
+    val h = when (max) {
+        r -> 60f * (((g - b) / d).mod(6f))
+        g -> 60f * ((b - r) / d + 2f)
+        else -> 60f * ((r - g) / d + 4f)
+    }
+    return when {
+        h < 15f -> "Red"; h < 45f -> "Orange"; h < 70f -> "Yellow"; h < 100f -> "Lime"; h < 160f -> "Green"
+        h < 200f -> "Teal"; h < 250f -> "Blue"; h < 290f -> "Violet"; h < 335f -> "Pink"; else -> "Red"
+    }
 }

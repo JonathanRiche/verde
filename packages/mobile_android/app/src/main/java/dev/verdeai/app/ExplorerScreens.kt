@@ -2,6 +2,9 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -348,10 +351,16 @@ internal fun FilesScreen(model: ExplorerModel, label: String?, onOpenFile: (root
 
 @Composable
 private fun TreeLine(depth: Int, open: Boolean, folder: Boolean, name: String, detail: String?, ignored: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    Row(modifier.fillMaxWidth().clickable(onClick = onClick).alpha(if (ignored) 0.5f else 1f)
+    // S4: 48dp rows, one TalkBack stop: "name, folder, expanded" / "name, size".
+    Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClick = onClick, onClickLabel = if (!folder) "Open" else if (open) "Collapse" else "Expand")
+        .semantics(mergeDescendants = true) {
+            contentDescription = listOfNotNull(name, if (folder) "folder" else null, detail).joinToString(", ")
+            if (folder) stateDescription = if (open) "Expanded" else "Collapsed"
+        }
+        .alpha(if (ignored) 0.5f else 1f)
         .padding(start = (8 + 16 * depth).dp, end = 16.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         if (folder) Icon(if (open) Icons.Filled.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
-            contentDescription = if (open) "Collapse" else "Expand", Modifier.size(20.dp), tint = VerdeColors.Muted)
+            contentDescription = null, Modifier.size(20.dp), tint = VerdeColors.Muted)
         else Spacer(Modifier.width(20.dp))
         Spacer(Modifier.width(6.dp))
         Text(name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,

@@ -7,6 +7,12 @@ import android.graphics.Typeface
 import android.os.PersistableBundle
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
@@ -159,12 +165,27 @@ private fun copySensitive(context: android.content.Context, text: String) {
 @Composable
 private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermInput) -> Unit,
     onCtrl: () -> Unit, onAlt: () -> Unit, onPaste: () -> Unit) {
-    @Composable fun keyButton(label: String, description: String = label, input: TermInput) =
-        TextButton(onClick = { send(input) }, enabled = enabled, contentPadding = PaddingValues(horizontal = 10.dp),
-            modifier = Modifier.semantics { contentDescription = description }) { Text(label) }
-    @Composable fun toggle(label: String, on: Boolean, action: () -> Unit) =
-        FilterChip(selected = on, onClick = action, enabled = enabled, label = { Text(label) }, modifier = Modifier.padding(horizontal = 2.dp))
-    Row(Modifier.fillMaxSize().testTag("terminal-keys").horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp),
+    // One keycap style for every key (Ctrl/Alt fill with the accent while latched), in a row that
+    // scrolls sideways with an edge fade, so no key is ever squeezed or cut off.
+    @Composable fun keycap(label: String, description: String, latched: Boolean? = null, onClick: () -> Unit) {
+        val fill = if (latched == true) VerdeColors.Accent else VerdeColors.PanelAlt
+        val ink = if (latched == true) MaterialTheme.colorScheme.onPrimary else VerdeColors.Text
+        Box(Modifier.padding(horizontal = 2.dp).sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .then(if (latched != null) Modifier.toggleable(latched, enabled = enabled, role = Role.Switch) { onClick() }
+                else Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick))
+            .semantics { contentDescription = description }, contentAlignment = Alignment.Center) {
+            Box(Modifier.sizeIn(minWidth = 44.dp).height(36.dp).background(fill, RoundedCornerShape(8.dp))
+                .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)).padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
+                Text(label, style = MaterialTheme.typography.labelLarge.copy(fontFamily = VerdeMono),
+                    color = if (enabled) ink else ink.copy(alpha = .38f), maxLines = 1)
+            }
+        }
+    }
+    @Composable fun keyButton(label: String, description: String = label, input: TermInput) = keycap(label, description) { send(input) }
+    @Composable fun toggle(label: String, on: Boolean, action: () -> Unit) = keycap(label, label, latched = on, onClick = action)
+    val scroll = rememberScrollState()
+    Row(Modifier.fillMaxSize().testTag("terminal-keys").horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically) {
         keyButton("Esc", "Escape", TermInput.Key("Escape"))
         keyButton("Tab", input = TermInput.Key("Tab"))
@@ -182,7 +203,7 @@ private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermIn
         keyButton("End", input = TermInput.Key("End"))
         keyButton("PgUp", "Page up", TermInput.Key("PageUp"))
         keyButton("PgDn", "Page down", TermInput.Key("PageDown"))
-        TextButton(onClick = onPaste, enabled = enabled, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("Paste") }
+        keycap("Paste", "Paste", onClick = onPaste)
     }
 }
 
