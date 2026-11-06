@@ -79,4 +79,31 @@ class ScreenSpecTest {
         assertTrue(ImageAttachments.plausibleImageType("application/octet-stream"))
         assertFalse(ImageAttachments.plausibleImageType("video/mp4"))
     }
+
+    @Test fun picturesAreReadToTheEndHoweverShortTheReads() {
+        val data = ByteArray(200_000) { (it % 251).toByte() }
+        // A provider stream that hands out a few bytes at a time, with the odd empty read.
+        val trickle = object : java.io.InputStream() {
+            var pos = 0; var calls = 0
+            override fun read(): Int = if (pos < data.size) data[pos++].toInt() and 0xff else -1
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (pos >= data.size) return -1
+                calls++
+                if (calls % 5 == 0) return 0
+                val n = minOf(len, 1 + calls % 7, data.size - pos)
+                System.arraycopy(data, pos, b, off, n); pos += n; return n
+            }
+            override fun available() = 1
+        }
+        val read = ImageAttachments.readFully(trickle)
+        assertTrue(read != null && read.contentEquals(data))
+        assertEquals(null, ImageAttachments.readFully(java.io.ByteArrayInputStream(data), limit = 1000))
+    }
+
+    @Test fun theFooterMarksWhereYouAre() {
+        assertEquals(Routes.SECURITY, footerTab(Routes.SECURITY))
+        assertEquals(Routes.WORKSPACES, footerTab(Routes.THREAD))
+        assertEquals(Routes.HOME, footerTab(ManageRoutes.HISTORY))
+        assertEquals(Routes.HOSTS, footerTab(Routes.HOSTS))
+    }
 }
