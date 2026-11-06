@@ -15,6 +15,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.outlined.Edit
 import kotlinx.coroutines.launch
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -320,7 +321,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val dockShown = companionUp && tier.docked && panes.moss != MossPlacement.SidebarSlot
     val companionCharacter = CompanionCharacter.of(companionActive?.character)
     val companionName = companionActive?.name?.ifBlank { null } ?: companionCharacter.label
-    val companionPoseNow = companionPose(browseState.host?.phase == "ready" && browseState.networkAvailable, companionNow.needKeys.isNotEmpty(), companionNow.crewRunning)
+    val companionPoseNow = companionPose(browseState.host?.phase == "ready" && browseState.networkAvailable, companionNow.asking, companionNow.crewRunning)
     val bubbleLive = if (liveView?.supported == false) null else BubbleLive(liveUi.active, { maxOf(liveLevel, liveInput) }, ::toggleLive)
     val bubbleTalk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
         start = {
@@ -376,6 +377,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                         navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.named("Open workspace drawer")) {
                             Icon(Icons.Filled.Menu, contentDescription = null)
                         } }, actions = {
+                            // A11-1: New chat as a compose button before the host pill on Home and
+                            // Workspaces; the docked sidebar has its own "+".
+                            if (!tier.docked && (route == Routes.HOME || route == Routes.WORKSPACES) && browseState.workspaces?.items.orEmpty().any { it.open })
+                                IconButton(onClick = { nav.navigate(ManageRoutes.newChat(null)) }, modifier = Modifier.named("New chat")) {
+                                    Icon(Icons.Outlined.Edit, contentDescription = null)
+                                }
                             HostSwitcher(hosts,
                                 // Hosts lists the machines; after a switch, land on the new host's Home.
                                 onSwitched = { if (nav.currentDestination?.route == Routes.HOSTS) nav.tab(Routes.HOME) },

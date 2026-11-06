@@ -328,11 +328,6 @@ private fun stateLine(parts: List<String?>, state: String?, kind: RowState): Ann
 
 /** Working rows spin; everything else has no dot (the coloured state text carries it). */
 @Composable
-private fun RowStateMark(kind: RowState) {
-    if (kind == RowState.Working) CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = MaterialTheme.colorScheme.primary)
-}
-
-@Composable
 private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: String? = null) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val canOpen = openable(pane)
@@ -350,7 +345,6 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
             val glyph = Modifier.size(20.dp)
             if (pane.kind == "chat") ProviderGlyph(provider, glyph) else if (pane.provider != null) ProviderGlyph(pane.provider, glyph)
             else Spacer(glyph)
-            RowStateMark(kind)
         } },
         badge = attentionLabel(pane.attention_kind))
 }
@@ -368,7 +362,6 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProviderGlyph(thread.provider, Modifier.size(20.dp))
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
-            RowStateMark(kind)
         } })
 }
 
@@ -466,8 +459,8 @@ private fun WorkspaceFolderRow(workspace: Workspace, parent: String?) {
     }
 }
 
-/** r5 (iOS parity): the bottom band's height: the 56dp New chat button / bubble with 16dp around them. */
-internal val BOTTOM_BAND = 88.dp
+/** The bottom band's height: the resting 56dp bubble 16dp off the bottom, and 8dp above it (A11-1: no FAB). */
+internal val BOTTOM_BAND = 80.dp
 
 /** An opaque strip under the floating controls: rows scroll beneath it, never beneath the controls. */
 @Composable
@@ -523,7 +516,7 @@ internal fun HomeScreen(
     val now = rememberListNow(panes.any { it.can_stop && it.started_at_ms != null })
     val docked = LocalWindowTier.current.docked
     Box(Modifier.fillMaxSize()) {
-        BrowseFrame("Home", state, now, model::refresh, onHosts, band = onNewChat != null || LocalBubbleReserve.current > 0.dp) {
+        BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
             // S26: three sections from the core's state. "Needs you" is its needs_you; "Running" is a
             // live turn or process; finished chats sit in "Recent", an unread one with a neutral dot.
@@ -558,15 +551,7 @@ internal fun HomeScreen(
                 items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace, parents[it.workspace_id]) }
             } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces menu.")
         }
-        if (onNewChat != null && hasContent(state) && !needsPairing(state) && state.workspaces?.items.orEmpty().any { it.open }) {
-            // S29: the FAB's own node is named "New chat" (a Material FAB names only its child text).
-            // In the band beside the resting bubble (its side's 56dp + margins), like iOS.
-            val bubbleRight = LocalBubbleReserve.current > 0.dp && BubblePrefs.of(LocalContext.current).placement.edge == BubbleEdge.Right
-            NamedButton("New chat", onNewChat, Modifier.align(androidx.compose.ui.Alignment.BottomEnd)
-                .padding(start = 16.dp, top = 16.dp, bottom = 16.dp, end = if (bubbleRight) 80.dp else 16.dp).heightIn(min = 56.dp),
-                container = MaterialTheme.colorScheme.primaryContainer, content = MaterialTheme.colorScheme.onPrimaryContainer,
-                shape = RoundedCornerShape(16.dp), padding = PaddingValues(horizontal = 20.dp), shadow = 6.dp)
-        }
+        // A11-1: New chat is a compose button in the top app bar (VerdeApp), not a floating pill.
     }
 }
 
