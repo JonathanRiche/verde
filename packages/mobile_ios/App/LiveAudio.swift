@@ -168,6 +168,7 @@ final class LiveAudio: LiveAudioEngine, @unchecked Sendable {
     }
 
     func start(inputRate: Double) throws {
+        guard microphoneAvailable() else { throw LiveVoiceError.failed("audio") }
         let input = engine.inputNode
         do {
             try input.setVoiceProcessingEnabled(true)

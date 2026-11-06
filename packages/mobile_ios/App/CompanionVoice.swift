@@ -4,6 +4,14 @@ import Observation
 import Speech
 import UIKit
 
+/// The audio session has an input to record from. `AVAudioEngine.inputNode` aborts the app when
+/// there is none (the simulator, some routes), so callers check this first.
+func microphoneAvailable() -> Bool {
+    let audio = AVAudioSession.sharedInstance()
+    guard audio.isInputAvailable else { return false }
+    return !audio.currentRoute.inputs.isEmpty || !(audio.availableInputs ?? []).isEmpty
+}
+
 /*
  * Companion voice, phase 1: on-device speech-to-text (Speech framework, server recognition only
  * when the user allows it) and spoken replies (AVSpeechSynthesizer). Audio callbacks run off the
@@ -84,6 +92,9 @@ final class CompanionVoice {
         }
         do {
             try activateAudio()
+            // Touching `inputNode` without an input route aborts the app (the simulator has no
+            // microphone), so check the session's route first (I3-2).
+            guard microphoneAvailable() else { return fail("No microphone is available.") }
             let input = engine.inputNode
             let format = input.outputFormat(forBus: 0)
             guard format.sampleRate > 0, format.channelCount > 0 else { return fail("No microphone is available.") }
