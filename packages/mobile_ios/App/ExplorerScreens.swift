@@ -787,23 +787,42 @@ struct ExplorerLinks: View {
     /// Named only to VoiceOver ("Changes in infra"); nothing is drawn.
     var spoken: String? = nil
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
-        HStack(spacing: 8) {
-            link("Changes", icon: "plusminus", id: "explorer-changes", action: onChanges)
-            link("Files", icon: "folder", id: "explorer-files", action: onFiles)
-            if let workspace {
-                // Says which workspace the chips open when the drawer lists all of them.
-                Text("in \(workspace)").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Spacer(minLength: 0)
+        // I11-1: the chips never wrap; at the accessibility sizes the caption takes its own line.
+        if dynamicTypeSize.isAccessibilitySize, let workspace {
+            VStack(alignment: .leading, spacing: 0) {
+                chips
+                caption(workspace)
+            }
+        } else {
+            HStack(spacing: 8) {
+                chips
+                if let workspace { caption(workspace) } else { Spacer(minLength: 0) }
             }
         }
     }
 
+    private var chips: some View {
+        HStack(spacing: 8) {
+            link("Changes", icon: "plusminus", id: "explorer-changes", action: onChanges)
+            link("Files", icon: "folder", id: "explorer-files", action: onFiles)
+        }.layoutPriority(1)
+    }
+
+    /// Says which workspace the chips open when the drawer lists all of them.
+    private func caption(_ workspace: String) -> some View {
+        Text("in \(workspace)").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func link(_ title: String, icon: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label(title, systemImage: icon).font(VerdeTheme.ui(13))
+            HStack(spacing: 6) {
+                Image(systemName: icon).accessibilityHidden(true)
+                Text(title).lineLimit(1).minimumScaleFactor(0.6)
+            }.font(VerdeTheme.ui(13)).fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(VerdeTheme.alternate, in: Capsule())
                 .overlay(Capsule().stroke(VerdeTheme.border))

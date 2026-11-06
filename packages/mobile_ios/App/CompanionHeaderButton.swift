@@ -28,7 +28,7 @@ extension EnvironmentValues {
 }
 
 /// The floating bubble shows only on the top-level lists; pushed screens dock it in their top bar.
-func floatingBubbleAllowed(tab: RootTab, pathDepth: Int) -> Bool { tab == .hosts || pathDepth == 0 }
+func floatingBubbleAllowed(tab: RootTab, pathDepth: Int) -> Bool { !tab.showsBrowse || pathDepth == 0 }
 
 /// Adds the header avatar as the screen's leading trailing-bar item. Screens with a "⋯" menu
 /// place `CompanionHeaderButton` themselves, just before it.

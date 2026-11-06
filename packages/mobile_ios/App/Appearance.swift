@@ -118,11 +118,11 @@ struct HostPalette: Decodable {
 /// The Theme row's helper: what the current choice does.
 func themeHelpText(_ mode: AppearanceMode) -> String {
     switch mode {
-    case .system: return "System follows your phone's Light or Dark appearance automatically."
-    case .light: return "Light keeps verde light, whatever your phone's appearance."
-    case .dark: return "Dark keeps verde dark, whatever your phone's appearance."
+    case .system: return "System follows your device's Light or Dark appearance automatically."
+    case .light: return "Light keeps verde light, whatever your device's appearance."
+    case .dark: return "Dark keeps verde dark, whatever your device's appearance."
     case .host: return "Host theme uses the theme set in verde on your computer."
-    default: return "\(mode.label) is a fixed theme; it doesn't follow your phone's Light or Dark appearance."
+    default: return "\(mode.label) is a fixed theme; it doesn't follow your device's Light or Dark appearance."
     }
 }
 
@@ -141,10 +141,20 @@ private let bundledLicences: [(String, String)] = [
 
 /// Settings (S8): Appearance, Notifications, Security, Companion, Hosts, then About, in the same
 /// order as Android. Commit messages (read-only, set on the computer) sit after Companion.
+/// The drawer button when Settings sits in the content pane and the sidebar is hidden.
+private struct EmbeddedNavigation: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled { content.modifier(VerdeNavigation()) } else { content }
+    }
+}
+
 struct AppSettings: View {
     let lock: AppLock
     let browse: BrowseModel
     let push: PushRegistry
+    /// In the content pane beside the sidebar (I11-6): no Done, the sidebar is the way out.
+    var embedded = false
     @Environment(\.dismiss) private var dismiss
     @State private var appearance = AppearanceSettings.shared
     @AppStorage(CompanionBubbleStore.hiddenKey) private var companionBubbleHidden = false
@@ -170,7 +180,7 @@ struct AppSettings: View {
                 Section {
                     Toggle("Companion bubble", isOn: Binding(get: { !companionBubbleHidden }, set: { companionBubbleHidden = !$0 }))
                 } header: { SectionTitle("Companion") } footer: {
-                    Text("A shortcut to your companion: floating on Home and Workspaces, in the top bar elsewhere, on hosts that support it.")
+                    Text("A shortcut to your companion on hosts that support it: on Home and Workspaces, and as an avatar in the top bar of other screens.")
                         .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                 }
                 CommitSettingsSection(browse: browse)
@@ -181,7 +191,8 @@ struct AppSettings: View {
             .textCase(nil)
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
-            .toolbar { BarButton("Done", bold: true) { dismiss() } }
+            .toolbar { if !embedded { BarButton("Done", bold: true) { dismiss() } } }
+            .modifier(EmbeddedNavigation(enabled: embedded))
         }.preferredColorScheme(appearance.resolvedScheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
     }
 
@@ -189,7 +200,7 @@ struct AppSettings: View {
     private var hostsSection: some View {
         let hosts = browse.hosts
         return Section {
-            if hosts.rows.isEmpty { Text("No hosts yet. Add one from Hosts in the drawer.").foregroundStyle(VerdeTheme.muted) }
+            if hosts.rows.isEmpty { Text("No hosts yet. Add one from Hosts.").foregroundStyle(VerdeTheme.muted) }
             ForEach(hosts.rows, id: \.saved.id) { row in
                 let status = hostStatus(row)
                 let current = hosts.active == row.saved.id
@@ -212,7 +223,7 @@ struct AppSettings: View {
                 .accessibilityHint(current ? "" : "Switches to this host.")
             }
         } header: { SectionTitle("Hosts") } footer: {
-            Text("Add, rename or sign out of hosts from Hosts in the drawer.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+            Text("Add, rename or sign out of hosts from Hosts.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
         }
     }
 

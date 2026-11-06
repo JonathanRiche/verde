@@ -744,10 +744,11 @@ struct CompanionClient {
 
 enum SummaryTone: Equatable { case attention, busy, failure, quiet }
 
-/// The header's short status suffix ("· 3 need you").
+/// The header's short status suffix ("· needs you"). The count itself shows once, in the strip's
+/// capsule below (I11-3).
 func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool) -> (text: String, tone: SummaryTone) {
     if !connected { return ("offline", .quiet) }
-    if needsYou > 0 { return (needsYouCount(needsYou), .attention) }
+    if needsYou > 0 { return ("needs you", .attention) }
     if failed { return ("needs a look", .failure) }
     if working { return ("working", .busy) }
     if crewRunning > 0 { return ("\(crewRunning) running", .busy) }

@@ -19,7 +19,8 @@ enum AdaptiveTier: Equatable {
 
     static let singleMinWidth: CGFloat = 600
     static let splitMinWidth: CGFloat = 700
-    static let tripleMinWidth: CGFloat = 1000
+    /// The sidebar, a usable content column and Moss's 360-point pane.
+    static let tripleMinWidth: CGFloat = 1020
 
     init(width: CGFloat) {
         if width >= Self.tripleMinWidth { self = .triple }
@@ -34,10 +35,26 @@ enum AdaptiveTier: Equatable {
     var docked: Bool { self == .split || self == .triple }
 }
 
+/// The sidebar's width for a text size (I11-2): 300 points, growing to 380 at the accessibility
+/// sizes so titles keep their words; never more than ~45% of the window.
+func adaptiveSidebarWidth(_ size: DynamicTypeSize, window: CGFloat) -> CGFloat {
+    let wanted: CGFloat
+    switch size {
+    case ...DynamicTypeSize.large: wanted = 300
+    case .xLarge: wanted = 310
+    case .xxLarge: wanted = 320
+    case .xxxLarge: wanted = 340
+    case .accessibility1: wanted = 360
+    default: wanted = 380
+    }
+    return max(AdaptivePanes.sidebarWidth, min(wanted, (window * 0.46).rounded()))
+}
+
 /// Where each pane goes for a width and the user's choices. Moss gets space only while `mossOpen`.
+/// Moss is a 360-point trailing inspector: over the content at two panes (I11-3), its own pane at three.
 struct AdaptivePanes: Equatable {
     static let sidebarWidth: CGFloat = 300
-    static let mossPaneWidth: CGFloat = 320
+    static let mossPaneWidth: CGFloat = 360
 
     let tier: AdaptiveTier
     /// The chat list is on screen.
@@ -45,8 +62,12 @@ struct AdaptivePanes: Equatable {
     /// Moss stays mounted while the chat list covers its slot, so it keeps its place.
     let mossMounted: Bool
     let mossVisible: Bool
-    /// Moss uses the sidebar slot rather than its own pane.
+    /// Moss used to take the sidebar slot; it never does now (I11-3), kept for the pane's strip.
     let mossInSlot: Bool
+    /// Moss floats over the content's trailing edge rather than taking its own pane.
+    let mossOverlay: Bool
+    /// The sidebar's width at this text size.
+    let sidebar: CGFloat
     let mossWidth: CGFloat
     let mossLeading: CGFloat
     let contentLeading: CGFloat
@@ -56,19 +77,20 @@ struct AdaptivePanes: Equatable {
     ///   - sidebarCollapsed: the user hid the sidebar for a full-width diff or terminal.
     ///   - mossOpen: the user opened Moss; nothing else may set this.
     ///   - chatsPeek: the chat list is showing over Moss in the sidebar slot.
-    init(width: CGFloat, sidebarCollapsed: Bool, mossOpen: Bool, chatsPeek: Bool) {
+    init(width: CGFloat, sidebarCollapsed: Bool, mossOpen: Bool, chatsPeek: Bool, sidebarWidth: CGFloat = AdaptivePanes.sidebarWidth) {
         let tier = AdaptiveTier(width: width)
         let moss = tier.docked && mossOpen
-        let slot = tier == .split && moss
         let third = tier == .triple && moss
         self.tier = tier
-        showsChats = tier.docked && (slot ? chatsPeek : !sidebarCollapsed)
+        sidebar = sidebarWidth
+        showsChats = tier.docked && !sidebarCollapsed
         mossMounted = moss
-        mossVisible = moss && !(slot && chatsPeek)
-        mossInSlot = slot
-        mossWidth = slot ? Self.sidebarWidth : Self.mossPaneWidth
-        mossLeading = third ? max(0, width - Self.mossPaneWidth) : 0
-        contentLeading = slot || showsChats ? Self.sidebarWidth : 0
+        mossVisible = moss
+        mossInSlot = false
+        mossOverlay = moss && !third
+        mossWidth = Self.mossPaneWidth
+        mossLeading = moss ? max(0, width - Self.mossPaneWidth) : 0
+        contentLeading = showsChats ? sidebarWidth : 0
         contentTrailing = third ? Self.mossPaneWidth : 0
     }
 }
@@ -89,6 +111,22 @@ func transcriptRowCap(_ item: TranscriptItem, tier: AdaptiveTier) -> CGFloat? {
     switch item {
     case .diff: return nil
     default: return transcriptTextWidth
+    }
+}
+
+/// The side margin that keeps a list's rows in the centred 720-point column (I11-13); nil (the
+/// list's own margins) when the window is no wider than that.
+func readableListMargin(_ width: CGFloat) -> CGFloat? {
+    let margin = ((width - transcriptTextWidth) / 2).rounded()
+    return margin > 16 ? margin : nil
+}
+
+/// Lists on wide windows read like the transcript: one centred column, not edge to edge.
+struct ReadableListWidth: ViewModifier {
+    func body(content: Content) -> some View {
+        GeometryReader { geometry in
+            content.contentMargins(.horizontal, readableListMargin(geometry.size.width), for: .scrollContent)
+        }
     }
 }
 
@@ -220,7 +258,7 @@ struct CompanionDock: View {
         } else if let notice = voice.notice {
             Text(notice).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.warning).lineLimit(1)
         } else {
-            Text(live.active ? "Live" : model.presence.status).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+            Text(live.active ? "Live" : model.presence.status).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
         }
     }
 

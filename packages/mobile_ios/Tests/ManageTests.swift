@@ -104,6 +104,7 @@ final class ManageTests: XCTestCase {
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .workspaces)
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: .thread(workspace: "w", thread: "t")), .workspaces)
         XCTAssertEqual(drawerFooterDestination(tab: .hosts, route: .changes("w")), .hosts)
+        XCTAssertEqual(drawerFooterDestination(tab: .settings, route: .changes("w")), .settings)
     }
 
     func testNewChatRowsNameTheResolvedDefault() {

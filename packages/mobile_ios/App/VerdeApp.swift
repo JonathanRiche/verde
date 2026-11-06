@@ -50,7 +50,13 @@ struct VerdeApp: App {
     }
 }
 
-enum RootTab: Hashable { case home, workspaces, hosts }
+enum RootTab: Hashable {
+    case home, workspaces, hosts
+    /// Settings in the content pane beside a permanent sidebar (I11-6); a sheet otherwise.
+    case settings
+    /// Home and Workspaces show the browse stack (chats, files, changes); the others replace it.
+    var showsBrowse: Bool { self == .home || self == .workspaces }
+}
 
 private struct PairingSheet: Identifiable { let id: String }
 
@@ -79,6 +85,7 @@ struct RootView: View {
     /// Drawer scope (nil = All Workspaces); survives drawer open/close, resets per host.
     @State private var workspaceScope: String?
     @Environment(\.accessibilityReduceMotion) private var reducedMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var monitor = NetworkMonitor()
     @State private var lock = AppLock()
     @State private var appearance = AppearanceSettings.shared
@@ -104,6 +111,7 @@ struct RootView: View {
             ZStack(alignment: .leading) {
                 Group {
                     if tab == .hosts { HostsScreen(model: hosts) { tab = .home; path = [] } }
+                    else if tab == .settings { AppSettings(lock: lock, browse: browse, push: push, embedded: true) }
                     else {
                         BrowseStack(model: browse, actions: actions, path: $path) {
                             if tab == .home { HomeScreen(model: browse, actions: actions) }
@@ -115,8 +123,8 @@ struct RootView: View {
                 .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
                 if panes.tier.docked {
-                    workspaceDrawer(permanent: true)
-                        .frame(width: AdaptivePanes.sidebarWidth)
+                    workspaceDrawer(permanent: true, width: panes.sidebar)
+                        .frame(width: panes.sidebar)
                         .overlay(alignment: .trailing) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
                         // Typing in the composer shouldn't squeeze the list beside it.
                         .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -128,13 +136,15 @@ struct RootView: View {
                         companionScreen(docked: true)
                     }
                     .frame(width: panes.mossWidth)
-                    .overlay(alignment: panes.mossInSlot ? .trailing : .leading) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
+                    .overlay(alignment: .leading) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
+                    // Over the content at two panes (I11-3): a shadow sets it apart.
+                    .shadow(color: .black.opacity(panes.mossOverlay ? 0.18 : 0), radius: 12, x: -2)
                     .offset(x: panes.mossLeading)
                     .adaptivePaneHidden(!panes.mossVisible)
                 }
                 if drawer {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { drawer = false }.accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
-                    workspaceDrawer(permanent: false)
+                    workspaceDrawer(permanent: false, width: min(380, geometry.size.width * 0.92))
                     .allowsHitTesting(true).disabled(false).zIndex(2)
                     .frame(width: min(380, geometry.size.width * 0.92))
                     .transition(.move(edge: .leading))
@@ -191,27 +201,33 @@ struct RootView: View {
 
     /// Pushed screens dock the companion in their top bar (wide windows dock it in the sidebar).
     private func companionEntry(docked: Bool) -> CompanionHeaderEntry? {
-        guard companion.available, !docked else { return nil }
+        // S10 / I11-9: the header avatar shows on wide windows too; it opens Moss's inspector there.
+        guard companion.available else { return nil }
         return CompanionHeaderEntry(model: companion, voice: companionVoice, live: live,
                               open: { companionSheet = true }, settings: { companionSettings = true })
     }
 
     private func panesFor(width: CGFloat) -> AdaptivePanes {
-        AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek)
+        AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek,
+                      sidebarWidth: adaptiveSidebarWidth(dynamicTypeSize, window: width))
     }
     private var currentPanes: AdaptivePanes { panesFor(width: windowWidth) }
 
     /// The overlay drawer on narrow windows, the permanent sidebar on wide ones.
-    private func workspaceDrawer(permanent: Bool) -> some View {
+    private func workspaceDrawer(permanent: Bool, width: CGFloat) -> some View {
         WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, scope: $workspaceScope, close: {
             drawer = false
             if permanent { if chatsPeek { chatsPeek = false } else { sidebarCollapsed = true } }
         }, open: { route in
-            if tab == .hosts { tab = .home }
+            if !tab.showsBrowse { tab = .home }
             openRoute(route)
             drawer = false
-        }, root: { next in tab = next; path = []; drawer = false }, settings: { drawer = false; settings = true },
-        permanent: permanent, dock: permanent && companion.available ? AnyView(companionDock) : nil)
+        }, root: { next in tab = next; path = []; drawer = false }, settings: {
+            drawer = false
+            // I11-6: beside a permanent sidebar Settings opens in the content pane like the other tabs.
+            if currentPanes.tier.docked { tab = .settings; path = [] } else { settings = true }
+        },
+        permanent: permanent, dock: permanent && companion.available ? AnyView(companionDock) : nil, width: width)
     }
 
     private var companionDock: some View {
@@ -229,7 +245,7 @@ struct RootView: View {
     private func companionScreen(docked: Bool) -> some View {
         CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, pill: livePill, open: { route in
             if !docked { companionSheet = false }
-            if tab == .hosts { tab = .home }
+            if !tab.showsBrowse { tab = .home }
             drawer = false
             openRoute(route)
         }, showHome: {
@@ -329,7 +345,7 @@ struct RootView: View {
             if !panes.tier.docked || panes.mossVisible, let key = companion.visibleKey() { keys.append(key) }
             if !panes.tier.docked { return keys }
         }
-        guard tab != .hosts, !drawer, !settings, let host = hosts.active,
+        guard tab.showsBrowse, !drawer, !settings, let host = hosts.active,
               case .thread(let workspace, let thread)? = path.last else { return keys }
         keys.append([host, workspace, thread].joined(separator: "/"))
         return keys
@@ -338,7 +354,7 @@ struct RootView: View {
     /// The bubble stays out of the drawer and off the companion's own chat screen.
     private var bubbleVisible: Bool {
         guard !drawer, !settings, !companionSettings else { return false }
-        if let conversation = companion.conversation, tab != .hosts,
+        if let conversation = companion.conversation, tab.showsBrowse,
            case .thread(let workspace, let thread)? = path.last,
            workspace == conversation.workspace, thread == conversation.thread { return false }
         return true
@@ -397,7 +413,7 @@ struct RootView: View {
         // Moss beside the chat doesn't cover it, so it stays as the user left it.
         if !currentPanes.tier.docked { companionSheet = false }
         companionSettings = false
-        if tab == .hosts { tab = .home }
+        if !tab.showsBrowse { tab = .home }
         if hosts.active != target.hostID {
             routeAfterSwitch = route
             if !hosts.select(target.hostID) { routeAfterSwitch = nil }

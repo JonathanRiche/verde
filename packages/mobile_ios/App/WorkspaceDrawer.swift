@@ -40,7 +40,7 @@ struct DrawerItem: Identifiable {
 /// The footer tab to mark (I10-4, Android parity): a chat, Files, Changes or any pushed screen is
 /// under Workspaces; Home and Hosts only when they are what's on screen.
 func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
-    guard tab != .hosts, route != nil else { return tab }
+    guard tab.showsBrowse, route != nil else { return tab }
     return .workspaces
 }
 
@@ -84,6 +84,8 @@ struct WorkspaceDrawer: View {
     var permanent = false
     /// Moss's docked controls, above the footer.
     var dock: AnyView? = nil
+    /// The drawer's own width; the scope popover stays inside it (I11-7).
+    var width: CGFloat = AdaptivePanes.sidebarWidth
     @Environment(\.verticalSizeClass) private var verticalSize
     @State private var search = ""
     @State private var switching = false
@@ -108,6 +110,7 @@ struct WorkspaceDrawer: View {
                 VerdeWordmark(); Spacer()
                 Button(action: close) { Image(systemName: permanent ? "sidebar.left" : "xmark").frame(width: 44, height: 44) }
                     .accessibilityLabel(permanent ? "Hide sidebar" : "Close workspace drawer")
+                    .accessibilityIdentifier(permanent ? "sidebar-hide" : "drawer-close")
                     .keyboardShortcut(permanent ? KeyboardShortcut("\\", modifiers: .command) : nil)
             }.padding(.horizontal, 12)
             if !all.isEmpty { switcher(all, scoped: scoped) }
@@ -157,7 +160,7 @@ struct WorkspaceDrawer: View {
                     footerIcon("Home", icon: "house", selected: here == .home) { root(.home) }
                     footerIcon("Workspaces", icon: "square.stack", selected: here == .workspaces) { root(.workspaces) }
                     footerIcon("Hosts", icon: "desktopcomputer", selected: here == .hosts) { root(.hosts) }
-                    footerIcon("Settings", icon: "gearshape", selected: false, action: settings)
+                    footerIcon("Settings", icon: "gearshape", selected: here == .settings, action: settings)
                 }.padding(.horizontal, 8)
             } else {
                 // S22: the same four destinations as Android, in the same order; the current one
@@ -167,7 +170,7 @@ struct WorkspaceDrawer: View {
                     footerTab("Workspaces", icon: "square.stack", selected: here == .workspaces) { root(.workspaces) }
                     footerTab("Hosts", icon: "desktopcomputer", selected: here == .hosts) { root(.hosts) }
                         .accessibilityIdentifier("drawer-hosts")
-                    footerTab("Settings", icon: "gearshape", selected: false, action: settings)
+                    footerTab("Settings", icon: "gearshape", selected: here == .settings, action: settings)
                 }.padding(.horizontal, 8).padding(.vertical, 6)
             }
         }
@@ -195,7 +198,7 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 10) {
                 if let scoped { WorkspaceChip(workspace: scoped, size: 22) }
                 else { Image(systemName: "square.grid.2x2").frame(width: 22, height: 22).foregroundStyle(VerdeTheme.muted) }
-                Text(scoped?.label ?? "All Workspaces").font(VerdeTheme.ui(14, bold: true)).lineLimit(1)
+                Text(scoped?.label ?? "All Workspaces").font(VerdeTheme.ui(14, bold: true)).lineLimit(2)
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.down").font(.caption).foregroundStyle(VerdeTheme.subtle)
             }.padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
@@ -252,7 +255,7 @@ struct WorkspaceDrawer: View {
             }
         }
         .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.text)
-        .frame(width: 300).background(VerdeTheme.alternate)
+        .frame(width: max(240, width - 24)).background(VerdeTheme.alternate)
     }
 
     @ViewBuilder private func rows(_ name: String, _ items: [DrawerItem], chip: Bool) -> some View {
@@ -312,7 +315,7 @@ struct WorkspaceDrawer: View {
             VStack(spacing: 2) {
                 // A fixed icon box so every label sits on the same baseline (I7-5).
                 Image(systemName: icon).font(.system(size: 16)).frame(width: 24, height: 20)
-                Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.8)
+                Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.6)
             }
             .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)
             .frame(maxWidth: .infinity, minHeight: 48)
@@ -346,7 +349,8 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 10) {
                 if let chip { WorkspaceChip(workspace: chip, size: 16) }
                 if let provider = pane.provider { ProviderGlyph(provider: provider) } else { Image(systemName: "terminal").frame(width: 18) }
-                Text(pane.title).lineLimit(1)
+                // I11-2: two lines before a title truncates (large text, narrow sidebar).
+                Text(pane.title).lineLimit(2)
                 Spacer(minLength: 0)
                 if pane.status == "working" || pane.status == "waiting" {
                     StatusPip(active: pane.status == "working", attention: pane.status == "waiting")
@@ -361,7 +365,7 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 10) {
                 if let chip { WorkspaceChip(workspace: chip, size: 16) }
                 ProviderGlyph(provider: thread.provider)
-                Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(1)
+                Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(2)
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                 StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")

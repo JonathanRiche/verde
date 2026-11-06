@@ -13,8 +13,8 @@ final class AdaptiveLayoutTests: XCTestCase {
         XCTAssertEqual(AdaptiveTier(width: 600), .single)
         XCTAssertEqual(AdaptiveTier(width: 699.5), .single)
         XCTAssertEqual(AdaptiveTier(width: 700), .split)
-        XCTAssertEqual(AdaptiveTier(width: 999.5), .split)
-        XCTAssertEqual(AdaptiveTier(width: 1000), .triple)
+        XCTAssertEqual(AdaptiveTier(width: 1019.5), .split)
+        XCTAssertEqual(AdaptiveTier(width: 1020), .triple)
         XCTAssertEqual(AdaptiveTier(width: 1400), .triple)
     }
 
@@ -65,23 +65,32 @@ final class AdaptiveLayoutTests: XCTestCase {
         }
     }
 
-    func testOpenMossTakesTheSidebarSlotAtTwoPanes() {
-        let layout = panes(800, moss: true)
+    /// I11-3: at two panes Moss is a 360-point inspector over the content's trailing edge; the
+    /// sidebar stays.
+    func testOpenMossIsATrailingInspectorAtTwoPanes() {
+        let layout = panes(834, moss: true)
         XCTAssertTrue(layout.mossVisible)
-        XCTAssertTrue(layout.mossInSlot)
-        XCTAssertFalse(layout.showsChats)
-        XCTAssertEqual(layout.mossWidth, AdaptivePanes.sidebarWidth)
-        XCTAssertEqual(layout.mossLeading, 0)
+        XCTAssertFalse(layout.mossInSlot)
+        XCTAssertTrue(layout.mossOverlay)
+        XCTAssertTrue(layout.showsChats)
+        XCTAssertEqual(layout.mossWidth, 360)
+        XCTAssertEqual(layout.mossLeading, 834 - 360)
         XCTAssertEqual(layout.contentLeading, AdaptivePanes.sidebarWidth)
         XCTAssertEqual(layout.contentTrailing, 0)
     }
 
-    func testChatListIsOneStepAwayWhileMossHoldsTheSlot() {
-        let layout = panes(800, moss: true, peek: true)
-        XCTAssertTrue(layout.showsChats)
-        XCTAssertTrue(layout.mossMounted, "Moss stays mounted so it keeps its place")
-        XCTAssertFalse(layout.mossVisible)
-        XCTAssertEqual(layout.contentLeading, AdaptivePanes.sidebarWidth)
+    func testListsKeepTheReadableColumn() {
+        XCTAssertNil(readableListMargin(402), "Phones keep the list's own margins")
+        XCTAssertNil(readableListMargin(534))
+        XCTAssertEqual(readableListMargin(834), 57)
+    }
+
+    func testSidebarGrowsWithTextSize() {
+        XCTAssertEqual(adaptiveSidebarWidth(.large, window: 834), 300)
+        XCTAssertEqual(adaptiveSidebarWidth(.accessibility3, window: 834), 380)
+        XCTAssertEqual(adaptiveSidebarWidth(.accessibility3, window: 700), 322)
+        XCTAssertEqual(panes(834).contentLeading, 300)
+        XCTAssertEqual(AdaptivePanes(width: 834, sidebarCollapsed: false, mossOpen: false, chatsPeek: false, sidebarWidth: 380).contentLeading, 380)
     }
 
     func testClosingMossReturnsTheSidebar() {
@@ -99,7 +108,8 @@ final class AdaptiveLayoutTests: XCTestCase {
         XCTAssertEqual(layout.mossLeading, 1200 - AdaptivePanes.mossPaneWidth)
         XCTAssertEqual(layout.contentLeading, AdaptivePanes.sidebarWidth)
         XCTAssertEqual(layout.contentTrailing, AdaptivePanes.mossPaneWidth)
-        XCTAssertGreaterThanOrEqual(1000 - AdaptivePanes.sidebarWidth - AdaptivePanes.mossPaneWidth, 360, "Content stays usable at the threshold")
+        XCTAssertFalse(layout.mossOverlay)
+        XCTAssertGreaterThanOrEqual(AdaptiveTier.tripleMinWidth - AdaptivePanes.sidebarWidth - AdaptivePanes.mossPaneWidth, 360, "Content stays usable at the threshold")
     }
 
     func testThirdPaneIgnoresAPeekLeftOverFromTheSlot() {

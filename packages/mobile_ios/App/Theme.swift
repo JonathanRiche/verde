@@ -127,6 +127,8 @@ struct DrawerButton: View {
         // With a permanent sidebar this only ever brings back a hidden one.
         Button(action: open) { Image(systemName: adaptive.tier.docked ? "sidebar.left" : "line.3.horizontal").frame(width: 44, height: 44).contentShape(Rectangle()) }
             .accessibilityLabel(adaptive.tier.docked ? "Show sidebar" : "Open workspace drawer")
+            // I11-8: distinct from the sidebar's own Hide button (both draw `sidebar.left`).
+            .accessibilityIdentifier(adaptive.tier.docked ? "sidebar-show" : "drawer-open")
             .keyboardShortcut(adaptive.tier.docked ? KeyboardShortcut("\\", modifiers: .command) : nil)
     }
 }
