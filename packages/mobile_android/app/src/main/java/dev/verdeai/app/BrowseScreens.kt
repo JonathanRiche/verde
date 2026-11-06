@@ -235,7 +235,7 @@ private fun MenuRow(
             headlineContent = { Text(headline, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_TITLE) },
             supportingContent = (styledSupporting ?: supporting?.let(::AnnotatedString))?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_SUBTITLE) } },
             leadingContent = leading,
-            trailingContent = badge?.let { { AttentionBadge(it) } },
+            trailingContent = badge?.let { { if (it == UNREAD) UnreadDot() else AttentionBadge(it) } },
             // S4: one TalkBack stop that reads "title, subtitle".
             modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
                 contentDescription = listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '), badge).joinToString(", ")
@@ -252,6 +252,14 @@ private fun MenuRow(
             }
         }
     }
+}
+
+internal const val UNREAD = "Unread"
+
+/** S21: an unread finished chat is just a dot (TalkBack: "Unread"), never an amber "needs you". */
+@Composable
+private fun UnreadDot() {
+    Box(Modifier.size(10.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
 }
 
 @Composable
@@ -503,7 +511,8 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
         active.takeIf { it > 0 }?.let { "$it active" },
         "closed".takeIf { !workspace.open },
     ).joinToString(" · ")
-    MenuRow(workspaceName(workspace), listOf(summary, workspace.path).filter { it.isNotEmpty() }.joinToString("\n"), true,
+    // S21: closed workspaces show their name and state, not a stale (often doubled) path.
+    MenuRow(workspaceName(workspace), listOf(summary, workspace.path.takeIf { workspace.open }.orEmpty()).filter { it.isNotEmpty() }.joinToString("\n"), true,
         { onOpen(workspace.workspace_id) },
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
         badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} attention" })

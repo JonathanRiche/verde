@@ -1,6 +1,9 @@
 package dev.verdeai.app
 
 import androidx.compose.foundation.background
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -26,12 +29,17 @@ internal fun HostSwitcher(model: HostsModel, onSwitched: () -> Unit, onPairing: 
     var adding by remember { mutableStateOf(false) }
     val active = state.rows.find { it.saved.id == state.active }
     Box {
-        TextButton(onClick = { expanded = true }, enabled = !state.loading,
-            contentPadding = PaddingValues(start = 8.dp, end = 2.dp),
-            modifier = Modifier.widthIn(max = 180.dp)) {
-            Text(active?.saved?.label ?: "Choose host", style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted,
+        // S22: the host pill (iOS parity): status dot, name, chevron; a 48dp target.
+        OutlinedButton(onClick = { expanded = true }, enabled = !state.loading, shape = RoundedCornerShape(50),
+            border = androidx.compose.foundation.BorderStroke(1.dp, VerdeColors.Border),
+            contentPadding = PaddingValues(start = 12.dp, end = 6.dp),
+            modifier = Modifier.heightIn(min = 48.dp).widthIn(max = 200.dp)
+                .semantics { contentDescription = "Host: ${active?.saved?.label ?: "none"}" + (active?.let { ", ${hostStatus(it)}" } ?: "") + ". Switch host" }) {
+            active?.let { Box(Modifier.size(8.dp).background(hostDotColor(it), CircleShape)) }
+            Spacer(Modifier.width(6.dp))
+            Text(active?.saved?.label ?: "Choose host", style = MaterialTheme.typography.labelLarge, color = VerdeColors.Text,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Switch host", tint = VerdeColors.Muted)
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = null, tint = VerdeColors.Muted)
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             LiveOverMenu()

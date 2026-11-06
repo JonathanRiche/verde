@@ -17,6 +17,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -58,13 +64,22 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                         val id = row.saved.id
                         val pending = row.busy || row.operation?.state == "pending"
                         val failure = row.operation?.error ?: row.view?.error
-                        OutlinedCard(Modifier.fillMaxWidth(), colors = CardDefaults.outlinedCardColors(containerColor = VerdeColors.Panel),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, if (state.active == id) VerdeColors.Accent else VerdeColors.Border)) {
-                            Column(Modifier.padding(16.dp), verticalArrangement=Arrangement.spacedBy(8.dp)) {
-                                HostHeading(row, selected=state.active == id, enabled=!state.busy,
-                                    onRename={ renameLabel=row.saved.label; renaming=id },
-                                    onSignOut=if (row.view != null && row.view.auth_state !in listOf("loading", "signed_out", "signing_out") && !pending && !row.fatal)
-                                        { { confirmation=id to false } } else null)
+                        // S22: each host is a list row (name, status, chevron; actions in its ⋮ menu), as on
+                        // iOS. Tapping an unselected paired host uses it; the selected one just says so.
+                        val selected = state.active == id
+                        val usable = row.view?.auth_state == "paired" && row.view.trust_proposal == null
+                        Column(Modifier.fillMaxWidth()) {
+                            HostHeading(row, selected=selected, enabled=!state.busy,
+                                onOpen=when {
+                                    pending || row.fatal || state.busy -> null
+                                    usable && !selected -> { { model.select(id, onUse) } }
+                                    !usable && row.view?.auth_state != "signing_out" && row.view?.auth_state != "signed_out" -> { { model.showPairing(id) } }
+                                    else -> null
+                                },
+                                onRename={ renameLabel=row.saved.label; renaming=id },
+                                onSignOut=if (row.view != null && row.view.auth_state !in listOf("loading", "signed_out", "signing_out") && !pending && !row.fatal)
+                                    { { confirmation=id to false } } else null)
+                            Column(Modifier.padding(start=56.dp), verticalArrangement=Arrangement.spacedBy(4.dp)) {
                                 when {
                                     failure?.code == "sign_out_unconfirmed" -> {
                                         Text("Sign out could not be confirmed. Your local pairing is still saved.")
@@ -81,17 +96,11 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                                         TextButton(onClick={ model.remove(id) }) { Text("Remove from hosts") }
                                         TextButton(onClick={ model.showPairing(id) }) { Text("Pair again") }
                                     }
-                                    else -> {
-                                        if (row.view?.auth_state == "paired" && row.view.trust_proposal == null) {
-                                            Button(modifier=Modifier.fillMaxWidth(), shape=MaterialTheme.shapes.small, onClick={ model.select(id, onUse) }, enabled=!state.busy && !pending && !row.fatal) { Text("Use ${row.saved.label}", maxLines=1, overflow=TextOverflow.Ellipsis) }
-                                        } else if (row.view?.auth_state != "signing_out") {
-                                            TextButton(onClick={ model.showPairing(id) }, enabled=!state.busy && !pending && !row.fatal) { Text("Pair / review host") }
-                                        }
-                                        if (failure?.retryable == true) TextButton(onClick={ model.retry(id) }, enabled=!state.busy && !pending) { Text("Retry connection") }
-                                    }
+                                    failure?.retryable == true -> TextButton(onClick={ model.retry(id) }, enabled=!state.busy && !pending) { Text("Retry connection") }
                                 }
                                 if (pending) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Finishing host action…") }
                             }
+                            HorizontalDivider(color=VerdeColors.Border)
                         }
                     }
                     // S15: list rows, as on iOS.
@@ -151,27 +160,31 @@ internal fun hostDotColor(row: HostRow): Color {
 
 /** Keep destructive actions out of the everyday machine-switching flow. */
 @Composable
-private fun HostHeading(row: HostRow, selected: Boolean, enabled: Boolean,
+private fun HostHeading(row: HostRow, selected: Boolean, enabled: Boolean, onOpen: (() -> Unit)?,
     onRename: () -> Unit, onSignOut: (() -> Unit)?) {
     var menu by remember(row.saved.id) { mutableStateOf(false) }
-    Row(Modifier.fillMaxWidth(), verticalAlignment=Alignment.CenterVertically,
-        horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+    val status = hostStatus(row)
+    Row(Modifier.fillMaxWidth().heightIn(min=64.dp)
+        .then(if (onOpen != null) Modifier.clickable(role=Role.Button, onClickLabel=if (row.view?.auth_state == "paired") "Use ${row.saved.label}" else "Pair", onClick=onOpen) else Modifier)
+        .semantics(mergeDescendants=true) { contentDescription = listOfNotNull(row.saved.label, status, "Selected".takeIf { selected }).joinToString(", ") }
+        .padding(vertical=8.dp), verticalAlignment=Alignment.CenterVertically,
+        horizontalArrangement=Arrangement.spacedBy(12.dp)) {
         Surface(color=if (selected) VerdeColors.AccentWash else VerdeColors.PanelAlt,
             shape=MaterialTheme.shapes.small) {
             Icon(painterResource(R.drawable.host_machine), contentDescription=null,
                 tint=if (selected) VerdeColors.Accent else VerdeColors.Muted,
-                modifier=Modifier.padding(10.dp).size(24.dp))
+                modifier=Modifier.padding(8.dp).size(24.dp))
         }
-        Column(Modifier.weight(1f), verticalArrangement=Arrangement.spacedBy(4.dp)) {
-            Text(row.saved.label, style=MaterialTheme.typography.titleMedium, maxLines=2,
-                overflow=TextOverflow.Ellipsis)
+        Column(Modifier.weight(1f), verticalArrangement=Arrangement.spacedBy(2.dp)) {
+            Text(row.saved.label, style=MaterialTheme.typography.bodyLarge, maxLines=2, overflow=TextOverflow.Ellipsis)
             Row(verticalAlignment=Alignment.CenterVertically, horizontalArrangement=Arrangement.spacedBy(6.dp)) {
                 Box(Modifier.size(7.dp).background(hostDotColor(row), CircleShape))
-                Text(hostStatus(row), style=MaterialTheme.typography.bodySmall, color=VerdeColors.Muted,
-                    modifier=Modifier.weight(1f))
+                Text(status, style=MaterialTheme.typography.bodySmall, color=VerdeColors.Muted)
             }
-            if (selected) Text("Selected", color=VerdeColors.Accent, style=MaterialTheme.typography.labelSmall)
         }
+        // S21: the selected host shows a check, never "Use" again; others get a chevron.
+        if (selected) Icon(Icons.Filled.Check, contentDescription=null, tint=VerdeColors.Accent)
+        else if (onOpen != null) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription=null, tint=VerdeColors.Muted)
         Box {
             IconButton(onClick={ menu=true }, enabled=enabled) {
                 Icon(Icons.Filled.MoreVert, contentDescription="Actions for ${row.saved.label}", modifier=Modifier.rotate(90f))
