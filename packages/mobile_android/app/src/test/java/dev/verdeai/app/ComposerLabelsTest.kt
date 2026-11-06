@@ -33,4 +33,19 @@ class ComposerLabelsTest {
             ChatMention("README.md", "README.md"))
         assertEquals(listOf("reconnect.ts" to "src", "README.md" to null), mentionSuggestions(mentions))
     }
+
+    @Test fun defaultModelAndEffortNameWhatTheyResolveTo() {
+        val models = listOf(ChatChoice("default", "Default"), ChatChoice("sonnet", "Sonnet 5.5"))
+        val efforts = listOf(ChatChoice("", "Default"), ChatChoice("high", "High"))
+        val known = dev.verdeai.core.ChatCatalogs(models = models, efforts = efforts, default_model_label = "Opus 5.5", default_effort_label = "High")
+        val unknown = dev.verdeai.core.ChatCatalogs(models = models, efforts = efforts)
+        val none = dev.verdeai.core.ChatSelection()
+        assertEquals("Default \u00b7 Opus 5.5", modelValueLabel(known, none))
+        assertEquals("Default", modelValueLabel(unknown, none))
+        assertEquals("Sonnet 5.5", modelValueLabel(known, dev.verdeai.core.ChatSelection(model = "sonnet")))
+        assertEquals("Default \u00b7 High", effortValueLabel(known, none))
+        assertEquals("Default", effortValueLabel(unknown, none))
+        assertEquals("High", effortValueLabel(known, dev.verdeai.core.ChatSelection(effort = "high")))
+        assertEquals("Default \u00b7 Opus 5.5 \u00b7 Default \u00b7 High", compactSettingsLabel(known, none))
+    }
 }

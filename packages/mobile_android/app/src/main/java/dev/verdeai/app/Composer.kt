@@ -360,10 +360,10 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
 }
 
 /** The compact composer's settings chip label: model, then effort ("Haiku 5.5 · Low"). */
-internal fun compactSettingsLabel(models: List<ChatChoice>, efforts: List<ChatChoice>, selection: ChatSelection): String {
-    val model = composerChoiceLabel(models, selection.model ?: models.firstOrNull()?.id) ?: "Model"
-    if (efforts.isEmpty()) return model
-    return "$model \u00b7 ${composerChoiceLabel(efforts, selection.effort) ?: "Default"}"
+internal fun compactSettingsLabel(c: ChatCatalogs, selection: ChatSelection): String {
+    val model = modelValueLabel(c, selection)
+    if (c.efforts.isEmpty()) return model
+    return "$model \u00b7 ${effortValueLabel(c, selection)}"
 }
 
 internal const val COMPOSER_SETTINGS = "composer-settings"
@@ -376,7 +376,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
     val c = view.catalogs
     val s = view.selection
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
-    val label = compactSettingsLabel(c.models, c.efforts, s)
+    val label = compactSettingsLabel(c, s)
     var menu by remember { mutableStateOf(false) }
     if (onBrain != null) {
         // The brain is chosen in settings; here: a "+" for access and attachments, and a read-only label.
@@ -418,8 +418,8 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             LiveOverMenu()
             val pickers = buildList {
                 if (fresh) add("Provider: ${PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"}" to ComposerPicker.Provider)
-                add("Model: ${composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model"}" to ComposerPicker.Model)
-                if (c.efforts.isNotEmpty()) add("Effort: ${composerChoiceLabel(c.efforts, s.effort) ?: "Default"}" to ComposerPicker.Effort)
+                add("Model: ${modelValueLabel(c, s)}" to ComposerPicker.Model)
+                if (c.efforts.isNotEmpty()) add("Effort: ${effortValueLabel(c, s)}" to ComposerPicker.Effort)
                 if (c.speeds.size > 1) add("Speed: ${composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard"}" to ComposerPicker.Speed)
                 if (c.access.isNotEmpty()) add("Access: ${accessValueLabel(c.access, s.access)}" to ComposerPicker.Access)
             }
@@ -562,6 +562,24 @@ internal fun accessValueLabel(access: List<ChatChoice>, selected: String?): Stri
     return "Default \u00b7 $fallback"
 }
 
+/** The provider's own default model/effort choice ("default" or the empty id). */
+internal fun isDefaultChoice(id: String?) = id.isNullOrEmpty() || id == "default"
+
+/** S11: the model chip: its name, or "Default · Opus 5.5" when the provider's default resolves (core C6). */
+internal fun modelValueLabel(c: ChatCatalogs, s: ChatSelection): String {
+    val id = s.model ?: c.models.firstOrNull()?.id
+    val label = composerChoiceLabel(c.models, id) ?: "Model"
+    val resolved = c.default_model_label?.takeIf { it.isNotBlank() }
+    return if (isDefaultChoice(id) && resolved != null) "$label \u00b7 $resolved" else label
+}
+
+/** S11: the effort chip, the same way ("Default · High" once the core resolves it). */
+internal fun effortValueLabel(c: ChatCatalogs, s: ChatSelection): String {
+    val label = composerChoiceLabel(c.efforts, s.effort) ?: "Default"
+    val resolved = c.default_effort_label?.takeIf { it.isNotBlank() }
+    return if (isDefaultChoice(s.effort) && resolved != null) "$label \u00b7 $resolved" else label
+}
+
 internal fun accessIsFull(access: List<ChatChoice>, selected: String?) = (selected?.takeIf { it.isNotEmpty() } ?: access.firstOrNull()?.id) == "full_access"
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -579,8 +597,8 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
         itemVerticalAlignment = Alignment.CenterVertically) {
         leading?.invoke()
         if (fresh) SettingChip("Provider", providerLabel, provider) { open(ComposerPicker.Provider) }
-        SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
-        if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default",
+        SettingChip("Model", modelValueLabel(c, s), provider) { open(ComposerPicker.Model) }
+        if (c.efforts.isNotEmpty()) SettingChip("Effort", effortValueLabel(c, s),
             icon = R.drawable.composer_reasoning,
             fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
         if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard",
@@ -608,9 +626,9 @@ internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?,
                     val c = catalogs
                     val s = selection
                     if (fresh) SettingChip("Provider", PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider", provider, compact = tight) { onPicker(ComposerPicker.Provider) }
-                    SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
+                    SettingChip("Model", modelValueLabel(c, s), provider,
                         modifier = Modifier.weight(1f, fill = false), maxWidth = 360.dp) { onPicker(ComposerPicker.Model) }
-                    if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default", compact = tight,
+                    if (c.efforts.isNotEmpty()) SettingChip("Effort", effortValueLabel(c, s), compact = tight,
                         icon = R.drawable.composer_reasoning,
                         fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { onPicker(ComposerPicker.Effort) }
                     if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = tight,
@@ -682,7 +700,13 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                 val selected = choice.id == current
                 VerdeListRow(
                     headlineContent = { Text(choice.label) },
-                    supportingContent = if (!choice.enabled) ({ Text(choice.reason ?: "Unavailable") }) else null,
+                    supportingContent = when {
+                        !choice.enabled -> ({ Text(choice.reason ?: "Unavailable") })
+                        // The Default row names what it resolves to, when the core knows.
+                        kind == ComposerPicker.Model && isDefaultChoice(choice.id) && !c.default_model_label.isNullOrBlank() -> ({ Text(c.default_model_label!!) })
+                        kind == ComposerPicker.Effort && isDefaultChoice(choice.id) && !c.default_effort_label.isNullOrBlank() -> ({ Text(c.default_effort_label!!) })
+                        else -> null
+                    },
                     leadingContent = {
                         when (kind) {
                             ComposerPicker.Provider -> ProviderGlyph(choice.id)
