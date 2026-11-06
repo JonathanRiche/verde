@@ -393,7 +393,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 LiveOverMenu()
-                if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${accessValueLabel(c.access, s.access)}") },
+                if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${accessChipLabel(c.access, s.access)}") },
                     onClick = { menu = false; onPicker(ComposerPicker.Access) })
                 DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() })
                 DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
@@ -428,7 +428,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
                 add("Model: ${modelValueLabel(c, s)}" to ComposerPicker.Model)
                 if (c.efforts.isNotEmpty()) add("Effort: ${effortValueLabel(c, s)}" to ComposerPicker.Effort)
                 if (c.speeds.size > 1) add("Speed: ${composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard"}" to ComposerPicker.Speed)
-                if (c.access.isNotEmpty()) add("Access: ${accessValueLabel(c.access, s.access)}" to ComposerPicker.Access)
+                if (c.access.isNotEmpty()) add("Access: ${accessChipLabel(c.access, s.access)}" to ComposerPicker.Access)
             }
             pickers.forEach { (text, picker) -> DropdownMenuItem(text = { Text(text) }, onClick = { menu = false; onPicker(picker) }) }
             HorizontalDivider()
@@ -581,20 +581,27 @@ internal fun effectiveAccess(selected: String?) = selected?.takeIf { it.isNotEmp
 /** The provider's own default model/effort choice ("default" or the empty id). */
 internal fun isDefaultChoice(id: String?) = id.isNullOrEmpty() || id == "default"
 
-/** S11: the model chip: its name, or "Default · Opus 5.5" when the provider's default resolves (core C6). */
+/**
+ * S18: the model chip shows the resolved model only ("Opus 5.5" for the provider's default when the
+ * core knows it, core C6); the picker marks which row is the default.
+ */
 internal fun modelValueLabel(c: ChatCatalogs, s: ChatSelection): String {
     val id = s.model ?: c.models.firstOrNull()?.id
     val label = composerChoiceLabel(c.models, id) ?: "Model"
     val resolved = c.default_model_label?.takeIf { it.isNotBlank() }
-    return if (isDefaultChoice(id) && resolved != null) "$label \u00b7 $resolved" else label
+    return if (isDefaultChoice(id) && resolved != null) resolved else label
 }
 
-/** S11: the effort chip, the same way ("Default · High" once the core resolves it). */
+/** S18: the effort chip, the same way ("High" once the core resolves the default). */
 internal fun effortValueLabel(c: ChatCatalogs, s: ChatSelection): String {
     val label = composerChoiceLabel(c.efforts, s.effort) ?: "Default"
     val resolved = c.default_effort_label?.takeIf { it.isNotBlank() }
-    return if (isDefaultChoice(s.effort) && resolved != null) "$label \u00b7 $resolved" else label
+    return if (isDefaultChoice(s.effort) && resolved != null) resolved else label
 }
+
+/** S18: the access chip names the mode the chat runs with; an unset one is [DEFAULT_ACCESS]. */
+internal fun accessChipLabel(access: List<ChatChoice>, selected: String?): String =
+    composerChoiceLabel(access, effectiveAccess(selected)) ?: "Full access"
 
 internal fun accessIsFull(@Suppress("UNUSED_PARAMETER") access: List<ChatChoice>, selected: String?) = effectiveAccess(selected) == "full_access"
 
@@ -608,21 +615,49 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
 
     val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
-    // Content-sized chips that wrap to a second line rather than squeeze or hide their values.
-    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp),
-        itemVerticalAlignment = Alignment.CenterVertically) {
-        leading?.invoke()
-        if (fresh) SettingChip("Provider", providerLabel, provider) { open(ComposerPicker.Provider) }
-        SettingChip("Model", modelValueLabel(c, s), provider) { open(ComposerPicker.Model) }
-        if (c.efforts.isNotEmpty()) SettingChip("Effort", effortValueLabel(c, s),
-            icon = R.drawable.composer_reasoning,
-            fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
-        if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard",
-            icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
-        if (c.access.isNotEmpty()) SettingChip("Access", accessValueLabel(c.access, s.access),
-            icon = if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
+    data class Chip(val name: String, val value: String, val provider: String?, val icon: Int?, val fill: Float, val picker: ComposerPicker, val iconOnly: Int)
+    val chips = buildList {
+        if (fresh) add(Chip("Provider", providerLabel, provider, null, 1f, ComposerPicker.Provider, Int.MAX_VALUE))
+        add(Chip("Model", modelValueLabel(c, s), provider, null, 1f, ComposerPicker.Model, Int.MAX_VALUE))
+        if (c.efforts.isNotEmpty()) add(Chip("Effort", effortValueLabel(c, s), null, R.drawable.composer_reasoning,
+            (c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size, ComposerPicker.Effort, 3))
+        if (c.access.isNotEmpty()) add(Chip("Access", accessChipLabel(c.access, s.access), null,
+            if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked, 1f, ComposerPicker.Access, 2))
+        if (c.speeds.size > 1) add(Chip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Normal", null,
+            if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard, 1f, ComposerPicker.Speed, 1))
+    }
+    val large = LocalDensity.current.fontScale > 1.15f
+    if (large) {
+        // Large text: the chips wrap to further lines rather than shrink their values.
+        FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp),
+            itemVerticalAlignment = Alignment.CenterVertically) {
+            leading?.invoke()
+            chips.forEach { SettingChip(it.name, it.value, it.provider, it.icon, it.fill) { open(it.picker) } }
+        }
+        return
+    }
+    // S18: one row at default text size. When the values don't all fit, speed, then access, then
+    // effort show only their icon (TalkBack still reads the value); past that the row scrolls.
+    val measurer = androidx.compose.ui.text.rememberTextMeasurer()
+    val labelStyle = MaterialTheme.typography.labelMedium
+    val density = LocalDensity.current
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // Icon-only chips keep their 48dp target; labelled ones measure their text.
+        fun width(chip: Chip, iconOnly: Boolean): Dp = if (iconOnly) 48.dp else
+            with(density) { measurer.measure(chip.value, labelStyle).size.width.toDp() } + CHIP_CHROME
+        val available = maxWidth - (if (leading != null) 52.dp else 0.dp)
+        val level = (0..3).firstOrNull { lvl -> chips.sumOf { width(it, it.iconOnly <= lvl).value.toDouble() } + chips.size * 4 <= available.value } ?: 3
+        val scroll = rememberScrollState()
+        Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll),
+            horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+            leading?.invoke()
+            chips.forEach { SettingChip(it.name, it.value, it.provider, it.icon, it.fill, iconOnly = it.iconOnly <= level) { open(it.picker) } }
+        }
     }
 }
+
+/** A compact chip's padding, icon and gap around its label. */
+private val CHIP_CHROME = 36.dp
 
 /**
  * The wide-window composer's single row: attach, the settings chips, then send. The model chip takes
@@ -649,7 +684,7 @@ internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?,
                         fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { onPicker(ComposerPicker.Effort) }
                     if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = tight,
                         icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { onPicker(ComposerPicker.Speed) }
-                    if (c.access.isNotEmpty()) SettingChip("Access", accessValueLabel(c.access, s.access), compact = tight,
+                    if (c.access.isNotEmpty()) SettingChip("Access", accessChipLabel(c.access, s.access), compact = tight,
                         icon = if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked) { onPicker(ComposerPicker.Access) }
                 }
             }
@@ -660,7 +695,7 @@ internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?,
 
 @Composable
 private fun SettingChip(name: String, value: String, provider: String? = null,
-    icon: Int? = null, fill: Float = 1f, compact: Boolean = false,
+    icon: Int? = null, fill: Float = 1f, compact: Boolean = false, iconOnly: Boolean = false,
     modifier: Modifier = Modifier, maxWidth: Dp = 220.dp, onClick: () -> Unit) {
     val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
@@ -675,11 +710,15 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
         }
         return
     }
-    AssistChip(onClick = onClick, leadingIcon = leading, label = { Text(value, style = MaterialTheme.typography.labelMedium,
-        maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        shape = RoundedCornerShape(14.dp), border = null,
-        colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
-        modifier = controlModifier.widthIn(max = maxWidth))
+    // A 32dp chip inside a 48dp target; icon-only when the row is short of room (S18).
+    Surface(onClick = onClick, shape = RoundedCornerShape(14.dp), color = VerdeColors.PanelAlt, contentColor = VerdeColors.Muted,
+        modifier = controlModifier.widthIn(max = maxWidth)) {
+        Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 8.dp, end = if (iconOnly) 12.dp else 10.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            leading?.invoke()
+            if (!iconOnly) Text(value, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
 }
 
 /** Shared glyph rendering for toolbar controls and their picker rows. */
@@ -721,6 +760,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                         // The Default row names what it resolves to, when the core knows.
                         kind == ComposerPicker.Model && isDefaultChoice(choice.id) && !c.default_model_label.isNullOrBlank() -> ({ Text(c.default_model_label!!) })
                         kind == ComposerPicker.Effort && isDefaultChoice(choice.id) && !c.default_effort_label.isNullOrBlank() -> ({ Text(c.default_effort_label!!) })
+                        kind == ComposerPicker.Access && choice.id == DEFAULT_ACCESS -> ({ Text("Default") })
                         else -> null
                     },
                     leadingContent = {
