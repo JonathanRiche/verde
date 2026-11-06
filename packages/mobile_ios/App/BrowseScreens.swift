@@ -278,6 +278,7 @@ private struct BrowseFrame<Content: View>: View {
             }
             .refreshable { await model.refresh() }
             .modifier(BubbleReserve(enabled: reservesBubble))
+            .modifier(ReadableListWidth())
         }
         .navigationTitle(title)
         .toolbar {
@@ -509,9 +510,8 @@ struct BrowseStack<Root: View>: View {
                 .modifier(OptionalCompanionToolbar(enabled: !isThreadRoute(route)))
                 // The sidebar replaces the route in place; a different route is a different screen.
                 .id(route)
+                // I11-5: every pushed screen keeps its back button, beside a sidebar too.
                 .modifier(VerdeNavigation())
-                // The sidebar is the way back from the first screen; back stays for drill-downs.
-                .navigationBarBackButtonHidden(adaptive.tier.docked && path == [route])
             }
         }
         .environment(\.openRoute, { route in path.append(route) })

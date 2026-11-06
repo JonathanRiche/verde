@@ -79,6 +79,7 @@ struct HistoryScreen: View {
             else if sections.isEmpty { Text("No chats match.") }
             if let error = history?.error { Text(error.message).foregroundStyle(.red) }
         }
+        .modifier(ReadableListWidth())
         .navigationTitle("History").navigationBarTitleDisplayMode(.inline)
         .task {
             while !Task.isCancelled {
@@ -86,7 +87,8 @@ struct HistoryScreen: View {
                 now = Int64(Date().timeIntervalSince1970 * 1000)
             }
         }
-        .searchable(text: $query, prompt: "Search chats")
+        // I11-12: the field sits under the title, so the title stays centred on wide windows.
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search chats")
         .task(id: query + "\u{0}" + workspace) {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
