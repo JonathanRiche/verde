@@ -21,6 +21,7 @@ struct TranscriptScreen: View {
     @State private var model: TranscriptModel?
     @State private var git: GitChangesModel?
     @Environment(\.adaptive) private var adaptive
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var fallbackTitle: String? {
         browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.threads.first { $0.thread_id == threadID }?.title
@@ -60,13 +61,18 @@ struct TranscriptScreen: View {
                 ToolbarItem(placement: .principal) {
                     // S37: the title takes the bar's whole middle; the provider glyph moves to the
                     // subtitle line and the title shrinks a little before it truncates.
+                    // S43: at larger text the title gets the bar's two lines (the provider line steps
+                    // aside) and only truncates when even that can't fit.
+                    let roomy = dynamicTypeSize <= .large
                     VStack(alignment: .center, spacing: 0) {
                         Text(summary.title.isEmpty ? "Chat" : summary.title).font(VerdeTheme.ui(15, bold: true))
-                            .lineLimit(1).minimumScaleFactor(0.85)
-                        HStack(spacing: 4) {
-                            ProviderGlyph(provider: summary.provider, size: 12)
-                            Text(rowSubtitle([providerDisplayName(summary.provider), summary.model]) ?? "")
-                                .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
+                            .lineLimit(roomy ? 1 : 2).minimumScaleFactor(0.8).multilineTextAlignment(.center)
+                        if roomy {
+                            HStack(spacing: 4) {
+                                ProviderGlyph(provider: summary.provider, size: 12)
+                                Text(rowSubtitle([providerDisplayName(summary.provider), summary.model]) ?? "")
+                                    .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity)
