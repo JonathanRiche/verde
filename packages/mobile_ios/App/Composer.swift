@@ -336,7 +336,7 @@ struct ChatComposer: View {
                     }.disabled(model.busy)
                 }.accessibilityIdentifier("composer-followup")
             }
-            if let notice = tmpNotice(model) {
+            if let notice = model.notice ?? model.view?.error?.message {
                 Text(notice) .font(VerdeTheme.ui(12)).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
             }
             if let token = model.token {
@@ -1133,12 +1133,3 @@ func composerPromptHeight(_ requested: CGFloat, available: CGFloat, minimum: CGF
     return min(maximum, max(minimum, requested))
 }
 
-// TEMP diagnostic (to be reverted): error codes only, never content.
-@MainActor func tmpNotice(_ model: ComposerModel) -> String? {
-    guard let base = model.notice ?? model.view?.error?.message else { return nil }
-    let a: String = model.view?.error?.rpc_code ?? "-"
-    let b: String = model.view?.error?.code ?? "-"
-    let c: String = model.chat.thread?.error?.rpc_code ?? "-"
-    let d: String = model.chat.thread?.error?.code ?? "-"
-    return base + " [TMP \(a)/\(b)/\(c)/\(d)]"
-}
