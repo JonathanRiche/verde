@@ -242,7 +242,8 @@ struct AttachmentThumbnail: View {
                         .contentShape(RoundedRectangle(cornerRadius: 10))
                         .onTapGesture { if let url = AttachmentImageCache.shared.file(for: key) { viewer = ViewerRequestImage(url: url) } }
                         .accessibilityElement()
-                        .accessibilityLabel("Image" + (attachment.name.isEmpty ? "" : ", " + attachment.name))
+                        // Host paths stay abstract on the phone: only the file name is read out.
+                        .accessibilityLabel("Image" + (attachment.name.isEmpty ? "" : ", " + basename(attachment.name)))
                         .accessibilityHint("Opens the image full screen.")
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { if let url = AttachmentImageCache.shared.file(for: key) { viewer = ViewerRequestImage(url: url) } }

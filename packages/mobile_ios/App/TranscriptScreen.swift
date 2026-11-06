@@ -54,7 +54,7 @@ struct TranscriptScreen: View {
                         ProviderGlyph(provider: summary.provider)
                         VStack(alignment: .leading, spacing: 0) {
                         Text(summary.title.isEmpty ? "Chat" : summary.title) .font(VerdeTheme.ui(15, bold: true)).lineLimit(1)
-                        Text([summary.provider, summary.model].compactMap { $0 }.joined(separator: " · "))
+                        Text(rowSubtitle([providerDisplayName(summary.provider), summary.model]) ?? "")
                              .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
