@@ -98,6 +98,8 @@ pub const types = .{
     .{ "AttentionStatus", attention.Status },
     .{ "AttentionItem", attention.Item },
     .{ "AttentionNeed", attention.Need },
+    .{ "AttentionChatState", attention.ChatState },
+    .{ "AttentionChat", attention.Chat },
     .{ "AttentionView", attention.View },
     .{ "AttentionQuery", wire.Query(attention.View) },
     .{ "ManageBusy", manage.Busy },

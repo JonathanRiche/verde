@@ -1878,6 +1878,7 @@ data class Pane(
     val `can_stop`: Boolean = false,
     val `attention_kind`: String? = null,
     val `needs_you`: Boolean = false,
+    val `state`: String? = null,
     val `provider`: String? = null,
 )
 
@@ -1895,6 +1896,7 @@ data class ThreadSummary(
     val `status`: String,
     val `history_bucket`: String,
     val `committed`: Boolean = true,
+    val `state`: String? = null,
 )
 
 @Serializable
@@ -2013,6 +2015,26 @@ data class AttentionNeed(
 )
 
 @Serializable
+enum class AttentionChatState {
+    `needs_you`,
+    `running`,
+    `failed`,
+    `unread`,
+    `idle`,
+}
+
+@Serializable
+data class AttentionChat(
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `title`: String,
+    val `deep_link`: String,
+    val `state`: AttentionChatState,
+    val `status`: String = "",
+    val `last_activity_at_ms`: Long? = null,
+)
+
+@Serializable
 data class AttentionView(
     val `items`: List<AttentionItem>,
     val `count`: Long,
@@ -2020,6 +2042,12 @@ data class AttentionView(
     val `needs`: List<AttentionNeed> = emptyList(),
     val `needs_you`: Long = 0,
     val `unread`: Long = 0,
+    val `running`: List<AttentionChat> = emptyList(),
+    val `running_count`: Long = 0,
+    val `failed`: List<AttentionChat> = emptyList(),
+    val `failed_count`: Long = 0,
+    val `unread_chats`: List<AttentionChat> = emptyList(),
+    val `recent`: List<AttentionChat> = emptyList(),
 )
 
 @Serializable

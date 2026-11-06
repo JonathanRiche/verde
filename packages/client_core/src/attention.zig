@@ -44,14 +44,24 @@ pub const State = struct {
 
 /// `attention` selector item; `kind` is the attention kind.
 pub const Item = struct { workspace_id: []const u8, thread_id: []const u8, turn_id: ?[]const u8, kind: Kind, status: Status, since_ms: i64, title: []const u8, deep_link: []const u8 };
-/// One chat that needs the user: `needs_approval` (its turn waits for an approval), `blocked`
-/// (it asked for input) or `failed` (a failure this device has not opened yet).
+/// One chat that needs the user: `needs_approval` (its turn waits for an approval) or `blocked`
+/// (it asked for input).
 pub const Need = struct { workspace_id: []const u8, thread_id: []const u8, kind: Kind, title: []const u8, deep_link: []const u8 };
-/// `items`/`count`: every attention entry, unread completions included. `needs`/`needs_you`: the
-/// "needs you" set every surface badges (approvals, input requests and unacknowledged failures
-/// across all workspaces, plus the companion crew's approvals and input requests), one per chat.
-/// `unread`: finished chats not opened yet; a separate state that never feeds `needs_you`.
-pub const View = struct { items: []const Item, count: u32, loading: bool, needs: []const Need = &.{}, needs_you: u32 = 0, unread: u32 = 0 };
+/// A chat's single state, by fixed precedence needs_you > running > failed > unread > idle:
+/// `needs_you` its turn waits for an approval or input (also via the companion crew); `running` a
+/// live turn; `failed` its latest turn failed and this device has not opened it since; `unread` it
+/// finished and this device has not opened it since; `idle` anything else.
+pub const ChatState = enum { needs_you, running, failed, unread, idle };
+/// One classified chat. `status` is its current turn status ("" without one).
+pub const Chat = struct { workspace_id: []const u8, thread_id: []const u8, title: []const u8, deep_link: []const u8, state: ChatState, status: []const u8 = "", last_activity_at_ms: ?i64 = null };
+pub const MAX_RECENT = 30;
+/// `items`/`count`: every attention entry. Every chat of an open workspace lands in exactly one
+/// of: `needs` (`needs_you` chats; `needs_you` is the badge count every surface shows),
+/// `running`, `failed` (unacknowledged failures; like the desktop, they are listed with the
+/// chats that need you but never counted in the badge), `unread_chats` (`unread` is its count)
+/// or idle. `recent`: idle and unread chats, newest activity first (at most MAX_RECENT), so it
+/// never repeats a chat shown under Needs you, Failed or Running.
+pub const View = struct { items: []const Item, count: u32, loading: bool, needs: []const Need = &.{}, needs_you: u32 = 0, unread: u32 = 0, running: []const Chat = &.{}, running_count: u32 = 0, failed: []const Chat = &.{}, failed_count: u32 = 0, unread_chats: []const Chat = &.{}, recent: []const Chat = &.{} };
 
 fn append(comptime T: type, a: A, slice: *[]const T, item: T) E!void {
     const next = try a.alloc(T, slice.len + 1);
@@ -367,54 +377,109 @@ pub fn view(a: A, state: *const h.State) E!View {
         try items.append(a, .{ .workspace_id = e.workspace_id, .thread_id = e.thread_id, .turn_id = if (e.turn_id.len > 0) e.turn_id else null, .kind = kind, .status = e.status, .since_ms = e.since_ms, .title = if (title.len > 0) title else "Chat", .deep_link = try push.deepLink(a, state.config.host_id, e.workspace_id, e.thread_id) });
     }
     std.mem.sort(Item, items.items, {}, newer);
-    const needs = try needsOf(a, state);
-    var unread: u32 = 0;
-    for (state.attention.entries) |e| if (e.attention == .unread and !listedNeed(needs, e.workspace_id, e.thread_id)) {
-        unread += 1;
-    };
-    return .{ .items = items.items, .count = @intCast(items.items.len), .loading = !state.attention.loaded, .needs = needs, .needs_you = @intCast(needs.len), .unread = unread };
+    var out: View = .{ .items = items.items, .count = @intCast(items.items.len), .loading = !state.attention.loaded };
+    try classifyAll(a, state, &out);
+    return out;
 }
 
-/// What needs the user for one chat: a pending approval (live or synced) first, then an
-/// approval, input or failure attention entry. Unread completions never do.
-fn needKind(state: *const h.State, ws: []const u8, thread_id: []const u8) ?Kind {
+/// The one chat classifier every list, badge and row uses (see `ChatState`). `kind` is why a
+/// `needs_you` chat waits (approval or input).
+pub fn classify(state: *const h.State, ws: []const u8, thread_id: []const u8) struct { state: ChatState, kind: ?Kind = null, status: []const u8 = "" } {
     const turn = current(state, ws, thread_id);
-    if (turn.approval or eq(turn.status, "waiting_approval")) return .needs_approval;
-    const i = find(state.attention.entries, ws, thread_id) orelse return null;
-    const kind = state.attention.entries[i].attention orelse return null;
-    return if (kind == .unread) null else kind;
+    const entry: ?Kind = if (find(state.attention.entries, ws, thread_id)) |i| state.attention.entries[i].attention else null;
+    if (turn.approval or eq(turn.status, "waiting_approval")) return .{ .state = .needs_you, .kind = .needs_approval, .status = turn.status };
+    if (entry == .blocked or entry == .needs_approval) return .{ .state = .needs_you, .kind = entry, .status = turn.status };
+    for (state.companion.view.crew.links) |link| {
+        if (link.hidden or !eq(link.workspace_id, ws) or !eq(link.local_thread_id, thread_id)) continue;
+        if (eq(link.status, "waiting_approval")) return .{ .state = .needs_you, .kind = .needs_approval, .status = turn.status };
+        if (eq(link.status, "blocked")) return .{ .state = .needs_you, .kind = .blocked, .status = turn.status };
+    }
+    if (turn.status.len > 0 and activeStatus(turn.status)) return .{ .state = .running, .status = turn.status };
+    if (entry == .failed) return .{ .state = .failed, .status = turn.status };
+    if (entry == .unread) return .{ .state = .unread, .status = turn.status };
+    return .{ .state = .idle, .status = turn.status };
 }
 fn listedNeed(needs: []const Need, ws: []const u8, thread_id: []const u8) bool {
     for (needs) |n| if (eq(n.workspace_id, ws) and eq(n.thread_id, thread_id)) return true;
     return false;
 }
-fn needsOf(a: A, state: *const h.State) E![]const Need {
-    var out: std.ArrayList(Need) = .empty;
+fn listedChat(chats: []const Chat, ws: []const u8, thread_id: []const u8) bool {
+    for (chats) |n| if (eq(n.workspace_id, ws) and eq(n.thread_id, thread_id)) return true;
+    return false;
+}
+fn recentFirst(_: void, l: Chat, r: Chat) bool {
+    const x = l.last_activity_at_ms orelse std.math.minInt(i64);
+    const y = r.last_activity_at_ms orelse std.math.minInt(i64);
+    if (x != y) return x > y;
+    const order = std.mem.order(u8, l.workspace_id, r.workspace_id);
+    return if (order == .eq) std.mem.lessThan(u8, l.thread_id, r.thread_id) else order == .lt;
+}
+fn classifyAll(a: A, state: *const h.State, out: *View) E!void {
+    var needs: std.ArrayList(Need) = .empty;
+    var running: std.ArrayList(Chat) = .empty;
+    var failed: std.ArrayList(Chat) = .empty;
+    var unread: std.ArrayList(Chat) = .empty;
+    var recent: std.ArrayList(Chat) = .empty;
     const Add = struct {
-        fn one(al: A, s: *const h.State, list: *std.ArrayList(Need), ws: []const u8, thread_id: []const u8, kind: Kind) E!void {
+        fn need(al: A, s: *const h.State, list: *std.ArrayList(Need), ws: []const u8, thread_id: []const u8, kind: Kind, title: []const u8) E!void {
             if (ws.len == 0 or thread_id.len == 0 or listedNeed(list.items, ws, thread_id)) return;
-            const title = titleOf(s, ws, thread_id);
             try list.append(al, .{ .workspace_id = ws, .thread_id = thread_id, .kind = kind, .title = if (title.len > 0) title else "Chat", .deep_link = try push.deepLink(al, s.config.host_id, ws, thread_id) });
         }
+        fn chat(al: A, s: *const h.State, list: *std.ArrayList(Chat), ws: []const u8, thread_id: []const u8, st: ChatState, status: []const u8, title: []const u8, at: ?i64) E!void {
+            if (ws.len == 0 or thread_id.len == 0 or listedChat(list.items, ws, thread_id)) return;
+            try list.append(al, .{ .workspace_id = ws, .thread_id = thread_id, .title = if (title.len > 0) title else "Chat", .deep_link = try push.deepLink(al, s.config.host_id, ws, thread_id), .state = st, .status = status, .last_activity_at_ms = at });
+        }
     };
-    // Open workspaces' chats (as Home lists them), then entries for chats sync has not listed.
-    for (try threads(a, state)) |t| {
-        const thread_id = p.s(t.thread, "local_thread_id");
-        if (p.yes(p.get(t.thread, "archived")) or !openWorkspace(state, t.workspace_id)) continue;
-        if (needKind(state, t.workspace_id, thread_id)) |kind| try Add.one(a, state, &out, t.workspace_id, thread_id, kind);
+    // Open workspaces' chats as the lists show them (titles and recency included).
+    const listed = try @import("sync.zig").query(a, state, "workspaces");
+    for (p.rows(p.get(listed, "items"))) |ws| {
+        if (!p.yes(p.get(ws, "open"))) continue;
+        const wid = p.s(ws, "workspace_id");
+        for (p.rows(p.get(ws, "threads"))) |t| {
+            if (p.yes(p.get(t, "archived"))) continue;
+            const thread_id = p.s(t, "thread_id");
+            const title = p.s(t, "title");
+            const at = p.num(p.get(t, "last_activity_at_ms"));
+            const c = classify(state, wid, thread_id);
+            switch (c.state) {
+                .needs_you => try Add.need(a, state, &needs, wid, thread_id, c.kind.?, title),
+                .running => try Add.chat(a, state, &running, wid, thread_id, .running, c.status, title, at),
+                .failed => try Add.chat(a, state, &failed, wid, thread_id, .failed, c.status, title, at),
+                .unread, .idle => {
+                    if (c.state == .unread) try Add.chat(a, state, &unread, wid, thread_id, .unread, c.status, title, at);
+                    // Drafts that never sent are not recent chats.
+                    if (p.get(t, "committed") == .bool and !p.get(t, "committed").bool) continue;
+                    try Add.chat(a, state, &recent, wid, thread_id, c.state, c.status, title, at);
+                },
+            }
+        }
     }
+    // Attention for chats sync has not listed (a push), and crew chats outside the listing.
     for (state.attention.entries) |e| {
         const kind = e.attention orelse continue;
-        if (kind == .unread or listedThread(state, e.workspace_id, e.thread_id)) continue;
-        try Add.one(a, state, &out, e.workspace_id, e.thread_id, kind);
+        if (listedThread(state, e.workspace_id, e.thread_id)) continue;
+        const title = titleOf(state, e.workspace_id, e.thread_id);
+        switch (kind) {
+            .needs_approval, .blocked => try Add.need(a, state, &needs, e.workspace_id, e.thread_id, kind, title),
+            .failed => try Add.chat(a, state, &failed, e.workspace_id, e.thread_id, .failed, "", title, null),
+            .unread => try Add.chat(a, state, &unread, e.workspace_id, e.thread_id, .unread, "", title, null),
+        }
     }
-    // The companion's delegated chats report approvals and input requests through their links.
     for (state.companion.view.crew.links) |link| {
-        if (link.hidden) continue;
+        if (link.hidden or listedThread(state, link.workspace_id, link.local_thread_id)) continue;
         const kind: Kind = if (eq(link.status, "waiting_approval")) .needs_approval else if (eq(link.status, "blocked")) .blocked else continue;
-        try Add.one(a, state, &out, link.workspace_id, link.local_thread_id, kind);
+        try Add.need(a, state, &needs, link.workspace_id, link.local_thread_id, kind, link.title);
     }
-    return out.items;
+    std.mem.sort(Chat, recent.items, {}, recentFirst);
+    out.needs = needs.items;
+    out.needs_you = @intCast(needs.items.len);
+    out.running = running.items;
+    out.running_count = @intCast(running.items.len);
+    out.failed = failed.items;
+    out.failed_count = @intCast(failed.items.len);
+    out.unread_chats = unread.items;
+    out.unread = @intCast(unread.items.len);
+    out.recent = recent.items[0..@min(recent.items.len, MAX_RECENT)];
 }
 /// True when sync lists the chat (its open/archived state then decides).
 fn listedThread(state: *const h.State, ws: []const u8, thread_id: []const u8) bool {
@@ -447,6 +512,7 @@ pub fn annotate(a: A, state: *const h.State, selector: []const u8, data: *V) E!v
             for (@constCast(p.rows(p.get(ws, "panes")))) |*pane| _ = try mark(a, state, pane);
             for (@constCast(p.rows(p.get(ws, "threads")))) |*thread| try relive(a, state, thread);
         }
+        for (@constCast(p.rows(p.get(p.get(data.*, "history"), "items")))) |*thread| try relive(a, state, thread);
         return;
     }
     if (!eq(selector, "home")) return;
@@ -497,18 +563,28 @@ fn liveStatus(state: *const h.State, ws: []const u8, thread_id: []const u8) ?[]c
 }
 fn relive(a: A, state: *const h.State, thread: *V) E!void {
     if (thread.* != .object) return;
-    const status = liveStatus(state, p.s(thread.*, "workspace_id"), p.s(thread.*, "thread_id")) orelse return;
-    try thread.object.put(a, "status", .{ .string = status });
+    const ws = p.s(thread.*, "workspace_id");
+    const id = p.s(thread.*, "thread_id");
+    if (liveStatus(state, ws, id)) |status| try thread.object.put(a, "status", .{ .string = status });
+    try thread.object.put(a, "state", .{ .string = @tagName(classify(state, ws, id).state) });
 }
 /// Applies the live turn and the attention entry; true when the pane has an attention kind.
 fn mark(a: A, state: *const h.State, pane: *V) E!bool {
-    if (pane.* != .object or !eq(p.s(pane.*, "kind"), "chat")) return false;
+    if (pane.* != .object) return false;
+    if (!eq(p.s(pane.*, "kind"), "chat")) {
+        // Terminals and other panes: running while their process works.
+        const busy = eq(p.s(pane.*, "status"), "working") or p.yes(p.get(pane.*, "can_stop"));
+        try pane.object.put(a, "state", .{ .string = if (busy) "running" else "idle" });
+        return false;
+    }
     if (liveStatus(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id"))) |status| {
         try pane.object.put(a, "status", .{ .string = status });
         try pane.object.put(a, "can_stop", .{ .bool = activeStatus(status) });
         try pane.object.put(a, "attention", .{ .bool = eq(status, "waiting_approval") });
     }
-    try pane.object.put(a, "needs_you", .{ .bool = needKind(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id")) != null });
+    const c = classify(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id"));
+    try pane.object.put(a, "needs_you", .{ .bool = c.state == .needs_you });
+    try pane.object.put(a, "state", .{ .string = @tagName(c.state) });
     const i = find(state.attention.entries, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id")) orelse return false;
     const kind = state.attention.entries[i].attention orelse return false;
     try pane.object.put(a, "attention", .{ .bool = true });

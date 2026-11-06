@@ -19,9 +19,12 @@ pub const Pane = struct {
     can_stop: bool = false,
     /// K-17 thread attention (unread, needs_approval, blocked, failed).
     attention_kind: ?[]const u8 = null,
-    /// Counts toward "needs you" (attention.zig `needs`): an approval or input wait, or an
-    /// unacknowledged failure. `attention` also covers unread completions; this never does.
+    /// Counts toward "needs you" (attention.zig `needs`): an approval or input wait.
+    /// `attention` also covers unread completions and failures; this never does.
     needs_you: bool = false,
+    /// attention.zig `ChatState` (needs_you, running, failed, unread, idle) on Home and Workspaces
+    /// panes; terminals are running or idle. Null where the core did not classify the pane.
+    state: ?[]const u8 = null,
     /// Agent provider of a TUI running in a terminal pane (desktop `agent_provider`).
     provider: ?[]const u8 = null,
 };
@@ -39,6 +42,9 @@ pub const ThreadSummary = struct {
     history_bucket: []const u8,
     /// False for a draft that never sent a message; lists hide it like the desktop sidebar.
     committed: bool = true,
+    /// attention.zig `ChatState` on Workspaces threads and History items; null elsewhere
+    /// (the chat screen's own summary).
+    state: ?[]const u8 = null,
 };
 pub const Workspace = struct {
     workspace_id: []const u8,

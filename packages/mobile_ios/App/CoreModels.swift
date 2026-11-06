@@ -7473,6 +7473,7 @@ struct Pane: Codable {
     var `can_stop`: Bool = false
     var `attention_kind`: String? = nil
     var `needs_you`: Bool = false
+    var `state`: String? = nil
     var `provider`: String? = nil
 }
 
@@ -7490,6 +7491,7 @@ extension Pane {
         case `can_stop`
         case `attention_kind`
         case `needs_you`
+        case `state`
         case `provider`
     }
     init(from decoder: Decoder) throws {
@@ -7522,6 +7524,9 @@ extension Pane {
         if !c.contains(.`needs_you`) { self.`needs_you` = false } else {
         self.`needs_you` = try c.decode(Bool.self, forKey: .`needs_you`)
         }
+        if !c.contains(.`state`) { self.`state` = nil } else {
+        self.`state` = try c.decodeIfPresent(String.self, forKey: .`state`)
+        }
         if !c.contains(.`provider`) { self.`provider` = nil } else {
         self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
         }
@@ -7540,6 +7545,7 @@ extension Pane {
         try c.encode(self.`can_stop`, forKey: .`can_stop`)
         try c.encode(self.`attention_kind`, forKey: .`attention_kind`)
         try c.encode(self.`needs_you`, forKey: .`needs_you`)
+        try c.encode(self.`state`, forKey: .`state`)
         try c.encode(self.`provider`, forKey: .`provider`)
     }
 }
@@ -7557,6 +7563,7 @@ struct ThreadSummary: Codable {
     var `status`: String
     var `history_bucket`: String
     var `committed`: Bool = true
+    var `state`: String? = nil
 }
 
 extension ThreadSummary {
@@ -7573,6 +7580,7 @@ extension ThreadSummary {
         case `status`
         case `history_bucket`
         case `committed`
+        case `state`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -7590,6 +7598,9 @@ extension ThreadSummary {
         if !c.contains(.`committed`) { self.`committed` = true } else {
         self.`committed` = try c.decode(Bool.self, forKey: .`committed`)
         }
+        if !c.contains(.`state`) { self.`state` = nil } else {
+        self.`state` = try c.decodeIfPresent(String.self, forKey: .`state`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -7605,6 +7616,7 @@ extension ThreadSummary {
         try c.encode(self.`status`, forKey: .`status`)
         try c.encode(self.`history_bucket`, forKey: .`history_bucket`)
         try c.encode(self.`committed`, forKey: .`committed`)
+        try c.encode(self.`state`, forKey: .`state`)
     }
 }
 
@@ -8000,6 +8012,60 @@ extension AttentionNeed {
     }
 }
 
+enum AttentionChatState: String, Codable {
+    case `needs_you`
+    case `running`
+    case `failed`
+    case `unread`
+    case `idle`
+}
+
+struct AttentionChat: Codable {
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `title`: String
+    var `deep_link`: String
+    var `state`: AttentionChatState
+    var `status`: String = ""
+    var `last_activity_at_ms`: Int64? = nil
+}
+
+extension AttentionChat {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `thread_id`
+        case `title`
+        case `deep_link`
+        case `state`
+        case `status`
+        case `last_activity_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`deep_link` = try c.decode(String.self, forKey: .`deep_link`)
+        self.`state` = try c.decode(AttentionChatState.self, forKey: .`state`)
+        if !c.contains(.`status`) { self.`status` = "" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`last_activity_at_ms`) { self.`last_activity_at_ms` = nil } else {
+        self.`last_activity_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`last_activity_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`deep_link`, forKey: .`deep_link`)
+        try c.encode(self.`state`, forKey: .`state`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`last_activity_at_ms`, forKey: .`last_activity_at_ms`)
+    }
+}
+
 struct AttentionView: Codable {
     var `items`: [AttentionItem]
     var `count`: UInt32
@@ -8007,6 +8073,12 @@ struct AttentionView: Codable {
     var `needs`: [AttentionNeed] = []
     var `needs_you`: UInt32 = 0
     var `unread`: UInt32 = 0
+    var `running`: [AttentionChat] = []
+    var `running_count`: UInt32 = 0
+    var `failed`: [AttentionChat] = []
+    var `failed_count`: UInt32 = 0
+    var `unread_chats`: [AttentionChat] = []
+    var `recent`: [AttentionChat] = []
 }
 
 extension AttentionView {
@@ -8017,6 +8089,12 @@ extension AttentionView {
         case `needs`
         case `needs_you`
         case `unread`
+        case `running`
+        case `running_count`
+        case `failed`
+        case `failed_count`
+        case `unread_chats`
+        case `recent`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -8032,6 +8110,24 @@ extension AttentionView {
         if !c.contains(.`unread`) { self.`unread` = 0 } else {
         self.`unread` = try c.decode(UInt32.self, forKey: .`unread`)
         }
+        if !c.contains(.`running`) { self.`running` = [] } else {
+        self.`running` = try c.decode([AttentionChat].self, forKey: .`running`)
+        }
+        if !c.contains(.`running_count`) { self.`running_count` = 0 } else {
+        self.`running_count` = try c.decode(UInt32.self, forKey: .`running_count`)
+        }
+        if !c.contains(.`failed`) { self.`failed` = [] } else {
+        self.`failed` = try c.decode([AttentionChat].self, forKey: .`failed`)
+        }
+        if !c.contains(.`failed_count`) { self.`failed_count` = 0 } else {
+        self.`failed_count` = try c.decode(UInt32.self, forKey: .`failed_count`)
+        }
+        if !c.contains(.`unread_chats`) { self.`unread_chats` = [] } else {
+        self.`unread_chats` = try c.decode([AttentionChat].self, forKey: .`unread_chats`)
+        }
+        if !c.contains(.`recent`) { self.`recent` = [] } else {
+        self.`recent` = try c.decode([AttentionChat].self, forKey: .`recent`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -8041,6 +8137,12 @@ extension AttentionView {
         try c.encode(self.`needs`, forKey: .`needs`)
         try c.encode(self.`needs_you`, forKey: .`needs_you`)
         try c.encode(self.`unread`, forKey: .`unread`)
+        try c.encode(self.`running`, forKey: .`running`)
+        try c.encode(self.`running_count`, forKey: .`running_count`)
+        try c.encode(self.`failed`, forKey: .`failed`)
+        try c.encode(self.`failed_count`, forKey: .`failed_count`)
+        try c.encode(self.`unread_chats`, forKey: .`unread_chats`)
+        try c.encode(self.`recent`, forKey: .`recent`)
     }
 }
 

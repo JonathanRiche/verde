@@ -426,31 +426,55 @@ fn homeNeeds(f: *Fixture) !usize {
     return n;
 }
 
-test "needs you counts approvals, input and unacknowledged failures, never unread completions" {
+fn chatState(f: *Fixture, selector: []const u8, thread_id: []const u8) ![]const u8 {
+    const data = p.get(try h.parse(f.a(), try f.host.query(selector, f.a())), "data");
+    if (h.eq(selector, "home")) {
+        for (p.rows(p.get(data, "items"))) |pane| if (h.eq(p.s(pane, "thread_id"), thread_id)) return p.s(pane, "state");
+        return "absent";
+    }
+    for (p.rows(p.get(data, "items"))) |w| for (p.rows(p.get(w, "threads"))) |t| if (h.eq(p.s(t, "thread_id"), thread_id)) return p.s(t, "state");
+    return "absent";
+}
+fn listLen(v: V, key: []const u8) usize {
+    return p.rows(p.get(v, key)).len;
+}
+
+test "one chat classifier: needs you > running > failed > unread > idle, each chat in one list" {
     var f = try Fixture.init(&.{"chat:read"});
     defer f.deinit();
-    // A finished chat not opened yet is unread, not "needs you".
+    // A finished chat not opened yet is unread: never "needs you", listed in Recent.
     try scene(&f, .{ .kind = .unread });
     var v = try attentionView(&f);
     try expect(p.uint(p.get(v, "needs_you")).? == 0 and p.uint(p.get(v, "unread")).? == 1 and p.uint(p.get(v, "count")).? == 1);
-    try expect(try homeNeeds(&f) == 0);
-    // A failure this device has not opened needs the user.
+    try eql("unread", try chatState(&f, "workspaces", "t"));
+    try eql("t", p.s(p.rows(p.get(v, "unread_chats"))[0], "thread_id"));
+    try expect(listLen(v, "recent") == 2 and try homeNeeds(&f) == 0);
+    // An unacknowledged failure is listed under `failed`, not counted in the badge (desktop rule).
     try scene(&f, .{ .kind = .failed });
     v = try attentionView(&f);
-    try expect(p.uint(p.get(v, "needs_you")).? == 1 and p.uint(p.get(v, "unread")).? == 0);
-    try eql("failed", p.s(p.rows(p.get(v, "needs"))[0], "kind"));
-    try eql("Rotate keys", p.s(p.rows(p.get(v, "needs"))[0], "title"));
-    try expect(try homeNeeds(&f) == 1);
-    // A pending approval counts even in the chat being viewed (its entry was cleared).
+    try expect(p.uint(p.get(v, "needs_you")).? == 0 and p.uint(p.get(v, "failed_count")).? == 1 and p.uint(p.get(v, "unread")).? == 0);
+    try eql("t", p.s(p.rows(p.get(v, "failed"))[0], "thread_id"));
+    try eql("failed", try chatState(&f, "workspaces", "t"));
+    try eql("failed", try chatState(&f, "home", "t"));
+    // Recent never repeats a chat shown under Failed: only "t2" is left.
+    try expect(listLen(v, "recent") == 1);
+    try eql("t2", p.s(p.rows(p.get(v, "recent"))[0], "thread_id"));
+    // A pending approval needs the user even in the chat being viewed.
     try scene(&f, .{ .sync_status = "waiting_approval", .live_status = "waiting_approval", .approval = true });
     v = try attentionView(&f);
-    try expect(p.uint(p.get(v, "needs_you")).? == 1 and p.uint(p.get(v, "count")).? == 0);
+    try expect(p.uint(p.get(v, "needs_you")).? == 1 and p.uint(p.get(v, "running_count")).? == 0);
     try eql("needs_approval", p.s(p.rows(p.get(v, "needs"))[0], "kind"));
+    try eql("needs_you", try chatState(&f, "home", "t"));
     try expect(try homeNeeds(&f) == 1);
-    // Resolved in the open chat: nothing needs the user.
-    try scene(&f, .{ .sync_status = "waiting_approval", .live_status = "running" });
-    try expect(p.uint(p.get(try attentionView(&f), "needs_you")).? == 0);
-    // Crew approvals and input requests count once per chat; hidden links and failed links do not.
+    // Resolved in the open chat and still working: running, in Running only, not Recent.
+    try scene(&f, .{ .sync_status = "waiting_approval", .live_status = "running", .kind = .failed });
+    v = try attentionView(&f);
+    try expect(p.uint(p.get(v, "needs_you")).? == 0 and p.uint(p.get(v, "running_count")).? == 1 and p.uint(p.get(v, "failed_count")).? == 0);
+    try eql("running", p.s(p.rows(p.get(v, "running"))[0], "status"));
+    try eql("running", try chatState(&f, "workspaces", "t"));
+    try eql("running", try chatState(&f, "home", "t"));
+    try expect(listLen(v, "recent") == 1);
+    // Crew approvals and input requests count once per chat; hidden and failed links do not.
     try scene(&f, .{ .kind = .failed, .links = &.{
         .{ .link_id = "l1", .workspace_id = "ws", .local_thread_id = "t2", .status = "blocked" },
         .{ .link_id = "l2", .workspace_id = "ws", .local_thread_id = "t", .status = "waiting_approval" },
@@ -458,10 +482,11 @@ test "needs you counts approvals, input and unacknowledged failures, never unrea
         .{ .link_id = "l4", .workspace_id = "ws", .local_thread_id = "t4", .status = "failed" },
     } });
     v = try attentionView(&f);
-    try expect(p.uint(p.get(v, "needs_you")).? == 2);
+    try expect(p.uint(p.get(v, "needs_you")).? == 2 and p.uint(p.get(v, "failed_count")).? == 0 and listLen(v, "recent") == 0);
     const needs = p.rows(p.get(v, "needs"));
     try eql("t", p.s(needs[0], "thread_id"));
-    try eql("failed", p.s(needs[0], "kind"));
+    try eql("needs_approval", p.s(needs[0], "kind"));
     try eql("t2", p.s(needs[1], "thread_id"));
     try eql("blocked", p.s(needs[1], "kind"));
+    try eql("needs_you", try chatState(&f, "workspaces", "t2"));
 }
