@@ -58,8 +58,12 @@ struct GitChatControls: View {
         }
         .onChange(of: browse.session?.store.snapshots["git_review"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_status"]) { _, _ in Task { await model?.refresh() } }
-        .onChange(of: browse.session?.store.snapshots["git_summary:" + workspace]) { _, _ in Task { await model?.refresh() } }
-        .onChange(of: browse.session?.store.snapshots["workspace_changes:" + workspace]) { _, _ in Task { await model?.refresh() } }
+        .onChange(of: workspaceSnapshots) { _, _ in Task { await model?.refresh() } }
+    }
+    /// The workspace's git summary and changes publications, as one value to watch.
+    private var workspaceSnapshots: [Data?] {
+        let store = browse.session?.store
+        return [store?.snapshots["git_summary:" + workspace], store?.snapshots["workspace_changes:" + workspace]]
     }
     private func catalogChanged() async {
         let workspaceValue = browse.session?.store.workspaces?.data?.items.first { $0.workspace_id == workspace }
