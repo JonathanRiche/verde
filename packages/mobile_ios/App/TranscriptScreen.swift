@@ -301,8 +301,15 @@ private struct TranscriptList: View {
 
     /// I14-2: scrolls the task's row into view and flashes it.
     private func showBackground(_ task: ChatBackgroundTask, _ proxy: ScrollViewProxy) {
-        follow = false
-        withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("b:" + task.row_id, anchor: .center) }
+        let id = "b:" + task.row_id
+        let items = model.items
+        let nearEnd = (items.lastIndex { $0.id == id }).map { $0 >= items.count - 3 } ?? false
+        withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) {
+            // P14-2: a task at the end is shown by going to the bottom, where the bar's room keeps it
+            // clear and no "Latest" strip appears over it; an older one is centred.
+            if nearEnd { follow = true; proxy.scrollTo(bottomID, anchor: .bottom) }
+            else { follow = false; proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.4)) }
+        }
         let key = backgroundHighlightKey(task.row_id)
         model.disclosure.setFlag(key, true)
         Task { @MainActor in

@@ -17,9 +17,10 @@ struct BackgroundStatusIcon: View {
         Group {
             switch status ?? "" {
             case "running": ProgressView().controlSize(.mini)
-            case "failed": Image(systemName: "xmark").font(.system(size: glyph, weight: .bold)).accessibilityHidden(true)
-            case "stopped": Image(systemName: "stop.fill").font(.system(size: glyph * 0.9, weight: .bold)).accessibilityHidden(true)
-            default: Image(systemName: "checkmark").font(.system(size: glyph, weight: .bold)).accessibilityRemoveTraits(.isSelected).accessibilityHidden(true)
+            case "failed": Image(systemName: "xmark").font(.system(size: glyph, weight: .bold)).accessibilityLabel("Failed").accessibilityHidden(true)
+            case "stopped": Image(systemName: "stop.fill").font(.system(size: glyph * 0.9, weight: .bold)).accessibilityLabel("Stopped").accessibilityHidden(true)
+            default: Image(systemName: "checkmark").font(.system(size: glyph, weight: .bold)).accessibilityLabel("Finished")
+                .accessibilityRemoveTraits(.isSelected).accessibilityHidden(true)
             }
         }
         .foregroundStyle(backgroundStatusColor(status))

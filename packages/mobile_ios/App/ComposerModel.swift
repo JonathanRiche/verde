@@ -110,6 +110,8 @@ final class ComposerModel {
     private(set) var text = ""
     private(set) var selection = NSRange(location: 0, length: 0)
     private(set) var busy = false
+    /// "Preparing images… 3 of 16" while a multi-pick loads and uploads (I15-1).
+    var attachProgress: String?
     private(set) var pendingSelection: ChatSelection?
     private var selectionVersion = 0
     private var selectionReceipt: String?
@@ -376,9 +378,13 @@ final class ComposerModel {
     /// `skipped` is the notice for picked items that couldn't be read; it shows unless a limit
     /// notice takes its place.
     func attachAll(_ images: [Data], skipped: String? = nil) {
-        guard !images.isEmpty else { if let skipped { notice = skipped }; return }
-        action { [self] in
-            guard await flush() else { return }
+        guard !images.isEmpty else { attachProgress = nil; if let skipped { notice = skipped }; return }
+        // I15-1: queued behind whatever runs, never dropped because the composer is busy.
+        enqueue { [self] in
+            busy = true
+            notice = nil
+            defer { busy = false; attachProgress = nil }
+            guard await flush() else { notice = "The images couldn't be added. Try again."; return }
             let existing = references()
             let fit = composerImagesThatFit(picked: images.count, existing: existing.count)
             let usable = images.prefix(fit.take).filter { $0.count <= Self.maxImageBytes }
@@ -392,7 +398,8 @@ final class ComposerModel {
                     (AttachmentInput(local_id: "img-" + UUID().uuidString, name: "Photo.jpg", mime: "image/jpeg",
                                      byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString()), bytes)
                 }
-                guard await setDraft(text, attached + added.map(\.0)) else { break }
+                attachProgress = "Adding images… \(attached.count - existing.count + 1) of \(usable.count)"
+                guard await setDraft(text, attached + added.map(\.0)) else { notice = "Some images couldn't be added. Try again."; break }
                 // Later batches refer to these by id only; the core already holds their bytes.
                 attached += added.map { input, _ in
                     AttachmentInput(local_id: input.local_id, name: input.name, mime: input.mime, byte_size: input.byte_size, bytes_base64: "")
@@ -406,6 +413,7 @@ final class ComposerModel {
             if fit.overLimit { notice = composerImageLimitNotice }
             else if tooLarge > 0 { notice = "This image is too large to attach." }
             else if let skipped { notice = skipped }
+            await refresh()
         }
     }
 

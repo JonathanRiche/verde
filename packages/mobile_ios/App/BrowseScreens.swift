@@ -299,6 +299,18 @@ private struct BrowseFrame<Content: View>: View {
         .toolbar {
             // iPad: the sidebar already shows the wordmark; one logo per screen.
             if title == "Home" && !adaptive.slotVisible { ToolbarItem(placement: .principal) { VerdeWordmark() } }
+            // I15-2: New chat is a compose button in the bar (Home and Workspaces), not a floating
+            // pill; beside a visible sidebar its "+" already does this.
+            if (title == "Home" || title == "Workspaces") && !adaptive.slotVisible && gateOpen(model.state)
+                && model.state.workspaces?.items.contains(where: \.open) == true {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink(value: BrowseRoute.newChat(nil)) {
+                        Image(systemName: "square.and.pencil").frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("New chat")
+                    .accessibilityIdentifier("home-new-chat")
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) { HostMenu(model: model.hosts) { addingHost = true } }
         }
         .modifier(RootCompanionToolbar())
@@ -337,20 +349,11 @@ struct HomeScreen: View {
     let model: BrowseModel
     let actions: BrowseActions
     @Environment(\.adaptive) private var adaptive
-    @Environment(\.companionBubbleShown) private var bubbleShown
-    @AppStorage(CompanionBubbleStore.edgeKey) private var bubbleEdge = BubbleEdge.trailing.rawValue
-    private var showsNewChat: Bool {
-        !adaptive.tier.docked && gateOpen(model.state) && model.state.workspaces?.items.contains(where: \.open) == true
-    }
-    /// "New chat" moves left of a bubble resting on the trailing edge.
-    private var newChatTrailing: CGFloat {
-        bubbleShown && bubbleEdge == BubbleEdge.trailing.rawValue ? 16 + BubbleLayout.diameter + BubbleLayout.margin : 16
-    }
     var body: some View {
         let hidden = model.companionThreads
         let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
         BrowseFrame(title: "Home", model: model, actions: actions,
-                    ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }, reservesBubble: !showsNewChat) { state, now in
+                    ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }) { state, now in
             // "Needs you" is the core's set (C8); unread completions stay with the rest.
             let attention = panes.filter(\.needs_you)
             // Only live turns and running processes are "Running" (I8-5); a finished, unread chat is not.
@@ -379,24 +382,6 @@ struct HomeScreen: View {
                 TitledSection("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden, all: workspaces) } }
             } else if state.workspaces != nil {
                 Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
-            }
-        }
-        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
-            // New chat docks in the permanent sidebar.
-            if showsNewChat {
-                NavigationLink(value: BrowseRoute.newChat(nil)) {
-                    Text("New chat").font(VerdeTheme.ui(14, bold: true))
-                        .padding(.horizontal, 24).frame(minHeight: 56)
-                        .foregroundStyle(VerdeTheme.text)
-                        .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 16))
-                        .shadow(color: .black.opacity(0.22), radius: 6, y: 3)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("home-new-chat")
-                .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 16)
-                // The band is opaque so rows never sit under New chat or the bubble beside it.
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .background(VerdeTheme.background.ignoresSafeArea(edges: .bottom))
             }
         }
     }

@@ -432,6 +432,14 @@ struct ChatComposer: View {
                     }.disabled(model.busy)
                 }.accessibilityIdentifier("composer-followup")
             }
+            if let progress = model.attachProgress {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(progress).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("composer-attach-progress")
+            }
             if let notice = model.notice ?? model.view?.error?.message {
                 Text(notice) .font(VerdeTheme.ui(12)).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
             }
@@ -913,7 +921,8 @@ struct ChatComposer: View {
     private func settingIcon(_ kind: ComposerPicker, value: String? = nil) -> String? {
         switch kind {
         case .effort: return "reasoning"
-        case .access: return (value ?? selectedID(kind) ?? choices(kind).first?.id) == "full_access" ? "unlocked" : "locked"
+        // P14-3: one glyph per value; unset means the host default (Full access), never the first row.
+        case .access: return (value ?? composerCurrentChoice(.access, value: selectedID(kind))) == "full_access" ? "unlocked" : "locked"
         case .speed: return (value ?? selectedID(kind)) == "on" ? "fast" : "standard"
         default: return nil
         }
@@ -946,20 +955,19 @@ struct ChatComposer: View {
 
     /// Loads the picked photos concurrently, keeps their order, and attaches the readable ones in
     /// one step; an unreadable one gets the per-item notice without blocking the rest.
+    /// I15-1: one photo at a time (a full-size photo can be tens of megabytes decoded, and 16 at
+    /// once could exhaust memory), each re-encoded and its original dropped before the next.
     @MainActor private func preparePhotos(_ items: [PhotosPickerItem]) async {
-        let loaded = await withTaskGroup(of: (Int, Data?).self) { group in
-            for (index, item) in items.enumerated() {
-                group.addTask { (index, try? await item.loadTransferable(type: Data.self)) }
-            }
-            var out = [Data?](repeating: nil, count: items.count)
-            for await (index, data) in group { out[index] = data }
-            return out
-        }
         var images: [Data] = []
         var unreadable = false
-        for data in loaded {
-            guard let data, data.count <= 24 * 1024 * 1024, let image = UIImage(data: data), let bytes = composerImage(image) else { unreadable = true; continue }
-            images.append(bytes)
+        for (index, item) in items.enumerated() {
+            model.attachProgress = "Preparing images… \(index + 1) of \(items.count)"
+            if let data = try? await item.loadTransferable(type: Data.self), data.count <= 24 * 1024 * 1024,
+               let image = UIImage(data: data), let bytes = composerImage(image) {
+                images.append(bytes)
+            } else {
+                unreadable = true
+            }
         }
         model.attachAll(images, skipped: unreadable ? "This image couldn't be opened." : nil)
     }
