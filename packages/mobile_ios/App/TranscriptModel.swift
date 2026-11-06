@@ -143,6 +143,10 @@ final class TranscriptModel: DiffRenderSource {
     private(set) var composer: ChatComposerView?
     /// Renderable items, rebuilt once per thread projection (never per frame).
     private(set) var items: [TranscriptItem] = []
+    /// Bumped on every send from this phone: the transcript follows it to the bottom even when the
+    /// turn fails at once and its row never shows as "Sending" (I8-4).
+    private(set) var ownSends = 0
+    func noteOwnSend() { ownSends += 1 }
     /// Failed messages the user removed (S19); the core drops them on its next read or send.
     private(set) var removedFailures: Set<String> = []
     func removeFailed(_ rowID: String) {

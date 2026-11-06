@@ -262,6 +262,7 @@ final class ComposerModel {
 
     /// `followup` overrides how a message sent during a running turn is delivered.
     func submit(voice: Bool, followup: FollowupKind? = nil) {
+        chat.noteOwnSend()
         guard canSubmit else { return }
         action { [self] in
             guard await flush(), let view else { return }

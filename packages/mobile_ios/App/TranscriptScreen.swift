@@ -226,7 +226,7 @@ let bottomRelease: CGFloat = 120
 /// The newest rows include your own message that is still on its way (just sent).
 func ownSendAtTail(_ items: [TranscriptItem]) -> Bool {
     items.suffix(3).contains { item in
-        if case .message(let row) = item { return row.role == "user" && row.delivery == "optimistic" }
+        if case .message(let row) = item { return row.role == "user" && (row.delivery == "optimistic" || row.delivery == "failed") }
         return false
     }
 }
@@ -362,6 +362,18 @@ private struct TranscriptList: View {
                         let bottom = transcriptAtBottom(atBottom, gap: maxY - viewport)
                         if bottom != atBottom { atBottom = bottom }
                         if bottom != follow { follow = bottom }
+                    }
+                    // Your own send always follows to the bottom (I8-4), now and once the new rows
+                    // (or a failure) have landed.
+                    .onChange(of: model.ownSends) {
+                        follow = true
+                        proxy.scrollTo(bottomID, anchor: .bottom)
+                        Task { @MainActor in
+                            for delay in [300, 900] {
+                                try? await Task.sleep(for: .milliseconds(delay))
+                                if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
+                            }
+                        }
                     }
                     .onChange(of: tailKey(items)) {
                         // Your own message always brings the transcript to the new turn (I3-6).

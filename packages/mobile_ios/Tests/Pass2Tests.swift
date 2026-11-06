@@ -81,6 +81,8 @@ final class TranscriptFollowTests: XCTestCase {
         XCTAssertTrue(ownSendAtTail([.message(reply), .message(sent)]))
         XCTAssertFalse(ownSendAtTail([.message(reply)]))
         XCTAssertFalse(ownSendAtTail([.message(ChatRow(id: "u2", role: "user", body: "old"))]))
+        // A send that failed at once still counts as your own new message (I8-4).
+        XCTAssertTrue(ownSendAtTail([.message(reply), .message(ChatRow(id: "u3", role: "user", body: "x", delivery: "failed"))]))
     }
 }
 
