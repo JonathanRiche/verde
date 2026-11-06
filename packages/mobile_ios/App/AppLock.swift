@@ -86,7 +86,7 @@ private struct LockCover: View {
                     Image(systemName: "lock.fill").font(.largeTitle).foregroundStyle(VerdeTheme.accent)
                     Text(lock.loaded ? "verde is locked" : "Security settings unavailable").font(VerdeTheme.display())
                     if let notice = lock.notice { Text(notice).multilineTextAlignment(.center).font(VerdeTheme.ui(13)) }
-                    Button(lock.loaded ? "Unlock" : "Retry") { Task { await lock.unlock() } }.buttonStyle(.borderedProminent).disabled(lock.busy)
+                    Button(lock.loaded ? "Unlock" : "Retry") { Task { await lock.unlock() } }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(lock.busy)
                 }
             }.padding(32)
         }.tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).accessibilityElement(children: .contain).accessibilityAddTraits(.isModal)

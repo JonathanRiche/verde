@@ -169,7 +169,7 @@ struct GitCommitSheet: View {
                                 Button(model.actionTitle(model.alternateAction)) { Task { await model.submitSheet(model.alternateAction) } }.disabled(!model.canSubmit)
                             }
                             Button(model.actionTitle(model.primaryAction)) { Task { await model.submitSheet(model.primaryAction) } }
-                                .buttonStyle(.borderedProminent).disabled(!model.canSubmit)
+                                .buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(!model.canSubmit)
                         }
                     }
                 }.font(VerdeTheme.ui(12, bold: true)).padding().background(VerdeTheme.panel)

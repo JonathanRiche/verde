@@ -177,11 +177,8 @@ struct ScheduledScreen: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
                 .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-                Button { form = .new } label: {
-                    Label("New scheduled task", systemImage: "plus").font(VerdeTheme.ui(15, bold: true))
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                }
-                .buttonStyle(.borderedProminent)
+                Button { form = .new } label: { Label("New scheduled task", systemImage: "plus") }
+                .buttonStyle(PrimaryButtonStyle())
                 .disabled(!view.can_edit)
                 .accessibilityIdentifier("schedule-empty-new")
                 Button { form = .example } label: { Text("Use this example").frame(minHeight: 44).contentShape(Rectangle()) }
@@ -612,7 +609,7 @@ private struct WeekdayChips: View {
                         .font(VerdeTheme.ui(12, bold: on))
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
-                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .frame(maxWidth: .infinity, minHeight: 44)
                         .background(on ? VerdeTheme.user : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(on ? VerdeTheme.accent : VerdeTheme.border))
                         .contentShape(Rectangle())

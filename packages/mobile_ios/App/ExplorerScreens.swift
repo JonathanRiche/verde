@@ -281,16 +281,16 @@ private struct CommitBar: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             switch filter {
             case .chat(let id, _):
-                Button("Commit") { onCommit(id) }.buttonStyle(.borderedProminent).accessibilityIdentifier("changes-commit")
+                Button("Commit") { onCommit(id) }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).accessibilityIdentifier("changes-commit")
             case .all:
                 Menu {
                     ForEach(owners, id: \.self) { owner in
                         if case .chat(let id, let title) = owner { Button(title) { onCommit(id) }.accessibilityIdentifier("commit-as-" + id) }
                     }
                 } label: { Text("Commit…") }
-                .buttonStyle(.borderedProminent).disabled(owners.isEmpty).accessibilityIdentifier("changes-commit")
+                .buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(owners.isEmpty).accessibilityIdentifier("changes-commit")
             case .unassigned:
-                Button("Commit…") {}.buttonStyle(.borderedProminent).disabled(true).accessibilityIdentifier("changes-commit")
+                Button("Commit…") {}.buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(true).accessibilityIdentifier("changes-commit")
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 6)

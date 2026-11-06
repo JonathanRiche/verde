@@ -202,7 +202,7 @@ private struct PlaceholderView: View {
             case .empty: Text("No messages yet.")
             case .error:
                 Text("Couldn't load this conversation.")
-                Button("Retry loading", action: retry).buttonStyle(.borderedProminent)
+                Button("Retry loading", action: retry).buttonStyle(PrimaryButtonStyle(fullWidth: false))
             }
         }
         .multilineTextAlignment(.center)
@@ -520,7 +520,7 @@ private struct StopBar: View {
                 if state.stopping {
                     Button("Stopping…") {}.buttonStyle(.bordered).disabled(true)
                 } else {
-                    Button("Stop", action: stop).buttonStyle(.borderedProminent).tint(.red).disabled(!state.canStop)
+                    Button("Stop", action: stop).buttonStyle(PrimaryButtonStyle(fullWidth: false)).tint(.red).disabled(!state.canStop)
                 }
             }
             .padding(.horizontal, 16).padding(.vertical, 8)

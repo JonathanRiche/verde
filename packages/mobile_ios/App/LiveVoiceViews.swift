@@ -109,7 +109,7 @@ private struct LivePillButton: View {
             Image(systemName: systemImage)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(colors.tint.opacity(enabled ? 1 : 0.4))
-                .frame(width: 40, height: 40)
+                .frame(width: 44, height: 44)
                 .background(colors.fill, in: Circle())
                 .overlay(Circle().stroke(colors.ring))
         }
@@ -233,7 +233,7 @@ struct LiveVoiceFullView: View {
                 Button(role: .destructive) { live.end() } label: {
                     Label("End", systemImage: "xmark").frame(maxWidth: .infinity, minHeight: 44)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PrimaryButtonStyle(fullWidth: false))
                 .accessibilityHint("Ends the live conversation.")
             }
         }

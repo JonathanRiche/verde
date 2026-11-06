@@ -255,7 +255,7 @@ struct SelectionBar: View {
             Text(picked.map(linesLabel) ?? "Nothing to ask about").font(VerdeTheme.ui(13, bold: true)).lineLimit(1)
             Spacer(minLength: 0)
             Button("Copy") { if let picked { UIPasteboard.general.string = picked.text } }.disabled(picked == nil)
-            Button("Ask agent", action: onAsk).buttonStyle(.borderedProminent).disabled(picked == nil)
+            Button("Ask agent", action: onAsk).buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(picked == nil)
                 .accessibilityIdentifier("selection-ask")
         }
         .font(VerdeTheme.ui(14))

@@ -144,6 +144,8 @@ extension VerdeTheme {
 
 /// A screen's primary action: a full-width accent fill with on-accent text (S6).
 struct PrimaryButtonStyle: ButtonStyle {
+    /// False for an inline action (Commit, Retry, Ask agent) that sizes to its label.
+    var fullWidth = true
     @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -151,7 +153,7 @@ struct PrimaryButtonStyle: ButtonStyle {
             .foregroundStyle(enabled ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
             .multilineTextAlignment(.center)
             .padding(.horizontal, 16).padding(.vertical, 10)
-            .frame(maxWidth: .infinity, minHeight: 50)
+            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: fullWidth ? 50 : 44)
             .background(enabled ? VerdeTheme.accent : VerdeTheme.disabledFill, in: RoundedRectangle(cornerRadius: 12))
             .opacity(configuration.isPressed ? 0.8 : 1)
             .contentShape(RoundedRectangle(cornerRadius: 12))

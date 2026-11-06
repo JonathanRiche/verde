@@ -274,7 +274,7 @@ struct FileViewer: View {
                     if canDownload {
                         Button { export() } label: {
                             if download != nil { ProgressView() } else { Label("Download file", systemImage: "arrow.down.circle") }
-                        }.buttonStyle(.borderedProminent).disabled(download != nil).padding(.top, 8)
+                        }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(download != nil).padding(.top, 8)
                     }
                     Button("Retry") { attempt += 1 }.padding(.top, 4)
                 }.padding()

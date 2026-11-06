@@ -238,7 +238,7 @@ struct ChatComposer: View {
                         Text("Run this command on the host?") .font(VerdeTheme.ui(15, bold: true))
                         Text(confirmation.command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                         Text(confirmation.cwd) .font(VerdeTheme.ui(12))
-                        HStack { Button("Cancel") { model.confirmShell(confirmation, accept: false) }; Spacer(); Button("Run") { model.confirmShell(confirmation, accept: true) }.buttonStyle(.borderedProminent) }
+                        HStack { Button("Cancel") { model.confirmShell(confirmation, accept: false) }; Spacer(); Button("Run") { model.confirmShell(confirmation, accept: true) }.buttonStyle(PrimaryButtonStyle(fullWidth: false)) }
                     }.padding().disabled(model.busy)
                 }.presentationDetents([.medium])
             }
