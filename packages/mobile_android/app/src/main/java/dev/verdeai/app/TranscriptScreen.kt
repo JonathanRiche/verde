@@ -14,6 +14,11 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -230,7 +235,17 @@ internal fun TranscriptScreen(
         }
         // A-KB: a tap on the transcript (not taken by a control) or a scroll drag puts the keyboard away.
         val dismissKeyboard = rememberKeyboardDismiss()
-        Box(Modifier.weight(1f).fillMaxWidth().dismissKeyboardOnTouch(dismissKeyboard)) {
+        // A5-3: Tab from inside the transcript goes on to the composer. The reversed lazy list can't
+        // hand focus past its last composed row, so the default search wrapped back to the header
+        // and the composer, its chips and Send were never reached. (Arrow keys move between rows.)
+        val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        Box(Modifier.weight(1f).fillMaxWidth().dismissKeyboardOnTouch(dismissKeyboard)
+            .onPreviewKeyEvent { event ->
+                val tab = event.key == androidx.compose.ui.input.key.Key.Tab && !event.isShiftPressed &&
+                    event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
+                if (tab) composerFocus.requestFocus()
+                tab
+            }.focusGroup()) {
             CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard) {
             when (val placeholder = transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, renderers)
@@ -238,7 +253,7 @@ internal fun TranscriptScreen(
             }
             }
         }
-        bottomBar(model, state)
+        CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
     }
     gitChanges?.let { GitChangesLayer(it) }
     }

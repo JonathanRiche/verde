@@ -26,6 +26,10 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.ui.draw.clip
@@ -67,6 +71,9 @@ import dev.verdeai.core.*
 import kotlinx.coroutines.launch
 
 internal const val COMPOSER = "composer"
+
+/** The chat screen's handle on the composer's text field, so focus can be sent to it (A5-3). */
+internal val LocalComposerFocus = staticCompositionLocalOf<FocusRequester?> { null }
 internal const val COMPOSER_FIELD = "composer-field"
 internal const val COMPOSER_SEND = "composer-send"
 internal const val COMPOSER_STOP = "composer-stop"
@@ -160,7 +167,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
         if (granted) startCamera() else composer.showNotice("Camera access is off. Allow it in Settings to take photos.")
     }
 
-    val fieldFocus = remember { FocusRequester() }
+    val fieldFocus = LocalComposerFocus.current ?: remember { FocusRequester() }
     LaunchedEffect(composer.focusRequest) { if (composer.focusRequest > 0) fieldFocus.requestFocus() }
     var picker by remember { mutableStateOf<ComposerPicker?>(null) }
     val running = state.turn != null
@@ -251,7 +258,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 BasicTextField(
                     value = composer.field,
                     onValueChange = { if (!sendPending) composer.edit(it) },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).focusRequester(fieldFocus).ownsFocusRing().testTag(COMPOSER_FIELD),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).focusRequester(fieldFocus).ownsFocusRing().tabMovesFocus().testTag(COMPOSER_FIELD),
                     readOnly = sendPending,
                     decorationBox = { innerTextField ->
                         Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
@@ -313,7 +320,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                     .then(resizedHeight?.let { Modifier.height(it.dp.coerceIn(56.dp, maxFieldHeight)) }
                         ?: Modifier.heightIn(min = 56.dp))
                     .onSizeChanged { measuredHeight = it.height / density.density }
-                    .focusRequester(fieldFocus).ownsFocusRing().testTag(COMPOSER_FIELD),
+                    .focusRequester(fieldFocus).ownsFocusRing().tabMovesFocus().testTag(COMPOSER_FIELD),
                 readOnly = sendPending,
                 decorationBox = { innerTextField ->
                     Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
@@ -758,5 +765,17 @@ private fun ShellSheet(confirmation: ChatShellConfirmation, composer: ComposerMo
                 Button(onClick = { composer.confirmShell(confirmation, true) }, enabled = !composer.busy) { Text("Run") }
             }
         }
+    }
+}
+
+/** A5-3: Tab / Shift+Tab move between controls instead of typing a tab into the prompt. */
+@Composable
+internal fun Modifier.tabMovesFocus(): Modifier {
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    return onPreviewKeyEvent { event ->
+        if (event.key != androidx.compose.ui.input.key.Key.Tab) return@onPreviewKeyEvent false
+        if (event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown)
+            focus.moveFocus(if (event.isShiftPressed) androidx.compose.ui.focus.FocusDirection.Previous else androidx.compose.ui.focus.FocusDirection.Next)
+        true
     }
 }

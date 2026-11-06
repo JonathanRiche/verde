@@ -7,6 +7,10 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -475,6 +479,15 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
                 state.live?.let { live -> add(CustomAccessibilityAction(if (live.active) "End live voice" else "Start live voice") { live.toggle(); true }) }
             }
         }
+        // A5-3: reachable with Tab; Enter or Space opens it like a tap.
+        .onKeyEvent { event ->
+            val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
+                (event.key == androidx.compose.ui.input.key.Key.Enter || event.key == androidx.compose.ui.input.key.Key.Spacebar ||
+                    event.key == androidx.compose.ui.input.key.Key.NumPadEnter)
+            if (activate) open()
+            activate
+        }
+        .focusable()
         .testTag(COMPANION_HEADER), contentAlignment = Alignment.Center) {
         Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
             if (state.live?.active == true) LiveRing(state.live.level()) else if (state.running || talking) RunningRing(reduced)
