@@ -163,8 +163,10 @@ internal fun CompactToolRow(row: ChatRow, indent: Boolean = false) {
             .clickable(onClickLabel = if (expanded) "Hide output" else "Show output") { expanded = !expanded }
             .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             StatusPip(compactToolColor(row), toolStatusLabel(row), commandRunning(row), size = 6.dp, command = true)
-            Text(row.author.ifEmpty { "Tool" }, style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted, maxLines = 1)
-            Text(commandPreview(row.body), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono),
+            val display = remember(row) { toolDisplay(row) }
+            Icon(toolKindPainter(display.kind), contentDescription = null, tint = VerdeColors.Subtle, modifier = Modifier.size(14.dp))
+            Text(display.title, style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted, maxLines = 1)
+            Text(display.summary.orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono),
                 color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (expanded) {
@@ -196,7 +198,7 @@ private fun CompactToolGroupRow(item: TranscriptItem.ToolGroup, ctx: TranscriptC
                 active = counts.running > 0 && counts.failed == 0, size = 6.dp, command = true)
             Text(toolGroupSummary(item.rows, item.subagent, elapsed), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
                 color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(if (expanded) "▾" else "▸", color = VerdeColors.Subtle)
+            Chevron(expanded)
         }
         if (expanded) item.rows.forEach { CompactToolRow(it, indent = true) }
     }

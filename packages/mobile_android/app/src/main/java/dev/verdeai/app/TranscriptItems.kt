@@ -122,7 +122,7 @@ internal fun toolGroupSummary(rows: List<ChatRow>, subagent: Boolean, elapsed: S
     val c = toolCounts(rows)
     val noun = if (subagent) (if (c.count == 1) "subagent" else "subagents") else (if (c.count == 1) "tool call" else "tool calls")
     return buildList {
-        add("${c.count} $noun"); add("${c.completed} completed")
+        add("${c.count} $noun")
         if (c.failed > 0) add("${c.failed} failed")
         if (c.running > 0) add("${c.running} running")
         if (c.running > 0 && elapsed != null) add(elapsed)

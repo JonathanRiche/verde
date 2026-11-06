@@ -66,7 +66,7 @@ internal class TranscriptContext(
  */
 internal data class TranscriptRenderers(
     val message: @Composable (TranscriptItem.Message, TranscriptContext) -> Unit = { item, ctx -> MessageRow(item.row, ctx) },
-    val tool: @Composable (TranscriptItem.Tool, TranscriptContext) -> Unit = { item, _ -> ToolCard(item.row, child = false) },
+    val tool: @Composable (TranscriptItem.Tool, TranscriptContext) -> Unit = { item, _ -> ToolRow(item.row, child = false) },
     val toolGroup: @Composable (TranscriptItem.ToolGroup, TranscriptContext) -> Unit = { item, ctx -> ToolGroupCard(item, ctx) },
     val think: @Composable (TranscriptItem.Think, TranscriptContext) -> Unit = { item, ctx -> ThinkCard(item.row, ctx) },
     val diff: @Composable (TranscriptItem.Diff, TranscriptContext) -> Unit = { item, ctx -> DiffCard(item.row, ctx) },
@@ -297,11 +297,14 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
             .distinctUntilChanged()
             .collect { top -> if (top >= list.layoutInfo.totalItemsCount - PREFETCH_ITEMS) ctx.model.loadOlder() }
     }
+    val anchor = remember(list, scope) { DisclosureAnchor(list, scope) }
     Box(Modifier.fillMaxSize()) {
+        CompositionLocalProvider(LocalDisclosureAnchor provides anchor) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             items(reversed, key = { it.key }, contentType = { it::class }) { item -> TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
+        }
         }
         ApprovalBanner(reversed, list, ctx.model.approvals, Modifier.align(Alignment.TopCenter))
         if (!atBottom && reversed.isNotEmpty()) {
@@ -386,94 +389,18 @@ internal fun streamTail(row: ChatRow, max: Int = 16_000): String {
 }
 
 @Composable
-private fun StatusDot(color: Color, description: String, active: Boolean = false) {
-    StatusPip(color, description, active, size = 8.dp, command = true)
-}
-
-@Composable
-private fun toolColor(row: ChatRow): Color = when {
-    commandFailed(row) -> MaterialTheme.colorScheme.error
-    commandRunning(row) -> MaterialTheme.colorScheme.primary
-    else -> MaterialTheme.colorScheme.outline
-}
-
-internal fun toolStatusLabel(row: ChatRow) = when {
-    commandFailed(row) -> "Failed"
-    commandRunning(row) -> "Running"
-    else -> "Completed"
-}
-
-private const val TOOL_PREVIEW_LINES = 40
-
-@Composable
-internal fun ToolCard(row: ChatRow, child: Boolean) {
-    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    var expanded by rememberSaveable(row.id) { mutableStateOf(commandFailed(row)) }
-    var all by rememberSaveable(row.id + ":all") { mutableStateOf(false) }
-    val colors = MaterialTheme.colorScheme
-    Column(Modifier.fillMaxWidth()
-        .border(1.dp, if (commandFailed(row)) colors.error else if (commandRunning(row)) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
-        .background(if (child) colors.surface else colors.surfaceContainerLow, RoundedCornerShape(10.dp))) {
-        Row(Modifier.fillMaxWidth().clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusDot(toolColor(row), toolStatusLabel(row), commandRunning(row))
-            Text(if (child) "$" else ">_", style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), color = colors.onSurfaceVariant)
-            Text(row.author.ifEmpty { "Tool" }, style = MaterialTheme.typography.labelMedium)
-            Text(commandPreview(row.body), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1,
-                overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariant)
-            TextButton(onClick = { clipboard.setText(AnnotatedString(row.body)) },
-                modifier = Modifier.semantics { contentDescription = "Copy output" }) { Text("Copy", style = MaterialTheme.typography.labelSmall) }
-            Text(if (expanded) "▾" else "▸", color = colors.onSurfaceVariant)
-        }
-        if (expanded) {
-            val total = remember(row.body) { countLines(row.body) }
-            val (shown, truncated) = remember(row.body, all) { if (all) row.body.trim() to false else leadingLines(row.body, TOOL_PREVIEW_LINES) }
-            Text(shown, Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = true)
-            Row(Modifier.padding(horizontal = 4.dp)) {
-                if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }
-            }
-        }
-    }
-}
-
-@Composable
-internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContext) {
-    val counts = remember(item.rows) { toolCounts(item.rows) }
-    var expanded by rememberSaveable(item.key) { mutableStateOf(counts.failed > 0) }
-    val colors = MaterialTheme.colorScheme
-    val elapsed = ctx.turnStartedAt?.let { elapsedLabel(it, ctx.now) }
-    Column(Modifier.fillMaxWidth()
-        .border(1.dp, if (counts.failed > 0) colors.error else if (counts.running > 0) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
-        .background(colors.surfaceContainerLow, RoundedCornerShape(10.dp))) {
-        Row(Modifier.fillMaxWidth().clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
-            .padding(horizontal = 12.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusDot(when { counts.failed > 0 -> colors.error; counts.running > 0 -> colors.primary; else -> colors.outline },
-                if (counts.failed > 0) "Some failed" else if (counts.running > 0) "Running" else "Completed",
-                active = counts.running > 0 && counts.failed == 0)
-            Text(toolGroupSummary(item.rows, item.subagent, elapsed), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariant)
-            Text(if (expanded) "▾" else "▸", color = colors.onSurfaceVariant)
-        }
-        if (expanded) Column(Modifier.padding(start = 8.dp, end = 8.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            item.rows.forEach { ToolCard(it, child = true) }
-        }
-    }
-}
-
-@Composable
 internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
-    var expanded by rememberSaveable(row.id) { mutableStateOf(false) }
+    val disclosure = rememberDisclosure("think:" + row.id, false)
     val colors = MaterialTheme.colorScheme
-    Column(Modifier.fillMaxWidth().clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
-        .padding(horizontal = 4.dp, vertical = 2.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(if (expanded) "▾" else "▸", style = MaterialTheme.typography.labelMedium, color = colors.outline)
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
+            .clickable(role = androidx.compose.ui.semantics.Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
+            .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Icon(toolKindPainter(ToolKind.Think), contentDescription = null, tint = colors.outline, modifier = Modifier.size(16.dp))
             Text(if (commandRunning(row)) "Thinking…" else "Thought", style = MaterialTheme.typography.labelMedium, color = colors.outline)
+            Chevron(disclosure.expanded)
         }
-        if (expanded && row.body.isNotEmpty()) {
+        if (disclosure.expanded && row.body.isNotEmpty()) {
             MarkdownText(streamTail(row), ctx.model, ctx.onCitation, Modifier.padding(start = 12.dp, top = 4.dp))
         }
     }
@@ -531,14 +458,15 @@ private fun ChildResultRow(notification: ChildNotification, key: String, ctx: Tr
     val title = childTitle(notification.childId, child?.title)
     var menu by remember { mutableStateOf(false) }
     // Keyed per message and child index, so the choice survives scrolling for the screen session.
-    var expanded by rememberSaveable(key) { mutableStateOf(notification.status.expandedByDefault) }
+    val disclosure = rememberDisclosure(key, notification.status.expandedByDefault)
+    val expanded = disclosure.expanded
     val summary = remember(notification.reply) { childReplySummary(notification.reply) }
     val colors = MaterialTheme.colorScheme
     val statusColor = childStatusColor(notification.status)
     val open = ctx.onOpenThread?.let { { it(notification.childId) } }
     Box(Modifier.fillMaxWidth()) {
-        Column(Modifier.fillMaxWidth()
-            .combinedClickable(onClickLabel = if (expanded) "Collapse" else "Expand", onClick = { expanded = !expanded },
+        Column(Modifier.fillMaxWidth().then(disclosure.track)
+            .combinedClickable(onClickLabel = if (expanded) "Collapse" else "Expand", onClick = { disclosure.toggle() },
                 onLongClickLabel = "Copy reply", onLongClick = { menu = true })
             .padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = if (expanded) 4.dp else 8.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
@@ -625,3 +553,4 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
         }
     }
 }
+
