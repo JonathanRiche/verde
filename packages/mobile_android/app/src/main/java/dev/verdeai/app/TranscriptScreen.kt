@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -303,21 +304,29 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
             .collect { top -> if (top >= list.layoutInfo.totalItemsCount - PREFETCH_ITEMS) ctx.model.loadOlder() }
     }
     val anchor = remember(list, scope) { DisclosureAnchor(list, scope) }
-    Box(Modifier.fillMaxSize()) {
+    // A2-6: "Jump to latest" takes its own strip under the transcript instead of floating over text.
+    Column(Modifier.fillMaxSize()) {
+    Box(Modifier.weight(1f).fillMaxWidth()) {
         CompositionLocalProvider(LocalDisclosureAnchor provides anchor) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
-            items(reversed, key = { it.key }, contentType = { it::class }) { item -> TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
+            itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->
+                CompositionLocalProvider(LocalTranscriptIndex provides index) { TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
+            }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
         }
         }
         ApprovalBanner(reversed, list, ctx.model.approvals, Modifier.align(Alignment.TopCenter))
-        if (!atBottom && reversed.isNotEmpty()) {
-            SmallFloatingActionButton(
-                onClick = { follow = true; scope.launch { list.animateScrollToItem(0) } },
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-            ) { Icon(Icons.Filled.KeyboardArrowDown, contentDescription = JUMP_TO_BOTTOM) }
+    }
+    if (!atBottom && reversed.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.End) {
+        FilledTonalButton(onClick = { follow = true; scope.launch { list.animateScrollToItem(0) } },
+            contentPadding = PaddingValues(start = 12.dp, end = 16.dp), modifier = Modifier.height(40.dp)
+                .semantics { contentDescription = JUMP_TO_BOTTOM }) {
+            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("Latest", style = MaterialTheme.typography.labelLarge)
         }
+    }
     }
 }
 
@@ -369,9 +378,10 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             }
             if (row.attachments.isNotEmpty()) AttachmentStrip(row, ctx)
             if (body.isNotEmpty()) {
-                // User text is shown verbatim (web parity); assistant output goes through the core AST.
-                if (mine) Text(body, style = MaterialTheme.typography.bodyLarge)
-                else MarkdownText(streamTail(row), ctx.model, ctx.onCitation)
+                // A2-11: prompts and replies share the core's markdown AST (desktop
+                // transcriptBodyUsesMarkdown), so `code` and **bold** in a prompt render. It is safe
+                // by construction: only http(s)/mailto links are tappable and remote images never load.
+                MarkdownText(streamTail(row.copy(body = body)), ctx.model, ctx.onCitation)
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -379,7 +389,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(body)) })
             DropdownMenuItem(text = { Text("Select text") }, onClick = { menu = false; selecting = true })
         }
-        if (selecting) SelectTextDialog(body) { selecting = false }
+        if (selecting) SelectTextDialog({ MarkdownText(body, ctx.model, ctx.onCitation) }) { selecting = false }
     }
 }
 
@@ -563,14 +573,14 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
     }
 }
 
-/** The whole message as selectable text, for copying part of it (long-press "Select text"). */
+/** The whole message, rendered (A2-7: no markdown marks) and selectable, for copying part of it. */
 @Composable
-private fun SelectTextDialog(text: String, onDismiss: () -> Unit) {
+private fun SelectTextDialog(content: @Composable () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss,
         title = { Text("Select text") },
         text = {
-            androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(text, Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodyMedium)
+            Box(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                androidx.compose.foundation.text.selection.SelectionContainer { content() }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } })
