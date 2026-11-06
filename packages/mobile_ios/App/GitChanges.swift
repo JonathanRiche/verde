@@ -38,11 +38,11 @@ struct GitChatControls: View {
                                     Text("+\(change.additions)").monospacedDigit().foregroundStyle(VerdeTheme.accent)
                                     Text("−\(change.deletions)").monospacedDigit().foregroundStyle(VerdeTheme.danger)
                                 }
-                            }.padding(.horizontal, 8).padding(.vertical, 7)
+                            }.padding(.horizontal, 8).frame(minHeight: 44).contentShape(Rectangle())
                         }.disabled(model.busy)
                         if model.canCommit {
                             Divider().frame(height: 18)
-                            Menu { GitMenuItems(model: model) } label: { Image(systemName: "chevron.down").padding(8).accessibilityLabel("Git actions") }
+                            Menu { GitMenuItems(model: model) } label: { Image(systemName: "chevron.down").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).accessibilityLabel("Git actions") }
                             .disabled(model.busy)
                         }
                     }.font(VerdeTheme.ui(11, bold: true))

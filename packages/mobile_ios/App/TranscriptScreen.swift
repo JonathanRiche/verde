@@ -20,6 +20,7 @@ struct TranscriptScreen: View {
 
     @State private var model: TranscriptModel?
     @State private var git: GitChangesModel?
+    @Environment(\.adaptive) private var adaptive
 
     private var fallbackTitle: String? {
         browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.threads.first { $0.thread_id == threadID }?.title
@@ -34,6 +35,9 @@ struct TranscriptScreen: View {
             }
         }
         .environment(\.gitChangesModel, git)
+        .background {
+            if !adaptive.tier.wide { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
+        }
         .overlay(alignment: .bottom) { if let git, !git.sheet { GitActionToastCard(model: git) } }
         .task(id: browse.hostID) {
             let next = GitChangesModel(browse: browse, workspace: workspaceID, thread: threadID)
@@ -43,7 +47,11 @@ struct TranscriptScreen: View {
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
+            // S10: [back] [drawer] title … [companion] [⋯]. Only wide windows add the Commit button;
+            // phones reach Git through ⋯ and keep its sheets mounted in the background.
+            if adaptive.tier.wide {
+                ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
+            }
             ToolbarItem(placement: .topBarTrailing) { CompanionHeaderButton(workspace: workspaceID, thread: threadID) }
             ToolbarItem(placement: .topBarTrailing) {
                 ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage, git: git) }
