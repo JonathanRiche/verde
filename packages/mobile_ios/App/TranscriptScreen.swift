@@ -460,6 +460,7 @@ struct TailGeometry: Equatable {
 
 /// Bookkeeping that must not re-render the transcript: writing it on every scroll frame (as
 /// `@State`) re-evaluated the scroll view inside its own layout pass.
+@available(iOS 18.0, *)
 private final class TailState {
     var phase: ScrollPhase = .idle
     var geometry: TailGeometry?
