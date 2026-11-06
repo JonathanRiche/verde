@@ -18,6 +18,11 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerCurrentChoice(.effort, value: nil, choices: [ChatChoice(id: "", label: "Default"), ChatChoice(id: "low", label: "Low")]), "")
     }
 
+    func testLongChipLabelsAreCut() {
+        XCTAssertEqual(chipDisplay("Opus 5.5", limit: 22), "Opus 5.5")
+        XCTAssertEqual(chipDisplay("Opus 5.5 (1M context) preview", limit: 10), "Opus 5.5 …")
+    }
+
     func testChipsShowResolvedValues() {
         let models = [ChatChoice(id: "opus", label: "Opus 5.5"), ChatChoice(id: "haiku", label: "Haiku 5.5")]
         XCTAssertEqual(composerModelLabel(models, value: nil), "Opus 5.5")

@@ -23,6 +23,11 @@ func composerHintLine(_ kind: FollowupKind?, text: String, followupShown: Bool) 
     return kind.hint + ". Long-press Send for other options."
 }
 
+/// A chip label cut to `limit` characters with "…" (a capped frame would stretch every chip to it).
+func chipDisplay(_ text: String, limit: Int) -> String {
+    text.count > limit ? String(text.prefix(max(1, limit - 1))) + "…" : text
+}
+
 /// A catalog row that stands for the provider's own default.
 func isDefaultChoice(_ id: String) -> Bool { id.isEmpty || id == "default" }
 
@@ -605,7 +610,7 @@ struct ChatComposer: View {
                             }
                         }.frame(width: 16, height: 16).accessibilityHidden(true)
                 }
-                if !compact { Text(chipText(kind)).lineLimit(1).truncationMode(.tail).frame(maxWidth: kind == .model ? 150 : nil) }
+                if !compact { Text(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)).lineLimit(1).fixedSize() }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
                 .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
