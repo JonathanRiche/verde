@@ -40,12 +40,15 @@ extension EnvironmentValues {
 
 private func nowMs(_ date: Date) -> Int64 { Int64(date.timeIntervalSince1970 * 1000) }
 
-/// Ticks every second only while a running timer is visible.
+/// How often "12 min ago" labels refresh when no timer is running (I2-4).
+let relativeTimeRefresh: TimeInterval = 30
+
+/// Ticks every second only while a running timer is visible, else every `relativeTimeRefresh`.
 private struct Clock<Content: View>: View {
     let ticking: Bool
     @ViewBuilder let content: (Int64) -> Content
     var body: some View {
-        TimelineView(.periodic(from: .now, by: ticking ? 1 : 60)) { context in content(nowMs(context.date)) }
+        TimelineView(.periodic(from: .now, by: ticking ? 1 : relativeTimeRefresh)) { context in content(nowMs(context.date)) }
     }
 }
 

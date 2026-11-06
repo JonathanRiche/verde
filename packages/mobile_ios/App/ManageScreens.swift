@@ -40,6 +40,8 @@ struct HistoryScreen: View {
     let manage: ManageModel
     @State private var query = ""
     @State private var workspace = ""
+    /// Refreshed every `relativeTimeRefresh` so "12 min ago" keeps up (I2-4).
+    @State private var now = Int64(Date().timeIntervalSince1970 * 1000)
     var body: some View {
         List {
             ManageNotice(model: manage)
@@ -50,7 +52,6 @@ struct HistoryScreen: View {
             let history = browse.state.workspaces?.history
             let sections = historySections(history?.items ?? [])
             let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
-            let now = Int64(Date().timeIntervalSince1970 * 1000)
             ForEach(sections.indices, id: \.self) { index in
                 Section {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
@@ -76,6 +77,12 @@ struct HistoryScreen: View {
             if let error = history?.error { Text(error.message).foregroundStyle(.red) }
         }
         .navigationTitle("History").navigationBarTitleDisplayMode(.inline)
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(relativeTimeRefresh))
+                now = Int64(Date().timeIntervalSince1970 * 1000)
+            }
+        }
         .searchable(text: $query, prompt: "Search chats")
         .task(id: query + "\u{0}" + workspace) {
             try? await Task.sleep(for: .milliseconds(300))
