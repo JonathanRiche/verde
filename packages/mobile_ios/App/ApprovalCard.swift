@@ -40,12 +40,10 @@ struct ApprovalCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Circle().fill(VerdeTheme.warning).frame(width: 9, height: 9).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Approval required").font(.caption.weight(.semibold)).foregroundStyle(VerdeTheme.warning)
-                        .accessibilityLabel("Approval required: \(title)")
-                    Text(title).font(.subheadline.weight(.semibold)).lineLimit(3)
-                        .accessibilityAddTraits(.isHeader)
-                }
+                // One title: the request's own, else "Permission required".
+                Text(title).font(.subheadline.weight(.semibold)).lineLimit(3)
+                    .accessibilityLabel("Approval required: \(title)")
+                    .accessibilityAddTraits(.isHeader)
             }
             ApprovalSummary(preview: preview)
             ApprovalDetails(approval: approval, preview: preview, disclosure: disclosure)
@@ -59,17 +57,12 @@ struct ApprovalCard: View {
             if phase != .stale && !phase.isSent {
                 let sending: ApprovalDecision? = { if case .sending(let d) = phase { return d }; return nil }()
                 HStack(spacing: 8) {
-                    Spacer()
-                    Button { decide(.deny) } label: {
-                        Text(sending == .deny ? "Denying…" : "Deny").frame(minWidth: 72, minHeight: 36)
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityLabel("Deny: \(title)")
-                    Button { decide(.approve) } label: {
-                        Text(sending == .approve ? "Approving…" : "Approve").frame(minWidth: 72, minHeight: 36)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityLabel("Approve: \(title)")
+                    Button { decide(.deny) } label: { Text(sending == .deny ? "Denying…" : "Deny") }
+                        .buttonStyle(TonalButtonStyle())
+                        .accessibilityLabel("Deny: \(title)")
+                    Button { decide(.approve) } label: { Text(sending == .approve ? "Approving…" : "Approve") }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .accessibilityLabel("Approve: \(title)")
                 }
                 .disabled(!phase.canDecide)
             }
@@ -151,8 +144,8 @@ func changePrefix(_ kind: PreviewKind) -> String {
 
 private func changeBackground(_ kind: PreviewKind) -> Color {
     switch kind {
-    case .add: return Color.green.opacity(0.2)
-    case .remove: return Color.red.opacity(0.2)
+    case .add: return addColor.opacity(0.18)
+    case .remove: return deleteColor.opacity(0.18)
     default: return .clear
     }
 }
@@ -173,8 +166,15 @@ private struct ApprovalDetails: View {
             let all = disclosure.flag(key + ":all")
             VStack(alignment: .leading, spacing: 4) {
                 if structured {
-                    Button(expanded ? "▾ Hide full request" : "▸ Show full request") { disclosure.toggle(key, !structured) }
-                        .font(.caption.weight(.medium)).foregroundStyle(.secondary).padding(.vertical, 6)
+                    Button { disclosure.toggle(key, !structured) } label: {
+                        HStack(spacing: 6) {
+                            Text(expanded ? "Hide full request" : "Show full request")
+                            DisclosureChevron(expanded: expanded)
+                        }
+                        .frame(minHeight: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 }
                 if expanded {
                     let (shown, truncated) = all ? (approval.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
@@ -187,10 +187,10 @@ private struct ApprovalDetails: View {
                     .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Approval details")
                     HStack(spacing: 16) {
-                        Button("Copy request") { UIPasteboard.general.string = approval.body }
-                        if truncated { Button("Show all \(countLines(approval.body)) lines") { disclosure.setFlag(key + ":all", true) } }
+                        Button("Copy request") { UIPasteboard.general.string = approval.body }.frame(minHeight: 44)
+                        if truncated { Button("Show all \(countLines(approval.body)) lines") { disclosure.setFlag(key + ":all", true) }.frame(minHeight: 44) }
                     }
-                     .font(VerdeTheme.ui(12))
+                    .font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
                 }
             }
         }
