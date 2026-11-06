@@ -25,6 +25,9 @@ enum TranscriptItem: Identifiable {
     case working(ChatTurn, waitingApproval: Bool)
     /// Pending tool approval.
     case approval(ChatApproval)
+    /// U1: background commands (`kind == "background_task"`): one compact row, or a run of
+    /// consecutive finished ones as one compact list. Running ones always stand alone.
+    case background([ChatRow])
 
     var id: String {
         switch self {
@@ -34,6 +37,7 @@ enum TranscriptItem: Identifiable {
         case .toolGroup(let rows, let subagent): return "g:\(subagent ? "subagent" : "tool"):" + (rows.first?.id ?? "")
         case .working: return "working"
         case .approval(let approval): return "approval:\(approval.turn_id):\(approval.call_id)"
+        case .background(let rows): return "b:" + (rows.first?.id ?? "")
         }
     }
 
@@ -50,6 +54,7 @@ enum TranscriptItem: Identifiable {
         case .usage: return "Usage"
         case .working: return "Working"
         case .approval: return "Approval"
+        case .background: return "Background"
         }
     }
 }
@@ -330,13 +335,52 @@ func groupVoiceRows(_ rows: [ChatRow]) -> [ChatRow] {
     return out
 }
 
+/// A background command row (U1, core C10).
+func isBackgroundRow(_ row: ChatRow) -> Bool { row.kind == "background_task" }
+
+/// "Running", "Finished", "Failed", "Stopped": the same words as desktop and Android.
+func backgroundStatusText(_ status: String?) -> String {
+    switch status ?? "" {
+    case "running": return "Running"
+    case "completed": return "Finished"
+    case "failed": return "Failed"
+    case "stopped": return "Stopped"
+    default: return (status ?? "").capitalized
+    }
+}
+
+/// A finished task's line in a compact list: "pytest -q finished · 1 h ago".
+func backgroundListLine(_ row: ChatRow, now: Int64) -> String {
+    let label = backgroundLabel(row)
+    let verb = backgroundStatusText(row.background?.status).lowercased()
+    let when = (row.background?.finished_at_ms ?? row.background?.started_at_ms ?? row.created_at_ms).map { " · " + agoLabel($0, now) } ?? ""
+    return "\(label) \(verb)\(when)"
+}
+
+/// The task's short name: the core's label, else the command's first line.
+func backgroundLabel(_ row: ChatRow) -> String {
+    let label = row.background?.label.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !label.isEmpty { return label }
+    return row.body.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? "Background task"
+}
+
+/// The bar above the composer: "1 background task running", "2 background tasks running".
+func backgroundBarText(_ count: Int) -> String {
+    count == 1 ? "1 background task running" : "\(count) background tasks running"
+}
+
 /// Pure projection from the core's thread view to renderable items (oldest first).
 func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
     var out: [TranscriptItem] = []
     out.reserveCapacity(view.rows.count + 2)
     var run: [ChatRow] = []
     var runSubagent = false
-    func flush() {
+    var finished: [ChatRow] = []
+    func flushFinished() {
+        if !finished.isEmpty { out.append(.background(finished)) }
+        finished = []
+    }
+    func flushTools() {
         if run.isEmpty { return }
         if runSubagent { out.append(.toolGroup(run, subagent: true)) }
         else if run.count >= 2 { out.append(.toolGroup(run, subagent: false)) }
@@ -344,16 +388,30 @@ func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
         run = []
         runSubagent = false
     }
+    // At most one of the two runs is open at a time.
+    func flush() { flushTools(); flushFinished() }
     let rows = view.rows.contains(where: { isVoiceSpeaker($0.author) }) ? groupVoiceRows(view.rows) : view.rows
     let lastUsage = view.usage == nil ? -1 : (rows.lastIndex { $0.role == "system" && $0.author == "Usage" } ?? -1)
     for (index, row) in rows.enumerated() {
         if row.author == hiddenAuthor { continue }
+        if isBackgroundRow(row) {
+            // Tool runs end here; finished tasks gather into one list, a running one stands alone.
+            flushTools()
+            if row.background?.status == "running" {
+                flushFinished()
+                out.append(.background([row]))
+            } else {
+                finished.append(row)
+            }
+            continue
+        }
         if let notifications = childNotifications(role: row.role, body: row.body) {
             flush()
             out.append(.childNotification(row, notifications))
             continue
         }
         if isCommandRow(row) && !isDiffRow(row) {
+            flushFinished()
             let subagent = isSubagentRow(row)
             if !run.isEmpty && subagent != runSubagent { flush() }
             runSubagent = subagent

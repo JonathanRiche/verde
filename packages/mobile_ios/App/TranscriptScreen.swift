@@ -144,7 +144,8 @@ struct TranscriptBody: View {
                     if let placeholder = transcriptPlaceholder(state) {
                         PlaceholderView(kind: placeholder, retry: model.retry)
                     } else {
-                        TranscriptList(model: model, page: state.thread?.page, approval: state.thread?.approval, turn: state.turn)
+                        TranscriptList(model: model, page: state.thread?.page, approval: state.thread?.approval, turn: state.turn,
+                                       background: state.thread?.background_tasks ?? [])
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -244,6 +245,8 @@ private struct TranscriptList: View {
     let page: ChatPage?
     let approval: ChatApproval?
     let turn: ChatTurn?
+    /// Running background tasks, pinned above the composer (U1).
+    var background: [ChatBackgroundTask] = []
 
     @State private var position: String?
     @State private var atBottom = true
@@ -278,6 +281,14 @@ private struct TranscriptList: View {
             try? await Task.sleep(for: .milliseconds(250))
             if !Task.isCancelled && wantsLatest { showLatest = true }
         }
+    }
+
+    /// Room under the last row for the background bar, which overlays the list's bottom edge.
+    @ScaledMetric(relativeTo: .body) private var backgroundBarReserve: CGFloat = 52
+
+    private func showBackground(_ task: ChatBackgroundTask, _ proxy: ScrollViewProxy) {
+        follow = false
+        withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("b:" + task.row_id, anchor: .center) }
     }
 
     private func jumpToLatest(_ proxy: ScrollViewProxy) {
@@ -320,10 +331,12 @@ private struct TranscriptList: View {
                             VStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: false) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
+                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarReserve)
                         } else {
                             LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: true) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
+                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarReserve)
                         }
                     }
                     .coordinateSpace(name: "transcript")
@@ -331,7 +344,11 @@ private struct TranscriptList: View {
                     // scroll view's size or insets: resizing the lazy transcript while scrolled up
                     // made its layout loop (I3-1). It only shows away from the newest output.
                     .overlay(alignment: .bottom) {
-                        if showLatest { LatestStrip { jumpToLatest(proxy) } }
+                        VStack(spacing: 0) {
+                            if showLatest { LatestStrip { jumpToLatest(proxy) } }
+                            // U1: running tasks above the composer; a tap shows the task's row.
+                            BackgroundTasksBar(tasks: background) { task in showBackground(task, proxy) }
+                        }
                     }
                     // Scrolling or tapping the transcript puts the keyboard away (I-KB); the tap is
                     // simultaneous, so rows, links and buttons still get it.
@@ -623,6 +640,7 @@ private struct TranscriptRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 12))
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)
         case .approval(let approval): ApprovalCard(approval: approval, controller: model.approvals, disclosure: model.disclosure)
+        case .background(let rows): BackgroundTaskCard(rows: rows, disclosure: model.disclosure)
         }
     }
 }
