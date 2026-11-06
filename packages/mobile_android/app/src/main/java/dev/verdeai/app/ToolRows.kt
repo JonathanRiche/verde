@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import dev.verdeai.core.ChatRow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.withFrameNanos
 import kotlin.math.abs
 
 /*
@@ -176,39 +177,50 @@ internal fun toolKindPainter(kind: ToolKind): Painter = when (kind) {
  * on its bottom item and jump).
  */
 internal class DisclosureAnchor(private val list: LazyListState, private val scope: CoroutineScope) {
-    fun toggle(header: () -> LayoutCoordinates?, change: () -> Unit) {
+    /** [item] is the toggled row's list index at the time of the tap (its header sits inside it). */
+    fun toggle(header: () -> LayoutCoordinates?, item: Int?, change: () -> Unit) {
         val before = header()?.takeIf { it.isAttached }?.positionInWindow()?.y
-        val anchorIndex = list.firstVisibleItemIndex
-        val anchorOffset = list.firstVisibleItemScrollOffset
+        // The item's top edge, in the reversed list's logical offsets (from the bottom).
+        val beforeTop = item?.let { i -> list.layoutInfo.visibleItemsInfo.find { it.index == i }?.let { it.offset + it.size } }
         change()
         if (before == null) return
         scope.launch {
-            // One frame to recompose and lay out the new height, then put the header back.
-            androidx.compose.runtime.withFrameNanos { }
-            androidx.compose.runtime.withFrameNanos { }
-            var after = header()?.takeIf { it.isAttached }?.positionInWindow()?.y
-            if (after == null) {
-                // The re-anchored list scrolled the header away: restore the old anchor, then measure.
-                list.scrollToItem(anchorIndex, anchorOffset)
-                androidx.compose.runtime.withFrameNanos { }
-                after = header()?.takeIf { it.isAttached }?.positionInWindow()?.y ?: return@launch
+            // Two frames to recompose and lay out the new height, then put the header back.
+            withFrameNanos { }
+            withFrameNanos { }
+            // A row the list no longer places can keep stale coordinates: trust them only while placed.
+            val placed = item == null || list.layoutInfo.visibleItemsInfo.any { it.index == item }
+            val after = if (placed) header()?.takeIf { it.isAttached }?.positionInWindow()?.y else null
+            if (after != null) {
+                val delta = after - before
+                // Reversed layout: a forward scroll moves content down the screen.
+                if (abs(delta) > 0.5f) list.scrollBy(-delta)
+                return@launch
             }
-            val delta = after - before
-            // Reversed layout: a forward scroll moves content down the screen.
-            if (abs(delta) > 0.5f) list.scrollBy(-delta)
+            // A big item that shrank re-anchors the reversed list past itself and its header is
+            // disposed: bring the item back to the bottom edge, then put its top where it was.
+            if (item == null || beforeTop == null) return@launch
+            list.scrollToItem(item, 0)
+            withFrameNanos { }
+            val info = list.layoutInfo.visibleItemsInfo.find { it.index == item } ?: return@launch
+            val shift = (info.offset + info.size) - beforeTop
+            if (shift != 0) list.scrollBy(shift.toFloat())
         }
     }
 }
 
 internal val LocalDisclosureAnchor = staticCompositionLocalOf<DisclosureAnchor?> { null }
+/** The transcript list index of the item being composed, for [DisclosureAnchor]. */
+internal val LocalTranscriptIndex = compositionLocalOf<Int?> { null }
 
 /** Expanded state for one disclosure whose toggle keeps [header] in place. */
 internal class Disclosure(private val state: MutableState<Boolean>, private val anchor: DisclosureAnchor?) {
     var header: LayoutCoordinates? = null
+    var index: Int? = null
     val expanded get() = state.value
     fun toggle() {
         val flip = { state.value = !state.value }
-        anchor?.toggle({ header }, flip) ?: flip()
+        anchor?.toggle({ header }, index, flip) ?: flip()
     }
     val track: Modifier get() = Modifier.onGloballyPositioned { header = it }
 }
@@ -217,7 +229,8 @@ internal class Disclosure(private val state: MutableState<Boolean>, private val 
 internal fun rememberDisclosure(key: String, initial: Boolean): Disclosure {
     val state = rememberSaveable(key) { mutableStateOf(initial) }
     val anchor = LocalDisclosureAnchor.current
-    return remember(state, anchor) { Disclosure(state, anchor) }
+    val index = LocalTranscriptIndex.current
+    return remember(state, anchor) { Disclosure(state, anchor) }.also { it.index = index }
 }
 
 // ---- Rows ----
