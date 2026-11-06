@@ -211,7 +211,12 @@ func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
 func composerPickerLabel(_ kind: ComposerPicker, _ choice: ChatChoice, defaultModel: String? = nil) -> String {
     switch kind {
     case .effort: return isDefaultChoice(choice.id) ? composerDefaultMarked("Auto") : choice.label
-    case .model: return isDefaultChoice(choice.id) ? composerDefaultMarked(composerDefaultLabel(defaultModel)) : choice.label
+    // The model's default row reads like desktop and Android: "Default (Opus 5.5)", or "Default"
+    // when the host doesn't name it; the explicit "Opus 5.5" row stays its own entry.
+    case .model:
+        guard isDefaultChoice(choice.id) else { return choice.label }
+        guard let defaultModel, !defaultModel.isEmpty else { return "Default" }
+        return "Default (\(defaultModel))"
     case .speed:
         guard choice.id == "off" || choice.id == "on" else { return choice.label }
         return choice.id == "off" ? composerDefaultMarked(composerSpeedLabel(choice.id)) : composerSpeedLabel(choice.id)

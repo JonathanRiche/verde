@@ -47,7 +47,10 @@ final class ComposerChipsTests: XCTestCase {
         let withDefault = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
         XCTAssertEqual(composerModelLabel(withDefault, value: nil, defaultLabel: "Opus 5.5"), "Opus 5.5")
         XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Auto")
-        XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: "Opus 5.5"), "Opus 5.5 (default)")
+        XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: "Opus 5.5"), "Default (Opus 5.5)")
+        XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: nil), "Default")
+        XCTAssertEqual(composerPickerLabel(.model, withDefault[1], defaultModel: "Opus 5.5"), "Opus 5.5")
+        XCTAssertEqual(newChatMenuLabel("Model", withDefault[0], defaultModel: "Opus 5.5"), "Default (Opus 5.5)")
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "off", label: "Normal")), "Standard (default)")
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "on", label: "Fast")), "Fast")
         XCTAssertEqual(composerPickerLabel(.access, access[1]), "Full access (default)")
