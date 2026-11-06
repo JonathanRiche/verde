@@ -37,12 +37,9 @@ struct DrawerItem: Identifiable {
     var activityMs: Int64? { thread?.last_activity_at_ms }
 }
 
-/// The footer tab to mark (I10-4, Android parity): a chat, Files, Changes or any pushed screen is
-/// under Workspaces; Home and Hosts only when they are what's on screen.
-func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
-    guard tab.showsBrowse, route != nil else { return tab }
-    return .workspaces
-}
+/// The footer tab to mark (I12-2): the tab whose list the back button returns to, so the
+/// highlight and the back label always agree (a chat opened from Home is under Home).
+func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab { tab }
 
 /// Active = running or needs_you, the same rule as Home's "Needs you" and "Running" sections.
 func drawerRowActive(threadStatus: String?, pane: Pane?) -> Bool {
@@ -96,6 +93,9 @@ struct WorkspaceDrawer: View {
     @State private var renaming: ThreadSummary?
     @State private var title = ""
     @State private var notice: String?
+    /// I12-9: row icons grow with the text.
+    @ScaledMetric(relativeTo: .footnote) private var chipSize: CGFloat = 16
+    @ScaledMetric(relativeTo: .footnote) private var glyphSize: CGFloat = 18
 
     var body: some View {
         let all = browse.state.workspaces?.items ?? []
@@ -255,7 +255,8 @@ struct WorkspaceDrawer: View {
             }
         }
         .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.text)
-        .frame(width: max(240, width - 24)).background(VerdeTheme.alternate)
+        // I12-8: the system popover background and shadow set it apart from the sidebar.
+        .frame(width: max(240, width - 24))
     }
 
     @ViewBuilder private func rows(_ name: String, _ items: [DrawerItem], chip: Bool) -> some View {
@@ -302,7 +303,7 @@ struct WorkspaceDrawer: View {
     private func row(_ title: String, icon: String, chip: Workspace? = nil, selected: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                if let chip { WorkspaceChip(workspace: chip, size: 16) }
+                if let chip { WorkspaceChip(workspace: chip, size: chipSize) }
                 Image(systemName: icon).frame(width: 18); Text(title).lineLimit(1); Spacer(minLength: 0)
             }
                 .font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
@@ -314,7 +315,7 @@ struct WorkspaceDrawer: View {
         Button(action: action) {
             VStack(spacing: 2) {
                 // A fixed icon box so every label sits on the same baseline (I7-5).
-                Image(systemName: icon).font(.system(size: 16)).frame(width: 24, height: 20)
+                Image(systemName: icon).font(.system(size: glyphSize * 0.9)).frame(width: glyphSize * 1.33, height: glyphSize * 1.1)
                 Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.6)
             }
             .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)
@@ -347,15 +348,15 @@ struct WorkspaceDrawer: View {
         let target = BrowseRoute.terminal(workspace: pane.workspace_id, terminal: id)
         return Button { open(target) } label: {
             HStack(spacing: 10) {
-                if let chip { WorkspaceChip(workspace: chip, size: 16) }
-                if let provider = pane.provider { ProviderGlyph(provider: provider) } else { Image(systemName: "terminal").frame(width: 18) }
+                if let chip { WorkspaceChip(workspace: chip, size: chipSize) }
+                if let provider = pane.provider { ProviderGlyph(provider: provider, size: glyphSize) } else { Image(systemName: "terminal").font(.system(size: glyphSize * 0.8)).frame(width: glyphSize) }
                 // I11-2: two lines before a title truncates (large text, narrow sidebar).
                 Text(pane.title).lineLimit(2)
                 Spacer(minLength: 0)
                 if pane.status == "working" || pane.status == "waiting" {
                     StatusPip(active: pane.status == "working", attention: pane.status == "waiting")
                 }
-            }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
+            }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
         }.buttonStyle(.plain).accessibilityAddTraits(selected == target ? .isSelected : [])
     }
@@ -363,13 +364,13 @@ struct WorkspaceDrawer: View {
         let target = BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)
         return Button { open(target) } label: {
             HStack(spacing: 10) {
-                if let chip { WorkspaceChip(workspace: chip, size: 16) }
-                ProviderGlyph(provider: thread.provider)
+                if let chip { WorkspaceChip(workspace: chip, size: chipSize) }
+                ProviderGlyph(provider: thread.provider, size: glyphSize)
                 Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(2)
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                 StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")
-            }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
+            }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
                 .overlay(alignment: .leading) { if selected == target { RoundedRectangle(cornerRadius: 2).fill(VerdeTheme.accent).frame(width: 2).padding(.vertical, 10) } }
         }.buttonStyle(.plain)

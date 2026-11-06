@@ -66,13 +66,14 @@ struct VerdeWordmark: View {
 }
 struct ProviderGlyph: View {
     let provider: String?
+    var size: CGFloat = 18
     var body: some View {
         let name = provider == "codex" ? "openai" : provider ?? ""
         if ["openai", "claude", "cursor", "opencode", "pi", "fx", "grok", "muse", "amp", "antigravity"].contains(name) {
             Image(uiImage: UIImage(named: "provider_" + name) ?? UIImage()).resizable()
                 .renderingMode(["openai", "cursor", "fx", "grok", "pi"].contains(name) ? .template : .original)
-                .scaledToFit().frame(width: 18, height: 18).foregroundStyle(VerdeTheme.text).accessibilityHidden(true)
-        } else { Image(systemName: "bubble.left").frame(width: 18, height: 18).foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true) }
+                .scaledToFit().frame(width: size, height: size).foregroundStyle(VerdeTheme.text).accessibilityHidden(true)
+        } else { Image(systemName: "bubble.left").frame(width: size, height: size).foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true) }
     }
 }
 
@@ -139,8 +140,12 @@ struct ToolbarChrome: ViewModifier {
         if #available(iOS 26.0, *) {
             content
         } else {
-            content.background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 9))
-                .overlay(RoundedRectangle(cornerRadius: 9).stroke(VerdeTheme.border))
+            // I12-7: the outline stays inside the bar; the 44-point target stays as it is.
+            content.background {
+                RoundedRectangle(cornerRadius: 9).fill(VerdeTheme.panel)
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(VerdeTheme.border))
+                    .padding(.vertical, 6)
+            }
         }
     }
 }

@@ -65,18 +65,28 @@ final class AdaptiveLayoutTests: XCTestCase {
         }
     }
 
-    /// I11-3: at two panes Moss is a 360-point inspector over the content's trailing edge; the
-    /// sidebar stays.
-    func testOpenMossIsATrailingInspectorAtTwoPanes() {
-        let layout = panes(834, moss: true)
-        XCTAssertTrue(layout.mossVisible)
-        XCTAssertFalse(layout.mossInSlot)
-        XCTAssertTrue(layout.mossOverlay)
-        XCTAssertTrue(layout.showsChats)
-        XCTAssertEqual(layout.mossWidth, 360)
-        XCTAssertEqual(layout.mossLeading, 834 - 360)
-        XCTAssertEqual(layout.contentLeading, AdaptivePanes.sidebarWidth)
-        XCTAssertEqual(layout.contentTrailing, 0)
+    /// I12-1: Moss beside the content whenever the content keeps 420 points; the sidebar yields
+    /// first; only a window too narrow for that gets a dimmed overlay.
+    func testMossSitsBesideTheContentAndTheSidebarYieldsFirst() {
+        let portrait = panes(834, moss: true)
+        XCTAssertFalse(portrait.mossOverlay)
+        XCTAssertFalse(portrait.showsChats, "834 - 300 can't hold 360 + 420: the sidebar steps aside")
+        XCTAssertTrue(portrait.sidebarYieldsToMoss)
+        XCTAssertEqual(portrait.contentLeading, 0)
+        XCTAssertEqual(portrait.contentTrailing, 360)
+        XCTAssertEqual(portrait.mossLeading, 834 - 360)
+        let landscape = panes(1210, moss: true)
+        XCTAssertTrue(landscape.showsChats)
+        XCTAssertFalse(landscape.mossOverlay)
+        XCTAssertEqual(landscape.contentLeading, 300)
+        XCTAssertEqual(landscape.contentTrailing, 360)
+        let narrow = panes(720, moss: true)
+        XCTAssertTrue(narrow.mossOverlay, "720 can't hold 360 + 420: a dimmed overlay")
+        XCTAssertEqual(narrow.contentTrailing, 0)
+        XCTAssertEqual(panes(834).showsChats, true, "Closing Moss brings the sidebar back")
+        let hidden = panes(834, collapsed: true, moss: true)
+        XCTAssertFalse(hidden.sidebarYieldsToMoss)
+        XCTAssertFalse(hidden.mossOverlay)
     }
 
     func testListsKeepTheReadableColumn() {

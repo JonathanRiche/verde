@@ -119,16 +119,22 @@ struct RootView: View {
                         }
                     }
                 }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
-                .environment(\.companionEntry, companionEntry(docked: panes.tier.docked))
+                .environment(\.companionEntry, companionEntry(dockShown: panes.tier.docked && panes.showsChats))
                 .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
-                if panes.tier.docked {
+                // I12-10: a hidden sidebar leaves the tree entirely (no disabled controls for VoiceOver).
+                if panes.tier.docked && panes.showsChats {
                     workspaceDrawer(permanent: true, width: panes.sidebar)
                         .frame(width: panes.sidebar)
                         .overlay(alignment: .trailing) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
                         // Typing in the composer shouldn't squeeze the list beside it.
                         .ignoresSafeArea(.keyboard, edges: .bottom)
-                        .adaptivePaneHidden(!panes.showsChats)
+                        .transition(.move(edge: .leading))
+                }
+                if panes.mossOverlay {
+                    // I12-1: too narrow to sit beside the content, Moss owns the screen: a scrim, then Moss.
+                    Color.black.opacity(0.4).ignoresSafeArea().onTapGesture { companionSheet = false }
+                        .accessibilityLabel("Close companion").accessibilityAddTraits(.isButton)
                 }
                 if panes.mossMounted {
                     CompanionPane(name: companion.active?.name ?? "Companion", inSlot: panes.mossInSlot,
@@ -137,8 +143,6 @@ struct RootView: View {
                     }
                     .frame(width: panes.mossWidth)
                     .overlay(alignment: .leading) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
-                    // Over the content at two panes (I11-3): a shadow sets it apart.
-                    .shadow(color: .black.opacity(panes.mossOverlay ? 0.18 : 0), radius: 12, x: -2)
                     .offset(x: panes.mossLeading)
                     .adaptivePaneHidden(!panes.mossVisible)
                 }
@@ -169,13 +173,16 @@ struct RootView: View {
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: sidebarCollapsed)
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: chatsPeek)
+            .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: companionSheet)
             .environment(\.openWorkspaceDrawer, {
                 if currentPanes.tier.docked {
                     sidebarCollapsed = false
-                    chatsPeek = currentPanes.mossInSlot
+                    // The sidebar wins when both can't fit beside the chat: Moss closes.
+                    if currentPanes.sidebarYieldsToMoss { companionSheet = false }
                 } else { drawer = true }
             })
-            .environment(\.adaptive, AdaptiveContext(tier: panes.tier, slotVisible: panes.contentLeading > 0))
+            .environment(\.adaptive, AdaptiveContext(tier: panes.tier, slotVisible: panes.contentLeading > 0,
+                                                     contentWidth: geometry.size.width - panes.contentLeading - panes.contentTrailing))
             .onChange(of: geometry.size.width, initial: true) { _, width in windowWidth = width }
             .onChange(of: panes.tier.docked) { _, docked in if docked { drawer = false } }
             .onChange(of: companionSettings) { _, open in if !open { companionSettingsLive = false } }
@@ -200,9 +207,9 @@ struct RootView: View {
     }
 
     /// Pushed screens dock the companion in their top bar (wide windows dock it in the sidebar).
-    private func companionEntry(docked: Bool) -> CompanionHeaderEntry? {
-        // S10 / I11-9: the header avatar shows on wide windows too; it opens Moss's inspector there.
-        guard companion.available else { return nil }
+    /// I12-11: one companion entry per layout: the sidebar's dock while it shows, else the header avatar.
+    private func companionEntry(dockShown: Bool) -> CompanionHeaderEntry? {
+        guard companion.available, !dockShown else { return nil }
         return CompanionHeaderEntry(model: companion, voice: companionVoice, live: live,
                               open: { companionSheet = true }, settings: { companionSettings = true })
     }

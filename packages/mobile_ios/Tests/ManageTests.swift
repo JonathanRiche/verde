@@ -101,8 +101,8 @@ final class ManageTests: XCTestCase {
         XCTAssertTrue(drawerRowActive(threadStatus: "working", pane: nil))
         XCTAssertFalse(drawerRowActive(threadStatus: "idle", pane: nil))
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: nil), .home)
-        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .workspaces)
-        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .thread(workspace: "w", thread: "t")), .workspaces)
+        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .home, "Back says Home, so Home is marked")
+        XCTAssertEqual(drawerFooterDestination(tab: .workspaces, route: .thread(workspace: "w", thread: "t")), .workspaces)
         XCTAssertEqual(drawerFooterDestination(tab: .hosts, route: .changes("w")), .hosts)
         XCTAssertEqual(drawerFooterDestination(tab: .settings, route: .changes("w")), .settings)
     }

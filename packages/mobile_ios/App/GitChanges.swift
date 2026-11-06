@@ -8,7 +8,7 @@ struct GitChatControls: View {
     @Environment(\.adaptive) private var adaptive
     /// Phones keep the header for the companion and the menu: the git actions move into the
     /// chat's "⋯" menu (`GitMenuItems`) and only the sheets and dialogs stay mounted here.
-    private var inline: Bool { adaptive.tier.wide }
+    private var inline: Bool { adaptive.inlineGit }
     private func hasActions(_ model: GitChangesModel) -> Bool {
         model.commitCount > 0 || model.ahead > 0 || model.notice != nil
     }

@@ -36,7 +36,7 @@ struct TranscriptScreen: View {
         }
         .environment(\.gitChangesModel, git)
         .background {
-            if !adaptive.tier.wide { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
+            if !adaptive.inlineGit { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
         }
         .overlay(alignment: .bottom) { if let git, !git.sheet { GitActionToastCard(model: git) } }
         .task(id: browse.hostID) {
@@ -49,7 +49,7 @@ struct TranscriptScreen: View {
         .toolbar {
             // S10: [back] [drawer] title … [companion] [⋯]. Only wide windows add the Commit button;
             // phones reach Git through ⋯ and keep its sheets mounted in the background.
-            if adaptive.tier.wide {
+            if adaptive.inlineGit {
                 ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
             }
             ToolbarItem(placement: .topBarTrailing) { CompanionHeaderButton(workspace: workspaceID, thread: threadID) }
@@ -786,7 +786,7 @@ private struct VoiceMessageRow: View {
     }
 }
 
-/// Companion sheet: your messages as compact right-aligned bubbles, replies as plain text.
+/// Companion sheet: your messages as compact right-aligned bubbles, replies as left-aligned ones.
 private struct CompactMessageRow: View {
     let row: ChatRow
     let model: TranscriptModel
@@ -809,7 +809,10 @@ private struct CompactMessageRow: View {
                             .padding(.horizontal, 10).padding(.vertical, 8)
                             .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
                     } else {
+                        // I12-4: replies sit in their own bubble, inset like yours, not on the pane's edge.
                         MarkdownText(text: streamTail(row), model: model)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 12))
                     }
                 }
                 if let delivery {
@@ -818,6 +821,7 @@ private struct CompactMessageRow: View {
             }
             .frame(maxWidth: mine ? nil : .infinity, alignment: mine ? .trailing : .leading)
             .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
+            if !mine { Spacer(minLength: 32) }
             .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
         }
         .accessibilityElement(children: .combine)

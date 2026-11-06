@@ -51,10 +51,13 @@ func adaptiveSidebarWidth(_ size: DynamicTypeSize, window: CGFloat) -> CGFloat {
 }
 
 /// Where each pane goes for a width and the user's choices. Moss gets space only while `mossOpen`.
-/// Moss is a 360-point trailing inspector: over the content at two panes (I11-3), its own pane at three.
+/// I12-1: Moss sits beside the content, which shrinks, whenever the content keeps 420 points:
+/// beside the sidebar if both fit, else with the sidebar hidden while Moss is open. Only a window
+/// too narrow for that gets Moss as a dimmed overlay that owns the screen.
 struct AdaptivePanes: Equatable {
     static let sidebarWidth: CGFloat = 300
     static let mossPaneWidth: CGFloat = 360
+    static let contentMinWidth: CGFloat = 420
 
     let tier: AdaptiveTier
     /// The chat list is on screen.
@@ -64,8 +67,10 @@ struct AdaptivePanes: Equatable {
     let mossVisible: Bool
     /// Moss used to take the sidebar slot; it never does now (I11-3), kept for the pane's strip.
     let mossInSlot: Bool
-    /// Moss floats over the content's trailing edge rather than taking its own pane.
+    /// Moss is a dimmed overlay (scrim and close) because the window can't fit it beside the content.
     let mossOverlay: Bool
+    /// The user's sidebar is hidden only while Moss needs its room.
+    let sidebarYieldsToMoss: Bool
     /// The sidebar's width at this text size.
     let sidebar: CGFloat
     let mossWidth: CGFloat
@@ -81,18 +86,22 @@ struct AdaptivePanes: Equatable {
          mossPaneWidth: CGFloat = AdaptivePanes.mossPaneWidth) {
         let tier = AdaptiveTier(width: width)
         let moss = tier.docked && mossOpen
-        let third = tier == .triple && moss
+        let sidebarWanted = tier.docked && !sidebarCollapsed
+        let room = mossPaneWidth + Self.contentMinWidth
+        let besideSidebar = moss && sidebarWanted && width - sidebarWidth >= room
+        let besideAlone = moss && !besideSidebar && width >= room
         self.tier = tier
         sidebar = sidebarWidth
-        showsChats = tier.docked && !sidebarCollapsed
+        showsChats = sidebarWanted && (!moss || besideSidebar)
+        sidebarYieldsToMoss = sidebarWanted && moss && !besideSidebar
         mossMounted = moss
         mossVisible = moss
         mossInSlot = false
-        mossOverlay = moss && !third
-        mossWidth = mossPaneWidth
+        mossOverlay = moss && !besideSidebar && !besideAlone
+        mossWidth = min(mossPaneWidth, width)
         mossLeading = moss ? max(0, width - mossPaneWidth) : 0
         contentLeading = showsChats ? sidebarWidth : 0
-        contentTrailing = third ? mossPaneWidth : 0
+        contentTrailing = moss && !mossOverlay ? mossPaneWidth : 0
     }
 }
 
@@ -136,7 +145,14 @@ struct AdaptiveContext: Equatable {
     var tier: AdaptiveTier = .phone
     /// The sidebar slot is on screen, holding the chat list or Moss.
     var slotVisible = false
+    /// The content pane's width (0 when unknown); bars move actions into "⋯" when it is narrow.
+    var contentWidth: CGFloat = 0
+    /// The Commit button sits in the chat's bar; otherwise its actions are in "⋯", as on phones.
+    var inlineGit: Bool { tier.wide && (contentWidth == 0 || contentWidth >= inlineGitMinWidth) }
 }
+
+/// I12-7: the chat bar keeps the Commit button only where the title still has room.
+let inlineGitMinWidth: CGFloat = 640
 
 private struct AdaptiveContextKey: EnvironmentKey { static let defaultValue = AdaptiveContext() }
 
