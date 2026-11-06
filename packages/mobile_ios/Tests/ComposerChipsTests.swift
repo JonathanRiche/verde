@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import VerdeApp
 
 /// S5: resolved chip values, current picker choice, de-duplicated suggestions, prompt bounds.
