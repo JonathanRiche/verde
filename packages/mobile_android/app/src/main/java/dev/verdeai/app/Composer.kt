@@ -26,6 +26,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.BorderStroke
@@ -212,7 +214,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
         border = BorderStroke(if (composerFocused) (if (keyboardMode) 2.dp else 1.5.dp) else 1.dp,
             if (composerFocused) VerdeColors.Accent else VerdeColors.PanelMuted),
         modifier = Modifier.fillMaxWidth().imePadding()
-            .then(if (wideRow) Modifier.wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH + 16.dp).fillMaxWidth() else Modifier)
+            // S17: the composer lines up with the capped transcript at every width.
+            .then(if (!compact) Modifier.wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH + 16.dp).fillMaxWidth() else Modifier)
             .padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
             .onFocusChanged { composerFocused = it.hasFocus }.focusGroup()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = if (dense) 8.dp else 12.dp, vertical = if (dense) 2.dp else 6.dp),
@@ -324,19 +327,22 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 maxLines = if (resizedHeight == null) 6 else Int.MAX_VALUE,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
             )
-            if (view != null) {
-                SettingsControls(view, state, provider) { picker = it }
-            }
-            // Keep actions anchored regardless of settings labels, font scale or turn state.
+            // S11: one row: the paperclip and the chips (wrapping only when they don't fit), then
+            // Stop and Send at the trailing end. While a turn runs with nothing typed, Stop is the
+            // only action (desktop): Send appears once there is something to steer with.
             Row(Modifier.fillMaxWidth().testTag("composer-actions"),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment = Alignment.Bottom,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                AttachButton(enabled = attach, onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
-                Spacer(Modifier.weight(1f))
+                Box(Modifier.weight(1f)) {
+                    if (view != null) SettingsControls(view, state, provider, leading = {
+                        AttachButton(enabled = attach, onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
+                    }) { picker = it }
+                    else AttachButton(enabled = attach, onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
+                }
                 if (running) {
                     StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
                 }
-                sendButton(canSubmit)
+                if (!running || hasContent) sendButton(canSubmit)
             }
             // A2-10: while the field is empty its placeholder already says this; say it once.
             if (running && view?.followup == null && text.isNotEmpty()) Text(followupHint(null, kind),
@@ -560,7 +566,8 @@ internal fun accessIsFull(access: List<ChatChoice>, selected: String?) = (select
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SettingsControls(view: ChatComposerView, state: TranscriptState, provider: String?, open: (ComposerPicker) -> Unit) {
+private fun SettingsControls(view: ChatComposerView, state: TranscriptState, provider: String?,
+    leading: (@Composable () -> Unit)? = null, open: (ComposerPicker) -> Unit) {
     val c = view.catalogs
     val s = view.selection
     // Like the desktop, the provider is fixed once a conversation has started.
@@ -568,7 +575,9 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
 
     val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
     // Content-sized chips that wrap to a second line rather than squeeze or hide their values.
-    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
+    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp),
+        itemVerticalAlignment = Alignment.CenterVertically) {
+        leading?.invoke()
         if (fresh) SettingChip("Provider", providerLabel, provider) { open(ComposerPicker.Provider) }
         SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
         if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default",
@@ -668,7 +677,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
     ModalBottomSheet(onDismissRequest = onDismiss, modifier = Modifier.testTag(COMPOSER_PICKER)) {
         LiveOverModal()
         Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-        LazyColumn(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+        LazyColumn(Modifier.fillMaxWidth().padding(bottom = 16.dp).selectableGroup()) {
             items(choices, key = { it.id }) { choice ->
                 val selected = choice.id == current
                 VerdeListRow(
@@ -687,10 +696,12 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                     trailingContent = {
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (choice.favorite) Icon(Icons.Filled.Star, contentDescription = "Favourite", modifier = Modifier.size(18.dp))
-                            if (selected) Icon(Icons.Filled.Check, contentDescription = "Selected")
+                            if (selected) Icon(Icons.Filled.Check, contentDescription = null, tint = VerdeColors.Accent)
                         }
                     },
-                    modifier = Modifier.fillMaxWidth().clickable(enabled = choice.enabled && !selected) { onPick(choice.id) },
+                    // TalkBack hears "Selected" on the current choice (a radio group), not just a check glyph.
+                    modifier = Modifier.fillMaxWidth().selectable(selected = selected, enabled = choice.enabled,
+                        role = Role.RadioButton) { if (!selected) onPick(choice.id) },
                 )
             }
         }
