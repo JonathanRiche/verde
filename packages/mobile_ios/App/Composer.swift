@@ -8,6 +8,140 @@ func composerChoiceLabel(_ choices: [ChatChoice], value: String?) -> String {
         ?? value.flatMap { $0.isEmpty ? nil : $0 } ?? "Default"
 }
 
+/// A new thread runs with full access unless the user picks otherwise (host default).
+let defaultAccessID = "full_access"
+
+/// The access chip's resolved value: "Supervised", "Full access", or "Default · Full access".
+func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
+    if let value, !value.isEmpty { return composerChoiceLabel(choices, value: value) }
+    let resolved = choices.first { $0.id == defaultAccessID }?.label ?? "Full access"
+    return "Default · " + resolved
+}
+
+/// The option a picker marks as current: the selection, else what an unset value means.
+func composerCurrentChoice(_ picker: ComposerPicker, value: String?) -> String {
+    if let value, !value.isEmpty { return value }
+    return picker == .access ? defaultAccessID : ""
+}
+
+/// One row of the "/" or "@" suggestion list.
+struct ComposerSuggestion: Identifiable, Equatable {
+    let id: String
+    let label: String
+    /// What is inserted: the command name or the file path.
+    let value: String
+    let detail: String?
+    let enabled: Bool
+}
+
+/// Matching commands or files, de-duplicated by id and label (a host can list a command twice).
+func composerSuggestions(_ token: ComposerToken, mentions: [ChatMention], slash: [ChatChoice]) -> [ComposerSuggestion] {
+    var seen = Set<String>()
+    var out: [ComposerSuggestion] = []
+    if token.marker == "@" {
+        for item in mentions where seen.insert(item.path).inserted {
+            let folder = (item.path as NSString).deletingLastPathComponent
+            out.append(ComposerSuggestion(id: item.path, label: item.label, value: item.path, detail: folder.isEmpty ? nil : folder, enabled: true))
+        }
+    } else {
+        for item in slash where token.query.isEmpty || item.label.localizedCaseInsensitiveContains(token.query) {
+            guard seen.insert(item.id).inserted, seen.insert("label:" + item.label).inserted else { continue }
+            out.append(ComposerSuggestion(id: item.id, label: item.label, value: item.label, detail: item.reason, enabled: item.enabled))
+        }
+    }
+    return out
+}
+
+/// Chips at their natural width, wrapping onto further lines when a row is full (large text).
+struct ChipFlow: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+        let height = rows.last.map { $0.y + $0.height } ?? 0
+        let widest = rows.map(\.width).max() ?? 0
+        return CGSize(width: proposal.width ?? widest, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = arrange(width: bounds.width, subviews: subviews)
+        for row in rows {
+            var x = bounds.minX
+            for index in row.items {
+                let size = subviews[index].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+                subviews[index].place(at: CGPoint(x: x, y: bounds.minY + row.y), proposal: ProposedViewSize(width: min(size.width, bounds.width), height: size.height))
+                x += size.width + spacing
+            }
+        }
+    }
+
+    private struct Row { var items: [Int] = []; var y: CGFloat = 0; var width: CGFloat = 0; var height: CGFloat = 0 }
+
+    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(ProposedViewSize(width: width, height: nil))
+            let next = current.items.isEmpty ? size.width : current.width + spacing + size.width
+            if !current.items.isEmpty && next > width {
+                rows.append(current)
+                current = Row(items: [], y: current.y + current.height + spacing)
+            }
+            current.width = current.items.isEmpty ? size.width : current.width + spacing + size.width
+            current.height = max(current.height, size.height)
+            current.items.append(index)
+        }
+        if !current.items.isEmpty { rows.append(current) }
+        return rows
+    }
+}
+
+/// The "/" commands or "@" files as one vertical list of 44-point rows (S5).
+private struct ComposerSuggestionList: View {
+    let items: [ComposerSuggestion]
+    let files: Bool
+    let accept: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(files ? "Files" : "Commands").font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.muted)
+                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 2)
+                .accessibilityAddTraits(.isHeader)
+            if items.count > 4 {
+                ScrollView { rows }.frame(height: 44 * 4.5)
+            } else {
+                rows
+            }
+        }
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityIdentifier("composer-suggestions")
+    }
+
+    private var rows: some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(items) { item in
+                Button { accept(item.value) } label: { row(item) }
+                    .buttonStyle(.plain)
+                    .disabled(!item.enabled)
+            }
+        }
+    }
+
+    private func row(_ item: ComposerSuggestion) -> some View {
+        HStack(spacing: 8) {
+            Text(item.label).font(files ? VerdeTheme.ui(14) : VerdeTheme.mono(14)).lineLimit(1)
+            if let detail = item.detail {
+                Text(detail).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).truncationMode(.head)
+            }
+            Spacer(minLength: 0)
+        }
+        .opacity(item.enabled ? 1 : 0.5)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
 /// The Companion sheet's single-row composer: placeholder, a live voice transcript shown in place
 /// of the field, a voice notice, and trailing controls (the mic).
 struct CompactComposer {
@@ -45,6 +179,10 @@ struct ChatComposer: View {
     @State private var focused = false
     @State private var resizedHeight: CGFloat?
     @State private var dragStart: CGFloat?
+    /// The text's own height; the field grows with it (a few lines) unless resized by hand.
+    @State private var contentHeight: CGFloat = 0
+    /// Two lines at the default size, more with larger text so glyphs are never cut off.
+    @ScaledMetric(relativeTo: .body) private var basePrompt: CGFloat = 56
 
     var body: some View {
         Group {
@@ -54,9 +192,10 @@ struct ChatComposer: View {
         .onDisappear { model.flushNow() }
         .sheet(item: $picker) { kind in
             NavigationStack {
+                let current = composerCurrentChoice(kind, value: selectedID(kind))
                 List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: {
-                        HStack { pickerGlyph(kind, value: choice.id); Text(choice.label); if choice.favorite { Image(systemName: "star.fill") }; Spacer(); if let reason = choice.reason { Text(reason) .font(VerdeTheme.ui(12)) } }
+                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: choice, selected: choice.id == current)
                     }.disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
             }.presentationDetents([.medium, .large])
@@ -112,17 +251,8 @@ struct ChatComposer: View {
                 Text(notice) .font(VerdeTheme.ui(12)).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
             }
             if let token = model.token {
-                ScrollView(.horizontal) {
-                    HStack {
-                        if token.marker == "@" {
-                            ForEach(model.view?.mentions ?? [], id: \.path) { item in Button(item.label) { model.accept(item.path) } }
-                        } else {
-                            ForEach((model.view?.catalogs.slash ?? []).filter { $0.label.localizedCaseInsensitiveContains(token.query) || token.query.isEmpty }, id: \.id) { item in
-                                Button(item.label) { model.accept(item.label) }.disabled(!item.enabled)
-                            }
-                        }
-                    } .font(VerdeTheme.ui(12))
-                }.accessibilityIdentifier("composer-suggestions")
+                let items = composerSuggestions(token, mentions: model.view?.mentions ?? [], slash: model.view?.catalogs.slash ?? [])
+                if !items.isEmpty { ComposerSuggestionList(items: items, files: token.marker == "@") { model.accept($0) } }
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
                 ScrollView(.horizontal) {
@@ -133,8 +263,11 @@ struct ChatComposer: View {
                                     Image(uiImage: image).resizable().scaledToFit().frame(width: 44, height: 44)
                                 }
                                 Text(item.name) .font(VerdeTheme.ui(12))
-                                Button { model.detach(item.local_id) } label: { Image(systemName: "xmark.circle.fill") }
-                                    .accessibilityLabel("Remove \(item.name)").disabled(model.busy || model.pending)
+                                Button { model.detach(item.local_id) } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.muted).minTarget()
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove \(item.name)").disabled(model.busy || model.pending)
                             }
                         }
                     }
@@ -149,7 +282,7 @@ struct ChatComposer: View {
                 .frame(maxWidth: .infinity).frame(height: adaptive.tier.wide ? 14 : 24).contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 2).onChanged { value in
                     if dragStart == nil { dragStart = promptHeight }
-                    resizedHeight = composerPromptHeight((dragStart ?? 56) - value.translation.height, available: availableHeight)
+                    resizedHeight = composerPromptHeight((dragStart ?? basePrompt) - value.translation.height, available: availableHeight, minimum: basePrompt)
                 }.onEnded { _ in dragStart = nil })
                 .onTapGesture(count: 2) { resizedHeight = nil }
                 .accessibilityElement().accessibilityLabel("Resize prompt box")
@@ -159,7 +292,8 @@ struct ChatComposer: View {
                 .accessibilityAction(named: "Shrink prompt box") { resizePrompt(-56) }
                 .accessibilityAction(named: "Reset prompt box size") { resizedHeight = nil }
                 .accessibilityIdentifier("composer-resize")
-            ComposerText(text: model.text, selection: model.selection, editable: !model.pending, edit: model.edit, focus: { focused = $0 })
+            ComposerText(text: model.text, selection: model.selection, editable: !model.pending, edit: model.edit, focus: { focused = $0 },
+                         height: { height in if abs(height - contentHeight) > 1 { contentHeight = height } })
                 .frame(height: promptHeight)
                 .overlay(alignment: .topLeading) {
                     if model.text.isEmpty {
@@ -170,11 +304,10 @@ struct ChatComposer: View {
                 .accessibilityIdentifier("composer-field")
             if !adaptive.tier.wide {
                 if visiblePickers.contains(.provider) { settingButton(.provider, compact: false) }
-                HStack(spacing: 4) {
+                // Natural widths; a full row (or large text) wraps onto the next line.
+                ChipFlow(spacing: 4) {
                     ForEach(visiblePickers.filter { $0 != .provider }) { kind in
-                        settingButton(kind, compact: kind == .speed || kind == .access)
-                            .frame(maxWidth: kind == .model ? .infinity : kind == .effort ? 100 : 44)
-                            .layoutPriority(kind == .model ? 0 : 1)
+                        settingButton(kind, compact: kind == .speed, stretch: false)
                     }
                 }
             }
@@ -183,7 +316,7 @@ struct ChatComposer: View {
                     Button("Photos", systemImage: "photo") { photos = true }
                     Button("Camera", systemImage: "camera") { openCamera() }
                     Button("Files", systemImage: "folder") { files = true }
-                } label: { Image(systemName: "paperclip").frame(width: 44, height: 44) }
+                } label: { Image(systemName: "paperclip").frame(width: 44, height: 44).accessibilityLabel("Attach image") }
                     .accessibilityLabel("Attach image").disabled(model.busy || model.pending)
                 if adaptive.tier.wide {
                     // Full labels when they fit; a tight pane drops effort to its icon first, and
@@ -200,7 +333,10 @@ struct ChatComposer: View {
                         .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
                 }
                 Button(action: model.submit) {
-                    Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.accent, in: Circle()).opacity(model.canSubmit ? 1 : 0.35)
+                    Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
+                        .frame(width: 44, height: 44)
+                        .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
                 }.buttonStyle(.plain)
                     .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
                     .accessibilityIdentifier("composer-send")
@@ -218,7 +354,7 @@ struct ChatComposer: View {
     private func inlineSettings(effortIcon: Bool) -> some View {
         HStack(spacing: 4) {
             ForEach(visiblePickers) { kind in
-                settingButton(kind, compact: kind == .speed || kind == .access || (kind == .effort && effortIcon), stretch: false)
+                settingButton(kind, compact: kind == .speed || (kind == .effort && effortIcon), stretch: false)
             }
         }
     }
@@ -251,8 +387,10 @@ struct ChatComposer: View {
                     .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
                 }
                 Button(action: model.submit) {
-                    Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(VerdeTheme.background)
-                        .frame(width: 32, height: 32).background(VerdeTheme.accent, in: Circle()).opacity(model.canSubmit ? 1 : 0.35)
+                    Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
+                        .frame(width: 32, height: 32)
+                        .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
                         .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -388,8 +526,11 @@ struct ChatComposer: View {
         case .queue: return "text.line.last.and.arrowtriangle.forward"
         }
     }
-    private var promptHeight: CGFloat { composerPromptHeight(resizedHeight ?? 56, available: availableHeight) }
-    private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight) }
+    private var promptHeight: CGFloat {
+        let natural = min(max(basePrompt, contentHeight), basePrompt * 3)
+        return composerPromptHeight(resizedHeight ?? natural, available: availableHeight, minimum: basePrompt)
+    }
+    private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
     private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true) -> some View {
         Button { picker = kind } label: {
             HStack(spacing: 6) {
@@ -445,6 +586,7 @@ struct ChatComposer: View {
     }
     private func selectionLabel(_ kind: ComposerPicker) -> String {
         let list = choices(kind)
+        if kind == .access { return composerAccessLabel(list, value: selectedID(kind)) }
         return composerChoiceLabel(list, value: selectedID(kind))
     }
     private func settingIcon(_ kind: ComposerPicker, value: String? = nil) -> String? {
@@ -509,9 +651,12 @@ private struct ComposerText: UIViewRepresentable {
     let editable: Bool
     let edit: (String, NSRange) -> Void
     let focus: (Bool) -> Void
+    /// The laid-out text height, reported after layout.
+    var height: (CGFloat) -> Void = { _ in }
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+        let view = MeasuredTextView()
+        view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.parent.height(height) }
         view.delegate = context.coordinator; view.backgroundColor = .clear
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 15) ?? .systemFont(ofSize: 15)); view.textColor = UIColor(VerdeTheme.text); view.tintColor = UIColor(VerdeTheme.accent); view.adjustsFontForContentSizeCategory = true
         view.textContainerInset = .zero; view.textContainer.lineFragmentPadding = 0
@@ -540,6 +685,42 @@ private struct ComposerText: UIViewRepresentable {
         func textViewDidEndEditing(_ view: UITextView) { parent.focus(false) }
         func textViewDidChange(_ view: UITextView) { parent.edit(view.text, view.selectedRange) }
         func textViewDidChangeSelection(_ view: UITextView) { parent.edit(view.text, view.selectedRange) }
+    }
+}
+
+/// Reports its content height whenever layout changes it (text, width or Dynamic Type).
+private final class MeasuredTextView: UITextView {
+    var onContentHeight: ((CGFloat) -> Void)?
+    private var reported: CGFloat = -1
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let height = ceil(contentSize.height)
+        guard abs(height - reported) > 0.5 else { return }
+        reported = height
+        let report = onContentHeight
+        DispatchQueue.main.async { report?(height) }
+    }
+}
+
+/// A picker sheet row: glyph, label, favourite star, reason and a checkmark on the current one.
+private struct PickerRow: View {
+    let glyph: AnyView
+    let choice: ChatChoice
+    let selected: Bool
+
+    var body: some View {
+        HStack {
+            glyph
+            Text(choice.label).font(VerdeTheme.ui(15, bold: selected))
+            if choice.favorite { Image(systemName: "star.fill").accessibilityLabel("Favorite") }
+            Spacer()
+            if let reason = choice.reason { Text(reason).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted) }
+            if selected { Image(systemName: "checkmark").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true) }
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -805,7 +986,7 @@ private struct ComposerGlyph: Shape {
 
 /// `available` comes from the keyboard-adjusted conversation container. Reserve
 /// space for controls and visible conversation even while the prompt is expanded.
-func composerPromptHeight(_ requested: CGFloat, available: CGFloat) -> CGFloat {
-    let maximum = max(56, min(available * 0.6, available - 200))
-    return min(maximum, max(56, requested))
+func composerPromptHeight(_ requested: CGFloat, available: CGFloat, minimum: CGFloat = 56) -> CGFloat {
+    let maximum = max(minimum, min(available * 0.6, available - 200))
+    return min(maximum, max(minimum, requested))
 }
