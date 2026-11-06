@@ -21,6 +21,8 @@ struct CompanionSheet: View {
     @State private var settingsBrain = false
     /// Settings open scrolled to the Live voice keys.
     @State private var settingsLive = false
+    /// The brain chip's picker, on its own (I3-10).
+    @State private var brainPicker = false
     @State private var confirmNew = false
     @State private var conversations = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
@@ -46,6 +48,7 @@ struct CompanionSheet: View {
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
         .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain, focusLiveVoice: settingsLive) }
+        .sheet(isPresented: $brainPicker) { CompanionBrainSheet(model: model, browse: browse) }
         .sheet(isPresented: $conversations) {
             CompanionConversations(model: model, browse: browse)
                 .presentationDetents([.medium, .large])
@@ -120,7 +123,7 @@ struct CompanionSheet: View {
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
                                       threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts,
-                                      openBrain: { settingsBrain = true; settingsLive = false; settings = true })
+                                      openBrain: { brainPicker = true })
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
                 CompanionStarter(busy: model.creatingThread, name: active.name, voice: voice, send: { prompt in
@@ -854,5 +857,21 @@ private struct LiveFailureCard: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.warning.opacity(0.6)))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("live-failure")
+    }
+}
+
+/// The composer's brain chip: the Brain page alone, with Done (I3-10).
+private struct CompanionBrainSheet: View {
+    let model: CompanionModel
+    let browse: BrowseModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            CompanionBrainScreen(model: model, browse: browse)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .presentationDetents([.medium, .large])
+        .tint(VerdeTheme.accent)
     }
 }
