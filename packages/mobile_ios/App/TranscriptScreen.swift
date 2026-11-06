@@ -94,6 +94,11 @@ extension TranscriptScreen {
     }
 }
 
+/// Resigns whichever field has the keyboard.
+@MainActor func dismissKeyboard() {
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+}
+
 private struct CompactChatKey: EnvironmentKey { static let defaultValue = false }
 
 extension EnvironmentValues {
@@ -262,6 +267,10 @@ private struct TranscriptList: View {
                         .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                     }
                     .coordinateSpace(name: "transcript")
+                    // Scrolling or tapping the transcript puts the keyboard away (I-KB); the tap is
+                    // simultaneous, so rows, links and buttons still get it.
+                    .scrollDismissesKeyboard(.interactively)
+                    .simultaneousGesture(TapGesture().onEnded { dismissKeyboard() })
                     .scrollPosition(id: $position)
                     .modifier(BottomAnchor())
                     // Lazy rows start at estimated heights, so the initial bottom offset can land
