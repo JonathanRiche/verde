@@ -565,3 +565,43 @@ test "composer catalogs name the model behind a provider's default choice" {
     out = try cat.catalogs(a, .{ .provider = "claude" }, try h.parse(a, "{\"models\":[{\"model_id\":\"sonnet\",\"model_name\":\"Sonnet 5.5\"}]}"), .null);
     try expect(out.default_model_label == null);
 }
+
+/// The `workspaces` selector's summary of the fixture thread.
+fn listedThread(f: *Fixture, catalog_activity_s: ?i64, turns: anytype) !V {
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    var meta = try h.parse(tx.allocator(), try h.encode(f.a(), tx.state.sync.catalog[0]));
+    try meta.object.put(tx.allocator(), "last_activity_at", if (catalog_activity_s) |n| .{ .integer = n } else .null);
+    tx.state.sync.catalog = try tx.allocator().dupe(V, &.{meta});
+    tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{ .snapshot = .{ .workspaces = .{.{ .workspace_id = ws, .label = "Fixture" }} }, .turns = turns }));
+    f.a().free(try tx.commit(&f.host, f.a()));
+    const out = try h.parse(f.a(), try f.host.query("workspaces", f.a()));
+    for (p.rows(p.get(p.get(out, "data"), "items"))) |w| for (p.rows(p.get(w, "threads"))) |t| if (h.eq(p.s(t, "thread_id"), thread)) return t;
+    return error.MissingThread;
+}
+
+test "thread activity follows turns this device observes until the host catches up" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const none = .{};
+    // No host activity and no observed turn yet.
+    try expect(p.get(try listedThread(&f, null, none), "last_activity_at_ms") == .null);
+    // Host value only (seconds).
+    try expect(p.num(p.get(try listedThread(&f, 1790000000, none), "last_activity_at_ms")).? == 1790000000000);
+    // A sync turn's start/finish counts even when the host never bumped the thread.
+    try expect(p.num(p.get(try listedThread(&f, 1790000000, .{.{ .workspace_id = ws, .local_thread_id = thread, .turn_id = "older", .status = "completed", .started_at_ms = 1790000100000, .finished_at_ms = 1790000200000 }}), "last_activity_at_ms")).? == 1790000200000);
+    // Tail progress seen on this device bumps it to the observed wall time.
+    try f.seedTurn();
+    f.now = 5000;
+    try f.tail(.{ .status = "completed", .events = .{.{ .seq = 1, .kind = "assistant_delta", .payload_json = "{\"text\":\"done\"}" }} });
+    const seen: i64 = 1790363191000 + 5000;
+    try expect(f.host.state.chat.threads[0].activity_ms.? == seen);
+    const listed = try listedThread(&f, 1790000000, none);
+    try expect(p.num(p.get(listed, "last_activity_at_ms")).? == seen);
+    try eql("Today", p.s(listed, "history_bucket"));
+    const view = try f.query("thread");
+    try expect(p.num(p.get(p.get(p.get(view, "data"), "thread"), "last_activity_at_ms")).? == seen);
+    // Once the host's value is newer, it wins.
+    try expect(p.num(p.get(try listedThread(&f, 1790363200, none), "last_activity_at_ms")).? == 1790363200000);
+}

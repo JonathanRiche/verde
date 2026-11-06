@@ -67,6 +67,9 @@ pub const Repository = store.Repository;
 pub const RepositoryBinding = store.RepositoryBinding;
 /// Wall-clock time the user last focused a workspace on this client.
 pub const FocusStamp = struct { workspace_id: []const u8, at_ms: i64 };
+/// Turn activity this device observed for a thread (wall ms). Hosts do not always bump
+/// `last_activity_at` for the turns they run, so summaries take the newest of both.
+pub const ActivityStamp = struct { workspace_id: []const u8, thread_id: []const u8, at_ms: i64 };
 /// FNV-1a 32-bit over the workspace id bytes; shared with desktop and web.
 pub fn identityHash(id: []const u8) u32 {
     var h: u32 = 0x811C9DC5;
@@ -161,9 +164,20 @@ fn turnFor(turns: V, ws: []const u8, id: []const u8) V {
     }
     return result;
 }
-fn summary(ws: []const u8, t: V, turns: V, now: i64) ThreadSummary {
+fn summary(ws: []const u8, t: V, turns: V, now: i64, activity: []const ActivityStamp) ThreadSummary {
     const sec = store.threadActivitySeconds(num(get(t, "last_activity_at")));
-    const ms = if (sec) |n| std.math.mul(i64, n, 1000) catch null else null;
+    const id = s(t, "local_thread_id");
+    var ms = if (sec) |n| std.math.mul(i64, n, 1000) catch null else null;
+    // The thread's turns (start or finish) and this device's observations count as activity.
+    for (rows(turns)) |turn| {
+        if (!eq(s(turn, "workspace_id"), ws) or !eq(s(turn, "local_thread_id"), id)) continue;
+        inline for (.{ "started_at_ms", "finished_at_ms" }) |key| if (num(get(turn, key))) |at| if (at > 0) {
+            ms = @max(ms orelse at, at);
+        };
+    }
+    for (activity) |stamp| if (eq(stamp.workspace_id, ws) and eq(stamp.thread_id, id)) {
+        ms = @max(ms orelse stamp.at_ms, stamp.at_ms);
+    };
     const age = @as(i128, now) - @as(i128, ms orelse 0);
     return .{ .workspace_id = ws, .thread_id = s(t, "local_thread_id"), .title = fallback(s(t, "title"), "Chat"), .provider = fallback(s(t, "provider"), "opencode"), .model = nullable(get(t, "model_ref")), .cwd = nullable(get(t, "cwd")), .open = !eqFalse(get(t, "open")), .archived = yes(get(t, "archived")), .committed = !eqFalse(get(t, "committed")), .last_activity_at_ms = ms, .status = fallback(s(turnFor(turns, ws, s(t, "local_thread_id")), "status"), "idle"), .history_bucket = if (age < 86_400_000) "Today" else if (age < 604_800_000) "This week" else "Older" };
 }
@@ -365,7 +379,7 @@ fn historyOrder(_: void, l: ThreadSummary, r: ThreadSummary) bool {
     return if (order == .eq) std.mem.lessThan(u8, l.thread_id, r.thread_id) else order == .lt;
 }
 pub fn project(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i64) host.ApiError!Models {
-    return projectFocused(a, snapshot, catalog, has_catalog, now, &.{});
+    return projectFocused(a, snapshot, catalog, has_catalog, now, &.{}, &.{});
 }
 /// Recency order: timestamped workspaces newest first, then untimed open, then
 /// untimed closed; snapshot order breaks ties (no closed-at time is synced).
@@ -398,7 +412,7 @@ pub fn rankWorkspaces(a: A, workspaces: []Workspace, focus: []const FocusStamp) 
     std.mem.sort(u32, order, workspaces, recencyBefore);
     for (order, 0..) |i, rank| workspaces[i].recency_rank = @intCast(rank);
 }
-pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i64, focus: []const FocusStamp) host.ApiError!Models {
+pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i64, focus: []const FocusStamp, activity: []const ActivityStamp) host.ApiError!Models {
     var workspaces: std.ArrayList(Workspace) = .empty;
     var home: std.ArrayList(Pane) = .empty;
     var history: std.ArrayList(ThreadSummary) = .empty;
@@ -419,7 +433,7 @@ pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, 
         }
         var summaries: std.ArrayList(ThreadSummary) = .empty;
         for (threads.items) |t| {
-            const item = summary(wid, t, turns, now);
+            const item = summary(wid, t, turns, now, activity);
             try summaries.append(a, item);
             if (item.committed) try history.append(a, item);
         }

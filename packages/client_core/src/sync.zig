@@ -5,6 +5,7 @@ const std = @import("std");
 const host = @import("host.zig");
 const rpc = @import("rpc.zig");
 const p = @import("projection.zig");
+const chat = @import("chat.zig");
 const store = @import("headless").store_protocol;
 const V = std.json.Value;
 const eq = host.eq;
@@ -389,7 +390,11 @@ pub fn intent(tx: *host.Transaction, tag: []const u8, event: V) host.ApiError!vo
 }
 pub fn query(a: std.mem.Allocator, state: *const host.State, selector: []const u8) host.ApiError!V {
     const s = &state.sync;
-    const models = try p.projectFocused(a, s.snapshot, s.catalog, s.has_catalog, state.wall_time_ms, s.focus);
+    var activity: std.ArrayList(p.ActivityStamp) = .empty;
+    for (state.chat.threads) |*t| if (chat.activityMs(t)) |at| {
+        try activity.append(a, .{ .workspace_id = t.workspace_id, .thread_id = t.id, .at_ms = at });
+    };
+    const models = try p.projectFocused(a, s.snapshot, s.catalog, s.has_catalog, state.wall_time_ms, s.focus, activity.items);
     const bytes = if (eq(selector, "home")) try std.json.Stringify.valueAlloc(a, .{ .items = models.active, .loading = s.loading, .stale = state.stale, .incomplete_scopes = if (p.get(s.snapshot, "incomplete_scopes") == .array) p.get(s.snapshot, "incomplete_scopes") else V{ .array = std.array_list.Managed(V).init(a) }, .@"error" = s.@"error" }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .items = models.workspaces, .loading = s.loading, .stale = state.stale, .@"error" = s.@"error", .history = .{ .query = "", .items = models.history, .next_cursor = @as(?[]const u8, null), .loading = s.loading, .@"error" = s.@"error" } }, .{});
     return host.parse(a, bytes);
 }

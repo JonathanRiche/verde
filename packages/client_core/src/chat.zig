@@ -45,6 +45,8 @@ pub const Thread = struct {
     turn: ?m.Turn = null,
     approval: ?m.Approval = null,
     after_seq: u64 = 0,
+    /// Wall ms of the newest turn activity this device saw (a send, tail progress, an end).
+    activity_ms: ?i64 = null,
     focused: bool = false,
     send: ?Send = null,
     send_intent: ?[]const u8 = null,
@@ -702,8 +704,18 @@ pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) E!bool {
     }
     return false;
 }
+/// Newest turn activity this device knows for a loaded thread: its observations and its turn's start.
+pub fn activityMs(t: *const Thread) ?i64 {
+    var at = t.activity_ms;
+    if (t.turn) |turn| if (turn.started_at_ms) |started| {
+        at = @max(at orelse started, started);
+    };
+    return at;
+}
 fn summary(a: A, t: *const Thread, wall: i64) E!p.ThreadSummary {
-    const timestamp = if (store.threadActivitySeconds(t.metadata.last_activity_at)) |n| std.math.mul(i64, n, 1000) catch null else null;
+    const host = if (store.threadActivitySeconds(t.metadata.last_activity_at)) |n| std.math.mul(i64, n, 1000) catch null else null;
+    const seen = activityMs(t);
+    const timestamp = if (host) |ms| @max(ms, seen orelse ms) else seen;
     const age = @as(i128, wall) - @as(i128, timestamp orelse 0);
     return .{ .workspace_id = try a.dupe(u8, t.workspace_id), .thread_id = t.id, .title = t.metadata.title, .provider = t.saved.selection.provider orelse t.metadata.provider, .model = t.saved.selection.model orelse t.metadata.model_ref, .cwd = t.cwd, .open = true, .archived = t.metadata.archived, .last_activity_at_ms = timestamp, .status = if (t.turn) |turn| turn.status else "idle", .history_bucket = if (age < 86400000) "Today" else if (age < 604800000) "This week" else "Older" };
 }
@@ -804,6 +816,7 @@ fn receiveTail(tx: *h.Transaction, i: usize, result: V) E!void {
         t.retry_at = std.math.maxInt(i64);
         return;
     }
+    const applied_from = t.after_seq;
     if (p.uint(p.get(result, "events_compacted_before_seq"))) |before| if (before > t.after_seq) {
         t.events = &.{};
         t.overlay = &.{};
@@ -849,6 +862,8 @@ fn receiveTail(tx: *h.Transaction, i: usize, result: V) E!void {
         try add(apply.ChatEvent, tx.allocator(), &t.events, .{ .kind = if (known) kind else "message", .payload_json = if (known) payload else try h.encode(tx.allocator(), .{ .title = kind, .body = if (p.s(decoded, "text").len > 0) p.s(decoded, "text") else payload }) });
         t.after_seq = seq;
     }
+    // New events or a status change are activity the host may not stamp on the thread.
+    if (t.after_seq != applied_from or !eq(t.turn.?.status, status)) t.activity_ms = tx.state.wall_time_ms;
     t.turn.?.status = status;
     t.turn.?.after_seq = try decimal(tx.allocator(), t.after_seq);
     t.turn.?.started_at_ms = p.num(p.get(result, "started_at_ms"));
@@ -1041,6 +1056,7 @@ fn receiveResult(tx: *h.Transaction, request: Request, result: V) E!void {
             const send = t.send.?;
             if (!eq(p.s(result, "turn_id"), send.turn_id)) return failed(tx, request, rpc.failure(.protocol, "unconfirmed_turn", true), false);
             t.turn = .{ .turn_id = send.turn_id, .status = "running", .started_at_ms = tx.state.wall_time_ms };
+            t.activity_ms = tx.state.wall_time_ms;
             t.events = &.{};
             t.after_seq = 0;
             t.retry_at = 0;
