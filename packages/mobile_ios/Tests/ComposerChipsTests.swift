@@ -26,6 +26,13 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(rankedMentions(all, query: "").count, all.count)
     }
 
+    func testChipsDropTheDefaultPrefix() {
+        let models = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
+        XCTAssertEqual(composerResolvedModel(models, value: nil, defaultLabel: "Opus 5.5"), "Opus 5.5")
+        XCTAssertEqual(composerResolvedModel(models, value: nil, defaultLabel: nil), "Default")
+        XCTAssertEqual(composerResolvedEffort([ChatChoice(id: "", label: "Default")], value: nil, defaultLabel: "High"), "High")
+    }
+
     func testLongChipLabelsAreCut() {
         XCTAssertEqual(chipDisplay("Opus 5.5", limit: 22), "Opus 5.5")
         XCTAssertEqual(chipDisplay("Opus 5.5 (1M context) preview", limit: 10), "Opus 5.5 …")

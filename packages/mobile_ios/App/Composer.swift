@@ -46,6 +46,18 @@ func composerModelLabel(_ models: [ChatChoice], value: String?, defaultLabel: St
     return composerChoiceLabel(models, value: id)
 }
 
+/// The model a chip names: what runs, without the "Default ·" prefix ("Opus 5.5").
+func composerResolvedModel(_ models: [ChatChoice], value: String?, defaultLabel: String?) -> String {
+    let label = composerModelLabel(models, value: value, defaultLabel: defaultLabel)
+    return label.hasPrefix("Default · ") ? String(label.dropFirst("Default · ".count)) : label
+}
+
+/// The effort a chip names: the chosen one, else the default's resolved effort ("High"), else "Default".
+func composerResolvedEffort(_ efforts: [ChatChoice], value: String?, defaultLabel: String?) -> String {
+    let label = composerEffortLabel(efforts, value: value, defaultLabel: defaultLabel)
+    return label.hasPrefix("Default · ") ? String(label.dropFirst("Default · ".count)) : label
+}
+
 /// The effort chip: the chosen effort, else "Default · <effort>" when the core names it.
 func composerEffortLabel(_ efforts: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
     guard let value, !isDefaultChoice(value) else { return composerDefaultLabel(defaultLabel) }
@@ -392,11 +404,18 @@ struct ChatComposer: View {
                     }
                     .layoutPriority(1)
                 } else {
-                    ChipFlow(spacing: 4) {
-                        attachMenu
-                        ForEach(visiblePickers) { kind in settingButton(kind, compact: false, stretch: false) }
+                    // S18: one row at the default text size. Full labels when they fit, then Access
+                    // and Speed as icons, then Effort too; only large text wraps the chips.
+                    ViewThatFits(in: .horizontal) {
+                        phoneChipRow(icons: [])
+                        phoneChipRow(icons: [.access, .speed])
+                        phoneChipRow(icons: [.access, .speed, .effort])
+                        ChipFlow(spacing: 4) {
+                            attachMenu
+                            ForEach(visiblePickers) { kind in settingButton(kind, compact: false, stretch: false) }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Spacer(minLength: 4)
                 if model.chat.state.turn != nil {
@@ -424,6 +443,15 @@ struct ChatComposer: View {
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
+    }
+
+    /// The paperclip and the chips on one line; `icons` show only their glyph (labels stay in VoiceOver).
+    private func phoneChipRow(icons: Set<ComposerPicker>) -> some View {
+        HStack(spacing: 4) {
+            attachMenu
+            ForEach(visiblePickers) { kind in settingButton(kind, compact: icons.contains(kind) && settingIcon(kind) != nil, stretch: false) }
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private var attachMenu: some View {
@@ -690,7 +718,14 @@ struct ChatComposer: View {
     /// The chip's own text: the resolved value alone ("Full access"); labels and menus keep
     /// "Default · …" so the inheritance is still announced.
     private func chipText(_ kind: ComposerPicker) -> String {
-        kind == .access ? composerResolvedAccess(choices(kind), value: selectedID(kind)) : selectionLabel(kind)
+        let catalogs = model.view?.catalogs
+        switch kind {
+        case .access: return composerResolvedAccess(choices(kind), value: selectedID(kind))
+        // S18: the chip shows the resolved value alone; the picker marks which row is the default.
+        case .model: return composerResolvedModel(choices(kind), value: selectedID(kind), defaultLabel: catalogs?.default_model_label)
+        case .effort: return composerResolvedEffort(choices(kind), value: selectedID(kind), defaultLabel: catalogs?.default_effort_label)
+        default: return selectionLabel(kind)
+        }
     }
     private func settingIcon(_ kind: ComposerPicker, value: String? = nil) -> String? {
         switch kind {
