@@ -204,7 +204,8 @@ struct BubbleReserve: ViewModifier {
     var enabled = true
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom, spacing: 0) {
-            if shown && enabled { Color.clear.frame(height: bubbleListReserve).accessibilityHidden(true) }
+            // Opaque, so rows never scroll beneath the bubble resting there (I3-7).
+            if shown && enabled { VerdeTheme.background.frame(height: bubbleListReserve).accessibilityHidden(true) }
         }
     }
 }

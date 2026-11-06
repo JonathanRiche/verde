@@ -349,6 +349,9 @@ struct HomeScreen: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("home-new-chat")
                 .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 12)
+                // The band is opaque so rows never sit under New chat or the bubble beside it.
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .background(VerdeTheme.background)
             }
         }
     }
