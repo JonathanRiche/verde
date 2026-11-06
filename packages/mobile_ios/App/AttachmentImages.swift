@@ -66,12 +66,25 @@ struct AttachmentFetchState: Decodable, Equatable {
     }
 }
 
-/// The `attachments` selector's data: a map of key → state (also accepted under `items`).
+/// The `attachments` selector's data by key. The core sends `items` as an array of entries that
+/// carry their `key`; a key → state map (top level or under `items`) is accepted too.
 func decodeAttachmentsView(_ data: Data?) -> [String: AttachmentFetchState] {
     guard let data, case .object(let envelope)? = try? JSONDecoder().decode(JSONValue.self, from: data),
           let payload = envelope["data"] else { return [:] }
     var map = payload
-    if case .object(let object) = payload, let items = object["items"], case .object = items { map = items }
+    if case .object(let object) = payload, let items = object["items"] {
+        if case .array(let entries) = items {
+            var byKey: [String: AttachmentFetchState] = [:]
+            for entry in entries {
+                guard case .object(let fields) = entry, case .string(let key)? = fields["key"],
+                      let encoded = try? JSONEncoder().encode(entry),
+                      let state = try? JSONDecoder().decode(AttachmentFetchState.self, from: encoded) else { continue }
+                byKey[key] = state
+            }
+            return byKey
+        }
+        if case .object = items { map = items }
+    }
     guard let encoded = try? JSONEncoder().encode(map) else { return [:] }
     return (try? JSONDecoder().decode([String: AttachmentFetchState].self, from: encoded)) ?? [:]
 }

@@ -22,6 +22,9 @@ final class AttachmentImageTests: XCTestCase {
         let view = decodeAttachmentsView(Data(json.utf8))
         XCTAssertEqual(view["ws|t|m|0"]?.status, "ready")
         XCTAssertEqual(view["ws|t|m|1"]?.error_code, "not_found")
+        // The core's shape: `items` is an array of entries carrying their key.
+        let items = "{\"api_version\":1,\"revision\":\"2\",\"data\":{\"items\":[" + ready.dropLast() + ",\"key\":\"ws|t|m|0\"}]}}"
+        XCTAssertEqual(decodeAttachmentsView(Data(items.utf8))["ws|t|m|0"]?.data_base64, png.base64EncodedString())
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let cache = AttachmentImageCache(directory: directory)
