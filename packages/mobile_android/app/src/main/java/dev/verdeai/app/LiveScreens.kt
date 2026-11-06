@@ -587,10 +587,12 @@ internal fun LiveFailureCard(ui: LiveUi, onSettings: () -> Unit, onRetry: () -> 
         Text(ui.error ?: liveError(ui.errorCode), Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Text)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            NamedButton("Not now", onClose)
+            // S46: the same pair as iOS: tonal "Not now" and the filled primary action, one height.
             val colors = MaterialTheme.colorScheme
-            NamedButton(if (setup) "Open Companion settings" else "Try again", if (setup) onSettings else onRetry,
-                container = VerdeColors.AccentWash, content = colors.primary, shape = MaterialTheme.shapes.small,
+            NamedButton("Not now", onClose, Modifier.heightIn(min = 44.dp), container = VerdeColors.AccentWash, content = colors.primary,
+                shape = MaterialTheme.shapes.small, padding = PaddingValues(horizontal = 16.dp))
+            NamedButton(if (setup) "Open Companion settings" else "Try again", if (setup) onSettings else onRetry, Modifier.heightIn(min = 44.dp),
+                container = colors.primary, content = colors.onPrimary, shape = MaterialTheme.shapes.small,
                 padding = PaddingValues(horizontal = 16.dp))
         }
     }

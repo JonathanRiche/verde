@@ -256,6 +256,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 !ready -> "Offline. Your draft is kept."
                 running -> followupHint(null, kind)
                 compact && placeholderText != null -> placeholderText
+                // S49: at the largest text sizes the hint stays short enough to fit.
+                LocalDensity.current.fontScale > 1.3f -> "Ask anything"
                 else -> "Ask anything, or use / for commands and @ to search files."
             }
             val attach = view != null && !sendPending && !composer.busy
@@ -553,6 +555,7 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
     // its own remove button and upload progress, so the composer never grows a row per image.
     val scroll = rememberScrollState()
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (items.size > 1) Text(draftImageCount(items.size), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted)
         Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).testTag(COMPOSER_ATTACHMENTS),
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             // A11-3: names that tell the images apart; generic ones become "Photo 1…16".
@@ -596,11 +599,12 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
 
 internal const val COMPOSER_ATTACHMENTS = "composer-attachments"
 
-/** Draft image names TalkBack can tell apart: the display name when it's unique, else "Photo <n>". */
-internal fun draftImageNames(raw: List<String>): List<String> {
-    val shown = raw.map(::attachmentDisplayName)
-    return shown.mapIndexed { i, name -> if (shown.count { it == name } > 1) "Photo ${i + 1}" else name }
-}
+/** S44: each draft image's indexed name, "Photo 3 of 16"; a lone image keeps its own name. */
+internal fun draftImageNames(raw: List<String>): List<String> =
+    if (raw.size <= 1) raw.map(::attachmentDisplayName) else raw.indices.map { "Photo ${it + 1} of ${raw.size}" }
+
+/** S44: the strip's count, "16 photos". */
+internal fun draftImageCount(count: Int): String = if (count == 1) "1 photo" else "$count photos"
 
 internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: id?.takeIf { it.isNotEmpty() }
 
@@ -669,15 +673,28 @@ internal fun chipShort(picker: ComposerPicker, value: String): String = when (pi
  */
 internal fun pickerRowLabel(kind: ComposerPicker, choice: ChatChoice, c: ChatCatalogs? = null): String = when (kind) {
     ComposerPicker.Effort -> if (isDefaultChoice(choice.id)) defaultMarked("Auto") else choice.label
-    // F5: the desktop's wording for the default model row: "Default (Opus 5.5)", so it doesn't read as
-    // a duplicate of the explicit "Opus 5.5" row below it.
-    ComposerPicker.Model -> if (isDefaultChoice(choice.id)) c?.default_model_label?.takeIf { it.isNotBlank() }?.let { "Default ($it)" } ?: "Default" else choice.label
+    // S45: one row for the default model, "Opus 5.5 (default)" (the explicit duplicate is left out,
+    // see [modelChoices]); "Default" when the core doesn't name it.
+    ComposerPicker.Model -> if (isDefaultChoice(choice.id)) c?.default_model_label?.takeIf { it.isNotBlank() }?.let(::defaultMarked) ?: "Default" else choice.label
     ComposerPicker.Speed -> when (choice.id) { "off" -> defaultMarked("Standard"); "on" -> "Fast"; else -> choice.label }
     ComposerPicker.Access -> if (choice.id == DEFAULT_ACCESS) defaultMarked(choice.label) else choice.label
     else -> choice.label
 }
 
 internal fun defaultMarked(label: String) = "$label (default)"
+
+/** S45: the model choices with the default named once: the explicit row the default resolves to is left out. */
+internal fun modelChoices(c: ChatCatalogs): List<ChatChoice> {
+    val resolved = c.default_model_label?.takeIf { it.isNotBlank() } ?: return c.models
+    if (c.models.none { isDefaultChoice(it.id) }) return c.models
+    return c.models.filter { isDefaultChoice(it.id) || it.label != resolved }
+}
+
+/** The id the picker marks for [selected]: a hidden duplicate of the default selects the default row. */
+internal fun modelCurrent(c: ChatCatalogs, selected: String?): String? {
+    val shown = modelChoices(c)
+    return selected?.takeIf { id -> shown.any { it.id == id } } ?: shown.firstOrNull { isDefaultChoice(it.id) }?.id ?: selected ?: c.models.firstOrNull()?.id
+}
 
 /** S18: the access chip names the mode the chat runs with; an unset one is [DEFAULT_ACCESS]. */
 internal fun accessChipLabel(access: List<ChatChoice>, selected: String?): String =
@@ -741,10 +758,12 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
             return@BoxWithConstraints
         }
         val modelRoom = (available - others).coerceIn(modelFloor, modelFull)
+        // S45: the same middle truncation as iOS, "GPT…Sol" (no space beside the ellipsis).
+        val modelShown = middleFit(modelChip.short, modelRoom - (modelFull - textWidth(modelChip.short)), ::textWidth)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
             leading?.invoke()
             chips.forEach {
-                SettingChip(it.name, it.value, it.provider, it.icon, it.fill, shown = it.short,
+                SettingChip(it.name, it.value, it.provider, it.icon, it.fill, shown = if (it === modelChip) modelShown else it.short,
                     maxWidth = if (it === modelChip) modelRoom.dp else 220.dp) { open(it.picker) }
             }
         }
@@ -752,6 +771,18 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
 }
 
 internal const val COMPOSER_CHIPS = "composer-chips"
+
+/** Keeps both ends of [text] within [max] (as measured by [width]), with no space beside the ellipsis: "GPT…Sol". */
+internal fun middleFit(text: String, max: Float, width: (String) -> Float): String {
+    if (width(text) <= max) return text
+    var keep = text.length - 1
+    while (keep > 1) {
+        val candidate = text.take((keep + 1) / 2).trimEnd() + "\u2026" + text.takeLast(keep / 2).trimStart()
+        if (width(candidate) <= max) return candidate
+        keep--
+    }
+    return text.take(1) + "\u2026"
+}
 
 /** S31 / I10-2: the speed a label or picker names: "Standard" or "Fast", never the core's "Normal". */
 internal fun speedLabel(id: String?) = if (id == "on") "Fast" else "Standard"
@@ -860,7 +891,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
     val (title, choices, current) = when (kind) {
         ComposerPicker.Provider -> Triple("Provider", PROVIDERS.map { ChatChoice(it.first, it.second) }, provider)
         // Desktop favourites first, otherwise in catalog order.
-        ComposerPicker.Model -> Triple("Model", c.models.sortedByDescending { it.favorite }, s.model ?: c.models.firstOrNull()?.id)
+        ComposerPicker.Model -> Triple("Model", modelChoices(c).sortedByDescending { it.favorite }, modelCurrent(c, s.model))
         ComposerPicker.Effort -> Triple("Reasoning effort", c.efforts, s.effort ?: "")
         ComposerPicker.Access -> Triple("Access", c.access, effectiveAccess(s.access))
         ComposerPicker.Speed -> Triple("Speed", c.speeds, s.speed ?: c.speeds.firstOrNull()?.id)

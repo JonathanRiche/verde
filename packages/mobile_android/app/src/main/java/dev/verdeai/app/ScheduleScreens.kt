@@ -124,7 +124,8 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULED_SHEET)) {
         LiveOverModal()
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.9f)) {
+        // S49: the sheet leaves at least 48dp of scrim above it, so "Close sheet" is a full target.
+        Column(Modifier.fillMaxWidth().height(sheetMaxContentHeight() - 48.dp)) {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Scheduled", style = MaterialTheme.typography.titleLarge)
@@ -346,7 +347,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULE_FORM)) {
         LiveOverModal()
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight() - 48.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Text(if (original == null) "New scheduled task" else "Edit scheduled task", Modifier.padding(horizontal = 16.dp),
                 style = MaterialTheme.typography.titleLarge)
             OutlinedTextField(draft.prompt, onValueChange = { draft = draft.copy(prompt = it) }, label = { Text("Prompt") },

@@ -101,6 +101,8 @@ internal fun NotificationSettingsSection() {
     var denied by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val enable = rememberEnableNotifications(controls) { denied = true }
+    // S50: a build without push shows no dead "aren't available" row; the section only when it can act.
+    if (state.loaded && state.status == PushStatus.Unavailable) return
     VerdeSection("Notifications")
     Row(Modifier.fillMaxWidth().toggleable(state.enabled, enabled = state.loaded && state.available, role = Role.Switch) { on ->
         if (on) enable() else scope.launch { controls.setEnabled(false) }

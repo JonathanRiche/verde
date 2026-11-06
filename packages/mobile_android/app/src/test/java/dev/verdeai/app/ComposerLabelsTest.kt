@@ -67,8 +67,13 @@ class ComposerLabelsTest {
         assertEquals("GPT-6.1 Sol", chipShort(ComposerPicker.Model, "GPT-6.1 Sol"))
         // S35: one wording on both platforms: "<value> (default)", never a bare "Default".
         assertEquals("Auto (default)", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
-        // F5: the model's default row uses the desktop wording.
-        assertEquals("Default (Opus 5.5)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
+        // S45: one default model row, "Opus 5.5 (default)"; the explicit "Opus 5.5" row is left out.
+        val cat = dev.verdeai.core.ChatCatalogs(models = listOf(ChatChoice("", "Default"), ChatChoice("opus", "Opus 5.5"), ChatChoice("fable", "Fable 5.1")),
+            default_model_label = "Opus 5.5")
+        assertEquals("Opus 5.5 (default)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), cat))
+        assertEquals(listOf("", "fable"), modelChoices(cat).map { it.id })
+        assertEquals("", modelCurrent(cat, "opus"))
+        assertEquals("fable", modelCurrent(cat, "fable"))
         assertEquals("Default", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
         assertEquals("Standard (default)", pickerRowLabel(ComposerPicker.Speed, ChatChoice("off", "Normal")))
         assertEquals("Fast", pickerRowLabel(ComposerPicker.Speed, ChatChoice("on", "Fast")))
@@ -83,9 +88,18 @@ class ComposerLabelsTest {
         assertTrue(ComposerModel.MAX_IMAGES.toLong() * ComposerModel.MAX_IMAGE_BYTES < 256L * 1024 * 1024)
     }
 
-    /** A11-3: sixteen "photo.jpg" drafts read "Photo 1…16"; a unique name stays. */
+    /** S44: drafts read "Photo 3 of 16" (Remove "Photo 3 of 16"); a lone image keeps its name; the strip counts them. */
     @Test fun draftImagesHaveDistinctNames() {
-        assertEquals(listOf("Photo 1", "Photo 2", "diagram.png"), draftImageNames(listOf("1000001.jpg", "1000002.jpg", "diagram.png")))
-        assertEquals((1..16).map { "Photo $it" }, draftImageNames(List(16) { "photo.jpg" }).let { names -> names.map { it } })
+        assertEquals(listOf("Photo 1 of 3", "Photo 2 of 3", "Photo 3 of 3"), draftImageNames(listOf("1000001.jpg", "1000002.jpg", "diagram.png")))
+        assertEquals("Photo 16 of 16", draftImageNames(List(16) { "photo.jpg" }).last())
+        assertEquals(listOf("diagram.png"), draftImageNames(listOf("diagram.png")))
+        assertEquals("16 photos", draftImageCount(16))
+    }
+
+    /** S45: the model chip keeps both ends with no space beside the ellipsis ("GPT…Sol"). */
+    @Test fun modelNameMiddleTruncatesWithoutSpaces() {
+        val width = { t: String -> t.length.toFloat() }
+        assertEquals("GPT-6.1 Sol", middleFit("GPT-6.1 Sol", 20f, width))
+        assertEquals("GPT…Sol", middleFit("GPT-6.1 Sol", 7f, width))
     }
 }
