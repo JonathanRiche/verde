@@ -195,7 +195,7 @@ struct RootView: View {
             // The companion's own chats stay out of Home, the drawer and History only once the core
             // holds the roster; read it as soon as the host is ready, not only when the bubble polls
             // (a hidden bubble never polls, and the first poll can come seconds after launch).
-            .task(id: (browse.hostID ?? "") + "/" + (browse.state.host?.phase ?? "")) {
+            .task(id: rosterKey) {
                 if browse.state.host?.phase == "ready" { await companion.refresh() }
             }
             .onChange(of: browse.state.workspaces?.items.map(\.workspace_id)) { _, ids in
@@ -205,6 +205,14 @@ struct RootView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
         }
+    }
+
+    /// Re-reads the companion roster when the host or its phase changes (kept out of the body so the
+    /// type checker stays fast on CI).
+    private var rosterKey: String {
+        let host: String = browse.hostID ?? ""
+        let phase: String = browse.state.host?.phase ?? ""
+        return host + "/" + phase
     }
 
     /// The floating bubble: only on the top-level lists, never over the keyboard.
