@@ -87,6 +87,8 @@ struct RootView: View {
     /// actions set this, so Moss never opens itself and a resize keeps it as it was.
     @State private var companionSheet = false
     @State private var companionSettings = false
+    /// Companion settings open on the Live voice keys (a Live error's repair).
+    @State private var companionSettingsLive = false
     /// The Live call bar's captions and full view, shared with the Companion sheet.
     @State private var livePill = LivePillState()
     /// The software keyboard is up: the floating bubble steps aside.
@@ -150,7 +152,7 @@ struct RootView: View {
                             .preferredColorScheme(appearance.scheme)
                         }
                         .sheet(isPresented: $companionSettings) {
-                            CompanionSettings(model: companion, browse: browse).preferredColorScheme(appearance.scheme)
+                            CompanionSettings(model: companion, browse: browse, focusLiveVoice: companionSettingsLive).preferredColorScheme(appearance.scheme)
                         }
                 }
             }
@@ -166,6 +168,7 @@ struct RootView: View {
             .environment(\.adaptive, AdaptiveContext(tier: panes.tier, slotVisible: panes.contentLeading > 0))
             .onChange(of: geometry.size.width, initial: true) { _, width in windowWidth = width }
             .onChange(of: panes.tier.docked) { _, docked in if docked { drawer = false } }
+            .onChange(of: companionSettings) { _, open in if !open { companionSettingsLive = false } }
             .onChange(of: companionSheet) { _, open in
                 if !open { chatsPeek = false }
                 // A Live error shown in the Companion goes away with it.
@@ -369,7 +372,7 @@ struct RootView: View {
     private func presentLiveTarget(_ target: LiveBarTarget, over base: LiveBarBase) {
         switch (target, base) {
         case (.fullView, .app): companionSheet = true
-        case (.voiceSettings, .app): companionSettings = true
+        case (.voiceSettings, .app): companionSettingsLive = true; companionSettings = true
         case (.voiceSettings, .companionSheet), (.voiceSettings, .companionPane): livePill.openVoiceSettings()
         default: break
         }

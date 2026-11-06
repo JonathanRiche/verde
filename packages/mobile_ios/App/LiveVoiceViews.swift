@@ -246,6 +246,8 @@ struct LiveVoiceFullView: View {
 /// Companion settings → Live voice: providers configured on the desktop and their keys.
 struct LiveVoiceSettings: View {
     let browse: BrowseModel
+    /// Flashes the section when settings open on it for a Live error's repair.
+    var highlighted = false
 
     var body: some View {
         let client = LiveVoiceClient(browse: browse)
@@ -279,6 +281,7 @@ struct LiveVoiceSettings: View {
         } header: { SectionTitle("Live voice") } footer: {
             Text("Talk with your companion in real time (double-tap the bubble or use Live in the companion sheet). Uses your own xAI, OpenAI or Google API key, kept on your desktop. ChatGPT, SuperGrok and Gemini app subscriptions don't include API access.")
         }
+        .listRowBackground(highlighted ? VerdeTheme.accent.opacity(0.18) : nil)
         .task(id: browse.hostID) { await client.refresh() }
     }
 }

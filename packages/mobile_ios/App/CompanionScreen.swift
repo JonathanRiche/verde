@@ -19,6 +19,8 @@ struct CompanionSheet: View {
     @State private var settings = false
     /// Settings open on the Brain page.
     @State private var settingsBrain = false
+    /// Settings open scrolled to the Live voice keys.
+    @State private var settingsLive = false
     @State private var confirmNew = false
     @State private var conversations = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
@@ -43,7 +45,7 @@ struct CompanionSheet: View {
         .tint(VerdeTheme.accent)
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
-        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain) }
+        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain, focusLiveVoice: settingsLive) }
         .sheet(isPresented: $conversations) {
             CompanionConversations(model: model, browse: browse)
                 .presentationDetents([.medium, .large])
@@ -70,7 +72,7 @@ struct CompanionSheet: View {
             conversations = false
             scheduled = false
             confirmNew = false
-            if request.voiceSettings { settingsBrain = false; settings = true } else { settings = false }
+            if request.voiceSettings { settingsBrain = false; settingsLive = true; settings = true } else { settings = false }
         }
     }
 
@@ -79,7 +81,7 @@ struct CompanionSheet: View {
             CompanionHeader(model: model, live: live, entry: active, panel: $panel, showHome: showHome,
                             newConversation: { confirmNew = true }, showConversations: { conversations = true },
                             showScheduled: { scheduled = true }) {
-                settingsBrain = false; settings = true
+                settingsBrain = false; settingsLive = false; settings = true
             }
             if let handoff = model.brainSwitchText {
                 HStack(spacing: 8) {
@@ -97,7 +99,7 @@ struct CompanionSheet: View {
             if !live.active, let failure = live.failure {
                 LiveFailureCard(message: failure, needsSetup: live.failureNeedsSetup,
                                 retry: { Task { await live.start() } },
-                                setup: { live.dismissFailure(); settingsBrain = false; settings = true },
+                                setup: { live.dismissFailure(); settingsBrain = false; settingsLive = true; settings = true },
                                 close: { live.dismissFailure() })
                     .padding(.horizontal, 12).padding(.bottom, 6)
             }
@@ -118,7 +120,7 @@ struct CompanionSheet: View {
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
                                       threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts,
-                                      openBrain: { settingsBrain = true; settings = true })
+                                      openBrain: { settingsBrain = true; settingsLive = false; settings = true })
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
                 CompanionStarter(busy: model.creatingThread, name: active.name, voice: voice, send: { prompt in
@@ -623,11 +625,18 @@ private struct CompanionConversations: View {
 
 enum CompanionSettingsPage: Hashable { case brain }
 
+/// Scroll target of the Live voice section in Companion settings.
+let liveVoiceAnchor = "companion-live-voice"
+
 struct CompanionSettings: View {
     let model: CompanionModel
     let browse: BrowseModel
     /// Opens straight on Brain (from the sheet composer's brain label).
     var startAtBrain = false
+    /// Opens scrolled to the Live voice keys, which flash briefly (from a Live error's repair).
+    var focusLiveVoice = false
+    @State private var liveHighlight = false
+    @State private var liveRevealed = false
     @Environment(\.dismiss) private var dismiss
     @State private var path: [CompanionSettingsPage]
     @State private var editingID = ""
@@ -636,10 +645,11 @@ struct CompanionSettings: View {
     @State private var orders = ""
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
-    init(model: CompanionModel, browse: BrowseModel, startAtBrain: Bool = false) {
+    init(model: CompanionModel, browse: BrowseModel, startAtBrain: Bool = false, focusLiveVoice: Bool = false) {
         self.model = model
         self.browse = browse
         self.startAtBrain = startAtBrain
+        self.focusLiveVoice = focusLiveVoice
         // Open on Brain from the first frame. Pushing it from `onAppear` was dropped on first show
         // and re-pushed every time the root reappeared, so Back from Brain did nothing.
         _path = State(initialValue: startAtBrain ? [.brain] : [])
@@ -655,23 +665,7 @@ struct CompanionSettings: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            Form {
-                if let notice = model.notice { Text(notice).foregroundStyle(VerdeTheme.warning) }
-                identity
-                Section {
-                    TextEditor(text: $orders).frame(minHeight: 120).font(VerdeTheme.ui(14))
-                        .accessibilityIdentifier("companion-orders")
-                } header: { SectionTitle("Standing orders") } footer: {
-                    Text("Sent with every turn, e.g. \u{201C}Always run the tests before calling work done.\u{201D}")
-                }
-                brain
-                CompanionVoiceSettings()
-                LiveVoiceSettings(browse: browse)
-                roster
-                Section {
-                    Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))
-                } footer: { Text("Long-press the bubble to hide it; turn it back on here or in Settings.") }
-            }
+            ScrollViewReader { proxy in settingsForm.task { await revealLiveVoice(proxy) } }
             .scrollContentBackground(.hidden)
             .background(VerdeTheme.background)
             .navigationTitle("Companion")
@@ -694,6 +688,37 @@ struct CompanionSettings: View {
             .onChange(of: orders) { _, value in let clipped = utf8Prefix(value, RosterEntry.ordersLimit); if clipped != value { orders = clipped } }
         }
         .tint(VerdeTheme.accent)
+    }
+
+    private var settingsForm: some View {
+        Form {
+                if let notice = model.notice { Text(notice).foregroundStyle(VerdeTheme.warning) }
+                identity
+                Section {
+                    TextEditor(text: $orders).frame(minHeight: 120).font(VerdeTheme.ui(14))
+                        .accessibilityIdentifier("companion-orders")
+                } header: { SectionTitle("Standing orders") } footer: {
+                    Text("Sent with every turn, e.g. \u{201C}Always run the tests before calling work done.\u{201D}")
+                }
+                brain
+                CompanionVoiceSettings()
+                LiveVoiceSettings(browse: browse, highlighted: liveHighlight).id(liveVoiceAnchor)
+                roster
+                Section {
+                    Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))
+                } footer: { Text("Long-press the bubble to hide it; turn it back on here or in Settings.") }
+        }
+    }
+
+    /// Scrolls to Live voice and flashes it once when opened for a Live error's repair (I2-7).
+    private func revealLiveVoice(_ proxy: ScrollViewProxy) async {
+        guard focusLiveVoice, !liveRevealed else { return }
+        liveRevealed = true
+        try? await Task.sleep(for: .milliseconds(400))
+        withAnimation { proxy.scrollTo(liveVoiceAnchor, anchor: .top) }
+        liveHighlight = true
+        try? await Task.sleep(for: .seconds(1.6))
+        withAnimation(.easeOut(duration: 0.4)) { liveHighlight = false }
     }
 
     private var identity: some View {
