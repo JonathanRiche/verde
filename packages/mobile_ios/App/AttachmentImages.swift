@@ -89,13 +89,32 @@ func decodeAttachmentsView(_ data: Data?) -> [String: AttachmentFetchState] {
     return (try? JSONDecoder().decode([String: AttachmentFetchState].self, from: encoded)) ?? [:]
 }
 
-enum ThumbnailPhase: Equatable { case image, loading, unavailable }
+enum ThumbnailPhase: Equatable {
+    case image, loading
+    /// The image is gone (not found, unavailable): "Preview unavailable".
+    case unavailable
+    /// The host refused to serve it (an older host): "Preview unavailable" and "Update verde on this
+    /// host to see images".
+    case hostRefused
+    /// A network or timeout failure: "Couldn't load image · Retry".
+    case retry
+}
 
-/// What a thumbnail shows: the image once cached; "Preview unavailable" only when the host said so.
-func thumbnailPhase(status: String?, cached: Bool) -> ThumbnailPhase {
+/// The host's refusals: an older gateway that doesn't let paired devices read attachments.
+let attachmentRefusalCodes: Set<String> = ["forbidden", "insufficient_scope", "method_not_found", "unknown_method", "not_allowed", "unauthorized"]
+
+/// What a thumbnail shows (the same mapping as Android): the image once cached; while loading a
+/// spinner; a refusal asks to update the host; "not found"/"unavailable" says so; anything else
+/// failed in transit and can be retried.
+func thumbnailPhase(status: String?, errorCode: String? = nil, cached: Bool) -> ThumbnailPhase {
     if cached { return .image }
+    let code = (errorCode ?? "").lowercased()
     switch status {
-    case "failed"?, "unavailable"?: return .unavailable
+    case "unavailable"?: return attachmentRefusalCodes.contains(code) ? .hostRefused : .unavailable
+    case "failed"?:
+        if attachmentRefusalCodes.contains(code) { return .hostRefused }
+        if code == "not_found" || code == "unavailable" { return .unavailable }
+        return .retry
     default: return .loading
     }
 }
@@ -224,6 +243,7 @@ struct AttachmentThumbnail: View {
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
     @State private var status: String?
+    @State private var errorCode: String?
     @State private var viewer: ViewerRequestImage?
     @State private var requested = false
 
@@ -231,7 +251,7 @@ struct AttachmentThumbnail: View {
     private var maxPixel: CGFloat { longest * displayScale }
 
     var body: some View {
-        let phase = thumbnailPhase(status: status, cached: image != nil)
+        let phase = thumbnailPhase(status: status, errorCode: errorCode, cached: image != nil)
         Group {
             switch phase {
             case .image:
@@ -254,14 +274,35 @@ struct AttachmentThumbnail: View {
                     .frame(width: longest * 0.8, height: longest * 0.6)
                     .overlay { ProgressView() }
                     .accessibilityLabel("Image loading")
-            case .unavailable:
+            case .unavailable, .hostRefused:
                 VStack(spacing: 4) {
                     Image(systemName: "photo").foregroundStyle(VerdeTheme.subtle)
                     Text("Preview unavailable").font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle)
+                    if phase == .hostRefused {
+                        Text("Update verde on this host to see images").font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.subtle)
+                            .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
+                .padding(.horizontal, 6)
                 .frame(width: longest * 0.8, height: longest * 0.6)
                 .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
                 .accessibilityElement(children: .combine)
+            case .retry:
+                Button { Task { await load(force: true) } } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: "photo").foregroundStyle(VerdeTheme.subtle)
+                        (Text("Couldn't load image · ").foregroundColor(VerdeTheme.subtle) + Text("Retry").foregroundColor(VerdeTheme.accent).bold())
+                            .font(VerdeTheme.ui(11)).multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 6)
+                    .frame(width: longest * 0.8, height: longest * 0.6)
+                    .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
+                    .contentShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Couldn't load image")
+                .accessibilityHint("Retries loading the image.")
+                .accessibilityIdentifier("attachment-retry")
             }
         }
         // Lazily: only rows on screen fetch.
@@ -273,7 +314,8 @@ struct AttachmentThumbnail: View {
         .fullScreenCover(item: $viewer) { request in AttachmentViewer(url: request.url) }
     }
 
-    private func load() async {
+    /// `force` (Retry) skips the core's remembered failure and asks for the bytes again.
+    private func load(force: Bool = false) async {
         // 1. Bytes attached on this phone.
         if let bytes = LocalAttachmentPreviews.shared.get(attachment.local_id), let local = downsampledImage(data: bytes, maxPixel: maxPixel) {
             AttachmentImageCache.shared.store(bytes, key: key, mime: attachment.mime.isEmpty ? "image/jpeg" : attachment.mime)
@@ -285,7 +327,11 @@ struct AttachmentThumbnail: View {
         // 3. Ask the core to fetch it (once per key across the app).
         guard let session = browse.session else { status = "unavailable"; return }
         requested = true
-        if let existing = decodeAttachmentsView(session.store.snapshots["attachments"])[key] {
+        if force {
+            // A failed fetch has already ended; make sure no stale in-flight mark blocks the retry.
+            AttachmentImageCache.shared.end(key)
+            errorCode = nil
+        } else if let existing = decodeAttachmentsView(session.store.snapshots["attachments"])[key] {
             await receive(existing)
             if image != nil || existing.status != "loading" && existing.status != "ready" { return }
         }
@@ -297,7 +343,8 @@ struct AttachmentThumbnail: View {
                                                     messageID: messageID, index: index)
         do { try await host.sendIntent(type, fields) } catch {
             AttachmentImageCache.shared.end(key)
-            status = "unavailable"
+            // Couldn't reach the core's host: retryable.
+            status = "failed"
         }
     }
 
@@ -305,6 +352,7 @@ struct AttachmentThumbnail: View {
     private func receive(_ state: AttachmentFetchState?) async {
         guard let state, image == nil else { return }
         status = state.status
+        errorCode = state.error_code
         if state.status == "failed" || state.status == "unavailable" { AttachmentImageCache.shared.end(key); return }
         guard state.status == "ready", let base64 = state.data_base64, let data = Data(base64Encoded: base64) else { return }
         let key = self.key, mime = state.mime, maxPixel = self.maxPixel

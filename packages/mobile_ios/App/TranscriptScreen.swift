@@ -331,6 +331,9 @@ private struct TranscriptList: View {
                 }
                 .onDisappear { if case .approval = item { cardVisible = false } }
         }
+        // The background bar's room sits above the bottom marker, so "scroll to the bottom" leaves
+        // the last row clear of the bar (I14-1).
+        if !background.isEmpty { Color.clear.frame(height: backgroundBarHeight + 8).accessibilityHidden(true) }
         Color.clear.frame(height: 1).id(bottomID)
             .background(GeometryReader { g in
                 Color.clear.preference(key: BottomOffsetKey.self, value: g.frame(in: .named("transcript")).maxY)
@@ -351,12 +354,10 @@ private struct TranscriptList: View {
                             VStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: false) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
-                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarHeight + 8)
                         } else {
                             LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: true) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
-                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarHeight + 8)
                         }
                     }
                     .coordinateSpace(name: "transcript")
@@ -369,7 +370,9 @@ private struct TranscriptList: View {
                             // U1: running tasks above the composer; a tap shows the task's row.
                             BackgroundTasksBar(tasks: background) { task in showBackground(task, proxy) }
                                 .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { height in
-                                    if height > 0 && abs(height - backgroundBarHeight) > 1 { backgroundBarHeight = height }
+                                    guard height > 0 && abs(height - backgroundBarHeight) > 1 else { return }
+                                    backgroundBarHeight = height
+                                    if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
                                 }
                         }
                     }
