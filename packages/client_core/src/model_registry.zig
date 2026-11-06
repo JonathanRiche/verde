@@ -25,6 +25,8 @@ pub const types = .{
     .{ "TerminalQuery", wire.Query(pump.View) },
     .{ "ChatAttachment", chat.Attachment },
     .{ "ChatTool", chat.Tool },
+    .{ "ChatBackground", chat.Background },
+    .{ "ChatBackgroundTask", chat.BackgroundTask },
     .{ "ChatRow", chat.Row },
     .{ "ChatTurn", chat.Turn },
     .{ "ChatApproval", chat.Approval },

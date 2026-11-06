@@ -447,6 +447,84 @@ extension ChatTool {
     }
 }
 
+struct ChatBackground: Codable {
+    var `label`: String
+    var `status`: String
+    var `task_id`: String? = nil
+    var `started_at_ms`: Int64? = nil
+    var `finished_at_ms`: Int64? = nil
+}
+
+extension ChatBackground {
+    private enum CodingKeys: String, CodingKey {
+        case `label`
+        case `status`
+        case `task_id`
+        case `started_at_ms`
+        case `finished_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        if !c.contains(.`task_id`) { self.`task_id` = nil } else {
+        self.`task_id` = try c.decodeIfPresent(String.self, forKey: .`task_id`)
+        }
+        if !c.contains(.`started_at_ms`) { self.`started_at_ms` = nil } else {
+        self.`started_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`started_at_ms`)
+        }
+        if !c.contains(.`finished_at_ms`) { self.`finished_at_ms` = nil } else {
+        self.`finished_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`finished_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`task_id`, forKey: .`task_id`)
+        try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
+        try c.encode(self.`finished_at_ms`, forKey: .`finished_at_ms`)
+    }
+}
+
+struct ChatBackgroundTask: Codable {
+    var `row_id`: String
+    var `task_id`: String? = nil
+    var `label`: String
+    var `status`: String
+    var `started_at_ms`: Int64? = nil
+}
+
+extension ChatBackgroundTask {
+    private enum CodingKeys: String, CodingKey {
+        case `row_id`
+        case `task_id`
+        case `label`
+        case `status`
+        case `started_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`row_id` = try c.decode(String.self, forKey: .`row_id`)
+        if !c.contains(.`task_id`) { self.`task_id` = nil } else {
+        self.`task_id` = try c.decodeIfPresent(String.self, forKey: .`task_id`)
+        }
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        if !c.contains(.`started_at_ms`) { self.`started_at_ms` = nil } else {
+        self.`started_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`started_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`row_id`, forKey: .`row_id`)
+        try c.encode(self.`task_id`, forKey: .`task_id`)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
+    }
+}
+
 struct ChatRow: Codable {
     var `id`: String
     var `role`: String
@@ -458,6 +536,7 @@ struct ChatRow: Codable {
     var `attachments`: [ChatAttachment] = []
     var `tool`: ChatTool? = nil
     var `message_id`: String? = nil
+    var `background`: ChatBackground? = nil
 }
 
 extension ChatRow {
@@ -472,6 +551,7 @@ extension ChatRow {
         case `attachments`
         case `tool`
         case `message_id`
+        case `background`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -499,6 +579,9 @@ extension ChatRow {
         if !c.contains(.`message_id`) { self.`message_id` = nil } else {
         self.`message_id` = try c.decodeIfPresent(String.self, forKey: .`message_id`)
         }
+        if !c.contains(.`background`) { self.`background` = nil } else {
+        self.`background` = try c.decodeIfPresent(ChatBackground.self, forKey: .`background`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -512,6 +595,7 @@ extension ChatRow {
         try c.encode(self.`attachments`, forKey: .`attachments`)
         try c.encode(self.`tool`, forKey: .`tool`)
         try c.encode(self.`message_id`, forKey: .`message_id`)
+        try c.encode(self.`background`, forKey: .`background`)
     }
 }
 
@@ -1026,6 +1110,7 @@ struct ChatThreadView: Codable {
     var `usage`: ChatUsage?
     var `stale`: Bool
     var `error`: LocalError?
+    var `background_tasks`: [ChatBackgroundTask] = []
 }
 
 extension ChatThreadView {
@@ -1038,6 +1123,7 @@ extension ChatThreadView {
         case `usage`
         case `stale`
         case `error`
+        case `background_tasks`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1049,6 +1135,9 @@ extension ChatThreadView {
         self.`usage` = try c.decodeIfPresent(ChatUsage.self, forKey: .`usage`)
         self.`stale` = try c.decode(Bool.self, forKey: .`stale`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        if !c.contains(.`background_tasks`) { self.`background_tasks` = [] } else {
+        self.`background_tasks` = try c.decode([ChatBackgroundTask].self, forKey: .`background_tasks`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -1060,6 +1149,7 @@ extension ChatThreadView {
         try c.encode(self.`usage`, forKey: .`usage`)
         try c.encode(self.`stale`, forKey: .`stale`)
         try c.encode(self.`error`, forKey: .`error`)
+        try c.encode(self.`background_tasks`, forKey: .`background_tasks`)
     }
 }
 

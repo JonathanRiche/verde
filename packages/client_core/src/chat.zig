@@ -10,6 +10,7 @@ const store = @import("headless").store_protocol;
 const apply = @import("verde_remote").transcript_apply;
 const wire = @import("wire.zig");
 const tool_body = @import("tool_body.zig");
+const background_rows = @import("background_rows.zig");
 const V = std.json.Value;
 const E = h.ApiError;
 const eq = h.eq;
@@ -1410,7 +1411,8 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
     if (turn) |*v| if (v.started_at_ms) |start| {
         v.elapsed_ms = @intCast(@max(0, @min(std.math.maxInt(i64), @as(i128, state.wall_time_ms) - start)));
     };
-    return try value(a, m.ThreadView{ .thread = try summary(a, t, state.wall_time_ms), .rows = rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error" });
+    const background = try background_rows.project(a, rows);
+    return try value(a, m.ThreadView{ .thread = try summary(a, t, state.wall_time_ms), .rows = background.rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error", .background_tasks = background.running });
 }
 /// Include precise chat selectors in the coalesced host notification.
 pub fn scopes(tx: *h.Transaction, before: *const h.State, host_changed: bool) E![]const []const u8 {

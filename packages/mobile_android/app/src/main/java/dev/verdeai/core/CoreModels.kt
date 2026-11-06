@@ -111,6 +111,24 @@ data class ChatTool(
 )
 
 @Serializable
+data class ChatBackground(
+    val `label`: String,
+    val `status`: String,
+    val `task_id`: String? = null,
+    val `started_at_ms`: Long? = null,
+    val `finished_at_ms`: Long? = null,
+)
+
+@Serializable
+data class ChatBackgroundTask(
+    val `row_id`: String,
+    val `task_id`: String? = null,
+    val `label`: String,
+    val `status`: String,
+    val `started_at_ms`: Long? = null,
+)
+
+@Serializable
 data class ChatRow(
     val `id`: String,
     val `role`: String,
@@ -122,6 +140,7 @@ data class ChatRow(
     val `attachments`: List<ChatAttachment> = emptyList(),
     val `tool`: ChatTool? = null,
     val `message_id`: String? = null,
+    val `background`: ChatBackground? = null,
 )
 
 @Serializable
@@ -250,6 +269,7 @@ data class ChatThreadView(
     val `usage`: ChatUsage?,
     val `stale`: Boolean,
     val `error`: LocalError?,
+    val `background_tasks`: List<ChatBackgroundTask> = emptyList(),
 )
 
 @Serializable

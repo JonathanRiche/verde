@@ -675,3 +675,65 @@ test "turns without repository metadata route through the workspace manifest so 
     try eql("local", meta.profile_id.?);
     try eql(runtime, meta.runtime_id.?);
 }
+
+test "background commands become one task row each and running tasks are listed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bg = @import("background_rows.zig");
+    const rows = [_]m.Row{
+        .{ .id = "u1", .role = "user", .body = "start the servers" },
+        .{ .id = "b1", .role = "system", .author = "Background command", .body = "bun run dev\n--port 3000\n\nVerde task ID: task-1\nOutput log: /tmp/verde-task-1.log\nPID file: /tmp/verde-task-1.pid\nStop command: kill 1", .created_at_ms = 10 },
+        .{ .id = "b2", .role = "system", .author = "Backgrounded command", .body = "Input:\nnpm run watch\n\nProvider: codex\nCodex item ID: item-2\nProcess ID: 42\nProvider thread ID: pt-1\nCWD: /repo", .created_at_ms = 11 },
+        .{ .id = "b3", .role = "system", .author = "Background command", .body = "tail -f log\n\nCodex item ID: item-3\nProcess ID: 43\nProvider thread ID: pt-1", .created_at_ms = 12 },
+        .{ .id = "b4", .role = "system", .author = "Background command", .body = "sleep 100\n\nProcess ID: 44\nProvider thread ID: pt-1", .created_at_ms = 13 },
+        .{ .id = "s1", .role = "system", .author = bg.CODEX_SNAPSHOT_AUTHOR, .body = "Provider thread ID: pt-1\nCodex item ID: item-3", .created_at_ms = 20 },
+        .{ .id = "e1", .role = "system", .author = "Background task completed", .body = "bun run dev\n--port 3000\n\nVerde task ID: task-1\nOutput log: /tmp/verde-task-1.log", .created_at_ms = 30 },
+        .{ .id = "b1-again", .role = "system", .author = "Background command", .body = "bun run dev\n\nVerde task ID: task-1", .created_at_ms = 31 },
+        .{ .id = "e4", .role = "system", .author = "Background task stopped", .body = "sleep 100\n\nProcess ID: 44\nProvider thread ID: pt-1", .created_at_ms = 40 },
+        .{ .id = "r1", .role = "system", .author = "Ran command", .body = "ls" },
+    };
+    const out = try bg.project(a, &rows);
+    // user, four tasks (merged, snapshot hidden), the plain command row.
+    try expect(out.rows.len == 6);
+    const dev = out.rows[1];
+    try eql("background_task", dev.kind);
+    try eql("b1", dev.id);
+    try eql("bun run dev\n--port 3000", dev.body);
+    try expect(std.mem.indexOf(u8, dev.body, "Verde task ID") == null);
+    try eql("bun run dev", dev.background.?.label);
+    try eql("completed", dev.background.?.status);
+    try eql("task-1", dev.background.?.task_id.?);
+    try expect(dev.background.?.started_at_ms.? == 10 and dev.background.?.finished_at_ms.? == 30);
+    // Codex released item-2 (absent from the snapshot); item-3 is still listed.
+    try eql("npm run watch", out.rows[2].background.?.label);
+    try eql("completed", out.rows[2].background.?.status);
+    try eql("item-2", out.rows[2].background.?.task_id.?);
+    try eql("running", out.rows[3].background.?.status);
+    try eql("stopped", out.rows[4].background.?.status);
+    try eql("44", out.rows[4].background.?.task_id.?);
+    try eql("Ran command", out.rows[5].author);
+    try expect(out.running.len == 1);
+    try eql("b3", out.running[0].row_id);
+    try eql("tail -f log", out.running[0].label);
+    try eql("item-3", out.running[0].task_id.?);
+}
+
+test "the thread view carries background task rows and the running list" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.tail(.{ .status = "running", .events = .{.{ .seq = 1, .kind = "message", .payload_json = "{\"title\":\"Background command\",\"body\":\"bun run dev\\n\\nVerde task ID: t-9\\nPID file: /tmp/x.pid\"}" }} });
+    const view = try std.json.parseFromValueLeaky(wire.Query(m.ThreadView), f.a(), try f.query("thread"), .{ .ignore_unknown_fields = true });
+    var found = false;
+    for (view.data.?.rows) |row| if (row.background) |b| {
+        try eql("bun run dev", row.body);
+        try eql("running", b.status);
+        try eql("t-9", b.task_id.?);
+        found = true;
+    };
+    try expect(found);
+    try expect(view.data.?.background_tasks.len == 1);
+    try eql("bun run dev", view.data.?.background_tasks[0].label);
+}
