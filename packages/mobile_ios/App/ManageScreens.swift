@@ -56,7 +56,9 @@ struct HistoryScreen: View {
             let history = browse.state.workspaces?.history
             let live = liveActivity(browse.state.workspaces)
             // I10-5: ordered by the activity the rows show (live activity included).
-            let sections = historySections((history?.items ?? []).map { withLiveActivity($0, live) })
+            // The companion's own conversation lives in its pane, not in History (U1 iPad).
+            let hidden = browse.companionThreads
+            let sections = historySections((history?.items ?? []).filter { !hidden.contains($0.thread_id) }.map { withLiveActivity($0, live) })
             let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             ForEach(sections.indices, id: \.self) { index in
                 Section {

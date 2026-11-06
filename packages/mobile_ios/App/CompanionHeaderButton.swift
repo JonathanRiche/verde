@@ -38,6 +38,17 @@ struct CompanionToolbar: ViewModifier {
     }
 }
 
+/// Home, Workspaces, Hosts and Settings beside a hidden sidebar: no bubble floats there on wide
+/// windows, so the header carries the avatar (U1 iPad). Phones keep their floating bubble.
+struct RootCompanionToolbar: ViewModifier {
+    @Environment(\.adaptive) private var adaptive
+    func body(content: Content) -> some View {
+        content.toolbar {
+            if adaptive.tier.docked { ToolbarItem(placement: .topBarTrailing) { CompanionHeaderButton() } }
+        }
+    }
+}
+
 struct CompanionHeaderButton: View {
     /// The chat on screen; the avatar stays off the companion's own conversation.
     var workspace: String? = nil

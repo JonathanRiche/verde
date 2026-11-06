@@ -174,10 +174,9 @@ private struct CompanionHeader: View {
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    /// Name and status side by side; stacked at the accessibility sizes so neither truncates.
-    private var nameLayout: AnyLayout {
-        dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
-    }
+    /// Name and status on one line at every size; at the accessibility sizes they shrink a little
+    /// rather than wrap (U1 iPad).
+    private var nameLayout: AnyLayout { AnyLayout(HStackLayout(spacing: 0)) }
 
     var body: some View {
         let presence = model.presence
@@ -196,7 +195,7 @@ private struct CompanionHeader: View {
         HStack(spacing: 8) {
             CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
             nameLayout {
-                Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1)
+                Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1).minimumScaleFactor(0.7).layoutPriority(1)
                     .accessibilityLabel("\(entry.name), \(presence.status)")
                     .accessibilityAddTraits(.isHeader)
                 if let target {
@@ -205,7 +204,7 @@ private struct CompanionHeader: View {
                         withAnimation(AppearanceSettings.shared.reducedMotion ? nil : .easeOut(duration: 0.15)) { panel = isOpen ? nil : target }
                     } label: {
                         HStack(spacing: 3) {
-                            Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1)
+                            Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1).minimumScaleFactor(0.6)
                             Image(systemName: isOpen ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .bold))
                                 .foregroundStyle(VerdeTheme.subtle)
                         }
@@ -218,7 +217,7 @@ private struct CompanionHeader: View {
                     .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
                     .accessibilityIdentifier("companion-header-status")
                 } else {
-                    Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1)
+                    Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1).minimumScaleFactor(0.6)
                         .accessibilityHidden(true)
                 }
             }

@@ -285,6 +285,7 @@ private struct BrowseFrame<Content: View>: View {
             if title == "Home" { ToolbarItem(placement: .principal) { VerdeWordmark() } }
             ToolbarItem(placement: .topBarTrailing) { HostMenu(model: model.hosts) { addingHost = true } }
         }
+        .modifier(RootCompanionToolbar())
         .modifier(AddHostAlert(model: model.hosts, isPresented: $addingHost))
         .navigationBarTitleDisplayMode(.inline)
         .listStyle(.plain)
@@ -510,8 +511,10 @@ struct BrowseStack<Root: View>: View {
                 .modifier(OptionalCompanionToolbar(enabled: !isThreadRoute(route)))
                 // The sidebar replaces the route in place; a different route is a different screen.
                 .id(route)
-                // I11-5: every pushed screen keeps its back button, beside a sidebar too.
+                // I11-5: every pushed screen keeps its back button, beside a sidebar too; it is the
+                // chevron alone everywhere, so it never reads "Home" on one screen and "Back" on another.
                 .modifier(VerdeNavigation())
+                .toolbarRole(.editor)
             }
         }
         .environment(\.openRoute, { route in path.append(route) })

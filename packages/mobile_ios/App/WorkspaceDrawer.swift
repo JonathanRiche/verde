@@ -316,7 +316,9 @@ struct WorkspaceDrawer: View {
             VStack(spacing: 2) {
                 // A fixed icon box so every label sits on the same baseline (I7-5).
                 Image(systemName: icon).font(.system(size: glyphSize * 0.9)).frame(width: glyphSize * 1.33, height: glyphSize * 1.1)
-                Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.6)
+                // One size for all four labels (U1 iPad): capped, so "Workspaces" never shrinks alone.
+                Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.8)
+                    .dynamicTypeSize(...DynamicTypeSize.xxLarge)
             }
             .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)
             .frame(maxWidth: .infinity, minHeight: 48)

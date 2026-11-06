@@ -8,7 +8,7 @@ final class CopyRulesTests: XCTestCase {
         XCTAssertEqual(needsYouCount(3), "3 need you")
         XCTAssertEqual(needsSummary(1), "1 needs you")
         XCTAssertNil(needsSummary(0))
-        XCTAssertEqual(companionStatusSuffix(needsYou: 1, crewRunning: 0, working: false, failed: false, connected: true).text, "needs you")
+        XCTAssertEqual(companionStatusSuffix(needsYou: 1, crewRunning: 0, working: false, failed: false, connected: true).text, "ready", "the needs-you capsule carries the count")
     }
 
     func testMissingVoiceKeyOffersSettingsNotRetry() {

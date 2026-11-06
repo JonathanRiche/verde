@@ -194,6 +194,7 @@ struct AppSettings: View {
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
             .toolbar { if !embedded { BarButton("Done", bold: true) { dismiss() } } }
             .modifier(EmbeddedNavigation(enabled: embedded))
+            .modifier(RootCompanionToolbar())
         }.preferredColorScheme(appearance.resolvedScheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
     }
 

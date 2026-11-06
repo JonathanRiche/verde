@@ -542,7 +542,9 @@ struct ChatComposer: View {
         let font = UIFont(name: "NotoSans-Regular", size: size) ?? .systemFont(ofSize: size)
         func measure(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
         return visiblePickers.map { kind in
-            let glyph: CGFloat = kind == .model || kind == .provider ? 24 : 0
+            // The provider glyph grows with text (ProviderGlyph), plus its 6-point gap.
+            let providerGlyph = providerGlyphSize(UIFontMetrics(forTextStyle: .footnote).scaledValue(for: 18, compatibleWith: traits)) + 6
+            let glyph: CGFloat = kind == .model || kind == .provider ? providerGlyph : 0
             let icon: CGFloat = hasChipIcon(kind) ? 22 : 0
             let full = glyph + icon + measure(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)) + 20
             let short = [.effort, .speed, .access].contains(kind) ? glyph + icon + measure(shortChipText(kind)) + 20 : nil
@@ -656,13 +658,15 @@ struct ChatComposer: View {
                           }), axis: .vertical)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 1...3 : 1...6)
                     .font(VerdeTheme.ui(15))
+                    // The field itself is the 44-point target, not only its pill.
+                    .frame(minHeight: 44).contentShape(Rectangle())
                     .disabled(model.pending)
                     .accessibilityLabel("Message")
                     // I12-5: distinct from the chat's own composer when both are on screen.
                     .accessibilityIdentifier("companion-composer-field")
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(.horizontal, 14).padding(.vertical, compact.transcript == nil ? 2 : 10)
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
         .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 18))
     }
@@ -695,8 +699,9 @@ struct ChatComposer: View {
         return Button(action: open) {
             HStack(spacing: 5) {
                 ProviderGlyph(provider: model.displayedSelection?.provider).scaleEffect(0.8)
-                Text(label).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                // One line at every size: it shrinks, then truncates in the middle.
+                Text(label).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+                    .minimumScaleFactor(0.7).truncationMode(.middle)
             }
             .padding(.horizontal, 10).padding(.vertical, 5)
             .frame(minHeight: 44, alignment: .leading)

@@ -66,8 +66,11 @@ struct VerdeWordmark: View {
 }
 struct ProviderGlyph: View {
     let provider: String?
-    var size: CGFloat = 18
+    /// A fixed size; nil grows with Dynamic Type from 18 up to 26 points (U1 iPad).
+    var size: CGFloat? = nil
+    @ScaledMetric(relativeTo: .footnote) private var scaled: CGFloat = 18
     var body: some View {
+        let size = self.size ?? providerGlyphSize(scaled)
         let name = provider == "codex" ? "openai" : provider ?? ""
         if ["openai", "claude", "cursor", "opencode", "pi", "fx", "grok", "muse", "amp", "antigravity"].contains(name) {
             Image(uiImage: UIImage(named: "provider_" + name) ?? UIImage()).resizable()
@@ -90,6 +93,9 @@ struct Pulse: ViewModifier {
         }
     }
 }
+/// The scaled provider glyph, capped so chips and rows keep their layout.
+func providerGlyphSize(_ scaled: CGFloat) -> CGFloat { min(26, max(18, scaled)) }
+
 /// A sheet's toolbar text button with a 44-point target (I10-8); the bar's own buttons draw a
 /// 29-point one.
 struct BarButton: View {

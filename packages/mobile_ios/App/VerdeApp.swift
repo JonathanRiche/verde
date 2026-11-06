@@ -119,7 +119,7 @@ struct RootView: View {
                         }
                     }
                 }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
-                .environment(\.companionEntry, companionEntry(dockShown: panes.tier.docked && panes.showsChats))
+                .environment(\.companionEntry, companionEntry(dockShown: (panes.tier.docked && panes.showsChats) || panes.mossVisible))
                 .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
                 // I12-10: a hidden sidebar leaves the tree entirely (no disabled controls for VoiceOver).
