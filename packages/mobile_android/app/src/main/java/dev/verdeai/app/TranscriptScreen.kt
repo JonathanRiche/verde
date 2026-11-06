@@ -90,6 +90,7 @@ internal data class TranscriptRenderers(
     val approval: @Composable (TranscriptItem.Approval, TranscriptContext) -> Unit = ApprovalRenderer,
     val childNotice: @Composable (TranscriptItem.ChildNotice, TranscriptContext) -> Unit = { item, ctx -> ChildNotificationCard(item, ctx) },
     val voice: @Composable (TranscriptItem.Voice, TranscriptContext) -> Unit = { item, ctx -> VoiceBlock(item, ctx, compact = false) },
+    val background: @Composable (TranscriptItem.Background, TranscriptContext) -> Unit = { item, ctx -> BackgroundTaskCard(item, ctx) },
 ) {
     @Composable
     fun Render(item: TranscriptItem, ctx: TranscriptContext) = when (item) {
@@ -104,6 +105,7 @@ internal data class TranscriptRenderers(
         is TranscriptItem.Approval -> approval(item, ctx)
         is TranscriptItem.ChildNotice -> childNotice(item, ctx)
         is TranscriptItem.Voice -> voice(item, ctx)
+        is TranscriptItem.Background -> background(item, ctx)
     }
 
     companion object { val Default = TranscriptRenderers() }
@@ -195,6 +197,9 @@ internal fun TranscriptScreen(
     val openDrawer = LocalWorkspaceMenu.current
     val tier = LocalWindowTier.current
     var chatMenu by remember { mutableStateOf(false) }
+    val jump = remember { TranscriptJump() }
+    // A8-6: where Shift+Tab lands when it leaves the top of the transcript (the header's last control).
+    val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(
@@ -223,7 +228,7 @@ internal fun TranscriptScreen(
             },
             actions = {
                 // Git actions never sit between the companion and ⋯: they get the row under the header.
-                if (onThreadAction != null) Box {
+                if (onThreadAction != null) Box(Modifier.focusRequester(headerFocus)) {
                     val thread = state.thread?.thread
                     IconButton(onClick = { chatMenu = true }, enabled = thread != null, modifier = Modifier.named("Chat actions")) {
                         Icon(Icons.Filled.MoreVert, contentDescription = null, modifier = Modifier.rotate(90f))
@@ -256,14 +261,18 @@ internal fun TranscriptScreen(
         var transcriptFocused by remember { mutableStateOf(false) }
         Box(Modifier.weight(1f).fillMaxWidth().dismissKeyboardOnTouch(dismissKeyboard)
             .onPreviewKeyEvent { event ->
-                val tab = event.key == androidx.compose.ui.input.key.Key.Tab && !event.isShiftPressed &&
+                val tab = event.key == androidx.compose.ui.input.key.Key.Tab &&
                     event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
                 if (tab) {
-                    focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Next)
+                    // On screen older rows are above: Shift+Tab walks up to older rows (the reversed
+                    // list's "next"), Tab down to newer ones; leaving the top goes to the header,
+                    // leaving the bottom to the composer, never the other way round.
+                    val back = event.isShiftPressed
+                    focusManager.moveFocus(if (back) androidx.compose.ui.focus.FocusDirection.Next else androidx.compose.ui.focus.FocusDirection.Previous)
                     tabScope.launch {
                         withFrameNanos { }
                         withFrameNanos { }
-                        if (!transcriptFocused) runCatching { composerFocus.requestFocus() }
+                        if (!transcriptFocused) runCatching { (if (back) headerFocus else composerFocus).requestFocus() }
                     }
                 }
                 tab
@@ -278,7 +287,7 @@ internal fun TranscriptScreen(
             }.focusGroup()) {
             CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard, LocalNewestFocus provides newestFocus) {
             when (val placeholder = transcriptPlaceholder(state)) {
-                null -> TranscriptList(items, state, context, renderers)
+                null -> TranscriptList(items, state, context, renderers, jump = jump)
                 else -> Placeholder(placeholder, model)
             }
             }
@@ -287,6 +296,8 @@ internal fun TranscriptScreen(
         // message (not the oldest one on screen); within the composer it moves back as usual.
         val backScope = rememberCoroutineScope()
         var composerFocused by remember { mutableStateOf(false) }
+        // U1: running background commands stay in view above the composer.
+        state.thread?.background_tasks?.takeIf { it.isNotEmpty() }?.let { tasks -> RunningTasksBar(tasks) { jump.target = it } }
         Box(Modifier.fillMaxWidth().onFocusChanged { composerFocused = it.hasFocus }.onPreviewKeyEvent { event ->
             val back = event.key == androidx.compose.ui.input.key.Key.Tab && event.isShiftPressed &&
                 event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
@@ -346,7 +357,7 @@ private const val PREFETCH_ITEMS = 5
 
 @Composable
 internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, ctx: TranscriptContext, renderers: TranscriptRenderers,
-    spacing: Dp = 8.dp, contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+    spacing: Dp = 8.dp, contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 8.dp), jump: TranscriptJump? = null) {
     // Newest first + reverseLayout: index 0 sits at the bottom, so growth of the streaming row
     // and older pages prepended at the top both leave the reading position alone.
     val reversed = remember(items) { items.asReversed() }
@@ -365,6 +376,13 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     }
     val newest = reversed.firstOrNull()?.key
     LaunchedEffect(newest, reversed.size) { if (follow && reversed.isNotEmpty()) list.scrollToItem(0) }
+    // U1: the running-tasks bar scrolls to a task's row.
+    LaunchedEffect(jump?.target) {
+        val id = jump?.target ?: return@LaunchedEffect
+        val index = reversed.indexOfFirst { item -> item is TranscriptItem.Background && item.rows.any { it.id == id } }
+        if (index >= 0) { follow = false; list.animateScrollToItem(index) }
+        jump.target = null
+    }
     val page = state.thread?.page
     LaunchedEffect(list, page) {
         snapshotFlow { list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }

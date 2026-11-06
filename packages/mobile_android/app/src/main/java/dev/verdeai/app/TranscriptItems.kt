@@ -37,6 +37,11 @@ internal sealed interface TranscriptItem {
     data class Voice(val rows: List<ChatRow>, val user: Boolean, val speaker: String, val body: String) : TranscriptItem {
         override val key get() = "v:" + rows.first().id
     }
+    /**
+     * U1: background commands (C10 `background_task` rows): one compact row each, or several
+     * consecutive finished ones as one compact list, like the desktop.
+     */
+    data class Background(val rows: List<ChatRow>) : TranscriptItem { override val key get() = "bg:" + rows.first().id }
     /** Pending tool approval — D-09 replaces the default renderer. */
     data class Approval(val approval: ChatApproval) : TranscriptItem { override val key get() = "approval:${approval.turn_id}:${approval.call_id}" }
 }
@@ -144,8 +149,20 @@ internal fun transcriptItems(view: ChatThreadView): List<TranscriptItem> {
         }
         run = ArrayList(); runSubagent = false
     }
+    var tasks = ArrayList<ChatRow>()
+    fun flushTasks() {
+        if (tasks.isEmpty()) return
+        out.addAll(backgroundItems(tasks))
+        tasks = ArrayList()
+    }
     view.rows.forEachIndexed { index, row ->
         if (row.author == HIDDEN_AUTHOR) return@forEachIndexed
+        if (isBackgroundRow(row)) {
+            flush()
+            tasks.add(row)
+            return@forEachIndexed
+        }
+        flushTasks()
         childNotifications(row.role, row.body)?.let {
             flush()
             out.add(TranscriptItem.ChildNotice(row, it))
@@ -168,9 +185,27 @@ internal fun transcriptItems(view: ChatThreadView): List<TranscriptItem> {
         })
     }
     flush()
+    flushTasks()
     groupVoice(out).let { out.clear(); out.addAll(it) }
     view.approval?.let { out.add(TranscriptItem.Approval(it)) }
     view.turn?.takeIf { activeTurn(it.status) }?.let { out.add(TranscriptItem.Working(it, it.status == "waiting_approval" || view.approval != null)) }
+    return out
+}
+
+/** A C10 background command row (the core strips its task ID / log / PID / stop lines). */
+internal fun isBackgroundRow(row: ChatRow) = row.kind == "background_task" && row.background != null
+
+internal fun backgroundRunning(row: ChatRow) = row.background?.status == "running"
+
+/** Consecutive background rows: a running task stands alone; finished ones next to each other share one list. */
+internal fun backgroundItems(rows: List<ChatRow>): List<TranscriptItem.Background> {
+    val out = ArrayList<TranscriptItem.Background>()
+    var done = ArrayList<ChatRow>()
+    fun flush() { if (done.isNotEmpty()) { out.add(TranscriptItem.Background(done)); done = ArrayList() } }
+    for (row in rows) {
+        if (backgroundRunning(row)) { flush(); out.add(TranscriptItem.Background(listOf(row))) } else done.add(row)
+    }
+    flush()
     return out
 }
 

@@ -63,4 +63,17 @@ class TranscriptTest {
         assertEquals("One.\n\nTwo.", (pair[0] as TranscriptItem.Voice).body)
         assertTrue(pair[1] is TranscriptItem.Message)
     }
+
+    @Test fun backgroundTasksGroupFinishedAndKeepRunningAlone() {
+        fun task(id: String, status: String) = ChatRow(id = id, role = "system", kind = "background_task", body = "sleep 1",
+            background = dev.verdeai.core.ChatBackground(label = "job $id", status = status, finished_at_ms = 1_000L))
+        val items = backgroundItems(listOf(task("a", "completed"), task("b", "failed"), task("c", "running"), task("d", "stopped")))
+        assertEquals(listOf(listOf("a", "b"), listOf("c"), listOf("d")), items.map { item -> item.rows.map { it.id } })
+        assertTrue(isBackgroundRow(task("e", "running")))
+        assertFalse(isBackgroundRow(ChatRow(id = "f", role = "system", body = "Ran command")))
+        assertEquals(listOf("Running", "Finished", "Failed", "Stopped"), listOf("running", "completed", "failed", "stopped").map(::backgroundStatusLabel))
+        assertEquals("2 background tasks running", runningTasksLabel(2))
+        assertEquals("1 background task running", runningTasksLabel(1))
+        assertEquals("1 h ago", backgroundAge(task("g", "completed").background!!, 1_000L + 3_600_000L))
+    }
 }
