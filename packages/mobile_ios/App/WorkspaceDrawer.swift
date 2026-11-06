@@ -303,7 +303,8 @@ struct WorkspaceDrawer: View {
         }.buttonStyle(.plain).disabled(!enabled).accessibilityAddTraits(selected ? .isSelected : [])
     }
     private func matches(_ value: String) -> Bool { search.isEmpty || value.localizedCaseInsensitiveContains(search) }
-    private func section(_ text: String) -> some View { Text(text.uppercased()).font(VerdeTheme.ui(10, bold: true)).tracking(0.8).foregroundStyle(VerdeTheme.subtle).padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4).accessibilityAddTraits(.isHeader) }
+    // S32: sentence-case section headers everywhere ("Active", "Open").
+    private func section(_ text: String) -> some View { Text(text).font(VerdeTheme.ui(12, bold: true)).foregroundStyle(VerdeTheme.subtle).padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4).accessibilityAddTraits(.isHeader) }
     private func row(_ title: String, icon: String, chip: Workspace? = nil, selected: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 10) {
@@ -375,7 +376,10 @@ struct WorkspaceDrawer: View {
                 Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(2)
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
-                StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")
+                // S32: a dot only with state (running, waiting, failed), as on Android.
+                if activeTurn(thread.status) || thread.status == "failed" {
+                    StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")
+                }
             }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
                 .overlay(alignment: .leading) { if selected == target { RoundedRectangle(cornerRadius: 2).fill(VerdeTheme.accent).frame(width: 2).padding(.vertical, 10) } }

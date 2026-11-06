@@ -286,6 +286,8 @@ struct RootView: View {
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
         .scrollContentBackground(.hidden)
+        // S32: grouped section headers keep their sentence case (the default uppercases them).
+        .headerProminence(.increased)
         .environment(\.defaultMinListRowHeight, 44)
         .accessibilityHidden(lock.covered)
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))

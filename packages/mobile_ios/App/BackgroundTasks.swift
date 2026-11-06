@@ -86,7 +86,8 @@ struct BackgroundTaskCard: View {
             Button { disclosure.toggle(key(row)) } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "terminal").foregroundStyle(VerdeTheme.muted).accessibilityHidden(true)
-                    Text(backgroundLabel(row)).font(VerdeTheme.mono(12)).lineLimit(1).truncationMode(.middle)
+                    // S36: up to two lines before the middle ellipsis.
+                    Text(backgroundLabel(row)).font(VerdeTheme.mono(12)).lineLimit(2).truncationMode(.middle)
                     Spacer(minLength: 8)
                     BackgroundStatusIcon(status: status)
                     Text(backgroundStatusText(status)).font(VerdeTheme.ui(12, bold: true)).foregroundStyle(backgroundStatusColor(status))
@@ -118,7 +119,7 @@ struct BackgroundTaskCard: View {
                 HStack(spacing: 8) {
                     BackgroundStatusIcon(status: status)
                     (Text(backgroundLabel(row)).font(VerdeTheme.mono(12)) + Text(tail).font(VerdeTheme.ui(12)).foregroundColor(VerdeTheme.muted))
-                        .lineLimit(1).truncationMode(.middle)
+                        .lineLimit(2).truncationMode(.middle)
                     Spacer(minLength: 4)
                     DisclosureChevron(expanded: expanded)
                 }

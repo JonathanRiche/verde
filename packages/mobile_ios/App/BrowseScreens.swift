@@ -67,7 +67,11 @@ private struct Dot: View {
     let color: Color
     let label: String
     var body: some View {
-        Circle().fill(color).frame(width: 6, height: 6).modifier(Pulse(active: ["Working", "Running", "Active"].contains(label))).accessibilityLabel(label)
+        // S32: a dot only when there is state; an idle row keeps the space but draws nothing.
+        let idle = label == "Idle"
+        Circle().fill(idle ? Color.clear : color).frame(width: 6, height: 6)
+            .modifier(Pulse(active: ["Working", "Running", "Active"].contains(label))).accessibilityLabel(label)
+            .accessibilityHidden(idle)
     }
 }
 
@@ -120,7 +124,7 @@ private struct RowContent: View {
     var unread = false
     var body: some View {
         HStack(spacing: 12) {
-            if let provider { ProviderGlyph(provider: provider).frame(width: 20, height: 20) } else { dot }
+            if let provider { ProviderGlyph(provider: provider).frame(minWidth: 20, minHeight: 20) } else { dot }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(VerdeTheme.ui(16)).lineLimit(2)
                 if let detail { subtitle(detail) }
@@ -215,7 +219,8 @@ private struct WorkspaceItem: View {
     var body: some View {
         let info = workspaceSummary(workspace, hidden: hidden)
         MenuRow(content: RowContent(title: workspaceDisplayLabel(workspace, among: all),
-                                    detail: [info.summary, workspace.path].filter { !$0.isEmpty }.joined(separator: "\n"),
+                                    // S34: no raw path in the list; the workspace screen shows it.
+                                    detail: info.summary.isEmpty ? nil : info.summary,
                                     dot: Dot(color: info.active > 0 ? VerdeTheme.accent : VerdeTheme.subtle, label: info.active > 0 ? "Active" : "Idle"),
                                     badge: info.badge),
                 destination: .workspace(workspace.workspace_id), copies: [("Copy path", workspace.path)])
@@ -246,6 +251,7 @@ private struct BrowseFrame<Content: View>: View {
     @ViewBuilder let content: (BrowseState, Int64) -> Content
     @State private var addingHost = false
 
+    @Environment(\.adaptive) private var adaptive
     var body: some View {
         let state = model.state
         Clock(ticking: ticking) { now in
@@ -282,7 +288,8 @@ private struct BrowseFrame<Content: View>: View {
         }
         .navigationTitle(title)
         .toolbar {
-            if title == "Home" { ToolbarItem(placement: .principal) { VerdeWordmark() } }
+            // iPad: the sidebar already shows the wordmark; one logo per screen.
+            if title == "Home" && !adaptive.slotVisible { ToolbarItem(placement: .principal) { VerdeWordmark() } }
             ToolbarItem(placement: .topBarTrailing) { HostMenu(model: model.hosts) { addingHost = true } }
         }
         .modifier(RootCompanionToolbar())

@@ -198,7 +198,7 @@ enum LiveVoiceIntent {
 /// User-facing text for a session or intent failure code.
 func liveVoiceMessage(_ code: String?) -> String {
     switch code {
-    case "voice_not_configured"?: return "Add an API key for a live voice provider in Companion settings."
+    case "voice_not_configured"?: return liveSetupBody
     case "voice_key_rejected"?: return "The provider rejected the API key saved on your desktop. Replace it in Companion settings."
     case "voice_provider_unavailable"?: return "The live voice provider is unavailable right now. Try again shortly."
     case "insufficient_scope"?, "scope_denied"?: return "This phone isn't allowed to start live voice on this host."

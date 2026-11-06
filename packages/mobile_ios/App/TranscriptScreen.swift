@@ -58,14 +58,18 @@ struct TranscriptScreen: View {
             }
             if let summary = model?.thread?.thread {
                 ToolbarItem(placement: .principal) {
-                    HStack(spacing: 8) {
-                        ProviderGlyph(provider: summary.provider)
-                        VStack(alignment: .leading, spacing: 0) {
-                        Text(summary.title.isEmpty ? "Chat" : summary.title) .font(VerdeTheme.ui(15, bold: true)).lineLimit(1)
-                        Text(rowSubtitle([providerDisplayName(summary.provider), summary.model]) ?? "")
-                             .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
+                    // S37: the title takes the bar's whole middle; the provider glyph moves to the
+                    // subtitle line and the title shrinks a little before it truncates.
+                    VStack(alignment: .center, spacing: 0) {
+                        Text(summary.title.isEmpty ? "Chat" : summary.title).font(VerdeTheme.ui(15, bold: true))
+                            .lineLimit(1).minimumScaleFactor(0.85)
+                        HStack(spacing: 4) {
+                            ProviderGlyph(provider: summary.provider, size: 12)
+                            Text(rowSubtitle([providerDisplayName(summary.provider), summary.model]) ?? "")
+                                .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
+                    .frame(maxWidth: .infinity)
                     .accessibilityElement(children: .combine)
                 }
             }
@@ -995,7 +999,8 @@ private struct NoticeRow: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        // S32: System rows are neutral, as on Android; amber is only for what waits on you.
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

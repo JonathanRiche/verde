@@ -61,14 +61,16 @@ struct ApprovalCard: View {
             }
             if phase != .stale && !phase.isSent {
                 let sending: ApprovalDecision? = { if case .sending(let d) = phase { return d }; return nil }()
+                // S37: Deny and Approve share one height at every text size.
                 HStack(spacing: 8) {
-                    Button { decide(.deny) } label: { Text(sending == .deny ? "Denying…" : "Deny") }
+                    Button { decide(.deny) } label: { Text(sending == .deny ? "Denying…" : "Deny").frame(maxHeight: .infinity) }
                         .buttonStyle(TonalButtonStyle(tall: true))
                         .accessibilityLabel("Deny: \(title)")
-                    Button { decide(.approve) } label: { Text(sending == .approve ? "Approving…" : "Approve") }
+                    Button { decide(.approve) } label: { Text(sending == .approve ? "Approving…" : "Approve").frame(maxHeight: .infinity) }
                         .buttonStyle(PrimaryButtonStyle())
                         .accessibilityLabel("Approve: \(title)")
                 }
+                .fixedSize(horizontal: false, vertical: true)
                 .disabled(!phase.canDecide)
             }
         }

@@ -112,7 +112,11 @@ struct CompanionSheet: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("live-connecting")
             }
-            if !live.active, let failure = live.failure {
+            if !live.active, live.failure != nil, live.failureNeedsSetup {
+                LiveSetupCard(setup: { live.dismissFailure(); settingsBrain = false; settingsLive = true; settings = true },
+                              close: { live.dismissFailure() })
+                    .padding(.horizontal, 12).padding(.bottom, 6)
+            } else if !live.active, let failure = live.failure {
                 LiveFailureCard(message: failure, needsSetup: live.failureNeedsSetup,
                                 retry: { Task { await live.start() } },
                                 setup: { live.dismissFailure(); settingsBrain = false; settingsLive = true; settings = true },

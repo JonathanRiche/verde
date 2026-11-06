@@ -52,6 +52,10 @@ struct LiveCallBarContent: View {
                     LivePill(live: live, character: entry?.character ?? .sprout, name: entry?.name ?? "Companion",
                              captionsShown: $pill.captionsShown, expand: { open(.fullView) },
                              openSettings: { open(.voiceSettings) })
+                } else if live.failure != nil, live.failureNeedsSetup {
+                    LiveSetupCard(setup: { live.dismissFailure(); open(.voiceSettings) }, close: { live.dismissFailure() })
+                        .shadow(color: .black.opacity(0.2), radius: 8, y: 4)
+                        .padding(.horizontal, 12)
                 } else if let failure = live.failure {
                     LiveFailureBar(message: failure, needsSetup: live.failureNeedsSetup, retry: { Task { await live.start() } },
                                    setup: { live.dismissFailure(); open(.voiceSettings) }, close: { live.dismissFailure() })
@@ -72,6 +76,39 @@ struct LiveCallBarContent: View {
         .onChange(of: live.failure) { _, failure in
             if let failure { UIAccessibility.post(notification: .announcement, argument: "Live voice stopped. \(failure)") }
         }
+    }
+}
+
+/// S33: the one needs-setup card, the same title, copy, amber outline and buttons as Android.
+let liveSetupTitle = "Live voice needs setup"
+let liveSetupBody = "Live voice needs an API key for a voice provider. Add one in Companion settings."
+
+struct LiveSetupCard: View {
+    let setup: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(liveSetupTitle).font(VerdeTheme.ui(15, bold: true)).accessibilityAddTraits(.isHeader)
+            Text(liveSetupBody).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.text)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("Not now", action: close)
+                    .font(VerdeTheme.ui(14, bold: true)).foregroundStyle(VerdeTheme.accent)
+                    .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                Button("Open Companion settings", action: setup)
+                    .buttonStyle(TonalButtonStyle(fullWidth: false))
+                    .accessibilityHint("Add a live voice provider key.")
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: 420, alignment: .leading)
+        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.warning, lineWidth: 1.5))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("live-setup")
     }
 }
 

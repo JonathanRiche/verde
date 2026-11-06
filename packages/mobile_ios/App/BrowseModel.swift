@@ -331,9 +331,18 @@ func dedupedWorkspaces(_ list: [Workspace]) -> [Workspace] {
 func workspaceDisplayLabel(_ workspace: Workspace, among all: [Workspace]) -> String {
     let twins = all.filter { $0.label == workspace.label && $0.workspace_id != workspace.workspace_id }
     guard !twins.isEmpty else { return workspace.label }
-    let parent = basename((workspace.path as NSString).deletingLastPathComponent)
-    let distinct = !parent.isEmpty && parent != "/" && twins.allSatisfy { basename(($0.path as NSString).deletingLastPathComponent) != parent }
-    if distinct { return workspace.label + " · " + parent }
-    let shown = workspace.path.isEmpty ? workspace.workspace_id : workspace.path
-    return workspace.label + " · " + (shown.count > 28 ? "…" + shown.suffix(27) : shown)
+    // S34: the label and its distinguishing parent ("scripts · demo"), never a raw path: the fewest
+    // trailing parent folders that tell it from its twins.
+    func parents(_ path: String) -> [String] {
+        (path as NSString).deletingLastPathComponent.split(separator: "/").map(String.init)
+    }
+    let mine = parents(workspace.path)
+    for count in 1...max(1, min(3, mine.count)) where count <= mine.count {
+        let tail = mine.suffix(count).joined(separator: "/")
+        if twins.allSatisfy({ parents($0.path).suffix(count).joined(separator: "/") != tail }) {
+            return workspace.label + " · " + tail
+        }
+    }
+    let index = (all.filter { $0.label == workspace.label }.firstIndex { $0.workspace_id == workspace.workspace_id } ?? 0) + 1
+    return workspace.label + " · \(index)"
 }
