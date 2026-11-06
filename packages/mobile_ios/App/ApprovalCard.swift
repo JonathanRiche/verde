@@ -42,8 +42,13 @@ struct ApprovalCard: View {
                 Circle().fill(VerdeTheme.warning).frame(width: 9, height: 9).accessibilityHidden(true)
                 // One title: the request's own, else "Permission required".
                 Text(title).font(.subheadline.weight(.semibold)).lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityLabel("Approval required: \(title)")
                     .accessibilityAddTraits(.isHeader)
+                // S12: Copy request is a 44-point icon button in the card header.
+                if !approval.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    CopyIconButton(label: "Copy request") { approval.body }
+                }
             }
             ApprovalSummary(preview: preview)
             ApprovalDetails(approval: approval, preview: preview, disclosure: disclosure)
@@ -187,7 +192,6 @@ private struct ApprovalDetails: View {
                     .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Approval details")
                     HStack(spacing: 16) {
-                        Button { UIPasteboard.general.string = approval.body } label: { TargetText("Copy request") }
                         if truncated { Button { disclosure.setFlag(key + ":all", true) } label: { TargetText("Show all \(countLines(approval.body)) lines") } }
                     }
                     .font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
