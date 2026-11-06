@@ -7382,6 +7382,7 @@ struct Pane: Codable {
     var `started_at_ms`: Int64? = nil
     var `can_stop`: Bool = false
     var `attention_kind`: String? = nil
+    var `needs_you`: Bool = false
     var `provider`: String? = nil
 }
 
@@ -7398,6 +7399,7 @@ extension Pane {
         case `started_at_ms`
         case `can_stop`
         case `attention_kind`
+        case `needs_you`
         case `provider`
     }
     init(from decoder: Decoder) throws {
@@ -7427,6 +7429,9 @@ extension Pane {
         if !c.contains(.`attention_kind`) { self.`attention_kind` = nil } else {
         self.`attention_kind` = try c.decodeIfPresent(String.self, forKey: .`attention_kind`)
         }
+        if !c.contains(.`needs_you`) { self.`needs_you` = false } else {
+        self.`needs_you` = try c.decode(Bool.self, forKey: .`needs_you`)
+        }
         if !c.contains(.`provider`) { self.`provider` = nil } else {
         self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
         }
@@ -7444,6 +7449,7 @@ extension Pane {
         try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
         try c.encode(self.`can_stop`, forKey: .`can_stop`)
         try c.encode(self.`attention_kind`, forKey: .`attention_kind`)
+        try c.encode(self.`needs_you`, forKey: .`needs_you`)
         try c.encode(self.`provider`, forKey: .`provider`)
     }
 }
@@ -7870,10 +7876,47 @@ extension AttentionItem {
     }
 }
 
+struct AttentionNeed: Codable {
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `kind`: AttentionKind
+    var `title`: String
+    var `deep_link`: String
+}
+
+extension AttentionNeed {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `thread_id`
+        case `kind`
+        case `title`
+        case `deep_link`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`kind` = try c.decode(AttentionKind.self, forKey: .`kind`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`deep_link` = try c.decode(String.self, forKey: .`deep_link`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`deep_link`, forKey: .`deep_link`)
+    }
+}
+
 struct AttentionView: Codable {
     var `items`: [AttentionItem]
     var `count`: UInt32
     var `loading`: Bool
+    var `needs`: [AttentionNeed] = []
+    var `needs_you`: UInt32 = 0
+    var `unread`: UInt32 = 0
 }
 
 extension AttentionView {
@@ -7881,18 +7924,33 @@ extension AttentionView {
         case `items`
         case `count`
         case `loading`
+        case `needs`
+        case `needs_you`
+        case `unread`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.`items` = try c.decode([AttentionItem].self, forKey: .`items`)
         self.`count` = try c.decode(UInt32.self, forKey: .`count`)
         self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        if !c.contains(.`needs`) { self.`needs` = [] } else {
+        self.`needs` = try c.decode([AttentionNeed].self, forKey: .`needs`)
+        }
+        if !c.contains(.`needs_you`) { self.`needs_you` = 0 } else {
+        self.`needs_you` = try c.decode(UInt32.self, forKey: .`needs_you`)
+        }
+        if !c.contains(.`unread`) { self.`unread` = 0 } else {
+        self.`unread` = try c.decode(UInt32.self, forKey: .`unread`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(self.`items`, forKey: .`items`)
         try c.encode(self.`count`, forKey: .`count`)
         try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`needs`, forKey: .`needs`)
+        try c.encode(self.`needs_you`, forKey: .`needs_you`)
+        try c.encode(self.`unread`, forKey: .`unread`)
     }
 }
 

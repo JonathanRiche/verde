@@ -95,6 +95,7 @@ pub const types = .{
     .{ "FileKind", files.Kind },
     .{ "AttentionStatus", attention.Status },
     .{ "AttentionItem", attention.Item },
+    .{ "AttentionNeed", attention.Need },
     .{ "AttentionView", attention.View },
     .{ "AttentionQuery", wire.Query(attention.View) },
     .{ "ManageBusy", manage.Busy },

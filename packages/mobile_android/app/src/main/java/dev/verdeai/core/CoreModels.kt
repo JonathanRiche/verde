@@ -1857,6 +1857,7 @@ data class Pane(
     val `started_at_ms`: Long? = null,
     val `can_stop`: Boolean = false,
     val `attention_kind`: String? = null,
+    val `needs_you`: Boolean = false,
     val `provider`: String? = null,
 )
 
@@ -1983,10 +1984,22 @@ data class AttentionItem(
 )
 
 @Serializable
+data class AttentionNeed(
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `kind`: AttentionKind,
+    val `title`: String,
+    val `deep_link`: String,
+)
+
+@Serializable
 data class AttentionView(
     val `items`: List<AttentionItem>,
     val `count`: Long,
     val `loading`: Boolean,
+    val `needs`: List<AttentionNeed> = emptyList(),
+    val `needs_you`: Long = 0,
+    val `unread`: Long = 0,
 )
 
 @Serializable

@@ -777,6 +777,8 @@ fn sharedViewsChanged(before: *const State, after: *const State, host_changed: b
     for (before.chat.threads) |t| if (t.focused and !focused) return true;
     if (before.terminal.rows.len != after.terminal.rows.len) return true;
     for (before.terminal.rows, after.terminal.rows) |old, new| if (old.view.attached != new.view.attached) return true;
+    // The "needs you" set (attention.zig) includes the companion crew's approvals.
+    if (!state_clone.equal(@TypeOf(before.companion.view.crew.links), before.companion.view.crew.links, after.companion.view.crew.links)) return true;
     // Home and Workspaces overlay a focused chat's live turn (attention.zig), so a
     // change in that turn's status or pending approval must re-announce them.
     if (before.chat.threads.len != after.chat.threads.len) return true;

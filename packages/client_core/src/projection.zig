@@ -19,6 +19,9 @@ pub const Pane = struct {
     can_stop: bool = false,
     /// K-17 thread attention (unread, needs_approval, blocked, failed).
     attention_kind: ?[]const u8 = null,
+    /// Counts toward "needs you" (attention.zig `needs`): an approval or input wait, or an
+    /// unacknowledged failure. `attention` also covers unread completions; this never does.
+    needs_you: bool = false,
     /// Agent provider of a TUI running in a terminal pane (desktop `agent_provider`).
     provider: ?[]const u8 = null,
 };

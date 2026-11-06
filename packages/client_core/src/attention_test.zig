@@ -397,3 +397,71 @@ test "needs-you clears as soon as an open chat's approval resolves or its turn c
     home = try listed(&f, "home", "waiting_approval", "running", false, false);
     try expect(needsYou(home) == 1);
 }
+
+const Scene = struct { sync_status: []const u8 = "completed", live_status: []const u8 = "completed", approval: bool = false, kind: ?attention.Kind = null, links: []const @import("companion.zig").Link = &.{} };
+/// One open chat "t" in workspace "ws" (plus "t2"), its attention entry and the companion crew.
+fn scene(f: *Fixture, s: Scene) !void {
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{
+        .snapshot = .{ .workspaces = .{.{ .workspace_id = "ws", .label = "Repo", .path = "/repo", .threads = .{ .{ .local_thread_id = "t", .title = "Rotate keys" }, .{ .local_thread_id = "t2", .title = "Child" } } }} },
+        .turns = .{.{ .workspace_id = "ws", .local_thread_id = "t", .turn_id = "turn-1", .status = s.sync_status, .started_at_ms = 10 }},
+    }));
+    var threads = try tx.allocator().alloc(chat.Thread, 1);
+    threads[0] = .{ .workspace_id = "ws", .id = "t", .metadata = .{ .local_thread_id = "t", .title = "Rotate keys" }, .cwd = "/repo", .loaded = true, .focused = true, .turn = .{ .turn_id = "turn-1", .status = s.live_status, .started_at_ms = 10 }, .approval = if (s.approval) .{ .turn_id = "turn-1", .call_id = "call-1", .title = "Approve?", .body = "Run it" } else null };
+    tx.state.chat.threads = threads;
+    tx.state.attention.entries = if (s.kind) |kind| try tx.allocator().dupe(attention.Entry, &.{.{ .workspace_id = "ws", .thread_id = "t", .turn_id = "turn-1", .status = .done, .attention = kind, .since_ms = 5 }}) else &.{};
+    tx.state.companion.view.crew.links = s.links;
+    f.a().free(try tx.commit(&f.host, f.a()));
+}
+fn attentionView(f: *Fixture) !V {
+    return p.get(try h.parse(f.a(), try f.host.query("attention", f.a())), "data");
+}
+fn homeNeeds(f: *Fixture) !usize {
+    const home = p.get(try h.parse(f.a(), try f.host.query("home", f.a())), "data");
+    var n: usize = 0;
+    for (p.rows(p.get(home, "items"))) |pane| if (p.yes(p.get(pane, "needs_you"))) {
+        n += 1;
+    };
+    return n;
+}
+
+test "needs you counts approvals, input and unacknowledged failures, never unread completions" {
+    var f = try Fixture.init(&.{"chat:read"});
+    defer f.deinit();
+    // A finished chat not opened yet is unread, not "needs you".
+    try scene(&f, .{ .kind = .unread });
+    var v = try attentionView(&f);
+    try expect(p.uint(p.get(v, "needs_you")).? == 0 and p.uint(p.get(v, "unread")).? == 1 and p.uint(p.get(v, "count")).? == 1);
+    try expect(try homeNeeds(&f) == 0);
+    // A failure this device has not opened needs the user.
+    try scene(&f, .{ .kind = .failed });
+    v = try attentionView(&f);
+    try expect(p.uint(p.get(v, "needs_you")).? == 1 and p.uint(p.get(v, "unread")).? == 0);
+    try eql("failed", p.s(p.rows(p.get(v, "needs"))[0], "kind"));
+    try eql("Rotate keys", p.s(p.rows(p.get(v, "needs"))[0], "title"));
+    try expect(try homeNeeds(&f) == 1);
+    // A pending approval counts even in the chat being viewed (its entry was cleared).
+    try scene(&f, .{ .sync_status = "waiting_approval", .live_status = "waiting_approval", .approval = true });
+    v = try attentionView(&f);
+    try expect(p.uint(p.get(v, "needs_you")).? == 1 and p.uint(p.get(v, "count")).? == 0);
+    try eql("needs_approval", p.s(p.rows(p.get(v, "needs"))[0], "kind"));
+    try expect(try homeNeeds(&f) == 1);
+    // Resolved in the open chat: nothing needs the user.
+    try scene(&f, .{ .sync_status = "waiting_approval", .live_status = "running" });
+    try expect(p.uint(p.get(try attentionView(&f), "needs_you")).? == 0);
+    // Crew approvals and input requests count once per chat; hidden links and failed links do not.
+    try scene(&f, .{ .kind = .failed, .links = &.{
+        .{ .link_id = "l1", .workspace_id = "ws", .local_thread_id = "t2", .status = "blocked" },
+        .{ .link_id = "l2", .workspace_id = "ws", .local_thread_id = "t", .status = "waiting_approval" },
+        .{ .link_id = "l3", .workspace_id = "ws", .local_thread_id = "t3", .status = "waiting_approval", .hidden = true },
+        .{ .link_id = "l4", .workspace_id = "ws", .local_thread_id = "t4", .status = "failed" },
+    } });
+    v = try attentionView(&f);
+    try expect(p.uint(p.get(v, "needs_you")).? == 2);
+    const needs = p.rows(p.get(v, "needs"));
+    try eql("t", p.s(needs[0], "thread_id"));
+    try eql("failed", p.s(needs[0], "kind"));
+    try eql("t2", p.s(needs[1], "thread_id"));
+    try eql("blocked", p.s(needs[1], "kind"));
+}
