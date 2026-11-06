@@ -207,7 +207,7 @@ internal fun CompanionBubbleSetting() {
         .padding(vertical = 12.dp).testTag("companion-bubble-setting"), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Show companion bubble", style = MaterialTheme.typography.bodyLarge)
-            Text("A floating shortcut to your companion on every screen.", style = MaterialTheme.typography.bodySmall,
+            Text("A floating shortcut on Home, Workspaces and Hosts; other screens keep it in the top bar.", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Switch(checked = !prefs.hidden, onCheckedChange = null)

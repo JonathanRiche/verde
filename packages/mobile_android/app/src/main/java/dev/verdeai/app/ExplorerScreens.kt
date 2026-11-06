@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -522,10 +523,14 @@ internal fun entrySize(bytes: Long) = if (bytes < 1024) "$bytes B" else sizeLabe
 @Composable
 internal fun ExplorerLinks(onChanges: () -> Unit, onFiles: () -> Unit, workspace: String? = null, modifier: Modifier = Modifier) {
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-        AssistChip(onClick = onChanges, label = { Text("Changes") }, modifier = Modifier.testTag(EXPLORER_CHANGES_LINK))
-        AssistChip(onClick = onFiles, label = { Text("Files") }, modifier = Modifier.testTag(EXPLORER_FILES_LINK))
-        workspace?.let { Text(it, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) }
+        // In All Workspaces scope the target is named ("in demo-app"), on screen and for TalkBack.
+        val target = workspace?.let { " in $it" }.orEmpty()
+        AssistChip(onClick = onChanges, label = { Text("Changes") },
+            modifier = Modifier.testTag(EXPLORER_CHANGES_LINK).semantics { contentDescription = "Changes$target" })
+        AssistChip(onClick = onFiles, label = { Text("Files") },
+            modifier = Modifier.testTag(EXPLORER_FILES_LINK).semantics { contentDescription = "Files$target" })
+        workspace?.let { Text("in $it", Modifier.weight(1f).clearAndSetSemantics {}, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted) }
     }
 }
 
