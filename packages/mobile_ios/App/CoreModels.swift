@@ -779,6 +779,8 @@ struct ChatCatalogs: Codable {
     var `access`: [ChatChoice] = []
     var `speeds`: [ChatChoice] = []
     var `slash`: [ChatChoice] = []
+    var `default_model_label`: String? = nil
+    var `default_effort_label`: String? = nil
 }
 
 extension ChatCatalogs {
@@ -788,6 +790,8 @@ extension ChatCatalogs {
         case `access`
         case `speeds`
         case `slash`
+        case `default_model_label`
+        case `default_effort_label`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -806,6 +810,12 @@ extension ChatCatalogs {
         if !c.contains(.`slash`) { self.`slash` = [] } else {
         self.`slash` = try c.decode([ChatChoice].self, forKey: .`slash`)
         }
+        if !c.contains(.`default_model_label`) { self.`default_model_label` = nil } else {
+        self.`default_model_label` = try c.decodeIfPresent(String.self, forKey: .`default_model_label`)
+        }
+        if !c.contains(.`default_effort_label`) { self.`default_effort_label` = nil } else {
+        self.`default_effort_label` = try c.decodeIfPresent(String.self, forKey: .`default_effort_label`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -814,6 +824,8 @@ extension ChatCatalogs {
         try c.encode(self.`access`, forKey: .`access`)
         try c.encode(self.`speeds`, forKey: .`speeds`)
         try c.encode(self.`slash`, forKey: .`slash`)
+        try c.encode(self.`default_model_label`, forKey: .`default_model_label`)
+        try c.encode(self.`default_effort_label`, forKey: .`default_effort_label`)
     }
 }
 

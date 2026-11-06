@@ -18,7 +18,12 @@ pub const Approval = struct { turn_id: []const u8, call_id: []const u8, title: [
 pub const Followup = struct { id: []const u8, kind: []const u8, state: []const u8 = "pending", delivery: []const u8 = "unsent", turn_id: []const u8, steer_id: []const u8, next_turn_id: []const u8, text: []const u8, attachments: []const Attachment = &.{}, voice: bool = false, paused: bool = false, can_retry: bool = false, can_pull_back: bool = true, @"error": ?h.LocalError = null };
 pub const Selection = struct { provider: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null };
 pub const Choice = struct { id: []const u8, label: []const u8, enabled: bool = true, reason: ?[]const u8 = null, favorite: bool = false };
-pub const Catalogs = struct { models: []const Choice = &.{}, efforts: []const Choice = &.{}, access: []const Choice = &.{}, speeds: []const Choice = &.{}, slash: []const Choice = &.{} };
+/// `default_model_label`: the concrete model behind the provider's `default` model choice (e.g.
+/// "Opus 5.5"), from the host's model list or the provider's built-in default; null when the
+/// catalog has no `default` choice or the provider resolves it from its own config.
+/// `default_effort_label`: the same for the `""` effort choice; null while hosts do not report the
+/// provider's per-model default effort (the CLI applies it), which is true of every provider today.
+pub const Catalogs = struct { models: []const Choice = &.{}, efforts: []const Choice = &.{}, access: []const Choice = &.{}, speeds: []const Choice = &.{}, slash: []const Choice = &.{}, default_model_label: ?[]const u8 = null, default_effort_label: ?[]const u8 = null };
 pub const Draft = struct { revision: []const u8, text: []const u8, attachments: []const Attachment, persisted: bool };
 pub const Mention = struct { path: []const u8, label: []const u8 };
 pub const ShellConfirmation = struct { id: []const u8, command: []const u8, cwd: []const u8 };

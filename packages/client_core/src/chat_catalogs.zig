@@ -32,6 +32,7 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
         try append(m.Choice, a, &out.models, .{ .id = value, .label = if (p.s(row, "model_name").len > 0) p.s(row, "model_name") else id });
     }
     if (out.models.len == 0) out.models = try choices(a, fallback(provider));
+    out.default_model_label = defaultModelLabel(provider, dynamic, out.models);
     const model = selection.model orelse if (out.models.len > 0) out.models[0].id else "";
     var selected: V = .null;
     for (p.rows(p.get(dynamic, "models"))) |row| {
@@ -108,6 +109,33 @@ pub fn favorites(a: A, catalog: m.Catalogs, provider: []const u8, config: V) h.A
     };
     out.models = models;
     return out;
+}
+/// Built-in defaults: the model each provider's `default` alias runs when the host lists none.
+fn builtinDefault(provider: []const u8) ?[]const u8 {
+    if (eq(provider, "claude")) return "Opus 5.5";
+    return null;
+}
+fn defaultModelLabel(provider: []const u8, dynamic: V, models: []const m.Choice) ?[]const u8 {
+    var listed = false;
+    for (models) |choice| if (eq(choice.id, "default")) {
+        listed = true;
+    };
+    if (!listed) return null;
+    for (p.rows(p.get(dynamic, "models"))) |row| {
+        if (!eq(p.s(row, "model_id"), "default")) continue;
+        // "Default (Opus 5.5)" names the model; "Default (fx config)" or "Default" defer to the CLI.
+        const name = std.mem.trim(u8, p.s(row, "model_name"), " \t");
+        const prefix = "Default (";
+        const inner = if (std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, ")")) std.mem.trim(u8, name[prefix.len .. name.len - 1], " ") else if (std.ascii.startsWithIgnoreCase(name, "default")) "" else name;
+        return if (namesModel(inner)) inner else null;
+    }
+    return builtinDefault(provider);
+}
+/// Model names carry a version ("Opus 5.5", "Wonder 1.0"); config pointers do not.
+fn namesModel(text: []const u8) bool {
+    if (std.mem.endsWith(u8, text, " config")) return false;
+    for (text) |byte| if (std.ascii.isDigit(byte)) return true;
+    return false;
 }
 fn fallback(provider: []const u8) []const []const u8 {
     if (eq(provider, "codex")) return &.{ "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };

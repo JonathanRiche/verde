@@ -535,3 +535,33 @@ test "transcript images are named by their file name and keep the host path as r
     try eql("/home/u/.local/share/verde/attachments/shot 1.png", images[0].reference.?);
     try eql("pic.jpg", images[1].name);
 }
+
+test "composer catalogs name the model behind a provider's default choice" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cat = @import("chat_catalogs.zig");
+    // Built-in Claude list before discovery answers.
+    var out = try cat.catalogs(a, .{ .provider = "claude" }, .null, .null);
+    try eql("default", out.models[0].id);
+    try eql("Opus 5.5", out.default_model_label.?);
+    try expect(out.default_effort_label == null);
+    // The host's list names the default; a selected concrete model keeps the label for the menu.
+    const listed = try h.parse(a,
+        \\{"models":[{"model_id":"default","model_name":"Default (Opus 6)"},{"model_id":"sonnet","model_name":"Sonnet 5.5"}]}
+    );
+    out = try cat.catalogs(a, .{ .provider = "claude", .model = "sonnet" }, listed, .null);
+    try eql("Opus 6", out.default_model_label.?);
+    // A default that defers to the CLI's own config, or an unnamed one, stays unknown.
+    out = try cat.catalogs(a, .{ .provider = "pi" }, try h.parse(a, "{\"models\":[{\"model_id\":\"default\",\"model_name\":\"Default (pi config)\"}]}"), .null);
+    try expect(out.default_model_label == null);
+    out = try cat.catalogs(a, .{ .provider = "claude" }, try h.parse(a, "{\"models\":[{\"model_id\":\"default\",\"model_name\":\"Default (recommended)\"}]}"), .null);
+    try expect(out.default_model_label == null);
+    out = try cat.catalogs(a, .{ .provider = "grok" }, .null, .null);
+    try expect(out.default_model_label == null);
+    // No default choice at all (Codex lists concrete models; a listed catalog without one).
+    out = try cat.catalogs(a, .{ .provider = "codex" }, .null, .null);
+    try expect(out.default_model_label == null);
+    out = try cat.catalogs(a, .{ .provider = "claude" }, try h.parse(a, "{\"models\":[{\"model_id\":\"sonnet\",\"model_name\":\"Sonnet 5.5\"}]}"), .null);
+    try expect(out.default_model_label == null);
+}

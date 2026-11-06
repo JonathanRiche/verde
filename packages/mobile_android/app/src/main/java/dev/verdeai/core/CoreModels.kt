@@ -187,6 +187,8 @@ data class ChatCatalogs(
     val `access`: List<ChatChoice> = emptyList(),
     val `speeds`: List<ChatChoice> = emptyList(),
     val `slash`: List<ChatChoice> = emptyList(),
+    val `default_model_label`: String? = null,
+    val `default_effort_label`: String? = null,
 )
 
 @Serializable
