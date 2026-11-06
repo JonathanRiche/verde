@@ -26,6 +26,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.horizontalScroll
@@ -219,8 +221,12 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 Text(notice, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.testTag(COMPOSER_NOTICE).semantics { liveRegion = LiveRegionMode.Polite })
             }
-            Suggestions(composer, view)
-            if (attachments.isNotEmpty()) Attachments(attachments, sendPending || composer.busy, composer)
+            // Full composer: the resize handle tops the card, so suggestions never strand it mid-card.
+            val extras = @Composable {
+                Suggestions(composer, view)
+                if (attachments.isNotEmpty()) Attachments(attachments, sendPending || composer.busy, composer)
+            }
+            if (dense) extras()
             val placeholder = when {
                 view == null -> "Loading…"
                 !ready -> "Offline. Your draft is kept."
@@ -294,6 +300,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 contentAlignment = Alignment.Center) {
                 Box(Modifier.size(40.dp, 4.dp).background(VerdeColors.Border, RoundedCornerShape(2.dp)))
             }
+            extras()
             BasicTextField(
                 value = composer.field,
                 onValueChange = { if (!sendPending) composer.edit(it) },
@@ -370,7 +377,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 LiveOverMenu()
-                if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${composerChoiceLabel(c.access, s.access) ?: "Access"}") },
+                if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${accessValueLabel(c.access, s.access)}") },
                     onClick = { menu = false; onPicker(ComposerPicker.Access) })
                 DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() })
                 DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
@@ -405,7 +412,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
                 add("Model: ${composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model"}" to ComposerPicker.Model)
                 if (c.efforts.isNotEmpty()) add("Effort: ${composerChoiceLabel(c.efforts, s.effort) ?: "Default"}" to ComposerPicker.Effort)
                 if (c.speeds.size > 1) add("Speed: ${composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard"}" to ComposerPicker.Speed)
-                if (c.access.isNotEmpty()) add("Access: ${composerChoiceLabel(c.access, s.access) ?: "Access"}" to ComposerPicker.Access)
+                if (c.access.isNotEmpty()) add("Access: ${accessValueLabel(c.access, s.access)}" to ComposerPicker.Access)
             }
             pickers.forEach { (text, picker) -> DropdownMenuItem(text = { Text(text) }, onClick = { menu = false; onPicker(picker) }) }
             HorizontalDivider()
@@ -464,36 +471,49 @@ private fun FollowupCard(f: ChatFollowup, composer: ComposerModel, kind: EventFo
     }
 }
 
+/** One suggestion row: the value, and for files the folder it lives in. */
+internal data class Suggestion(val label: String, val detail: String?, val accept: () -> Unit)
+
+/** Slash commands matching [query], one row per command name (catalogs can repeat a command). */
+internal fun slashSuggestions(choices: List<ChatChoice>, query: String): List<String> {
+    val prefix = "/$query"
+    return choices.filter { it.enabled }.map { if (it.label.startsWith("/")) it.label else "/" + it.label }
+        .filter { it.startsWith(prefix, ignoreCase = true) }.distinctBy { it.lowercase() }
+}
+
+/** `@` file results: one row per path, file name first and its folder as detail. */
+internal fun mentionSuggestions(mentions: List<ChatMention>, max: Int = 8): List<Pair<String, String?>> =
+    mentions.distinctBy { it.path }.take(max).map { m ->
+        val name = basename(m.path)
+        val folder = m.path.removeSuffix(name).trimEnd('/').ifEmpty { null }
+        name to folder
+    }
+
+/** S5: `/` and `@` share one vertical list of 48dp rows inside the composer card. */
 @Composable
 private fun Suggestions(composer: ComposerModel, view: ChatComposerView?) {
     val slash = composer.slash
     val mention = composer.mention
-    val rows: List<Pair<String, () -> Unit>> = when {
-        view == null -> emptyList()
-        slash != null -> {
-            val prefix = "/" + slash.query
-            view.catalogs.slash.map { it to if (it.label.startsWith("/")) it.label else "/" + it.label }
-                .filter { (c, name) -> c.enabled && name.startsWith(prefix, ignoreCase = true) }
-                .map { (_, name) -> name to { composer.acceptSlash(name) } }
-        }
-        mention != null -> view.mentions.take(8).map { m -> m.path to { composer.acceptMention(m.path) } }
-        else -> emptyList()
+    if (view == null || (slash == null && mention == null)) return
+    val rows: List<Suggestion> = if (slash != null)
+        slashSuggestions(view.catalogs.slash, slash.query).map { name -> Suggestion(name, null) { composer.acceptSlash(name) } }
+    else {
+        val paths = view.mentions.distinctBy { it.path }.take(8)
+        mentionSuggestions(paths).zip(paths).map { (shown, m) -> Suggestion(shown.first, shown.second) { composer.acceptMention(m.path) } }
     }
-    if (slash != null) {
-        Column(Modifier.fillMaxWidth().heightIn(max = 168.dp).verticalScroll(rememberScrollState()).testTag(COMPOSER_SUGGESTIONS)) {
-            VerdeSection("Commands")
-            if (rows.isEmpty()) Text(if (composer.slashLoading) "Loading commands…" else "No matching commands for this provider.",
-                color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall)
-            for ((label, accept) in rows) TextButton(onClick = accept, modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp)) {
-                Text(label, modifier = Modifier.fillMaxWidth(), color = VerdeColors.Text)
-            }
-        }
-        return
-    }
-    if (rows.isEmpty()) return
-    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag(COMPOSER_SUGGESTIONS), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        for ((label, accept) in rows) {
-            SuggestionChip(onClick = accept, label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+    if (mention != null && rows.isEmpty()) return
+    Column(Modifier.fillMaxWidth().heightIn(max = 200.dp).verticalScroll(rememberScrollState()).testTag(COMPOSER_SUGGESTIONS)) {
+        VerdeSection(if (slash != null) "Commands" else "Files", inset = 4.dp)
+        if (rows.isEmpty()) Text(if (composer.slashLoading) "Loading commands…" else "No matching commands for this provider.",
+            Modifier.padding(horizontal = 4.dp, vertical = 8.dp), color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall)
+        for (row in rows) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
+            .clickable(role = Role.Button, onClick = row.accept)
+            .semantics(mergeDescendants = true) { contentDescription = listOfNotNull(row.label, row.detail).joinToString(", ") }
+            .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(row.label, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = if (slash != null) VerdeMono else VerdeSans),
+                color = VerdeColors.Text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            row.detail?.let { Text(it, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodySmall,
+                color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.MiddleEllipsis) }
         }
     }
 }
@@ -522,6 +542,20 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
 
 internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: id?.takeIf { it.isNotEmpty() }
 
+/**
+ * S5: what the Access chip says — the chosen mode ("Supervised", "Full access"), or the mode a
+ * chat without a choice resolves to ("Default · Supervised"). Never just "Access".
+ */
+internal fun accessValueLabel(access: List<ChatChoice>, selected: String?): String {
+    val chosen = selected?.takeIf { it.isNotEmpty() }
+    if (chosen != null) return composerChoiceLabel(access, chosen) ?: chosen
+    val fallback = access.firstOrNull()?.label ?: return "Default"
+    return "Default \u00b7 $fallback"
+}
+
+internal fun accessIsFull(access: List<ChatChoice>, selected: String?) = (selected?.takeIf { it.isNotEmpty() } ?: access.firstOrNull()?.id) == "full_access"
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsControls(view: ChatComposerView, state: TranscriptState, provider: String?, open: (ComposerPicker) -> Unit) {
     val c = view.catalogs
@@ -530,22 +564,17 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
 
     val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
-    if (fresh) SettingChip("Provider", providerLabel) { open(ComposerPicker.Provider) }
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val compact = maxWidth < 480.dp
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
-                modifier = Modifier.weight(1f)) { open(ComposerPicker.Model) }
-            if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default",
-                modifier = Modifier.widthIn(max = if (compact) 100.dp else 160.dp),
-                icon = R.drawable.composer_reasoning,
-                fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
-            if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = compact,
-                icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
-            if (c.access.isNotEmpty()) SettingChip("Access", composerChoiceLabel(c.access, s.access) ?: "Access", compact = compact,
-                icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
-        }
+    // Content-sized chips that wrap to a second line rather than squeeze or hide their values.
+    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
+        if (fresh) SettingChip("Provider", providerLabel, provider) { open(ComposerPicker.Provider) }
+        SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
+        if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default",
+            icon = R.drawable.composer_reasoning,
+            fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
+        if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard",
+            icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
+        if (c.access.isNotEmpty()) SettingChip("Access", accessValueLabel(c.access, s.access),
+            icon = if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
     }
 }
 
@@ -574,8 +603,8 @@ internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?,
                         fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { onPicker(ComposerPicker.Effort) }
                     if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = tight,
                         icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { onPicker(ComposerPicker.Speed) }
-                    if (c.access.isNotEmpty()) SettingChip("Access", composerChoiceLabel(c.access, s.access) ?: "Access", compact = tight,
-                        icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { onPicker(ComposerPicker.Access) }
+                    if (c.access.isNotEmpty()) SettingChip("Access", accessValueLabel(c.access, s.access), compact = tight,
+                        icon = if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked) { onPicker(ComposerPicker.Access) }
                 }
             }
             actions()

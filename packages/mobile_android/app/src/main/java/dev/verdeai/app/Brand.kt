@@ -109,10 +109,11 @@ internal fun SendControl(label: String, enabled: Boolean, onClick: () -> Unit, m
     /** While a turn runs: other ways to send (steer / interrupt / queue). */
     onLongClick: (() -> Unit)? = null) {
     val face = @Composable {
-        Box(Modifier.size(44.dp).graphicsLayer { alpha = if (enabled) 1f else .35f }
-            .background(VerdeColors.Accent, CircleShape), contentAlignment = Alignment.Center) {
+        // S5: disabled is the same muted token in light and dark (an accent at partial alpha reads enabled on dark).
+        Box(Modifier.size(44.dp).background(if (enabled) VerdeColors.Accent else VerdeColors.PanelMuted, CircleShape),
+            contentAlignment = Alignment.Center) {
             Icon(painterResource(R.drawable.composer_send), contentDescription = null,
-                tint = Color(0xFF06210F), modifier = Modifier.size(16.dp))
+                tint = if (enabled) Color(0xFF06210F) else VerdeColors.Subtle, modifier = Modifier.size(16.dp))
         }
     }
     if (onLongClick == null) {
