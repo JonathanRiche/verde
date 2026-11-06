@@ -328,10 +328,11 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
             }
         }
     }
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         LiveOverModal()
+        DialogSystemBars()
         Surface(Modifier.fillMaxSize().testTag(DIFF_FULL_SCREEN)) {
-            Column {
+            Column(Modifier.safeDrawingPadding()) {
                 VerdeTopBar(showWorkspaceMenu = false,
                     title = { Text(path, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = MaterialTheme.typography.titleSmall) },
                     navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "Close diff") } },

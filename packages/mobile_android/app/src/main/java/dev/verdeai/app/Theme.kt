@@ -281,3 +281,20 @@ internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composa
         HorizontalDivider(color = VerdeColors.Border)
     }
 }
+
+/**
+ * A5-5: a full-screen dialog has its own window and system bars; keep their icons readable in the
+ * selected theme (light icons on dark themes, dark icons on light ones).
+ */
+@Composable
+internal fun DialogSystemBars(dark: Boolean = VerdeColors.dark) {
+    val view = androidx.compose.ui.platform.LocalView.current
+    SideEffect {
+        (view.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window?.let { window ->
+            androidx.core.view.WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+}
