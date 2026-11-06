@@ -117,8 +117,15 @@ class ScreenSpecTest {
         assertEquals(Routes.WORKSPACES, footerTab(Routes.THREAD))
         assertEquals(Routes.HOME, footerTab(ManageRoutes.HISTORY))
         assertEquals(Routes.HOSTS, footerTab(Routes.HOSTS))
-        // r5: the tab a screen was opened from: a chat from Home marks Home.
-        assertEquals(Routes.HOME, footerTab(Routes.THREAD, listOf(Routes.HOME, Routes.THREAD)))
-        assertEquals(Routes.WORKSPACES, footerTab(Routes.THREAD, listOf(Routes.HOME, Routes.WORKSPACES, Routes.WORKSPACE, Routes.THREAD)))
+    }
+
+    /** The footer highlight follows the current screen's type, the same fixed mapping as iOS. */
+    @Test fun footerHighlightsTheCurrentScreensType() {
+        listOf(Routes.THREAD, Routes.FILES, Routes.CHANGES, Routes.PATCH, Routes.FILE, Routes.WORKSPACE_FILE, Routes.TERMINAL,
+            Routes.NEW_TERMINAL, Routes.WORKSPACES, Routes.WORKSPACE).forEach { assertEquals(it, Routes.WORKSPACES, footerTab(it)) }
+        listOf(Routes.HOME, ManageRoutes.HISTORY, ManageRoutes.NEW_CHAT, ManageRoutes.NEW_CHAT_IN).forEach { assertEquals(it, Routes.HOME, footerTab(it)) }
+        assertEquals(Routes.SECURITY, footerTab(Routes.SECURITY))
+        assertEquals(Routes.HOSTS, footerTab(Routes.HOSTS))
+        assertEquals("", footerTab(null))
     }
 }
