@@ -225,7 +225,10 @@ test "chat approvals reconcile from tail and reject stale or duplicate decisions
     defer f.deinit();
     try f.open();
     try f.seedTurn();
-    try f.tail(.{ .status = "running", .events = .{}, .pending_approval = .{ .call_id = "call", .title = "Approve", .body = "Run fixture" } });
+    try f.tail(.{ .status = "running", .events = .{.{ .seq = 1, .kind = "approval_requested", .payload_json = "{\"call_id\":\"call\"}" }}, .pending_approval = .{ .call_id = "call", .title = "Approve", .body = "Run fixture" } });
+    // The lifecycle marker advances the cursor but never becomes a transcript row.
+    try expect(f.host.state.chat.threads[0].after_seq == 1);
+    for (f.host.state.chat.threads[0].overlay) |row| try expect(std.mem.indexOf(u8, row.body, "approval_requested") == null and !h.eq(row.author, "approval_requested"));
     _ = try f.intent("approval_decide", .{ .turn_id = "fixture-turn", .call_id = "stale", .decision = "approve" });
     try std.testing.expectError(error.MissingRequest, f.find("chat.turn.approve"));
     _ = try f.intent("approval_decide", .{ .turn_id = "fixture-turn", .call_id = "call", .decision = "approve" });

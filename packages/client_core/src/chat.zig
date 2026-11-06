@@ -812,6 +812,12 @@ fn receiveTail(tx: *h.Transaction, i: usize, result: V) E!void {
             return;
         }
         const kind = p.s(event, "kind");
+        // Lifecycle marker only: the approval card comes from the turn itself
+        // (approvalFromTurn), so never show it as a raw transcript row.
+        if (eq(kind, "approval_requested")) {
+            t.after_seq = seq;
+            continue;
+        }
         const payload = p.s(event, "payload_json");
         const decoded = h.parse(tx.allocator(), payload) catch |e| {
             if (e == error.OutOfMemory) return e;
