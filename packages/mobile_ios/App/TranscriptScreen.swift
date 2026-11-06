@@ -722,107 +722,6 @@ private struct StatusDot: View {
     var body: some View { Circle().fill(color).frame(width: 9, height: 9).accessibilityLabel(label) }
 }
 
-private func toolColor(_ row: ChatRow) -> Color {
-    commandFailed(row) ? .red : commandRunning(row) ? .accentColor : .secondary
-}
-
-private let toolPreviewLines = 40
-
-private struct ToolCard: View {
-    let row: ChatRow
-    let child: Bool
-    let disclosure: DisclosureStore
-    @Environment(\.compactChat) private var compact
-
-    var body: some View {
-        let key = "\(row.id):tool"
-        let expanded = disclosure.flag(key, commandFailed(row))
-        let all = disclosure.flag(key + ":all")
-        VStack(alignment: .leading, spacing: 0) {
-            Button { disclosure.toggle(key, commandFailed(row)) } label: {
-                HStack(spacing: 8) {
-                    StatusDot(color: toolColor(row), label: toolStatusLabel(row))
-                    Text(row.author.isEmpty ? "Tool" : row.author).font(.subheadline.weight(.medium))
-                    Text(commandPreview(row.body)) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
-                }
-                .font(compact ? VerdeTheme.ui(12) : nil)
-                .padding(.horizontal, compact ? 2 : 12).padding(.vertical, compact ? 4 : 10)
-                .frame(minHeight: compact ? 44 : nil)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint(expanded ? "Collapse" : "Expand")
-            if expanded {
-                let (shown, truncated) = all ? (row.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
-                    : leadingLines(row.body, toolPreviewLines)
-                ScrollView(.horizontal) {
-                    Text(shown).font(VerdeTheme.mono()).fixedSize().textSelection(.enabled).padding(.horizontal, 12)
-                }
-                HStack(spacing: 16) {
-                    Button("Copy output") { UIPasteboard.general.string = row.body }
-                    if truncated { Button("Show all \(countLines(row.body)) lines") { disclosure.setFlag(key + ":all", true) } }
-                }
-                 .font(VerdeTheme.ui(12))
-                .padding(.horizontal, 12).padding(.vertical, 8)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(compact ? Color.clear : child ? VerdeTheme.background : VerdeTheme.assistant,
-                    in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            if !compact { RoundedRectangle(cornerRadius: 10).stroke(commandRunning(row) ? Color.accentColor : VerdeTheme.border) }
-        }
-    }
-}
-
-private struct ToolGroupCard: View {
-    let id: String
-    let rows: [ChatRow]
-    let subagent: Bool
-    let turnStartedAt: Int64?
-    let disclosure: DisclosureStore
-    @Environment(\.compactChat) private var compact
-
-    var body: some View {
-        let counts = toolCounts(rows)
-        let expanded = disclosure.flag(id, counts.failed > 0)
-        VStack(alignment: .leading, spacing: 0) {
-            Button { disclosure.toggle(id, counts.failed > 0) } label: {
-                HStack(spacing: 8) {
-                    StatusDot(color: counts.failed > 0 ? .red : counts.running > 0 ? .accentColor : .secondary,
-                              label: counts.failed > 0 ? "Some failed" : counts.running > 0 ? "Running" : "Completed")
-                    // Only a running group ticks; finished groups never schedule a timeline.
-                    TimelineView(.periodic(from: .now, by: counts.running > 0 && turnStartedAt != nil ? 1 : 3600)) { context in
-                        Text(toolGroupSummary(rows, subagent: subagent,
-                                              elapsed: turnStartedAt.map { elapsedLabel($0, nowMs(context.date)) }))
-                             .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, compact ? 2 : 12).padding(.vertical, compact ? 4 : 12)
-                .frame(minHeight: compact ? 44 : nil)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint(expanded ? "Collapse" : "Expand")
-            if expanded {
-                VStack(spacing: 6) {
-                    ForEach(rows, id: \.id) { ToolCard(row: $0, child: true, disclosure: disclosure) }
-                }
-                .padding(.horizontal, compact ? 0 : 8).padding(.leading, compact ? 12 : 0).padding(.bottom, compact ? 2 : 8)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(compact ? Color.clear : VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            if !compact { RoundedRectangle(cornerRadius: 10).stroke(counts.running > 0 && counts.failed == 0 ? Color.accentColor : VerdeTheme.border) }
-        }
-    }
-}
-
 private struct ThinkCard: View {
     let row: ChatRow
     let model: TranscriptModel
@@ -833,10 +732,12 @@ private struct ThinkCard: View {
         VStack(alignment: .leading, spacing: 4) {
             Button { model.disclosure.toggle(key) } label: {
                 HStack(spacing: 6) {
-                    Text(expanded ? "▾" : "▸")
+                    Image(systemName: "lightbulb").font(.system(size: 12)).accessibilityHidden(true)
                     Text(commandRunning(row) ? "Thinking…" : "Thought")
+                    DisclosureChevron(expanded: expanded)
                 }
                 .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                .frame(minHeight: 44)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)

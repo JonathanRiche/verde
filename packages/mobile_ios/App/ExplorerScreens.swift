@@ -669,7 +669,7 @@ private struct PatchLines: View {
                         Text(model.hunks[h].header).font(.caption2.monospaced()).foregroundStyle(VerdeTheme.muted)
                             .padding(.horizontal, 8).padding(.vertical, 4)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(VerdeTheme.accent.opacity(0.08))
+                            .background(hunkBackground)
                     case .line(let h, let r, let at):
                         let row = model.hunks[h].rows[r]
                         Text(diffRowText(row, width: model.numberWidth)).font(selectableLineFont)

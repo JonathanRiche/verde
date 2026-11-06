@@ -164,10 +164,11 @@ func toolCounts(_ rows: [ChatRow]) -> ToolCounts {
     return ToolCounts(count: rows.count, completed: rows.count - failed - running, failed: failed, running: running)
 }
 
+/// "4 tool calls · 1 failed": the count, then only what didn't simply finish.
 func toolGroupSummary(_ rows: [ChatRow], subagent: Bool, elapsed: String?) -> String {
     let c = toolCounts(rows)
     let noun = subagent ? (c.count == 1 ? "subagent" : "subagents") : (c.count == 1 ? "tool call" : "tool calls")
-    var parts = ["\(c.count) \(noun)", "\(c.completed) completed"]
+    var parts = ["\(c.count) \(noun)"]
     if c.failed > 0 { parts.append("\(c.failed) failed") }
     if c.running > 0 { parts.append("\(c.running) running") }
     if c.running > 0, let elapsed { parts.append(elapsed) }
@@ -176,6 +177,109 @@ func toolGroupSummary(_ rows: [ChatRow], subagent: Bool, elapsed: String?) -> St
 
 func toolStatusLabel(_ row: ChatRow) -> String {
     commandFailed(row) ? "Failed" : commandRunning(row) ? "Running" : "Completed"
+}
+
+/// What a tool row shows (desktop ToolRow parity): the core's parsed fields when it sends them,
+/// else the row's author and body sections.
+struct ToolParts: Equatable {
+    var kind: String
+    var title: String
+    /// One plain line naming what the call acts on; empty when nothing fits.
+    var summary: String
+    var input: String?
+    var output: String?
+    var error: String?
+}
+
+/// The tool's kind (read, edit, delete, move, search, execute, think, fetch, mcp, subagent, other).
+func toolKind(_ row: ChatRow) -> String {
+    if let kind = row.tool?.kind, !kind.isEmpty { return kind }
+    switch row.author.lowercased() {
+    case "ran command", "command failed", "bash", "shell": return "execute"
+    case "read": return "read"
+    case "edit", "write", "multiedit": return "edit"
+    case "search", "grep", "glob": return "search"
+    case "subagent", "task": return "subagent"
+    case "fetch", "webfetch", "websearch": return "fetch"
+    default: return shellLike(row.body) ? "execute" : "other"
+    }
+}
+
+/// SF Symbol per tool kind.
+func toolSymbol(_ kind: String) -> String {
+    switch kind {
+    case "read": return "doc.text"
+    case "edit": return "pencil"
+    case "delete": return "trash"
+    case "move": return "arrow.right"
+    case "search": return "magnifyingglass"
+    case "execute": return "terminal"
+    case "think": return "lightbulb"
+    case "fetch": return "globe"
+    case "mcp": return "wrench.and.screwdriver"
+    case "subagent": return "person.2"
+    default: return "wrench"
+    }
+}
+
+private let summaryKeys = ["command", "cmd", "file_path", "filePath", "path", "pattern", "query", "url", "name", "description"]
+
+/// The value an input names first (command, path, pattern, url…), or its first plain line.
+func toolInputSummary(_ input: String?) -> String {
+    guard let input = input?.trimmingCharacters(in: .whitespacesAndNewlines), !input.isEmpty else { return "" }
+    if input.hasPrefix("{"), let data = input.data(using: .utf8),
+       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+        for key in summaryKeys {
+            if let value = object[key] as? String, !value.isEmpty { return oneLine(value) }
+            if let parts = object[key] as? [String], !parts.isEmpty { return oneLine(parts.joined(separator: " ")) }
+        }
+        return ""
+    }
+    return oneLine(input)
+}
+
+private func oneLine(_ text: String) -> String {
+    let first = text.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? ""
+    return String(first.prefix(300)).trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "`")))
+}
+
+func toolParts(_ row: ChatRow) -> ToolParts {
+    let body = row.body
+    let input = toolField(body, "Input")
+    let output = toolField(body, "Output")
+    let error = toolField(body, "Error")
+    let sectioned = input != nil || output != nil || error != nil || toolField(body, "Tool") != nil
+    let raw = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = row.author.isEmpty ? "Tool" : row.author
+    var summary = toolInputSummary(input)
+    if summary.isEmpty, !sectioned { summary = oneLine(raw) }
+    return coreToolParts(row, ToolParts(kind: toolKind(row), title: title, summary: summary, input: input,
+                                        output: sectioned ? output : (raw.isEmpty ? nil : raw), error: error))
+}
+
+/// The core's parsed tool fields, where present, over the local fallback.
+private func coreToolParts(_ row: ChatRow, _ fallback: ToolParts) -> ToolParts {
+    fallback
+}
+
+/// The text Copy puts on the pasteboard: the whole tool body.
+func toolCopyText(_ row: ChatRow) -> String { row.body }
+
+/// One diff line's role in an Edit's unified-diff output.
+enum ToolDiffLine: Equatable { case hunk, add, delete, context }
+
+/// Unified-diff output (an Edit's result) is coloured like the patch view.
+func toolOutputIsDiff(_ parts: ToolParts) -> Bool {
+    guard parts.kind == "edit", let output = parts.output else { return false }
+    return output.hasPrefix("@@") || output.contains("\n@@") || output.hasPrefix("--- ") || output.hasPrefix("diff --git")
+}
+
+func toolDiffLine(_ line: Substring) -> ToolDiffLine {
+    if line.hasPrefix("@@") { return .hunk }
+    if line.hasPrefix("+++") || line.hasPrefix("---") || line.hasPrefix("diff ") || line.hasPrefix("index ") { return .hunk }
+    if line.hasPrefix("+") { return .add }
+    if line.hasPrefix("-") { return .delete }
+    return .context
 }
 
 /// Consecutive live-voice lines from one speaker become one row (the first row's id, the last

@@ -15,6 +15,8 @@ enum VerdeTheme {
     static var heading2: Color { AppearanceSettings.shared.color("heading2", fallback: 0xf6d27a, light: 0x86620d) }
     static var heading3: Color { AppearanceSettings.shared.color("heading3", fallback: 0x99dcb3, light: 0x197d43) }
     static var warning: Color { AppearanceSettings.shared.color("warning", fallback: 0xfbbf24, light: 0xa36800) }
+    /// Added lines in diffs (patch view and transcript edits); removed lines use `danger`.
+    static var diffAdd: Color { AppearanceSettings.shared.color("diff_add", fallback: 0x54b76b, light: 0x1d7f3a) }
     static var danger: Color { AppearanceSettings.shared.color("diff_remove", fallback: 0xff6464, light: 0xb52828) }
     /// Android's attention badge uses errorContainer/onErrorContainer, rather
     /// than bright error text. Host themes tint their own panel and text.

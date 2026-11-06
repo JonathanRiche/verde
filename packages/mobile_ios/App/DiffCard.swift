@@ -37,8 +37,11 @@ final class DisclosureStore {
     }
 }
 
-private let addColor = Color(uiColor: .systemGreen)
-private let deleteColor = Color(uiColor: .systemRed)
+/// The diff palette, shared by the patch view, diff cards and transcript Edit output.
+var addColor: Color { VerdeTheme.diffAdd }
+var deleteColor: Color { VerdeTheme.danger }
+/// Hunk headers: muted text on a faint accent band.
+var hunkBackground: Color { VerdeTheme.accent.opacity(0.08) }
 private let diffFont = Font.system(.footnote, design: .monospaced)
 
 private func copy(_ text: String) { UIPasteboard.general.string = text }
