@@ -149,7 +149,7 @@ struct NewChatScreen: View {
     /// The whole row opens the menu (not only its value), and the menu marks the current choice.
     @ViewBuilder private func choice(_ label: String, value: String?, choices: [ChatChoice], update: @escaping (String) -> ChatSelection) -> some View {
         if !choices.isEmpty {
-            let catalogs = manage.view?.new_chat?.catalogs
+            let catalogs = manage.view?.new_chat.catalogs
             let resolved = label == "Model" ? catalogs?.default_model_label : label == "Effort" ? catalogs?.default_effort_label : nil
             let shown = newChatChoiceLabel(label, value: value, choices: choices, defaultLabel: resolved)
             Menu {
