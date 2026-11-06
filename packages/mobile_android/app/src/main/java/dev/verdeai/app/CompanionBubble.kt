@@ -72,7 +72,8 @@ internal enum class BubbleEdge { Left, Right }
 
 /** Saved placement: the side it hugs and its height as a fraction of the free vertical range. */
 internal data class BubblePlacement(val edge: BubbleEdge = BubbleEdge.Right, val fraction: Float = DEFAULT_BUBBLE_FRACTION)
-internal const val DEFAULT_BUBBLE_FRACTION = .62f
+/** Bottom of the free range: just above the screen's New chat button, clear of list rows above it. */
+internal const val DEFAULT_BUBBLE_FRACTION = 1f
 
 /** Where the bubble's whole square may sit, in px: safe insets, top bar and composer region excluded. */
 internal data class BubbleArea(val left: Float, val top: Float, val right: Float, val bottom: Float)
@@ -387,6 +388,116 @@ private fun DockTalk(talk: BubbleTalk, name: String) {
                 talk.speaking -> "Stop speaking"
                 else -> "Talk to $name"
             }, tint = if (listening || talk.speaking) VerdeColors.Accent else VerdeColors.Text, modifier = Modifier.size(20.dp))
+    }
+}
+
+internal const val COMPANION_HEADER = "companion-header"
+
+/** Space a top-level list leaves under its last row while the floating bubble is up: its height + 16. */
+internal val BUBBLE_RESERVE = 72.dp
+internal val LocalBubbleReserve = compositionLocalOf { 0.dp }
+
+/**
+ * The companion in a content screen's top app bar (shared spec S1): set by the shell on every
+ * screen except the top-level lists, where the floating bubble stays. Null: no header button.
+ */
+internal val LocalCompanionHeader = compositionLocalOf<CompanionDockState?> { null }
+
+/**
+ * A 40dp avatar button (48dp target) with the needs-you badge; tap opens (or ends Live), double-tap
+ * starts Live, press and hold talks: the floating bubble's gestures without the drag. Pop-ups show beneath it.
+ */
+@Composable
+internal fun CompanionHeaderButton(state: CompanionDockState) {
+    val context = LocalContext.current
+    val reduced = remember(context) { reducedMotion(context) }
+    val haptics = LocalHapticFeedback.current
+    val current by rememberUpdatedState(state)
+    val talking = state.talk != null && state.talk.state !is TalkState.Idle
+    val open = {
+        val s = current
+        s.chip.clear()
+        s.talk?.stopSpeaking()
+        val ending = s.live?.takeIf { it.active }
+        if (ending != null) ending.toggle() else if (!s.opened) s.onToggle()
+    }
+    Box(Modifier.size(48.dp)
+        .pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown()
+                val gesture = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                    val slop = awaitTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                    if (slop == null) BubbleGesture.Tap else BubbleGesture.Drag
+                } ?: BubbleGesture.Hold
+                when (gesture) {
+                    BubbleGesture.Tap -> {
+                        val liveHooks = current.live
+                        if (liveHooks == null || liveHooks.active) open()
+                        else {
+                            val second = withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) { awaitFirstDown() }
+                            if (second == null) open() else { second.consume(); waitForUpOrCancellation(); liveHooks.toggle() }
+                        }
+                    }
+                    // A slide off the button is not a tap.
+                    BubbleGesture.Drag -> Unit
+                    BubbleGesture.Hold -> {
+                        val hooks = current.talk
+                        if (hooks == null) { open(); return@awaitEachGesture }
+                        if (!hooks.start()) return@awaitEachGesture
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        val center = Offset(size.width / 2f, size.height / 2f)
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                            if (change == null) { hooks.cancel(); break }
+                            if (!change.pressed) { change.consume(); hooks.release(); break }
+                            change.consume()
+                            hooks.move((change.position - center).getDistance() > size.width * 1.5f)
+                        }
+                    }
+                }
+            }
+        }
+        .semantics {
+            role = Role.Button
+            contentDescription = bubbleDescription(state.name, state.count)
+            onClick(label = "Open ${state.name}") { open(); true }
+            customActions = buildList {
+                val talk = state.talk
+                if (talk != null) add(CustomAccessibilityAction(if (talking) "Stop and send" else "Talk to ${state.name}") {
+                    if (talking) talk.release() else talk.start()
+                    true
+                })
+                if (talk?.speaking == true) add(CustomAccessibilityAction("Stop speaking") { talk.stopSpeaking(); true })
+                state.live?.let { live -> add(CustomAccessibilityAction(if (live.active) "End live voice" else "Start live voice") { live.toggle(); true }) }
+            }
+        }
+        .testTag(COMPANION_HEADER), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+            if (state.live?.active == true) LiveRing(state.live.level()) else if (state.running || talking) RunningRing(reduced)
+            Box(Modifier.size(36.dp).background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
+                .border(1.dp, if (talking) VerdeColors.Accent else if (state.count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
+                contentAlignment = Alignment.Center) {
+                CompanionAvatar(state.character, if (talking) CompanionPose.Working else state.pose, size = 30.dp)
+            }
+        }
+        if (state.count > 0) NeedsBadge(state.count, Modifier.align(Alignment.TopEnd))
+        state.chip.text?.let { text ->
+            androidx.compose.ui.window.Popup(alignment = Alignment.TopEnd,
+                offset = with(LocalDensity.current) { IntOffset(0, 52.dp.roundToPx()) },
+                onDismissRequest = { state.chip.clear() }) {
+                Surface(onClick = { if (!talking) open() }, shape = RoundedCornerShape(14.dp),
+                    color = if (state.talk?.state.let { it is TalkState.Listening && it.cancelArmed }) VerdeColors.DangerPanel else VerdeColors.Panel,
+                    shadowElevation = 6.dp, border = androidx.compose.foundation.BorderStroke(1.dp, VerdeColors.Border),
+                    modifier = Modifier.widthIn(max = 280.dp).padding(end = 8.dp).testTag(COMPANION_BUBBLE_POPUP)) {
+                    Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val talk = state.talk
+                        if (talk != null && talk.state is TalkState.Listening) LevelBars(talk.level)
+                        Text(text, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
     }
 }
 

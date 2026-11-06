@@ -286,7 +286,9 @@ private fun BrowseFrame(
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         }
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
-            LazyColumn(Modifier.fillMaxSize().testTag(BROWSE_LIST)) {
+            // Top-level lists keep their last rows clear of the New chat button and the companion bubble (S1).
+            LazyColumn(Modifier.fillMaxSize().testTag(BROWSE_LIST),
+                contentPadding = PaddingValues(bottom = if (onBack == null) LocalBubbleReserve.current + 80.dp else 16.dp)) {
                 if (onBack == null) item(key = "title") {
                     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp)) {
                         Text(title, style = MaterialTheme.typography.titleLarge)

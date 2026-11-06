@@ -102,6 +102,8 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                 }
             }
             onSecurity?.let { open -> TextButton(modifier=Modifier.fillMaxWidth(), onClick=open) { Text("Settings") } }
+            // Clear of the companion bubble (S1).
+            Spacer(Modifier.height(LocalBubbleReserve.current))
         }
     }
     if (adding) AddHostDialog(onAdd={ model.add(it) }, onDismiss={ adding=false })

@@ -78,6 +78,7 @@ internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = r
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState) {
     val nav = rememberNavController()
@@ -273,7 +274,13 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
     // Moss on a docked window: in the sidebar, or its rail, rather than floating over the content.
     val companionUp = companionState.available && !bubblePrefs.hidden && !pairing
-    val bubbleShown = companionUp && !tier.docked && !companionOpen && !onCompanionThread && !immersive && !drawerOpen && !hostsState.loading
+    // S1: the floating bubble only on the top-level lists, never over the keyboard or a dialog;
+    // every other screen carries the companion in its top app bar instead.
+    val topLevel = route in TABS
+    val imeUp = WindowInsets.isImeVisible
+    val bubbleShown = companionUp && !tier.docked && topLevel && !companionOpen && !onCompanionThread && !drawerOpen &&
+        !hostsState.loading && !imeUp && threadAction == null
+    val headerShown = companionUp && !tier.docked && !topLevel && route != null && !onCompanionThread && !hostsState.loading
     val dockShown = companionUp && tier.docked && panes.moss != MossPlacement.SidebarSlot
     val companionCharacter = CompanionCharacter.of(companionActive?.character)
     val companionName = companionActive?.name?.ifBlank { null } ?: companionCharacter.label
@@ -291,9 +298,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         },
         move = voice::move, release = voice::release, cancel = voice::cancel,
         stopSpeaking = voice::stopSpeaking, clearError = voice::clearError)
-    val bubbleChip = rememberBubbleChip(bubbleShown || (dockShown && !companionOpen), browseState.hostId, companionName, companionNow.needKeys,
+    val bubbleChip = rememberBubbleChip(bubbleShown || ((headerShown || dockShown) && !companionOpen), browseState.hostId, companionName, companionNow.needKeys,
         companionNow.companionThread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
         { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk)
+    val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
+        companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
+        onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
     val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
@@ -325,7 +335,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             },
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
-                CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit }))) {
+                CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
+                    LocalCompanionHeader provides headerState,
+                    LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {
                     Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
                 }
             }

@@ -169,13 +169,15 @@ internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null
 /** Insets are owned by the app shell (or the containing dialog). */
 @Composable
 internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composable () -> Unit = {},
-    showWorkspaceMenu: Boolean = true, actions: @Composable RowScope.() -> Unit = {}) {
+    showWorkspaceMenu: Boolean = true, companion: Boolean = true, actions: @Composable RowScope.() -> Unit = {}) {
     Column(Modifier.background(VerdeColors.Panel)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             navigationIcon()
             Box(Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 6.dp)) {
                 ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
             }
+            // S1: on content screens the companion sits here, trailing, before the screen's own actions and ⋯ menu.
+            if (companion) LocalCompanionHeader.current?.let { CompanionHeaderButton(it) }
             actions()
             if (showWorkspaceMenu) LocalWorkspaceMenu.current?.let { open ->
                 IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
