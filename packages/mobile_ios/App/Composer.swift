@@ -523,7 +523,7 @@ struct ChatComposer: View {
             let icon: CGFloat = hasChipIcon(kind) ? 22 : 0
             let full = glyph + icon + measure(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)) + 20
             let short = [.effort, .speed, .access].contains(kind) ? glyph + icon + measure(shortChipText(kind)) + 20 : nil
-            let bare = short != nil && icon > 0 ? measure(shortChipText(kind)) + 20 : nil
+            let bare = short != nil && icon > 0 ? max(44, measure(shortChipText(kind)) + 20) : nil
             let minimum: CGFloat? = kind == .model ? glyph + measure("GPT-6…") + 20 : nil
             return ComposerChipWidth(kind: kind, full: full, iconOnly: hasChipIcon(kind) ? 44 : nil, short: short, bare: bare, minimum: minimum)
         }
@@ -766,7 +766,7 @@ struct ChatComposer: View {
                         .lineLimit(1).truncationMode(kind == .model ? .middle : .tail)
                 }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
-                .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
+                .frame(minWidth: 44, maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
                 .background(VerdeTheme.alternate, in: Capsule())
         }.buttonStyle(.plain)
