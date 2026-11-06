@@ -654,11 +654,12 @@ struct ChatComposer: View {
                           text: Binding(get: { model.text }, set: { value in
                               model.edit(value, selection: NSRange(location: (value as NSString).length, length: 0))
                           }), axis: .vertical)
-                    .lineLimit(1...6)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 1...3 : 1...6)
                     .font(VerdeTheme.ui(15))
                     .disabled(model.pending)
                     .accessibilityLabel("Message")
-                    .accessibilityIdentifier("composer-field")
+                    // I12-5: distinct from the chat's own composer when both are on screen.
+                    .accessibilityIdentifier("companion-composer-field")
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
@@ -1307,7 +1308,9 @@ private struct ComposerGlyph: Shape {
 
 /// `available` comes from the keyboard-adjusted conversation container. Reserve
 /// space for controls and visible conversation even while the prompt is expanded.
+/// I12-6: the field never takes more than 40% of the height (large text, keyboard up); longer text
+/// scrolls inside it.
 func composerPromptHeight(_ requested: CGFloat, available: CGFloat, minimum: CGFloat = 56) -> CGFloat {
-    let maximum = max(minimum, min(available * 0.6, available - 200))
+    let maximum = max(minimum, min(available * 0.4, available - 200))
     return min(maximum, max(minimum, requested))
 }

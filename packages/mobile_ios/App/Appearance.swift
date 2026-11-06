@@ -190,6 +190,7 @@ struct AppSettings: View {
             // Section headers keep the case they're written in (S7), including the shared sections.
             .textCase(nil)
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
+            .modifier(ReadableListWidth())
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
             .toolbar { if !embedded { BarButton("Done", bold: true) { dismiss() } } }
             .modifier(EmbeddedNavigation(enabled: embedded))

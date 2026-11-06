@@ -36,6 +36,7 @@ struct HostsScreen: View {
                     }
                 }
             }
+            .modifier(ReadableListWidth())
             .navigationTitle("Hosts").modifier(VerdeNavigation())
             .listStyle(.plain).scrollContentBackground(.hidden).background(VerdeTheme.background)
             .modifier(BubbleReserve())

@@ -44,6 +44,8 @@ struct HistoryScreen: View {
     @State private var now = Int64(Date().timeIntervalSince1970 * 1000)
     var body: some View {
         List {
+            // I12-3: the search field sits in the list's 720-point column, not across the bar.
+            HistorySearchField(query: $query)
             ManageNotice(model: manage)
             Picker("Workspace", selection: $workspace) {
                 Text("All workspaces").tag("")
@@ -88,14 +90,31 @@ struct HistoryScreen: View {
                 now = Int64(Date().timeIntervalSince1970 * 1000)
             }
         }
-        // I11-12: the field sits under the title, so the title stays centred on wide windows.
-        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search chats")
         .task(id: query + "\u{0}" + workspace) {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             await manage.history(query, workspace: workspace.isEmpty ? nil : workspace)
         }
         .onDisappear { Task { await manage.history("", workspace: nil) } }
+    }
+}
+
+/// History's search field, a row of the list so it keeps the list's width.
+private struct HistorySearchField: View {
+    @Binding var query: String
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
+            TextField("Search chats", text: $query).textInputAutocapitalization(.never).autocorrectionDisabled()
+                .submitLabel(.search).accessibilityIdentifier("history-search")
+            if !query.isEmpty {
+                Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.subtle).frame(width: 44, height: 44) }
+                    .buttonStyle(.plain).accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12).frame(minHeight: 44)
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
+        .listRowSeparator(.hidden)
     }
 }
 
@@ -146,7 +165,10 @@ struct NewChatScreen: View {
                 .accessibilityLabel("Start chat")
                 .accessibilityIdentifier("create-chat")
             }
-        }.navigationTitle("New chat").navigationBarTitleDisplayMode(.inline)
+        }
+        // I12-3: every content screen keeps the same centred 720-point column.
+        .modifier(ReadableListWidth())
+        .navigationTitle("New chat").navigationBarTitleDisplayMode(.inline)
         .onAppear { workspace = initialWorkspace ?? mostRecentOpenWorkspace(workspaces)?.workspace_id ?? "" }
         .task(id: workspace) { if !workspace.isEmpty { await manage.select(workspace) } }
     }
@@ -276,7 +298,9 @@ struct AddWorkspaceScreen: View {
                 }
             } header: { SectionTitle("Browse folders") }
             .disabled(manage.busy)
-        }.navigationTitle("Add workspace").navigationBarTitleDisplayMode(.inline)
+        }
+        .modifier(ReadableListWidth())
+        .navigationTitle("Add workspace").navigationBarTitleDisplayMode(.inline)
         .task { await manage.directory() }
     }
 
@@ -363,7 +387,7 @@ struct ThreadActions: View {
     @Environment(\.adaptive) private var adaptive
     var body: some View {
         Menu {
-            if let git, !adaptive.tier.wide { Section { GitMenuItems(model: git) }.disabled(git.busy) }
+            if let git, !adaptive.inlineGit { Section { GitMenuItems(model: git) }.disabled(git.busy) }
             Button("Rename chat") { name = title; rename = true }
             Button("Sync chat") { Task { await manage.thread("sync", workspace: workspace, thread: thread) } }
             Button("Close chat", role: .destructive) { close = true }

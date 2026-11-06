@@ -99,6 +99,7 @@ struct ChangesRoute: View {
         }
         .background(VerdeTheme.background)
         .accessibilityIdentifier("changes-screen")
+        .modifier(ReadableListWidth())
         .navigationTitle("Changes")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -408,6 +409,7 @@ struct FilesRoute: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(VerdeTheme.background)
         .accessibilityIdentifier("files-screen")
+        .modifier(ReadableListWidth())
         .navigationTitle("Files")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

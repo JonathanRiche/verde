@@ -78,7 +78,7 @@ final class ComposerChipsTests: XCTestCase {
     func testPromptHeightKeepsAScaledMinimum() {
         XCTAssertEqual(composerPromptHeight(10, available: 800), 56)
         XCTAssertEqual(composerPromptHeight(10, available: 800, minimum: 90), 90)
-        XCTAssertEqual(composerPromptHeight(2000, available: 800, minimum: 90), 480)
+        XCTAssertEqual(composerPromptHeight(2000, available: 800, minimum: 90), 320, "40% of the height at most")
     }
 }
 
