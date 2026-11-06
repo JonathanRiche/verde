@@ -65,11 +65,14 @@ class ComposerLabelsTest {
         assertEquals("Ask", chipShort(ComposerPicker.Access, "Supervised"))
         assertEquals("Full", chipShort(ComposerPicker.Access, "Full access"))
         assertEquals("GPT-6.1 Sol", chipShort(ComposerPicker.Model, "GPT-6.1 Sol"))
-        assertEquals("Auto", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
-        // A8-3: the model's default row names what it resolves to, else "Auto"; access rows say what they do.
-        assertEquals("Default \u00b7 Opus 5.5", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
-        assertEquals("Auto", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
-        assertEquals("Runs commands without asking (default)", accessSubtitle("full_access"))
-        assertEquals("Asks before running commands", accessSubtitle("supervised"))
+        // S35: one wording on both platforms: "<value> (default)", never a bare "Default".
+        assertEquals("Auto (default)", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
+        assertEquals("Opus 5.5 (default)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
+        assertEquals("Auto (default)", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
+        assertEquals("Standard (default)", pickerRowLabel(ComposerPicker.Speed, ChatChoice("off", "Normal")))
+        assertEquals("Fast", pickerRowLabel(ComposerPicker.Speed, ChatChoice("on", "Fast")))
+        assertEquals("Full access (default)", pickerRowLabel(ComposerPicker.Access, ChatChoice("full_access", "Full access")))
+        assertEquals("Supervised", pickerRowLabel(ComposerPicker.Access, ChatChoice("supervised", "Supervised")))
+        assertEquals("Standard", speedLabel(null))
     }
 }

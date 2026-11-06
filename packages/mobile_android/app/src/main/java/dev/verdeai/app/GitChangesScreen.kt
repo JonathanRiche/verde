@@ -299,9 +299,15 @@ internal fun GitCommitSettingsSection(settings: GitSettings) {
     VerdeSection("Commit messages")
     Column(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val provider = when (settings.provider.lowercase()) { "codex" -> "Codex"; "claude" -> "Claude"; "cursor" -> "Cursor"; "opencode" -> "OpenCode"; else -> "Auto" }
-        Text("Provider · $provider", style = MaterialTheme.typography.bodyMedium)
-        Text("Model · ${settings.model?.takeIf { it.isNotBlank() } ?: "Default (fast model)"}", style = MaterialTheme.typography.bodyMedium)
-        Text("Default action · ${settings.action.label}", style = MaterialTheme.typography.bodyMedium)
+        // S32 / S35: label and value rows like iOS's; an unset model reads what it runs.
+        @Composable fun valueRow(label: String, value: String) = Row(Modifier.fillMaxWidth().heightIn(min = 32.dp)
+            .semantics(mergeDescendants = true) {}, verticalAlignment = Alignment.CenterVertically) {
+            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            Text(value, style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Muted)
+        }
+        valueRow("Provider", provider)
+        valueRow("Model", settings.model?.takeIf { it.isNotBlank() } ?: "Auto (provider\u2019s fast model)")
+        valueRow("Default action", settings.action.label)
         Text("Change on your computer", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
     }
 }
