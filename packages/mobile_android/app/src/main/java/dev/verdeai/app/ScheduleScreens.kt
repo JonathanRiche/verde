@@ -63,7 +63,7 @@ internal fun ScheduledButton(count: Int?, onClick: () -> Unit) {
         tooltip = { PlainTooltip { Text("Scheduled tasks") } }, state = rememberTooltipState()) {
         Row(Modifier.heightIn(min = 48.dp).widthIn(min = 48.dp).clip(RoundedCornerShape(24.dp))
             .clickable(onClickLabel = "Open scheduled tasks", role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = scheduledButtonLabel(count) }
+            .nameOnly(scheduledButtonLabel(count))
             .padding(horizontal = 8.dp).testTag(SCHEDULED_BUTTON),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally)) {
             Icon(painterResource(R.drawable.ic_schedule), contentDescription = null, modifier = Modifier.size(22.dp),
@@ -252,8 +252,8 @@ private fun ScheduleRow(entry: ScheduleEntry, state: ScheduleUiState, now: Long,
                         color = if (lastRunFailed(entry)) MaterialTheme.colorScheme.error else VerdeColors.Subtle)
                 }
                 if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                IconButton(onClick = onRun, enabled = canEdit && !busy) {
-                    Icon(Icons.Filled.PlayArrow, contentDescription = "Run $title now")
+                IconButton(onClick = onRun, enabled = canEdit && !busy, modifier = Modifier.named("Run $title now")) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = null)
                 }
                 Switch(checked = enabled, onCheckedChange = onEnabled, enabled = canEdit && entry.id !in state.toggling,
                     modifier = Modifier.semantics { contentDescription = "$title enabled" })
@@ -528,7 +528,7 @@ private fun Hint(text: String) {
 @Composable
 private fun ChoiceRow(label: String, detail: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
-        .padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        .nameOnly("$label, $detail").padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         RadioButton(selected = selected, onClick = null, enabled = enabled)
         Column(Modifier.weight(1f)) {
             Text(label, style = MaterialTheme.typography.bodyMedium, color = if (enabled) VerdeColors.Text else VerdeColors.Subtle)

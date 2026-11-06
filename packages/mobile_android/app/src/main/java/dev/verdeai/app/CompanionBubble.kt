@@ -208,6 +208,7 @@ internal fun CompanionBubbleSetting() {
     val prefs = remember(context) { BubblePrefs.of(context) }
     VerdeSection("Companion")
     Row(Modifier.fillMaxWidth().toggleable(!prefs.hidden, role = Role.Switch) { prefs.updateHidden(!it) }
+        .nameOnly("Show companion bubble, A floating shortcut on Home, Workspaces and Hosts; other screens keep it in the top bar.")
         .padding(vertical = 12.dp).testTag("companion-bubble-setting"), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Show companion bubble", style = MaterialTheme.typography.bodyLarge)
@@ -336,7 +337,7 @@ internal fun CompanionDock(state: CompanionDockState) {
             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
                 .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
                 .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-                .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count) }
+                .semantics { contentDescription = bubbleDescription(state.name, state.count) }
                 .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DockAvatar(state)
                 Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -354,7 +355,7 @@ internal fun CompanionRailDock(state: CompanionDockState) {
     state.talk?.let { DockTalk(it, state.name) }
     Box(Modifier.size(48.dp).clip(CircleShape)
         .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-        .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count) }
+        .semantics { contentDescription = bubbleDescription(state.name, state.count) }
         .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
 }
 
@@ -380,8 +381,8 @@ private fun DockAvatar(state: CompanionDockState) {
 @Composable
 private fun DockTalk(talk: BubbleTalk, name: String) {
     val listening = talk.state !is TalkState.Idle
-    if (talk.state is TalkState.Listening) IconButton(onClick = talk.cancel) {
-        Icon(Icons.Filled.Close, contentDescription = "Cancel recording", tint = VerdeColors.Muted)
+    if (talk.state is TalkState.Listening) IconButton(onClick = talk.cancel, modifier = Modifier.named("Cancel recording")) {
+        Icon(Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Muted)
     }
     IconButton(onClick = {
         when {
@@ -389,13 +390,13 @@ private fun DockTalk(talk: BubbleTalk, name: String) {
             talk.speaking -> talk.stopSpeaking()
             else -> talk.start()
         }
-    }) {
-        Icon(painterResource(if (talk.speaking && !listening) R.drawable.ic_waveform else R.drawable.ic_mic),
-            contentDescription = when {
+    }, modifier = Modifier.named(when {
                 listening -> "Stop and send"
                 talk.speaking -> "Stop speaking"
                 else -> "Talk to $name"
-            }, tint = if (listening || talk.speaking) VerdeColors.Accent else VerdeColors.Text, modifier = Modifier.size(20.dp))
+            })) {
+        Icon(painterResource(if (talk.speaking && !listening) R.drawable.ic_waveform else R.drawable.ic_mic),
+            contentDescription = null, tint = if (listening || talk.speaking) VerdeColors.Accent else VerdeColors.Text, modifier = Modifier.size(20.dp))
     }
 }
 

@@ -73,7 +73,7 @@ internal fun AppearanceSettingsSection() {
     var choosing by remember { mutableStateOf(false) }
     // A standard two-line row: Theme and its value, the palette as trailing preview.
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(role = Role.Button, onClickLabel = "Change theme") { choosing = true }
-        .semantics(mergeDescendants = true) {}.padding(vertical = 8.dp).testTag("appearance-theme-picker"),
+        .nameOnly("Theme, ${settings.mode.label}").padding(vertical = 8.dp).testTag("appearance-theme-picker"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text("Theme", style = MaterialTheme.typography.bodyLarge)
@@ -89,7 +89,7 @@ internal fun AppearanceSettingsSection() {
             LazyColumn(Modifier.heightIn(max = 420.dp).testTag("appearance-theme-list").selectableGroup()) {
                 items(AppearanceMode.entries, key = { it.name }) { mode ->
                     Row(Modifier.fillMaxWidth().selectable(selected = settings.mode == mode, role = Role.RadioButton,
-                        onClick = { settings.select(mode); choosing = false }).heightIn(min = 48.dp).padding(vertical = 4.dp),
+                        onClick = { settings.select(mode); choosing = false }).nameOnly(mode.label).heightIn(min = 48.dp).padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = settings.mode == mode, onClick = null)
                         Text(mode.label, Modifier.weight(1f).padding(horizontal = 8.dp))

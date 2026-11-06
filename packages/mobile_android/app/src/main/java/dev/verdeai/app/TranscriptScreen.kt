@@ -4,6 +4,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -39,6 +40,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -212,9 +214,9 @@ internal fun TranscriptScreen(
             navigationIcon = {
                 // Beside a permanent sidebar neither has a job: chats are switched from the list.
                 if (!tier.docked) Row {
-                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
+                    IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) }
                     openDrawer?.let { open ->
-                        IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
+                        IconButton(onClick = open, modifier = Modifier.named("Open workspace drawer")) { Icon(Icons.Filled.Menu, contentDescription = null) }
                     }
                 }
             },
@@ -222,8 +224,8 @@ internal fun TranscriptScreen(
                 // Git actions never sit between the companion and ⋯: they get the row under the header.
                 if (onThreadAction != null) Box {
                     val thread = state.thread?.thread
-                    IconButton(onClick = { chatMenu = true }, enabled = thread != null) {
-                        Icon(Icons.Filled.MoreVert, contentDescription = "Chat actions", modifier = Modifier.rotate(90f))
+                    IconButton(onClick = { chatMenu = true }, enabled = thread != null, modifier = Modifier.named("Chat actions")) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = null, modifier = Modifier.rotate(90f))
                     }
                     DropdownMenu(expanded = chatMenu, onDismissRequest = { chatMenu = false }) {
                         LiveOverMenu()
@@ -242,17 +244,27 @@ internal fun TranscriptScreen(
         }
         // A-KB: a tap on the transcript (not taken by a control) or a scroll drag puts the keyboard away.
         val dismissKeyboard = rememberKeyboardDismiss()
-        // A5-3: Tab from inside the transcript goes on to the composer. The reversed lazy list can't
-        // hand focus past its last composed row, so the default search wrapped back to the header
-        // and the composer, its chips and Send were never reached. (Arrow keys move between rows.)
+        // A5-3 / S29: Tab walks every control in the transcript (Copy code, row actions, disclosure
+        // headers). The reversed lazy list can't hand focus on past its last composed row, so when a
+        // Tab would wrap back to the header it goes on to the composer instead (its chips and Send).
         val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+        val tabScope = rememberCoroutineScope()
+        var transcriptFocused by remember { mutableStateOf(false) }
         Box(Modifier.weight(1f).fillMaxWidth().dismissKeyboardOnTouch(dismissKeyboard)
             .onPreviewKeyEvent { event ->
                 val tab = event.key == androidx.compose.ui.input.key.Key.Tab && !event.isShiftPressed &&
                     event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
-                if (tab) composerFocus.requestFocus()
+                if (tab) {
+                    focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Next)
+                    tabScope.launch {
+                        withFrameNanos { }
+                        withFrameNanos { }
+                        if (!transcriptFocused) runCatching { composerFocus.requestFocus() }
+                    }
+                }
                 tab
-            }.focusGroup()) {
+            }.onFocusChanged { transcriptFocused = it.hasFocus }.focusGroup()) {
             CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard) {
             when (val placeholder = transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, renderers)
@@ -395,8 +407,11 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             Modifier.fillMaxWidth()
                 .background(when { steer != null -> VerdeColors.Panel; mine -> VerdeColors.UserBubble; else -> VerdeColors.Assistant }, RoundedCornerShape(10.dp))
                 .border(1.dp, if (mine) VerdeColors.UserBubble else VerdeColors.Border, RoundedCornerShape(10.dp))
+                // S29: a message is focusable and long-pressable, not an unnamed tap target (the
+                // transcript already puts the keyboard away on a tap).
                 .focusRequester(rowFocus)
-                .combinedClickable(onClick = { dismissKeyboard?.invoke() }, onLongClickLabel = "Message actions", onLongClick = { menu = true })
+                .focusable()
+                .longPressMenu("Message actions") { menu = true }
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
@@ -455,6 +470,7 @@ internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = androidx.compose.ui.semantics.Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
+            .nameOnly(if (commandRunning(row)) "Thinking…" else "Thought", state = if (disclosure.expanded) "Expanded" else "Collapsed")
             .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Icon(toolKindPainter(ToolKind.Think), contentDescription = null, tint = colors.outline, modifier = Modifier.size(16.dp))
             Text(if (commandRunning(row)) "Thinking…" else "Thought", style = MaterialTheme.typography.labelMedium, color = colors.outline)

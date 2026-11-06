@@ -37,6 +37,7 @@ import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -282,8 +283,8 @@ internal fun Chevron(expanded: Boolean, modifier: Modifier = Modifier) {
 @Composable
 internal fun CopyIconButton(label: String, text: () -> String) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    IconButton(onClick = { clipboard.setText(AnnotatedString(text())) }) {
-        Icon(painterResource(R.drawable.ic_copy), contentDescription = label, tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    IconButton(onClick = { clipboard.setText(AnnotatedString(text())) }, modifier = Modifier.named(label)) {
+        Icon(painterResource(R.drawable.ic_copy), contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.size(18.dp))
     }
 }
@@ -302,9 +303,12 @@ internal fun ToolRow(row: ChatRow, child: Boolean) {
         else -> Modifier
     }
     Column(Modifier.fillMaxWidth().then(frame)) {
+        // S29: the header's clickable node carries its name and state; Copy output sits over it as
+        // its own target (outside the cleared subtree) so it stays reachable by TalkBack and Tab.
+        Box(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
-            .semantics(mergeDescendants = true) {
+            .clearAndSetSemantics {
                 contentDescription = toolRowLabel(display, row)
                 stateDescription = if (disclosure.expanded) "Expanded" else "Collapsed"
             }
@@ -316,9 +320,13 @@ internal fun ToolRow(row: ChatRow, child: Boolean) {
             Text(display.summary.orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariant)
             ToolStatusIcon(row)
-            if (disclosure.expanded) CopyIconButton("Copy output") { toolCopyText(display, row) }
-            else Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(if (disclosure.expanded) 48.dp else 4.dp))
             Chevron(disclosure.expanded, Modifier.padding(end = 8.dp))
+        }
+        // End inset: row padding 4 + chevron 20 + its padding 8 + the 8dp gap before it.
+        if (disclosure.expanded) Box(Modifier.align(Alignment.CenterEnd).padding(end = 40.dp)) {
+            CopyIconButton("Copy output") { toolCopyText(display, row) }
+        }
         }
         if (disclosure.expanded) ToolBody(row, display)
     }
@@ -415,7 +423,7 @@ internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContex
     Column(Modifier.fillMaxWidth().border(1.dp, colors.outlineVariant, shape).background(colors.surfaceContainerLow, shape)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
-            .semantics(mergeDescendants = true) {
+            .clearAndSetSemantics {
                 contentDescription = summary
                 stateDescription = if (disclosure.expanded) "Expanded" else "Collapsed"
             }

@@ -108,7 +108,7 @@ internal fun FileViewerScreen(
         if (toggle != null) TextButton(onClick = { formatted = !formatted }) { Text(toggle) }
         if (model.path != null) {
             if (saving) CircularProgressIndicator(Modifier.padding(12.dp).size(24.dp).testTag("file-saving"), strokeWidth = 2.dp)
-            else IconButton(onClick = download) { Icon(DownloadIcon, contentDescription = "Download file") }
+            else IconButton(onClick = download, modifier = Modifier.named("Download file")) { Icon(DownloadIcon, contentDescription = null) }
         }
     }) {
         val content = state.content
@@ -181,7 +181,7 @@ private fun FileScaffold(title: String, subtitle: String?, onBack: () -> Unit,
                     subtitle?.let { Text(it, style = MaterialTheme.typography.labelMedium) }
                 }
             },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } },
             actions = actions)
         Box(Modifier.weight(1f).fillMaxWidth()) { body() }
     }

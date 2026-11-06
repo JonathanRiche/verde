@@ -335,7 +335,7 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
             Column(Modifier.safeDrawingPadding()) {
                 VerdeTopBar(showWorkspaceMenu = false,
                     title = { Text(path, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = MaterialTheme.typography.titleSmall) },
-                    navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "Close diff") } },
+                    navigationIcon = { IconButton(onClick = onClose, modifier = Modifier.named("Close diff")) { Icon(Icons.Filled.Close, contentDescription = null) } },
                     actions = {
                         FilterChip(selected = wrap, onClick = { wrap = !wrap }, label = { Text("Wrap lines") })
                         TextButton(onClick = { if (patch != null) clipboard.setText(AnnotatedString(patch)) },

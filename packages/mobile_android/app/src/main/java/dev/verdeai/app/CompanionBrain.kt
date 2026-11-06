@@ -133,7 +133,7 @@ internal fun CompanionBrainSheet(companion: CompanionModel, manage: ManageModel,
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(dialogText)
-                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(skipBrief, role = Role.Checkbox) { skipBrief = it },
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(skipBrief, role = Role.Checkbox) { skipBrief = it }.nameOnly("Skip the brief"),
                     verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = skipBrief, onCheckedChange = null)
                     Text("Skip the brief", Modifier.padding(start = 8.dp))
@@ -147,7 +147,7 @@ internal fun CompanionBrainSheet(companion: CompanionModel, manage: ManageModel,
 @Composable
 private fun BrainRow(label: String, reason: String?, selected: Boolean, enabled: Boolean, leading: (@Composable () -> Unit)? = null, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
-        .padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        .nameOnly(listOfNotNull(label, reason).joinToString(", ")).padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         RadioButton(selected = selected, onClick = null, enabled = enabled)
         leading?.invoke()
         Column(Modifier.weight(1f)) {

@@ -1,6 +1,9 @@
 package dev.verdeai.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,11 +33,12 @@ internal fun HostSwitcher(model: HostsModel, onSwitched: () -> Unit, onPairing: 
     val active = state.rows.find { it.saved.id == state.active }
     Box {
         // S22: the host pill (iOS parity): status dot, name, chevron; a 48dp target.
-        OutlinedButton(onClick = { expanded = true }, enabled = !state.loading, shape = RoundedCornerShape(50),
-            border = androidx.compose.foundation.BorderStroke(1.dp, VerdeColors.Border),
-            contentPadding = PaddingValues(start = 12.dp, end = 6.dp),
-            modifier = Modifier.heightIn(min = 48.dp).widthIn(max = 200.dp)
-                .semantics { contentDescription = "Host: ${active?.saved?.label ?: "none"}" + (active?.let { ", ${hostStatus(it)}" } ?: "") + ". Switch host" }) {
+        val pill = RoundedCornerShape(50)
+        // S29: the pill's clickable node carries its name (not an unnamed wrapper over named text).
+        Row(Modifier.heightIn(min = 48.dp).widthIn(max = 200.dp).clip(pill).border(1.dp, VerdeColors.Border, pill)
+            .clickable(enabled = !state.loading, role = androidx.compose.ui.semantics.Role.Button) { expanded = true }
+            .nameOnly("Host: ${active?.saved?.label ?: "none"}" + (active?.let { ", ${hostStatus(it)}" } ?: "") + ". Switch host")
+            .padding(start = 12.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             active?.let { Box(Modifier.size(8.dp).background(hostDotColor(it), CircleShape)) }
             Spacer(Modifier.width(6.dp))
             Text(active?.saved?.label ?: "Choose host", style = MaterialTheme.typography.labelLarge, color = VerdeColors.Text,

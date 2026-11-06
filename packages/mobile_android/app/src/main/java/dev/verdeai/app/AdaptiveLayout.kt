@@ -152,8 +152,8 @@ internal fun SidebarRail(onExpand: () -> Unit, onNewChat: () -> Unit, dock: (@Co
     Column(Modifier.fillMaxHeight().background(VerdeColors.Panel)
         .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Start + WindowInsetsSides.Vertical))
         .width(SIDEBAR_RAIL_WIDTH), horizontalAlignment = Alignment.CenterHorizontally) {
-        IconButton(onClick = onExpand) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Expand sidebar") }
-        IconButton(onClick = onNewChat) { Icon(Icons.Filled.Add, "New chat") }
+        IconButton(onClick = onExpand, modifier = Modifier.named("Expand sidebar")) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) }
+        IconButton(onClick = onNewChat, modifier = Modifier.named("New chat")) { Icon(Icons.Filled.Add, null) }
         Spacer(Modifier.weight(1f))
         dock?.invoke(this)
     }

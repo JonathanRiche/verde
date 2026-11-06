@@ -49,7 +49,7 @@ internal fun VoiceBlock(item: TranscriptItem.Voice, ctx: TranscriptContext, comp
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             Column(Modifier.align(Alignment.CenterEnd).widthIn(max = maxWidth * (if (compact) .8f else .9f))
                 .background(VerdeColors.UserBubble, RoundedCornerShape(if (compact) 12.dp else 10.dp))
-                .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+                .longPressMenu("Copy message") { menu = true }
                 .padding(horizontal = if (compact) 10.dp else 12.dp, vertical = if (compact) 8.dp else 10.dp),
                 horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 VoiceLabel(label, user = true)
@@ -66,7 +66,7 @@ internal fun VoiceBlock(item: TranscriptItem.Voice, ctx: TranscriptContext, comp
         val card = if (compact) Modifier.padding(horizontal = 2.dp, vertical = 2.dp)
             else Modifier.background(VerdeColors.Assistant, RoundedCornerShape(10.dp)).border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))
         Column(Modifier.fillMaxWidth().then(card)
-            .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+            .longPressMenu("Copy message") { menu = true }
             .then(if (compact) Modifier else Modifier.padding(horizontal = 12.dp, vertical = 10.dp)),
             verticalArrangement = Arrangement.spacedBy(2.dp)) {
             VoiceLabel(label, user = false)
@@ -95,7 +95,7 @@ internal fun VoiceNote(row: ChatRow) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth()) {
-        Row(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+        Row(Modifier.fillMaxWidth().longPressMenu("Copy message") { menu = true }
             .padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Icon(painterResource(R.drawable.ic_mic), contentDescription = "Live voice", tint = VerdeColors.Subtle,
                 modifier = Modifier.padding(top = 2.dp).size(12.dp))
@@ -120,7 +120,7 @@ private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             Column(Modifier.align(Alignment.CenterEnd).widthIn(max = maxWidth * .8f)
                 .background(VerdeColors.UserBubble, RoundedCornerShape(12.dp))
-                .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+                .longPressMenu("Copy message") { menu = true }
                 .padding(horizontal = 10.dp, vertical = 8.dp), horizontalAlignment = Alignment.End) {
                 Text(row.body, style = MaterialTheme.typography.bodyMedium)
                 delivery?.let { Text(it, style = MaterialTheme.typography.labelSmall,
@@ -134,7 +134,7 @@ private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
         return
     }
     Box(Modifier.fillMaxWidth()) {
-        Column(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+        Column(Modifier.fillMaxWidth().longPressMenu("Copy message") { menu = true }
             .padding(horizontal = 2.dp, vertical = 2.dp)) {
             if (row.body.isNotEmpty()) MarkdownText(streamTail(row), ctx.model, ctx.onCitation)
             delivery?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) }

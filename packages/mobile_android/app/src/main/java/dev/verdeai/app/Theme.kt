@@ -2,6 +2,10 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -14,7 +18,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
@@ -274,7 +285,7 @@ internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composa
             navigationIcon()
             // The drawer button always sits next to Back on the leading side (iOS and the chat header).
             if (showWorkspaceMenu) LocalWorkspaceMenu.current?.let { open ->
-                IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
+                IconButton(onClick = open, modifier = Modifier.named("Open workspace drawer")) { Icon(Icons.Filled.Menu, contentDescription = null) }
             }
             Box(Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 6.dp)) {
                 ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
@@ -301,5 +312,51 @@ internal fun DialogSystemBars(dark: Boolean = VerdeColors.dark) {
                 isAppearanceLightNavigationBars = !dark
             }
         }
+    }
+}
+
+/**
+ * S29: a control's name on its own clickable node (the icon inside passes `contentDescription = null`),
+ * so TalkBack and dumps never see a clickable without a name above a named child.
+ */
+internal fun Modifier.named(label: String): Modifier = semantics { contentDescription = label }
+
+/**
+ * S29: a long-press-only target (message bubbles): no tap, so no unnamed, undersized clickable
+ * node; TalkBack still offers the long-press action by [label].
+ */
+internal fun Modifier.longPressMenu(label: String, onLongPress: () -> Unit): Modifier =
+    pointerInput(Unit) { detectTapGestures(onLongPress = { onLongPress() }) }
+        .semantics { onLongClick(label) { onLongPress(); true } }
+
+/**
+ * S29: the clickable node carries the whole name and its children add none, so TalkBack and dumps
+ * see one named target (not an unnamed clickable over a named child). Chain it after the clickable.
+ */
+internal fun Modifier.nameOnly(label: String, selected: Boolean? = null, state: String? = null): Modifier = clearAndSetSemantics {
+    contentDescription = label
+    if (selected != null) this.selected = selected
+    if (state != null) stateDescription = state
+}
+
+/**
+ * S29: a text button whose clickable node is the one named target (Material buttons hand their
+ * label to an unnamed wrapper's child). [container] null draws a text button.
+ */
+@Composable
+internal fun NamedButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
+    container: Color? = null, content: Color = MaterialTheme.colorScheme.primary,
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(20.dp),
+    padding: PaddingValues = PaddingValues(horizontal = 12.dp), shadow: Dp = 0.dp,
+    border: androidx.compose.foundation.BorderStroke? = null,
+    body: @Composable RowScope.() -> Unit = { Text(label) }) {
+    val ink = if (enabled) content else content.copy(alpha = .38f)
+    Row(modifier.minimumInteractiveComponentSize().heightIn(min = 40.dp)
+        .then(if (shadow > 0.dp) Modifier.shadow(shadow, shape) else Modifier)
+        .clip(shape).then(if (container != null) Modifier.background(container, shape) else Modifier)
+        .then(if (border != null) Modifier.border(border, shape) else Modifier)
+        .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick).nameOnly(label)
+        .padding(padding), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+        CompositionLocalProvider(LocalContentColor provides ink, LocalTextStyle provides MaterialTheme.typography.labelLarge) { body() }
     }
 }

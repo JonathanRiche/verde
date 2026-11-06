@@ -175,7 +175,7 @@ internal fun SelectionBar(picked: PickedLines?, onAsk: () -> Unit, onClear: () -
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     Surface(modifier.fillMaxWidth().testTag(SELECTION_BAR_TAG), color = VerdeColors.PanelAlt, tonalElevation = 3.dp) {
         Row(Modifier.navigationBarsPadding().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onClear) { Icon(Icons.Filled.Close, contentDescription = "Clear selection") }
+            IconButton(onClick = onClear, modifier = Modifier.named("Clear selection")) { Icon(Icons.Filled.Close, contentDescription = null) }
             Text(picked?.let(::linesLabel) ?: "Nothing to ask about", Modifier.weight(1f),
                 style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
             TextButton(onClick = { picked?.let { clipboard.setText(AnnotatedString(it.text)) } }, enabled = picked != null) { Text("Copy") }

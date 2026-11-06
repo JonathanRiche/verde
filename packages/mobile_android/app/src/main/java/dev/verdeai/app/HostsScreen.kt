@@ -164,9 +164,13 @@ private fun HostHeading(row: HostRow, selected: Boolean, enabled: Boolean, onOpe
     onRename: () -> Unit, onSignOut: (() -> Unit)?) {
     var menu by remember(row.saved.id) { mutableStateOf(false) }
     val status = hostStatus(row)
-    Row(Modifier.fillMaxWidth().heightIn(min=64.dp)
+    // S29: the row's clickable part is one named node; the actions button beside it stays its own target.
+    val name = listOfNotNull(row.saved.label, status, "Selected".takeIf { selected }).joinToString(", ")
+    Row(Modifier.fillMaxWidth().heightIn(min=64.dp), verticalAlignment=Alignment.CenterVertically,
+        horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+    Row(Modifier.weight(1f).heightIn(min=64.dp)
         .then(if (onOpen != null) Modifier.clickable(role=Role.Button, onClickLabel=if (row.view?.auth_state == "paired") "Use ${row.saved.label}" else "Pair", onClick=onOpen) else Modifier)
-        .semantics(mergeDescendants=true) { contentDescription = listOfNotNull(row.saved.label, status, "Selected".takeIf { selected }).joinToString(", ") }
+        .nameOnly(name)
         .padding(vertical=8.dp), verticalAlignment=Alignment.CenterVertically,
         horizontalArrangement=Arrangement.spacedBy(12.dp)) {
         Surface(color=if (selected) VerdeColors.AccentWash else VerdeColors.PanelAlt,
@@ -185,9 +189,10 @@ private fun HostHeading(row: HostRow, selected: Boolean, enabled: Boolean, onOpe
         // S21: the selected host shows a check, never "Use" again; others get a chevron.
         if (selected) Icon(Icons.Filled.Check, contentDescription=null, tint=VerdeColors.Accent)
         else if (onOpen != null) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription=null, tint=VerdeColors.Muted)
+    }
         Box {
-            IconButton(onClick={ menu=true }, enabled=enabled) {
-                Icon(Icons.Filled.MoreVert, contentDescription="Actions for ${row.saved.label}", modifier=Modifier.rotate(90f))
+            IconButton(onClick={ menu=true }, enabled=enabled, modifier = Modifier.named("Actions for ${row.saved.label}")) {
+                Icon(Icons.Filled.MoreVert, contentDescription = null, modifier=Modifier.rotate(90f))
             }
             DropdownMenu(expanded=menu, onDismissRequest={ menu=false }) {
                 LiveOverMenu()

@@ -116,8 +116,8 @@ private fun GitPrimaryAction(model: GitChangesModel, state: GitChangesState, acc
                 if (summary.files > 0) Text((summary.files - summary.attention).coerceAtLeast(0).toString(), Modifier.padding(start = 8.dp).background(color.copy(alpha = .16f), CircleShape).padding(horizontal = 6.dp, vertical = 2.dp), color = color)
             }
             if (writable) Box {
-                IconButton(onClick = { menu = true }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.size(44.dp)) {
-                    Icon(Icons.Filled.KeyboardArrowDown, "Git actions", tint = color)
+                IconButton(onClick = { menu = true }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.size(44.dp).named("Git actions")) {
+                    Icon(Icons.Filled.KeyboardArrowDown, null, tint = color)
                 }
                 DropdownMenu(menu, onDismissRequest = { menu = false }) {
                     LiveOverMenu()
@@ -203,7 +203,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("COMMIT MESSAGE", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
                 if (state.generating) Text("Generating…", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
-                IconButton(onClick = model::regenerate, enabled = !state.busy && !state.generating && state.fileCount > 0) { Icon(Icons.Filled.Refresh, "Regenerate commit message") }
+                IconButton(onClick = model::regenerate, enabled = !state.busy && !state.generating && state.fileCount > 0, modifier = Modifier.named("Regenerate commit message")) { Icon(Icons.Filled.Refresh, null) }
             }
             OutlinedTextField(state.typedMessage, onValueChange = model::message, modifier = Modifier.fillMaxWidth().testTag("git-message"),
                 enabled = !state.busy, minLines = 2, maxLines = 4,
@@ -324,7 +324,7 @@ internal fun GitResultCard(notice: GitNotice?, model: GitChangesModel, modifier:
                 if (notice.detail.isNotBlank()) Text(notice.detail, style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 if (notice.rejectedRoots.isNotEmpty()) TextButton(onClick = { model.push(true) }) { Text("Pull & push") }
             }
-            if (notice.phase != GitResultPhase.Running) IconButton(onClick = { model.dismissNotice(notice.id) }, modifier = Modifier.size(44.dp)) { Icon(Icons.Filled.Close, "Dismiss Git result") }
+            if (notice.phase != GitResultPhase.Running) IconButton(onClick = { model.dismissNotice(notice.id) }, modifier = Modifier.size(44.dp).named("Dismiss Git result")) { Icon(Icons.Filled.Close, null) }
         }
     }
 }

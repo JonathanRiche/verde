@@ -104,7 +104,7 @@ internal fun NotificationSettingsSection() {
     VerdeSection("Notifications")
     Row(Modifier.fillMaxWidth().toggleable(state.enabled, enabled = state.loaded && state.available, role = Role.Switch) { on ->
         if (on) enable() else scope.launch { controls.setEnabled(false) }
-    }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+    }.nameOnly("Agent notifications, ${pushStatusText(state)}").padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text("Agent notifications")
             Text(pushStatusText(state), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

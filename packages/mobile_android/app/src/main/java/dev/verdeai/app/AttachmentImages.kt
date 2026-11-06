@@ -260,10 +260,10 @@ private fun ImageViewer(file: File?, local: ByteArray?, mime: String, label: Str
                         .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offsetX, translationY = offsetY))
             } ?: CircularProgressIndicator(Modifier.align(Alignment.Center))
             Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(8.dp)) {
-                if (file != null) IconButton(onClick = { shareImage(context, file, mime) }) {
-                    Icon(Icons.Filled.Share, contentDescription = "Share image", tint = Color.White)
+                if (file != null) IconButton(onClick = { shareImage(context, file, mime) }, modifier = Modifier.named("Share image")) {
+                    Icon(Icons.Filled.Share, contentDescription = null, tint = Color.White)
                 }
-                IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = "Close image", tint = Color.White) }
+                IconButton(onClick = onDismiss, modifier = Modifier.named("Close image")) { Icon(Icons.Filled.Close, contentDescription = null, tint = Color.White) }
             }
         }
     }

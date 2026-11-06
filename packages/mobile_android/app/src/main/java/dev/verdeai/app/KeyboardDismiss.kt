@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -34,19 +35,31 @@ internal fun rememberKeyboardDismiss(): () -> Unit {
 
 /**
  * A-KB: a tap on this area that no control consumed, or a user scroll inside it, dismisses the
- * keyboard. Rows and buttons keep their own taps; programmatic scrolls (following output) don't count.
+ * keyboard. Rows and buttons keep their own taps; programmatic scrolls (following output) don't count,
+ * and neither do scrolls with no finger down (S29: Tab bringing a focused row into view must not
+ * drop the focus it just moved).
  */
-internal fun Modifier.dismissKeyboardOnTouch(dismiss: () -> Unit): Modifier = this
-    .nestedScroll(object : NestedScrollConnection {
-        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-            if (source == NestedScrollSource.UserInput && available.y != 0f) dismiss()
-            return Offset.Zero
+internal fun Modifier.dismissKeyboardOnTouch(dismiss: () -> Unit): Modifier = composed {
+    val touching = remember { booleanArrayOf(false) }
+    this
+        .nestedScroll(remember(dismiss) {
+            object : NestedScrollConnection {
+                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                    if (touching[0] && source == NestedScrollSource.UserInput && available.y != 0f) dismiss()
+                    return Offset.Zero
+                }
+            }
+        })
+        .pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) touching[0] = awaitPointerEvent(PointerEventPass.Initial).changes.any { it.pressed }
+            }
         }
-    })
-    .pointerInput(dismiss) {
-        awaitEachGesture {
-            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
-            val up = waitForUpOrCancellation(PointerEventPass.Final)
-            if (up != null && !up.isConsumed) dismiss()
+        .pointerInput(dismiss) {
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
+                val up = waitForUpOrCancellation(PointerEventPass.Final)
+                if (up != null && !up.isConsumed) dismiss()
+            }
         }
-    }
+}
