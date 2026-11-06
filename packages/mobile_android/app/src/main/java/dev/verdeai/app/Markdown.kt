@@ -28,6 +28,9 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import dev.verdeai.core.*
 
 /**
@@ -223,9 +226,11 @@ private fun MdBlockView(block: MdBlock, model: HighlightSource) {
     val type = MaterialTheme.typography
     when (block) {
         is MdBlock.Paragraph -> Text(block.text, style = type.bodyMedium)
-        is MdBlock.Heading -> Text(block.text,
-            color = when (block.level) { 1 -> VerdeColors.Heading1; 2 -> VerdeColors.Heading2; 3 -> VerdeColors.Heading3; else -> VerdeColors.Heading4 },
-            style = (when (block.level) { 1 -> type.headlineMedium; 2 -> type.headlineSmall; else -> type.titleLarge }))
+        // S15: headings use the body family (semibold, onSurface), as on iOS; the display face is for app titles.
+        is MdBlock.Heading -> Text(block.text, Modifier.semantics { heading() }, color = MaterialTheme.colorScheme.onSurface,
+            style = androidx.compose.ui.text.TextStyle(fontFamily = VerdeSans, fontWeight = FontWeight.SemiBold,
+                fontSize = when (block.level) { 1 -> 20.sp; 2 -> 18.sp; 3 -> 16.sp; else -> 15.sp },
+                lineHeight = when (block.level) { 1 -> 26.sp; 2 -> 24.sp; 3 -> 22.sp; else -> 21.sp }))
         is MdBlock.Bullets -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             block.items.forEachIndexed { index, item ->
                 Row {

@@ -41,4 +41,27 @@ class ScreenSpecTest {
         assertEquals("/", labels["/"])
         assertEquals(paths.size, labels.values.distinct().size)
     }
+
+    @Test fun sharedWorkspaceNamesGetTheirParentFolder() {
+        fun ws(id: String, label: String, path: String) = dev.verdeai.core.Workspace(id, label, path, open = false, panes = emptyList(), threads = emptyList())
+        val labels = workspaceLabels(listOf(ws("a", "scripts", "/tmp/x/demo/scripts"), ws("b", "scripts", "/tmp/y/nope/scripts"),
+            ws("c", "scripts", "/tmp/y/nope/scripts"), ws("d", "web", "/srv/web")))
+        assertEquals("web", labels["d"])
+        assertEquals("scripts · demo", labels["a"])
+        assertEquals("scripts · nope", labels["b"])
+        assertEquals("scripts · nope (2)", labels["c"])
+    }
+
+    @Test fun textRolesReadOnEverySurface() {
+        for (p in listOf(DarkPalette, LightPalette).map { it.readable() }) {
+            for (fg in listOf(p.Subtle, p.Muted, p.Accent, p.Warning, p.Danger, p.Text)) for (bg in listOf(p.Background, p.Panel)) {
+                assertTrue("contrast ${contrast(fg, bg)}", contrast(fg, bg) >= 4.5f)
+            }
+            assertTrue(contrast(p.Subtle, p.PanelAlt) >= 4.5f)
+        }
+    }
+
+    @Test fun licencesReflowAndHaveNoPlaceholders() {
+        assertEquals("one two\n\nthree", reflowLicence("one\ntwo\n\n three \n"))
+    }
 }

@@ -15,6 +15,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -189,6 +190,11 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHos
             HorizontalDivider()
             VerdeSection("About")
             SettingValue("Version", appVersionLabel())
+            var licences by rememberSaveable { mutableStateOf(false) }
+            SettingLink("Open-source licences", "The fonts and icons verde ships with.") { licences = true }
+            val uri = androidx.compose.ui.platform.LocalUriHandler.current
+            SettingLink("Source code", SOURCE_URL.removePrefix("https://")) { uri.openUri(SOURCE_URL) }
+            if (licences) LicencesScreen { licences = false }
         }
         }
     }
@@ -229,5 +235,57 @@ private fun SettingSwitch(title: String, detail: String, checked: Boolean, enabl
             Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Switch(checked = checked, onCheckedChange = null, enabled = enabled)
+    }
+}
+
+internal const val SOURCE_URL = "https://github.com/JonathanRiche/verde"
+
+/** One bundled component and its licence text (a raw resource), shown on the Licences page. */
+internal data class BundledLicence(val name: String, val licence: String, val raw: Int?, val url: String? = null)
+
+internal val BUNDLED_LICENCES = listOf(
+    BundledLicence("Noto Sans", "SIL Open Font License 1.1", R.raw.licence_noto_sans),
+    BundledLicence("Cal Sans", "SIL Open Font License 1.1", R.raw.licence_cal_sans),
+    BundledLicence("JetBrains Mono", "SIL Open Font License 1.1", R.raw.licence_jetbrains_mono),
+    BundledLicence("Material Icons", "Apache License 2.0", null, "https://www.apache.org/licenses/LICENSE-2.0"),
+)
+
+/** Licence text reflowed for a phone: hard-wrapped lines join; blank lines stay paragraph breaks. */
+internal fun reflowLicence(text: String): String =
+    text.replace("\r\n", "\n").split(Regex("\n\\s*\n")).joinToString("\n\n") { para ->
+        para.lines().map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ")
+    }.trim()
+
+/** S15: every bundled font's licence in full (no template placeholders), selectable. */
+@Composable
+private fun LicencesScreen(onClose: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val uri = androidx.compose.ui.platform.LocalUriHandler.current
+    androidx.compose.ui.window.Dialog(onDismissRequest = onClose,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        LiveOverModal()
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+                VerdeTopBar(title = { Text("Open-source licences") }, showWorkspaceMenu = false, companion = false,
+                    navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+                androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+                    BUNDLED_LICENCES.forEach { item ->
+                        item(key = item.name) {
+                            Column(Modifier.padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(item.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+                                Text(item.licence, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                val text = remember(item.raw) {
+                                    item.raw?.let { id -> context.resources.openRawResource(id).bufferedReader().use { r -> reflowLicence(r.readText()) } }
+                                }
+                                if (text != null) androidx.compose.foundation.text.selection.SelectionContainer {
+                                    Text(text, style = MaterialTheme.typography.bodySmall)
+                                }
+                                item.url?.let { url -> TextButton(onClick = { uri.openUri(url) }, contentPadding = PaddingValues(horizontal = 0.dp)) { Text(url) } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
