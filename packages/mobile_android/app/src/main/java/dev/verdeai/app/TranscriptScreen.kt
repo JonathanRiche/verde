@@ -38,6 +38,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
@@ -334,16 +336,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     Column(Modifier.fillMaxSize()) {
     Box(Modifier.weight(1f).fillMaxWidth()) {
         CompositionLocalProvider(LocalDisclosureAnchor provides anchor, LocalDisclosureStore provides disclosures) {
-        // S20: when the viewport changes height (keyboard, attachment strip, composer growth) the
-        // reading position holds: at the bottom it stays at the bottom (the reversed list anchors
-        // there); scrolled up, the top row stays put instead of sliding under the header.
-        var viewport by remember { mutableIntStateOf(-1) }
-        LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST)
-            .onSizeChanged { size ->
-                val before = viewport
-                viewport = size.height
-                if (before > 0 && before != size.height && !atBottom) list.dispatchRawDelta((before - size.height).toFloat())
-            }, state = list, reverseLayout = true,
+        LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST).keepTopRowOnResize(list) { atBottom }, state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->
                 CompositionLocalProvider(LocalTranscriptIndex provides index) { TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
@@ -388,6 +381,9 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
     var selecting by remember { mutableStateOf(false) }
+    // A6-2: closing a menu or the Select text dialog returns focus here, not to the header's Back.
+    val rowFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    var refocus by remember { mutableIntStateOf(0) }
     val dismissKeyboard = LocalDismissKeyboard.current
     val mine = row.role == "user"
     // Steers from an orchestrating parent agent show only its words, labelled as the parent.
@@ -399,6 +395,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             Modifier.fillMaxWidth()
                 .background(when { steer != null -> VerdeColors.Panel; mine -> VerdeColors.UserBubble; else -> VerdeColors.Assistant }, RoundedCornerShape(10.dp))
                 .border(1.dp, if (mine) VerdeColors.UserBubble else VerdeColors.Border, RoundedCornerShape(10.dp))
+                .focusRequester(rowFocus)
                 .combinedClickable(onClick = { dismissKeyboard?.invoke() }, onLongClickLabel = "Message actions", onLongClick = { menu = true })
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -425,7 +422,15 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(body)) })
             DropdownMenuItem(text = { Text("Select text") }, onClick = { menu = false; selecting = true })
         }
-        if (selecting) SelectTextDialog({ MarkdownText(body, ctx.model, ctx.onCitation) }) { selecting = false }
+        if (selecting) SelectTextDialog({ MarkdownText(body, ctx.model, ctx.onCitation) }) {
+            selecting = false
+            refocus++
+        }
+        LaunchedEffect(refocus) {
+            if (refocus == 0) return@LaunchedEffect
+            withFrameNanos { }
+            runCatching { rowFocus.requestFocus() }
+        }
     }
 }
 
@@ -637,4 +642,27 @@ private fun FailedSend(row: ChatRow, model: TranscriptModel) {
             TextButton(onClick = { model.removeFailed(row.id) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Remove") }
         }
     }
+}
+
+/**
+ * S20 / A6-1: when a reversed list's viewport changes height (keyboard, attachment strip, composer
+ * growth, the Latest strip) the reading position holds: at the bottom it stays at the bottom (the
+ * reversed list anchors there by itself); scrolled up, the top row stays put instead of sliding
+ * under the header. The size is only recorded during layout; the correction runs afterwards, from
+ * a coroutine, because scrolling inside a measure/layout callback crashes Compose.
+ */
+@Composable
+internal fun Modifier.keepTopRowOnResize(list: LazyListState, atBottom: () -> Boolean): Modifier {
+    val viewport = remember { mutableIntStateOf(-1) }
+    val bottom by rememberUpdatedState(atBottom)
+    LaunchedEffect(list) {
+        var last = -1
+        snapshotFlow { viewport.intValue }.collect { height ->
+            val before = last
+            last = height
+            // Outside layout: a raw delta neither takes the scroll lock nor cancels the user's drag.
+            if (before > 0 && height > 0 && before != height && !bottom()) list.dispatchRawDelta((before - height).toFloat())
+        }
+    }
+    return this.onSizeChanged { viewport.intValue = it.height }
 }
