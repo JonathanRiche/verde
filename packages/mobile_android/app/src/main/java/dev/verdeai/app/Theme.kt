@@ -12,6 +12,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -21,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.ScrollState
+import androidx.compose.ui.zIndex
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.onFocusedBoundsChanged
 import androidx.compose.ui.layout.LayoutCoordinates
@@ -61,6 +63,33 @@ internal data class VerdePalette(
     val DangerPanel: Color = Color(0xFF422829),
 ) {
     val AccentWash get() = Accent.copy(alpha = .19f)
+}
+
+/** WCAG contrast ratio of two opaque colours. */
+internal fun contrast(a: Color, b: Color): Float {
+    val la = a.luminance(); val lb = b.luminance()
+    return (maxOf(la, lb) + .05f) / (minOf(la, lb) + .05f)
+}
+
+/** [fg] moved toward [toward] until it reads at [ratio] on every one of [on] (unchanged when it already does). */
+internal fun readableOn(fg: Color, on: List<Color>, toward: Color, ratio: Float = 4.5f): Color {
+    if (on.all { contrast(fg, it) >= ratio }) return fg
+    var t = 0f
+    var out = fg
+    while (t < 1f && on.any { contrast(out, it) < ratio }) { t += .05f; out = androidx.compose.ui.graphics.lerp(fg, toward, t) }
+    return out
+}
+
+/**
+ * Text roles kept at 4.5:1 on every surface they sit on (background, panels, chips), for the built-in
+ * palettes and every bundled theme: subtle, muted, accent, warning and danger text.
+ */
+internal fun VerdePalette.readable(): VerdePalette {
+    val surfaces = listOf(Background, Panel, PanelAlt, Assistant)
+    return copy(Subtle = readableOn(Subtle, surfaces, Text), Muted = readableOn(Muted, surfaces, Text),
+        Accent = readableOn(Accent, listOf(Background, Panel, Assistant), Text),
+        Warning = readableOn(Warning, listOf(Background, Panel, Assistant), Text),
+        Danger = readableOn(Danger, listOf(Background, Panel, Assistant), Text))
 }
 
 internal val DarkPalette = VerdePalette()
@@ -120,7 +149,8 @@ internal fun VerdeTheme(content: @Composable () -> Unit) {
     val context = LocalContext.current
     val inherited = LocalAppearanceSettings.current
     val settings = inherited ?: remember(context) { AppearanceSettings(context) }
-    val palette = settings.palette(isSystemInDarkTheme())
+    val raw = settings.palette(isSystemInDarkTheme())
+    val palette = remember(raw) { raw.readable() }
     CompositionLocalProvider(LocalAppearanceSettings provides settings, LocalVerdePalette provides palette) {
         MaterialTheme(colorScheme = verdeScheme(palette), typography = VerdeTypography,
             shapes = Shapes(extraSmall = RoundedCornerShape(7.dp), small = RoundedCornerShape(7.dp),
@@ -232,18 +262,21 @@ internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null
 @Composable
 internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composable () -> Unit = {},
     showWorkspaceMenu: Boolean = true, companion: Boolean = true, actions: @Composable RowScope.() -> Unit = {}) {
-    Column(Modifier.background(VerdeColors.Panel)) {
+    // Above the content below it, so a transcript row scrolled under the bar never takes the bar's
+    // touch or accessibility area (its 48dp buttons were reported 25dp tall).
+    Column(Modifier.zIndex(1f).background(VerdeColors.Panel)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             navigationIcon()
+            // The drawer button always sits next to Back on the leading side (iOS and the chat header).
+            if (showWorkspaceMenu) LocalWorkspaceMenu.current?.let { open ->
+                IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
+            }
             Box(Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 6.dp)) {
                 ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
             }
             // S1: on content screens the companion sits here, trailing, before the screen's own actions and ⋯ menu.
             if (companion) LocalCompanionHeader.current?.let { CompanionHeaderButton(it) }
             actions()
-            if (showWorkspaceMenu) LocalWorkspaceMenu.current?.let { open ->
-                IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
-            }
         }
         HorizontalDivider(color = VerdeColors.Border)
     }
