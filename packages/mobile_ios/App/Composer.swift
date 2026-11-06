@@ -338,6 +338,10 @@ struct ChatComposer: View {
     /// place in the tree either way, so crossing the threshold keeps its text and keyboard focus.
     @Environment(\.adaptive) private var adaptive
     @State private var picker: ComposerPicker?
+    /// The picker shown as a popover on its chip (I11-4, regular width).
+    @State private var anchored: ComposerPicker?
+    @State private var popoverRowsHeight: CGFloat = 0
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var photo: PhotosPickerItem?
     /// The library picker is presented from the composer, not embedded in the attach menu: a
     /// `PhotosPicker` inside a `Menu` is torn down when the menu closes, so it never appears.
@@ -361,11 +365,9 @@ struct ChatComposer: View {
         .sheet(item: $picker) { kind in
             NavigationStack {
                 let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
-                List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
-                    Button { model.select(kind, choice.id); picker = nil } label: {
-                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: pickerChoice(kind, choice), selected: choice.id == current,
-                                  subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
-                    }.disabled(!choice.enabled)
+                List(sortedChoices(kind), id: \.id) { choice in
+                    Button { model.select(kind, choice.id); picker = nil } label: { pickerRow(kind, choice, current: current) }
+                        .disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { BarButton("Done", bold: true) { picker = nil } }
             }.presentationDetents([.medium, .large])
         }
@@ -764,8 +766,47 @@ struct ChatComposer: View {
         return composerPromptHeight(resizedHeight ?? natural, available: availableHeight, minimum: basePrompt)
     }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
+    private func sortedChoices(_ kind: ComposerPicker) -> [ChatChoice] { choices(kind).sorted { $0.favorite && !$1.favorite } }
+
+    private func pickerRow(_ kind: ComposerPicker, _ choice: ChatChoice, current: String) -> some View {
+        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: pickerChoice(kind, choice), selected: choice.id == current,
+                  subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
+    }
+
+    /// I11-4: on regular widths a picker is a popover on its chip, as tall as its rows (up to a
+    /// cap, then it scrolls, its indicator flashing so more rows read as more).
+    private func pickerPopover(_ kind: ComposerPicker) -> some View {
+        let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
+        return VStack(spacing: 0) {
+            HStack {
+                Text(kind.rawValue.capitalized).font(VerdeTheme.ui(15, bold: true)).accessibilityAddTraits(.isHeader)
+                Spacer()
+                BarButton("Done", bold: true) { anchored = nil }
+            }.padding(.leading, 16).padding(.trailing, 6)
+            Divider().overlay(VerdeTheme.border)
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(sortedChoices(kind), id: \.id) { choice in
+                        Button { model.select(kind, choice.id); anchored = nil } label: {
+                            pickerRow(kind, choice, current: current).padding(.horizontal, 16).padding(.vertical, 4)
+                        }.buttonStyle(.plain).disabled(!choice.enabled)
+                    }
+                }.onGeometryChange(for: CGFloat.self) { $0.size.height.rounded() } action: { popoverRowsHeight = $0 }
+            }
+            .scrollIndicatorsFlash(onAppear: true)
+            .frame(height: popoverRowsHeight > 0 ? min(popoverRowsHeight, 480) : nil)
+        }
+        .frame(width: 340)
+        .background(VerdeTheme.background)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    private func openPicker(_ kind: ComposerPicker) {
+        if horizontalSizeClass == .regular { anchored = kind } else { picker = kind }
+    }
+
     private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true, short: Bool = false, bare: Bool = false) -> some View {
-        Button { picker = kind } label: {
+        Button { openPicker(kind) } label: {
             HStack(spacing: 6) {
                 if kind == .model { ProviderGlyph(provider: model.displayedSelection?.provider) }
                 // S25: a bolt for Fast and a gauge for Standard, not a bare ring.
@@ -793,6 +834,9 @@ struct ChatComposer: View {
         }.buttonStyle(.plain)
             .accessibilityLabel("\(kind.rawValue.capitalized): \(selectionLabel(kind)). Change")
             .accessibilityIdentifier("composer-setting-" + kind.rawValue)
+            .popover(isPresented: Binding(get: { anchored == kind }, set: { if !$0 && anchored == kind { anchored = nil } }), arrowEdge: .bottom) {
+                pickerPopover(kind)
+            }
     }
     private var visiblePickers: [ComposerPicker] {
         guard let view = model.view else { return [] }
