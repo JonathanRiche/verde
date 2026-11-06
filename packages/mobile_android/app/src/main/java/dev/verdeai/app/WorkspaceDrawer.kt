@@ -3,6 +3,10 @@ package dev.verdeai.app
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.ui.input.pointer.*
@@ -69,8 +73,7 @@ internal data class DrawerItem(val workspace: Workspace, val thread: ThreadSumma
 }
 
 /**
- * Flat Active/Open rows by workspace recency. Active always spans every open workspace;
- * Open follows the scope (null = All Workspaces). Under All Workspaces Open interleaves
+ * Flat Active/Open rows by workspace recency. Both follow the scope (null = All Workspaces). Under All Workspaces Open interleaves
  * every workspace newest activity first (untimed last; the stable sort keeps workspace
  * then layout order for ties), matching the desktop sidebar.
  */
@@ -82,7 +85,8 @@ internal fun drawerItems(items: List<Workspace>, scope: String?, hidden: Set<Str
     }
     val (active, open) = rows.partition { it.active }
     if (scope == null) return active to open.sortedWith(compareByDescending { it.activityMs ?: Long.MIN_VALUE })
-    return active to open.filter { it.workspace.workspace_id == scope }
+    // A6-8: a workspace scope scopes Active too.
+    return active.filter { it.workspace.workspace_id == scope } to open.filter { it.workspace.workspace_id == scope }
 }
 
 /** Shared browse projections only: scope and search never mutate the host. */
@@ -165,8 +169,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                             }
                         }
                     }
-                    // Active is global, so its rows always name their workspace.
-                    section("Active", active, chip = true)
+                    section("Active", active, chip = scope == null)
                     section("Open", open, chip = scope == null)
                     if (filter.isNotEmpty()) item(key = "history") { DrawerRow("Search all chat history for \"$filter\"", false, onClick = onHistory) }
                 }
@@ -192,25 +195,31 @@ internal const val SIDEBAR_NEW_CHAT = "sidebar-new-chat"
  * The drawer's destinations, the same four on both platforms: Home, Workspaces, Hosts, Settings.
  * Content-sized, so "Workspaces" never truncates; two per row when the drawer is narrow.
  */
+/**
+ * The drawer's destinations, the same four on both platforms: Home, Workspaces, Hosts, Settings.
+ * A6-7: one row of icon-over-label tabs that fits a 300dp sidebar, so nothing wraps and the chat
+ * list above keeps its height.
+ */
 @Composable
 private fun DrawerFooter(currentTab: String, onTab: (String) -> Unit, onSettings: (() -> Unit)?) {
-    val tabs = buildList<Triple<String, Boolean, () -> Unit>> {
-        add(Triple("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) })
-        add(Triple("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) })
-        add(Triple("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) })
-        onSettings?.let { add(Triple("Settings", false, it)) }
+    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        FooterTab("Home", rememberVectorPainter(Icons.Filled.Home), currentTab == Routes.HOME, Modifier.weight(1f)) { onTab(Routes.HOME) }
+        FooterTab("Workspaces", painterResource(R.drawable.ic_folder), currentTab == Routes.WORKSPACES, Modifier.weight(1f)) { onTab(Routes.WORKSPACES) }
+        FooterTab("Hosts", painterResource(R.drawable.host_machine), currentTab == Routes.HOSTS, Modifier.weight(1f)) { onTab(Routes.HOSTS) }
+        onSettings?.let { open -> FooterTab("Settings", painterResource(R.drawable.ic_settings), false, Modifier.weight(1f), open) }
     }
-    // A5-6: one row when the labels fit; otherwise a 2×2 grid of equal cells, never a lone wrapped tab.
-    BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
-        val perRow = if (maxWidth >= 360.dp || tabs.size <= 2) tabs.size else 2
-        Column {
-            tabs.chunked(perRow).forEach { row ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    row.forEach { (label, active, onClick) -> SidebarTab(label, active, Modifier.weight(1f), onClick) }
-                    repeat(perRow - row.size) { Spacer(Modifier.weight(1f)) }
-                }
-            }
-        }
+}
+
+@Composable
+private fun FooterTab(label: String, icon: androidx.compose.ui.graphics.painter.Painter, active: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val tint = if (active) VerdeColors.AccentHi else VerdeColors.Muted
+    Column(modifier.heightIn(min = 56.dp).clip(RoundedCornerShape(10.dp))
+        .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
+        .semantics(mergeDescendants = true) { selected = active }.clickable(role = Role.Tab, onClick = onClick)
+        .padding(vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+        Text(label, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
     }
 }
 
