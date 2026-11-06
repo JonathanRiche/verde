@@ -164,7 +164,7 @@ internal fun CompactToolRow(row: ChatRow, indent: Boolean = false) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
             .clickable(onClickLabel = if (expanded) "Hide output" else "Show output") { expanded = !expanded }
             .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            StatusPip(compactToolColor(row), toolStatusLabel(row), commandRunning(row), size = 6.dp, command = true)
+            StatusPip(compactToolColor(row), toolStatusLabel(row), commandRunning(row), size = 8.dp, command = true)
             val display = remember(row) { toolDisplay(row) }
             Icon(toolKindPainter(display.kind), contentDescription = null, tint = VerdeColors.Subtle, modifier = Modifier.size(14.dp))
             Text(display.title, style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted, maxLines = 1)
@@ -197,7 +197,7 @@ private fun CompactToolGroupRow(item: TranscriptItem.ToolGroup, ctx: TranscriptC
             .clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }.padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             StatusPip(color, if (counts.failed > 0) "Some failed" else if (counts.running > 0) "Running" else "Completed",
-                active = counts.running > 0 && counts.failed == 0, size = 6.dp, command = true)
+                active = counts.running > 0 && counts.failed == 0, size = 8.dp, command = true)
             Text(toolGroupSummary(item.rows, item.subagent, elapsed), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
                 color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Chevron(expanded)
@@ -211,7 +211,7 @@ private fun CompactWorkingRow(item: TranscriptItem.Working, ctx: TranscriptConte
     val elapsed = item.turn.started_at_ms?.let { elapsedLabel(it, ctx.now) }
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        StatusPip(active = true, size = 6.dp, command = true)
+        StatusPip(active = true, size = 8.dp, command = true)
         Text(workingLabel(item, elapsed), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
     }
 }

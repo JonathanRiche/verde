@@ -93,7 +93,8 @@ private fun BackgroundLine(row: ChatRow, task: ChatBackground, now: Long) {
 @Composable
 private fun StatusGlyph(status: String, tint: Color) {
     when (status) {
-        "running" -> CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = tint, trackColor = tint.copy(alpha = .2f))
+        // F1: a steady 8dp pulsing dot, never an indeterminate arc that shrinks to a speck.
+        "running" -> RunningDot(tint)
         "completed" -> Icon(Icons.Filled.Check, contentDescription = null, tint = tint, modifier = Modifier.size(14.dp))
         "failed" -> Icon(Icons.Filled.Close, contentDescription = null, tint = tint, modifier = Modifier.size(14.dp))
         else -> Box(Modifier.size(8.dp).background(tint, RoundedCornerShape(1.dp)))
@@ -114,7 +115,7 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
         .clickable(role = Role.Button, onClickLabel = "Show") { onJump(tasks.first().row_id) }
         .nameOnly("$title: $labels").padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = colors.primary, trackColor = colors.primary.copy(alpha = .2f))
+        RunningDot(colors.primary)
         Text(title, style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)
         Text(labels, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall.copy(fontFamily = VerdeMono),
             color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)

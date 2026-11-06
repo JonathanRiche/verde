@@ -112,13 +112,14 @@ internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): Co
     val attention = browse.attention
     val keys = attention?.needs?.map { chatKey(it.workspace_id, it.thread_id) }?.toCollection(LinkedHashSet())
         ?: bubbleNeedKeys(needs, crew, thread)
-    val pulse = companionPulse(panes, crew, hidden).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
+    val liveThreads = browse.workspaces?.items.orEmpty().filter { it.open }.flatMap { it.threads }
+    val pulse = companionPulse(panes, crew, hidden, liveThreads).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
     val asking = attention?.needs?.any { it.kind != dev.verdeai.core.AttentionKind.failed }
         ?: (needs.any { it.status != "failed" && it.attention_kind != "failed" } ||
             crew.any { crewStatus(it).needsYou && crewStatus(it) != ChildStatus.Failed } || thread?.status == "waiting_approval")
     return CompanionSnapshot(active, needs, crew, pulse,
         keys, crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
-        companionActivity(panes, crew, hidden), asking = asking)
+        companionActivity(panes, crew, hidden, liveThreads), asking = asking)
 }
 
 /**
@@ -213,6 +214,8 @@ internal fun CompanionSheet(
                 // Hosts without scheduled tasks hide the entry; the count appears once the list loads.
                 onScheduled = if (schedules.view?.supported != false) ({ scheduled = true }) else null,
                 scheduledCount = schedules.enabledCount.takeIf { schedules.loaded })
+            // F4: Back closes an open needs-you / running list before it closes the companion.
+            BackHandler(enabled = shownStrip != null) { strip = null }
             SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
             // S9: a failed call explains itself here and offers its repair; it goes away with the sheet.
             if (live != null && liveUi?.phase == LivePhase.Failed) LiveFailureCard(liveUi,

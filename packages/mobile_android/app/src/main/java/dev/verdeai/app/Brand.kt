@@ -89,6 +89,14 @@ internal fun StatusPip(color: Color = VerdeColors.Accent, description: String? =
         .semantics { if (description != null) contentDescription = description })
 }
 
+/**
+ * F1: the one "running" mark for rows and bars: a steady 8dp dot that pulses its opacity, so a still
+ * frame or a glance never catches a shrinking spinner arc as a stray dot.
+ */
+@Composable
+internal fun RunningDot(color: Color = VerdeColors.Accent, description: String? = null) =
+    StatusPip(color, description, active = true, size = 8.dp)
+
 /** Web's mobile yellow stop circle inside an accessible 48dp touch target. */
 @Composable
 internal fun StopControl(stopping: Boolean, enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {

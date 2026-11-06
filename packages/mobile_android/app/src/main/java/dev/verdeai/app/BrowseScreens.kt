@@ -314,7 +314,7 @@ internal fun rowState(status: String, attention: Boolean): RowState = when {
 
 /** "workspace · state · age", leaving out empty parts (no dangling separators); the state is coloured. */
 @Composable
-private fun stateLine(parts: List<String?>, state: String?, kind: RowState): AnnotatedString {
+internal fun stateLine(parts: List<String?>, state: String?, kind: RowState): AnnotatedString {
     val colors = MaterialTheme.colorScheme
     val tint = when (kind) { RowState.Working -> colors.primary; RowState.NeedsYou -> colors.tertiary; RowState.Failed -> colors.error; RowState.Quiet -> null }
     return androidx.compose.ui.text.buildAnnotatedString {
@@ -526,15 +526,25 @@ internal fun HomeScreen(
                 header("Needs you")
                 items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
-            if (running.isNotEmpty()) {
+            // F2: one "running" rule everywhere (a live turn or process): chats whose turn is live count
+            // even without an open pane, and a chat in Needs you or Running isn't repeated in Recent.
+            val labels = workspaceLabels(state.workspaces?.items.orEmpty())
+            val shown = (attention + running).mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
+            val runningThreads = state.workspaces?.items.orEmpty().filter { it.open }.flatMap { it.threads }
+                .filter { activeStatus(it.status) && listed(it) && it.thread_id !in hidden && (it.workspace_id to it.thread_id) !in shown }
+            if (running.isNotEmpty() || runningThreads.isNotEmpty()) {
                 header("Running")
                 items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
+                items(runningThreads, key = { "running-thread:${it.workspace_id}:${it.thread_id}" }) {
+                    ThreadItem(it, now, labels[it.workspace_id], onOpenThread)
+                }
             }
-            if (attention.isEmpty() && running.isEmpty()) note("idle", "Nothing is running or waiting on you.")
-            val labels = workspaceLabels(state.workspaces?.items.orEmpty())
+            if (attention.isEmpty() && running.isEmpty() && runningThreads.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             val unread = panes.filter { it.attention_kind == "unread" && it.thread_id != null }.map { it.workspace_id to it.thread_id!! }.toSet()
+            val current = shown + runningThreads.map { it.workspace_id to it.thread_id }
             // Beside the docked sidebar (foldable, tablet) Home keeps a short Recent (S26).
-            val recent = recentThreads(state.workspaces, limit = if (docked) 5 else 8, hidden = hidden)
+            val recent = recentThreads(state.workspaces, limit = (if (docked) 5 else 8) + current.size, hidden = hidden)
+                .filter { (it.workspace_id to it.thread_id) !in current }.take(if (docked) 5 else 8)
             if (recent.isNotEmpty()) {
                 header("Recent")
                 items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) {

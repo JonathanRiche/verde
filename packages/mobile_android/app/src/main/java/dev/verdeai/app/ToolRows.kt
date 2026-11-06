@@ -267,7 +267,7 @@ private fun ToolStatusIcon(row: ChatRow) {
     val colors = MaterialTheme.colorScheme
     Box(Modifier.size(18.dp), contentAlignment = Alignment.Center) {
         when {
-            commandRunning(row) -> CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = colors.primary)
+            commandRunning(row) -> RunningDot(colors.primary)
             commandFailed(row) -> Icon(Icons.Filled.Close, contentDescription = null, tint = colors.error, modifier = Modifier.size(18.dp))
             else -> Icon(Icons.Filled.Check, contentDescription = null, tint = colors.primary, modifier = Modifier.size(18.dp))
         }
@@ -435,7 +435,7 @@ internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContex
             Text(summary, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium,
                 maxLines = 2, overflow = TextOverflow.Ellipsis,
                 color = if (counts.failed > 0) colors.error else colors.onSurfaceVariant)
-            if (counts.running > 0) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = colors.primary)
+            if (counts.running > 0) RunningDot(colors.primary)
             Chevron(disclosure.expanded)
         }
         if (disclosure.expanded) Column(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, bottom = 4.dp)) {
