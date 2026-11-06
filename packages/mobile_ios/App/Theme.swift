@@ -109,7 +109,7 @@ struct DrawerButton: View {
     @Environment(\.adaptive) private var adaptive
     var body: some View {
         // With a permanent sidebar this only ever brings back a hidden one.
-        Button(action: open) { Image(systemName: adaptive.tier.docked ? "sidebar.left" : "line.3.horizontal").frame(width: 32, height: 32) }
+        Button(action: open) { Image(systemName: adaptive.tier.docked ? "sidebar.left" : "line.3.horizontal").frame(width: 44, height: 44).contentShape(Rectangle()) }
             .accessibilityLabel(adaptive.tier.docked ? "Show sidebar" : "Open workspace drawer")
             .keyboardShortcut(adaptive.tier.docked ? KeyboardShortcut("\\", modifiers: .command) : nil)
     }
@@ -183,7 +183,7 @@ struct PrimaryRow: ViewModifier {
     func body(content: Content) -> some View {
         content.buttonStyle(PrimaryButtonStyle())
             .listRowBackground(Color.clear)
-            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
     }
 }
 

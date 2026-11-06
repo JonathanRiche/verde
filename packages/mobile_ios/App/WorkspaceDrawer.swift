@@ -100,10 +100,10 @@ struct WorkspaceDrawer: View {
                     TextField("Search", text: $search).textInputAutocapitalization(.never).autocorrectionDisabled()
                 }.padding(.horizontal, 12).frame(minHeight: 40).background(VerdeTheme.alternate, in: Capsule())
                 if !all.isEmpty {
-                    Button { open(.newChat(target?.workspace_id)) } label: { Image(systemName: "square.and.pencil").frame(width: 40, height: 40) }
+                    Button { open(.newChat(target?.workspace_id)) } label: { Image(systemName: "square.and.pencil").frame(width: 44, height: 44).contentShape(Rectangle()) }
                         .accessibilityLabel("New chat")
                     if let target {
-                        Button { open(.newTerminal(workspace: target.workspace_id, request: UUID())) } label: { Image(systemName: "terminal").frame(width: 40, height: 40) }
+                        Button { open(.newTerminal(workspace: target.workspace_id, request: UUID())) } label: { Image(systemName: "terminal").frame(width: 44, height: 44).contentShape(Rectangle()) }
                             .accessibilityLabel("New terminal")
                     }
                 }
@@ -258,7 +258,7 @@ struct WorkspaceDrawer: View {
             }.opacity(ws.open ? 1 : 0.55)
             if ws.open {
                 Button { switching = false; open(.workspace(ws.workspace_id)) } label: {
-                    Image(systemName: "gearshape").frame(width: 44, height: 44)
+                    Image(systemName: "gearshape").frame(width: 44, height: 44).contentShape(Rectangle())
                 }.buttonStyle(.plain).foregroundStyle(VerdeTheme.muted).accessibilityLabel("Settings for " + ws.label)
             }
         }
