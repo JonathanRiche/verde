@@ -131,3 +131,78 @@ struct VerdeNavigation: ViewModifier {
             .navigationBarTitleDisplayMode(.inline)
     }
 }
+
+extension VerdeTheme {
+    /// Text and icons on an accent fill (the theme's background reads on its own accent).
+    static var onAccent: Color { background }
+    /// Disabled fills and their content: the same muted pair in light and dark.
+    static var disabledFill: Color { mutedPanel }
+    static var disabledContent: Color { subtle }
+}
+
+/// A screen's primary action: a full-width accent fill with on-accent text (S6).
+struct PrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(VerdeTheme.ui(16, bold: true))
+            .foregroundStyle(enabled ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, minHeight: 50)
+            .background(enabled ? VerdeTheme.accent : VerdeTheme.disabledFill, in: RoundedRectangle(cornerRadius: 12))
+            .opacity(configuration.isPressed ? 0.8 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// A secondary action beside or under a primary one: a tonal fill (S6). `destructive` uses the
+/// error colour for its text.
+struct TonalButtonStyle: ButtonStyle {
+    var destructive = false
+    var fullWidth = true
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(VerdeTheme.ui(15, bold: true))
+            .foregroundStyle(enabled ? (destructive ? VerdeTheme.danger : VerdeTheme.text) : VerdeTheme.disabledContent)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: 44)
+            .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
+            .opacity(configuration.isPressed ? 0.8 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// A form's primary action as its own list row, without the row's background.
+struct PrimaryRow: ViewModifier {
+    func body(content: Content) -> some View {
+        content.buttonStyle(PrimaryButtonStyle())
+            .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+    }
+}
+
+/// At least a 44-point hit target around a small control (S4).
+struct MinTarget: ViewModifier {
+    func body(content: Content) -> some View {
+        content.frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+    }
+}
+
+extension View {
+    func minTarget() -> some View { modifier(MinTarget()) }
+}
+
+/// Keeps the list's last rows clear of the floating companion bubble.
+struct BubbleReserve: ViewModifier {
+    @Environment(\.companionBubbleShown) private var shown
+    var enabled = true
+    func body(content: Content) -> some View {
+        content.safeAreaInset(edge: .bottom, spacing: 0) {
+            if shown && enabled { Color.clear.frame(height: bubbleListReserve).accessibilityHidden(true) }
+        }
+    }
+}

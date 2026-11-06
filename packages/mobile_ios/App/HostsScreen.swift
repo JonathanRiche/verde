@@ -35,6 +35,7 @@ struct HostsScreen: View {
             }
             .navigationTitle("Hosts").modifier(VerdeNavigation())
             .listStyle(.plain).scrollContentBackground(.hidden).background(VerdeTheme.background)
+            .modifier(BubbleReserve())
         }
         .modifier(AddHostAlert(model: model, isPresented: $adding))
         .alert(confirmation.map { $0.forget ? "Remove \($0.name) from this phone?" : "Sign out of \($0.name)?" } ?? "",

@@ -44,6 +44,7 @@ struct TranscriptScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
+            ToolbarItem(placement: .topBarTrailing) { CompanionHeaderButton(workspace: workspaceID, thread: threadID) }
             ToolbarItem(placement: .topBarTrailing) {
                 ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
             }

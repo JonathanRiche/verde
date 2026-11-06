@@ -170,6 +170,8 @@ private struct BrowseFrame<Content: View>: View {
     let actions: BrowseActions
     var ticking = false
     var large = true
+    /// Home's "New chat" button already keeps the bottom band; it sits beside the bubble.
+    var reservesBubble = true
     @ViewBuilder let content: (BrowseState, Int64) -> Content
     @State private var addingHost = false
 
@@ -204,6 +206,7 @@ private struct BrowseFrame<Content: View>: View {
                 }
             }
             .refreshable { await model.refresh() }
+            .modifier(BubbleReserve(enabled: reservesBubble))
         }
         .navigationTitle(title)
         .toolbar {
@@ -245,11 +248,20 @@ struct HomeScreen: View {
     let model: BrowseModel
     let actions: BrowseActions
     @Environment(\.adaptive) private var adaptive
+    @Environment(\.companionBubbleShown) private var bubbleShown
+    @AppStorage(CompanionBubbleStore.edgeKey) private var bubbleEdge = BubbleEdge.trailing.rawValue
+    private var showsNewChat: Bool {
+        !adaptive.tier.docked && gateOpen(model.state) && model.state.workspaces?.items.contains(where: \.open) == true
+    }
+    /// "New chat" moves left of a bubble resting on the trailing edge.
+    private var newChatTrailing: CGFloat {
+        bubbleShown && bubbleEdge == BubbleEdge.trailing.rawValue ? 16 + BubbleLayout.diameter + BubbleLayout.margin : 16
+    }
     var body: some View {
         let hidden = model.companionThreads
         let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
         BrowseFrame(title: "Home", model: model, actions: actions,
-                    ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }) { state, now in
+                    ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }, reservesBubble: !showsNewChat) { state, now in
             let attention = panes.filter(\.attention)
             let running = panes.filter { !$0.attention }
             if !attention.isEmpty {
@@ -276,7 +288,7 @@ struct HomeScreen: View {
         }
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
             // New chat docks in the permanent sidebar.
-            if !adaptive.tier.docked, gateOpen(model.state), model.state.workspaces?.items.contains(where: \.open) == true {
+            if showsNewChat {
                 NavigationLink(value: BrowseRoute.newChat(nil)) {
                     Text("New chat").font(VerdeTheme.ui(14, bold: true))
                         .padding(.horizontal, 24).frame(minHeight: 56)
@@ -286,7 +298,7 @@ struct HomeScreen: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("home-new-chat")
-                .padding(.horizontal, 16).padding(.vertical, 12)
+                .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 12)
             }
         }
     }
@@ -362,6 +374,18 @@ struct WorkspaceScreen: View {
     }
 }
 
+private func isThreadRoute(_ route: BrowseRoute) -> Bool {
+    if case .thread = route { return true }
+    return false
+}
+
+private struct OptionalCompanionToolbar: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled { content.modifier(CompanionToolbar()) } else { content }
+    }
+}
+
 /// One tab's stack: every browse route resolves against the selected host only.
 struct BrowseStack<Root: View>: View {
     let model: BrowseModel
@@ -388,6 +412,8 @@ struct BrowseStack<Root: View>: View {
                 case .workspaceFile(let workspace, let root, let path, let absolute):
                     WorkspaceFileRoute(browse: model, workspaceID: workspace, root: root, path: path, absolute: absolute)
                 } }
+                // The chat screen places the companion itself, before its "⋯" menu.
+                .modifier(OptionalCompanionToolbar(enabled: !isThreadRoute(route)))
                 // The sidebar replaces the route in place; a different route is a different screen.
                 .id(route)
                 .modifier(VerdeNavigation())

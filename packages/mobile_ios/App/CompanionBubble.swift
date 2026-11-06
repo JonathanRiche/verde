@@ -53,6 +53,19 @@ struct BubbleLayout: Equatable {
     }
 }
 
+private struct CompanionBubbleShownKey: EnvironmentKey { static let defaultValue = false }
+
+extension EnvironmentValues {
+    /// The floating bubble sits over this list: it reserves room at the bottom for it.
+    var companionBubbleShown: Bool {
+        get { self[CompanionBubbleShownKey.self] }
+        set { self[CompanionBubbleShownKey.self] = newValue }
+    }
+}
+
+/// Bottom room a list keeps clear for the floating bubble (its diameter plus 16).
+let bubbleListReserve: CGFloat = BubbleLayout.diameter + 16 + 8
+
 /// Badge: approvals and blocked chats across workspaces (crew included) plus the companion's own
 /// pending approval.
 func companionBadgeCount(needsYou: Int, ownApproval: Bool) -> Int { needsYou + (ownApproval ? 1 : 0) }
@@ -123,9 +136,11 @@ struct CompanionBubbleLayer: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let layout = BubbleLayout(size: geometry.size)
+            // The lists keep a band clear at the bottom, so the bubble rests there (on either
+            // edge) instead of over rows and their chevrons.
+            let layout = BubbleLayout(size: geometry.size, bottom: 4)
             if !hidden, visible, !sheetOpen, let active = model.active {
-                let rest = layout.center(edge: edge, fraction: fraction)
+                let rest = layout.center(edge: edge, fraction: 1)
                 let point = drag ?? rest
                 bubble(active, layout: layout)
                     .position(point)

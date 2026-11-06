@@ -89,6 +89,8 @@ struct RootView: View {
     @State private var companionSettings = false
     /// The Live call bar's captions and full view, shared with the Companion sheet.
     @State private var livePill = LivePillState()
+    /// The software keyboard is up: the floating bubble steps aside.
+    @State private var keyboardUp = false
 
     @ViewBuilder private var shell: some View {
         let actions = BrowseActions(hosts: { tab = .hosts }, pair: {
@@ -107,6 +109,8 @@ struct RootView: View {
                         }
                     }
                 }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
+                .environment(\.companionEntry, companionEntry(docked: panes.tier.docked))
+                .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
                 if panes.tier.docked {
                     workspaceDrawer(permanent: true)
@@ -134,7 +138,7 @@ struct RootView: View {
                     .transition(.move(edge: .leading))
                 }
                 if companion.available {
-                    CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: bubbleVisible && !panes.tier.docked,
+                    CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: floatingBubble(docked: panes.tier.docked),
                                          docked: panes.tier.docked, open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
                         .sheet(isPresented: Binding(get: { companionSheet && !AdaptiveTier(width: windowWidth).docked },
@@ -168,7 +172,21 @@ struct RootView: View {
                 if let scope = workspaceScope, let ids, !ids.contains(scope) { workspaceScope = nil }
             }
             .background(VerdeTheme.background.ignoresSafeArea())
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
         }
+    }
+
+    /// The floating bubble: only on the top-level lists, never over the keyboard.
+    private func floatingBubble(docked: Bool) -> Bool {
+        companion.available && bubbleVisible && !docked && !keyboardUp && floatingBubbleAllowed(tab: tab, pathDepth: path.count)
+    }
+
+    /// Pushed screens dock the companion in their top bar (wide windows dock it in the sidebar).
+    private func companionEntry(docked: Bool) -> CompanionEntry? {
+        guard companion.available, !docked else { return nil }
+        return CompanionEntry(model: companion, voice: companionVoice, live: live,
+                              open: { companionSheet = true }, settings: { companionSettings = true })
     }
 
     private func panesFor(width: CGFloat) -> AdaptivePanes {
