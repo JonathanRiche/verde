@@ -494,3 +494,19 @@ test "streamed and stored tool rows expose parsed tool fields in the thread view
     };
     try expect(found);
 }
+
+test "slash choices list each command once and keep a runnable copy" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const slash = try h.parse(a,
+        \\{"commands":[{"id":"code-review","name":"/code-review","availability":"needs_thread"},{"id":"code-review","name":"/code-review"},{"id":"plugin:code-review","name":"code-review"},{"id":"code-review","name":"/code-review"},{"id":"init","name":"/init"},{"id":"other","name":""},{"id":"another","name":""}]}
+    );
+    const out = try @import("chat_catalogs.zig").catalogs(a, .{ .provider = "claude" }, .null, slash);
+    try expect(out.slash.len == 4);
+    try eql("code-review", out.slash[0].id);
+    try expect(out.slash[0].enabled and out.slash[0].reason == null);
+    try eql("init", out.slash[1].id);
+    try eql("other", out.slash[2].id);
+    try eql("another", out.slash[3].id);
+}

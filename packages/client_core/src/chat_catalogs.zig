@@ -74,9 +74,28 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     out.speeds = try choices(a, if (eq(provider, "codex") or (eq(provider, "fx") and (selected == .null or p.yes(p.get(selected, "cursor_fast_supported")))) or (eq(provider, "cursor") and (p.yes(p.get(selected, "cursor_fast_supported")) or (selected == .null and (std.mem.startsWith(u8, model, "gpt-") or eq(model, "grok-4.7-medium") or eq(model, "composer-2.5") or eq(model, "cursor-grok-4.5-high") or eq(model, "claude-opus-4-8-thinking-high")))))) &.{ "off", "on" } else &.{"off"});
     for (p.rows(p.get(slash, "commands"))) |row| {
         const availability = p.s(row, "availability");
-        try append(m.Choice, a, &out.slash, .{ .id = p.s(row, "id"), .label = p.s(row, "name"), .enabled = availability.len == 0 or eq(availability, "available"), .reason = if (availability.len > 0 and !eq(availability, "available")) availability else null });
+        try addSlash(a, &out.slash, .{ .id = p.s(row, "id"), .label = p.s(row, "name"), .enabled = availability.len == 0 or eq(availability, "available"), .reason = if (availability.len > 0 and !eq(availability, "available")) availability else null });
     }
     return out;
+}
+/// Providers can list one command from several sources (project, user, plugin); the menu shows it
+/// once. A later enabled copy replaces a disabled one so the command stays runnable.
+fn addSlash(a: A, dest: *[]const m.Choice, item: m.Choice) h.ApiError!void {
+    for (dest.*, 0..) |existing, i| {
+        const name = slashName(item.label);
+        const same_name = name.len > 0 and std.ascii.eqlIgnoreCase(slashName(existing.label), name);
+        if (!eq(existing.id, item.id) and !same_name) continue;
+        if (!existing.enabled and item.enabled) {
+            const next = try a.dupe(m.Choice, dest.*);
+            next[i] = item;
+            dest.* = next;
+        }
+        return;
+    }
+    try append(m.Choice, a, dest, item);
+}
+fn slashName(label: []const u8) []const u8 {
+    return std.mem.trimStart(u8, std.mem.trim(u8, label, " \t"), "/");
 }
 /// Marks models starred in the desktop config (`config.chat.favorite_models`) for this provider.
 pub fn favorites(a: A, catalog: m.Catalogs, provider: []const u8, config: V) h.ApiError!m.Catalogs {
