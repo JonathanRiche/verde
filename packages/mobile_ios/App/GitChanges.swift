@@ -140,7 +140,7 @@ struct GitCommitSheet: View {
                                 Text("Commit message").font(VerdeTheme.ui(13, bold: true))
                                 Spacer()
                                 if model.view?.message_state == "loading" { ProgressView() }
-                                Button { Task { await model.generate() } } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Regenerate commit message").disabled(model.view?.message_state == "loading")
+                                Button { Task { await model.generate() } } label: { Image(systemName: "arrow.clockwise").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("Regenerate commit message").disabled(model.view?.message_state == "loading")
                             }
                             TextField(model.generated.isEmpty ? "Generate or enter a commit message" : model.generated, text: $model.message, axis: .vertical)
                                 .lineLimit(2...5).padding(12).background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 10))

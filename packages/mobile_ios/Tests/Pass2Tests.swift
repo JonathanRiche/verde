@@ -144,3 +144,26 @@ final class TruthfulListTests: XCTestCase {
         XCTAssertNil(routeWorkspaceID(.history))
     }
 }
+
+final class Pass7Tests: XCTestCase {
+    func testSpokenImageNames() {
+        XCTAssertEqual(attachmentSpokenName("verde-attachment:779cabcdef"), "Photo")
+        XCTAssertEqual(attachmentSpokenName("/home/u/shots/dashboard.png"), "dashboard.png")
+        XCTAssertEqual(attachmentSpokenName(""), "Photo")
+    }
+
+    func testFolderSuggestionsDropClosedOnlyFolders() {
+        let open = Workspace(workspace_id: "o", label: "demo", path: "/tmp/demo", open: true, panes: [], threads: [])
+        let closed = Workspace(workspace_id: "c", label: "scripts", path: "/tmp/old/scripts", open: false, panes: [], threads: [])
+        let kept = freshFolderSuggestions(["/tmp/demo", "/tmp/demo/", "/tmp/old/scripts", "/tmp", "/srv/x"], workspaces: [open, closed])
+        XCTAssertEqual(kept, ["/tmp/demo", "/tmp", "/srv/x"])
+    }
+
+    func testHistoryTakesTheLiveActivityTime() {
+        var thread = ThreadSummary(workspace_id: "w", thread_id: "t", title: "T", provider: "codex", model: nil, cwd: nil,
+                                   open: true, archived: false, last_activity_at_ms: 1_000, status: "idle", history_bucket: "today")
+        XCTAssertEqual(withLiveActivity(thread, ["t": 5_000]).last_activity_at_ms, 5_000)
+        thread.last_activity_at_ms = 9_000
+        XCTAssertEqual(withLiveActivity(thread, ["t": 5_000]).last_activity_at_ms, 9_000)
+    }
+}

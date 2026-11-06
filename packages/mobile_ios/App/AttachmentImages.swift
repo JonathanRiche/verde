@@ -243,7 +243,7 @@ struct AttachmentThumbnail: View {
                         .onTapGesture { if let url = AttachmentImageCache.shared.file(for: key) { viewer = ViewerRequestImage(url: url) } }
                         .accessibilityElement()
                         // Host paths stay abstract on the phone: only the file name is read out.
-                        .accessibilityLabel("Image" + (attachment.name.isEmpty ? "" : ", " + basename(attachment.name)))
+                        .accessibilityLabel("Image, " + attachmentSpokenName(attachment.name))
                         .accessibilityHint("Opens the image full screen.")
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { if let url = AttachmentImageCache.shared.file(for: key) { viewer = ViewerRequestImage(url: url) } }
@@ -419,4 +419,12 @@ struct AttachmentViewer: View {
             scale = 1; committedScale = 1; offset = .zero; committedOffset = .zero
         }
     }
+}
+
+/// What VoiceOver calls an image: its file name, or "Photo" for an internal reference
+/// ("verde-attachment:…") or a name without an extension (I7-2).
+func attachmentSpokenName(_ name: String) -> String {
+    let base = basename(name)
+    if base.isEmpty || base.contains(":") || (base as NSString).pathExtension.isEmpty { return "Photo" }
+    return base
 }

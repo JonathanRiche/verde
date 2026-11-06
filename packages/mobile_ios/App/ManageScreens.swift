@@ -54,10 +54,11 @@ struct HistoryScreen: View {
             let history = browse.state.workspaces?.history
             let sections = historySections(history?.items ?? [])
             let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
+            let live = liveActivity(browse.state.workspaces)
             ForEach(sections.indices, id: \.self) { index in
                 Section {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
-                        let subtitle = historySubtitle(thread, workspace: labels[thread.workspace_id], now: now)
+                        let subtitle = historySubtitle(withLiveActivity(thread, live), workspace: labels[thread.workspace_id], now: now)
                         NavigationLink(value: BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)) {
                             HStack(alignment: .top, spacing: 12) {
                                 ProviderGlyph(provider: thread.provider).padding(.top, 2)
@@ -227,7 +228,7 @@ struct AddWorkspaceScreen: View {
                     if !directory.supported { Text("Folder browsing needs a newer host. You can still enter a path.") }
                     else {
                         // Host lists can repeat a folder; a repeated row id can break the list's updates.
-                        ForEach(uniqued(directory.suggestions), id: \.self) { root in
+                        ForEach(freshFolderSuggestions(directory.suggestions, workspaces: manage.browse.state.workspaces?.items ?? []), id: \.self) { root in
                             folderRow(root, systemImage: "folder") { Task { await manage.directory(root) } }
                         }
                         if !directory.path.isEmpty {

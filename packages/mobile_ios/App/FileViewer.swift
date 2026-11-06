@@ -300,7 +300,7 @@ struct FileViewer: View {
                 if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
                 if canDownload {
                     if download != nil { ProgressView() }
-                    else { Button { export() } label: { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Share or open file") }
+                    else { Button { export() } label: { Image(systemName: "square.and.arrow.up").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("Share or open file") }
                 }
             }
         }

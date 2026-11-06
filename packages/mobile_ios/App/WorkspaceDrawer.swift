@@ -38,8 +38,8 @@ struct DrawerItem: Identifiable {
     var activityMs: Int64? { thread?.last_activity_at_ms }
 }
 
-/// Flat Active/Open rows by workspace recency. Active always spans every open workspace;
-/// Open follows the scope (nil = All Workspaces). Under All Workspaces Open interleaves
+/// Flat Active/Open rows by workspace recency. Both follow the scope (nil = All Workspaces):
+/// a workspace's drawer lists only its own chats, active ones included. Under All Workspaces Open interleaves
 /// every workspace newest activity first (untimed last; ties keep workspace then layout
 /// order), matching the desktop sidebar. Companion chats (`hidden`) never appear; the bubble opens them.
 func drawerItems(_ items: [Workspace], scope: String?, hidden: Set<String> = []) -> (active: [DrawerItem], open: [DrawerItem]) {
@@ -48,12 +48,13 @@ func drawerItems(_ items: [Workspace], scope: String?, hidden: Set<String> = [])
         return chats + ws.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.map { DrawerItem(workspace: ws, thread: nil, pane: $0) }
     }
     let open = rows.filter { !$0.active && (scope == nil || $0.workspace.workspace_id == scope) }
-    guard scope == nil else { return (rows.filter(\.active), open) }
+    let active = rows.filter { $0.active && (scope == nil || $0.workspace.workspace_id == scope) }
+    guard scope == nil else { return (active, open) }
     let recent = open.enumerated().sorted {
         let (l, r) = ($0.element.activityMs ?? .min, $1.element.activityMs ?? .min)
         return l != r ? l > r : $0.offset < $1.offset
     }.map(\.element)
-    return (rows.filter(\.active), recent)
+    return (active, recent)
 }
 
 struct WorkspaceDrawer: View {
@@ -293,7 +294,8 @@ struct WorkspaceDrawer: View {
     private func footerTab(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 2) {
-                Image(systemName: icon).font(.system(size: 16))
+                // A fixed icon box so every label sits on the same baseline (I7-5).
+                Image(systemName: icon).font(.system(size: 16)).frame(width: 24, height: 20)
                 Text(title).font(VerdeTheme.ui(11, bold: selected)).lineLimit(1).minimumScaleFactor(0.8)
             }
             .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)

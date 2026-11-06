@@ -46,6 +46,21 @@ func workspaceFolderMessage(_ error: LocalError?) -> String {
 }
 
 /// Drops repeated values, keeping the first of each (host lists can repeat a folder).
+/// Add-workspace suggestions worth offering (I7-6, Android parity): folders tied to an open
+/// workspace (the folder, a parent or one inside it) stay; folders known only from closed
+/// workspaces go, since the host can't vouch they still exist. One row per folder.
+func freshFolderSuggestions(_ suggestions: [String], workspaces: [Workspace]) -> [String] {
+    func norm(_ p: String) -> String { var s = Substring(p); while s.hasSuffix("/") && s.count > 1 { s = s.dropLast() }; return String(s) }
+    func related(_ a: String, _ b: String) -> Bool {
+        let x = norm(a), y = norm(b)
+        return x == y || x.hasPrefix(y + "/") || y.hasPrefix(x + "/")
+    }
+    let open = workspaces.filter { $0.open && !$0.path.isEmpty }.map(\.path)
+    let closed = workspaces.filter { !$0.open && !$0.path.isEmpty }.map(\.path)
+    let kept = suggestions.filter { s in open.contains { related(s, $0) } || !closed.contains { related(s, $0) } }
+    return uniqued(kept, by: norm)
+}
+
 func uniqued<T: Hashable>(_ items: [T]) -> [T] {
     var seen = Set<T>()
     return items.filter { seen.insert($0).inserted }
@@ -54,6 +69,23 @@ func uniqued<T: Hashable>(_ items: [T]) -> [T] {
 func uniqued<T, K: Hashable>(_ items: [T], by key: (T) -> K) -> [T] {
     var seen = Set<K>()
     return items.filter { seen.insert(key($0)).inserted }
+}
+
+/// The live catalog's last activity per chat (the core moves it after mobile turns, C7).
+func liveActivity(_ workspaces: WorkspacesView?) -> [String: Int64] {
+    var out: [String: Int64] = [:]
+    for workspace in workspaces?.items ?? [] {
+        for thread in workspace.threads { if let ms = thread.last_activity_at_ms { out[thread.thread_id] = ms } }
+    }
+    return out
+}
+
+/// A History row with the newer of its paged and live activity times, so Home and History agree (I7-7).
+func withLiveActivity(_ thread: ThreadSummary, _ live: [String: Int64]) -> ThreadSummary {
+    guard let ms = live[thread.thread_id], ms > (thread.last_activity_at_ms ?? 0) else { return thread }
+    var copy = thread
+    copy.last_activity_at_ms = ms
+    return copy
 }
 
 /// "demo-app · Working · 2 h ago": only the parts that exist, so no separator dangles.

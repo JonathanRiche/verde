@@ -105,7 +105,7 @@ struct ChangesRoute: View {
             ExplorerTitle(title: "Changes", subtitle: workspace?.label)
             ToolbarItem(placement: .primaryAction) {
                 if changes?.loading == true { ProgressView() }
-                else { Button { model.openChanges() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh changes") }
+                else { Button { model.openChanges() } label: { Image(systemName: "arrow.clockwise").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("Refresh changes") }
             }
         }
         .modifier(ExplorerSync(browse: browse, model: model))
@@ -411,7 +411,7 @@ struct FilesRoute: View {
         .toolbar {
             ExplorerTitle(title: "Files", subtitle: label)
             ToolbarItem(placement: .primaryAction) {
-                Button { model.loadRoots(); expanded.forEach(list) } label: { Image(systemName: "arrow.clockwise") }
+                Button { model.loadRoots(); expanded.forEach(list) } label: { Image(systemName: "arrow.clockwise").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
                     .accessibilityLabel("Refresh files")
             }
         }
