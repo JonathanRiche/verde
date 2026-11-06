@@ -82,11 +82,12 @@ func adaptivePath(_ path: [BrowseRoute], opening route: BrowseRoute, docked: Boo
 /// About 720: long lines are hard to read. Nil leaves a row the full width.
 let transcriptTextWidth: CGFloat = 720
 
-/// Prose rows are capped on wide windows; diffs and tool output (code, terminals) may go wider.
+/// Wide windows keep the transcript in one centred column (S17): every row, tool calls included
+/// (their output scrolls sideways), is capped; only diff cards may use the full width.
 func transcriptRowCap(_ item: TranscriptItem, tier: AdaptiveTier) -> CGFloat? {
     guard tier.wide else { return nil }
     switch item {
-    case .diff, .tool, .toolGroup: return nil
+    case .diff: return nil
     default: return transcriptTextWidth
     }
 }

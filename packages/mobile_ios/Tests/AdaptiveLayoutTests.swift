@@ -123,8 +123,8 @@ final class AdaptiveLayoutTests: XCTestCase {
             XCTAssertEqual(transcriptRowCap(.think(row), tier: tier), transcriptTextWidth)
             XCTAssertEqual(transcriptRowCap(.notice(row), tier: tier), transcriptTextWidth)
             XCTAssertNil(transcriptRowCap(.diff(row), tier: tier))
-            XCTAssertNil(transcriptRowCap(.tool(row), tier: tier))
-            XCTAssertNil(transcriptRowCap(.toolGroup([row], subagent: false), tier: tier))
+            XCTAssertEqual(transcriptRowCap(.tool(row), tier: tier), transcriptTextWidth)
+            XCTAssertEqual(transcriptRowCap(.toolGroup([row], subagent: false), tier: tier), transcriptTextWidth)
         }
         XCTAssertNil(transcriptRowCap(.message(row), tier: .phone), "Phones are unchanged")
     }
