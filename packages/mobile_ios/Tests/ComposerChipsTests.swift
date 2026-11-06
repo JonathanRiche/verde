@@ -79,9 +79,9 @@ final class ComposerChipsTests: XCTestCase {
 /// I7-1 / S25: the chip layout is a pure function of the widths.
 final class ComposerChipPlanTests: XCTestCase {
     private let chips = [ComposerChipWidth(kind: .model, full: 110, iconOnly: nil, minimum: 70),
-                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44, short: 70),
-                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44, short: 66),
-                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44, short: 66)]
+                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44, short: 70, bare: 48),
+                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44, short: 66, bare: 44),
+                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44, short: 66, bare: 44)]
 
     func testLabelsShortenBeforeTheyDisappear() {
         // 44 + 114 + 94 + 94 + 114 = 460
@@ -93,8 +93,15 @@ final class ComposerChipPlanTests: XCTestCase {
         XCTAssertEqual(truncated.short, [.effort, .speed, .access])
         XCTAssertEqual(truncated.modelCap, 340 - (44 + 74 + 70 + 70) - 4)
         XCTAssertTrue(truncated.icons.isEmpty)
+        // Then the effort and access glyphs go (the labels stay), then the speed glyph.
+        let bare = composerChipPlan(widths: chips, available: 300)
+        XCTAssertEqual(bare.short, [.effort, .speed, .access])
+        XCTAssertEqual(bare.bare, [.effort, .access])
+        XCTAssertTrue(bare.icons.isEmpty)
+        // 44 + 4 + 70 (minimum) + 52 + 48 + 48 = 266
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 266).bare, [.effort, .speed, .access])
         // Only below that do the icons alone remain.
-        let icons = composerChipPlan(widths: chips, available: 300)
+        let icons = composerChipPlan(widths: chips, available: 264)
         XCTAssertEqual(icons.icons, [.effort, .speed, .access])
         XCTAssertFalse(icons.twoRows)
     }

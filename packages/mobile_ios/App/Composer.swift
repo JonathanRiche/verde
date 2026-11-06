@@ -44,6 +44,8 @@ struct ComposerChipWidth: Equatable {
     let iconOnly: CGFloat?
     /// With the short label (Auto, Std, Ask…); `full` when the chip has none.
     var short: CGFloat? = nil
+    /// With the short label and no glyph ("Auto", "Std").
+    var bare: CGFloat? = nil
     /// The narrowest a model chip may truncate to.
     var minimum: CGFloat? = nil
 }
@@ -55,6 +57,8 @@ struct ComposerChipPlan: Equatable {
     var second: [ComposerPicker] = []
     var icons: Set<ComposerPicker> = []
     var short: Set<ComposerPicker> = []
+    /// Short labels shown without their glyph, so a narrow phone keeps every label.
+    var bare: Set<ComposerPicker> = []
     var modelCap: CGFloat? = nil
     var twoRows: Bool { !second.isEmpty }
 }
@@ -67,24 +71,31 @@ func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> Compos
     let labelled: Set<ComposerPicker> = [.effort, .speed, .access]
     let shortKinds = Set(widths.filter { $0.short != nil && labelled.contains($0.kind) }.map(\.kind))
     let iconKinds = Set(widths.filter { $0.iconOnly != nil && labelled.contains($0.kind) }.map(\.kind))
-    func w(_ c: ComposerChipWidth, short: Set<ComposerPicker>, icons: Set<ComposerPicker>) -> CGFloat {
+    func w(_ c: ComposerChipWidth, short: Set<ComposerPicker>, icons: Set<ComposerPicker>, bare: Set<ComposerPicker> = []) -> CGFloat {
         if icons.contains(c.kind), let icon = c.iconOnly { return icon }
+        if bare.contains(c.kind), let b = c.bare { return b }
         if short.contains(c.kind), let s = c.short { return s }
         return c.full
     }
-    func total(_ items: [ComposerChipWidth], short: Set<ComposerPicker>, icons: Set<ComposerPicker>) -> CGFloat {
-        items.reduce(0) { $0 + spacing + w($1, short: short, icons: icons) }
+    func total(_ items: [ComposerChipWidth], short: Set<ComposerPicker>, icons: Set<ComposerPicker>, bare: Set<ComposerPicker> = []) -> CGFloat {
+        items.reduce(0) { $0 + spacing + w($1, short: short, icons: icons, bare: bare) }
     }
     let kinds = widths.map(\.kind)
     // 1. Full labels, 2. short labels.
     for short in [Set<ComposerPicker>(), shortKinds] where attach + total(widths, short: short, icons: []) <= available {
         return ComposerChipPlan(first: kinds, short: short)
     }
-    // 3. Short labels with the model truncated, down to its minimum.
+    // 3. Short labels with the model truncated, down to its minimum; then the same without the
+    //    effort and access glyphs, then without the speed glyph too: labels outlast glyphs.
+    let bareKinds = Set(widths.filter { $0.bare != nil && labelled.contains($0.kind) }.map(\.kind))
+    let bareSteps: [Set<ComposerPicker>] = [[], bareKinds.subtracting([.speed]), bareKinds]
     if let model = widths.first(where: { $0.kind == .model }), let minimum = model.minimum {
-        let others = attach + total(widths.filter { $0.kind != .model }, short: shortKinds, icons: []) + spacing
-        let cap = available - others
-        if cap >= minimum { return ComposerChipPlan(first: kinds, short: shortKinds, modelCap: cap) }
+        let others = widths.filter { $0.kind != .model }
+        for bare in bareSteps {
+            let cap = available - attach - total(others, short: shortKinds, icons: [], bare: bare) - spacing
+            if cap >= model.full { return ComposerChipPlan(first: kinds, short: shortKinds, bare: bare) }
+            if cap >= minimum { return ComposerChipPlan(first: kinds, short: shortKinds, bare: bare, modelCap: cap) }
+        }
     }
     // 4. Icons only, the model truncated if need be.
     if attach + total(widths, short: [], icons: iconKinds) <= available {
@@ -512,8 +523,9 @@ struct ChatComposer: View {
             let icon: CGFloat = hasChipIcon(kind) ? 22 : 0
             let full = glyph + icon + measure(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)) + 20
             let short = [.effort, .speed, .access].contains(kind) ? glyph + icon + measure(shortChipText(kind)) + 20 : nil
+            let bare = short != nil && icon > 0 ? measure(shortChipText(kind)) + 20 : nil
             let minimum: CGFloat? = kind == .model ? glyph + measure("GPT-6…") + 20 : nil
-            return ComposerChipWidth(kind: kind, full: full, iconOnly: hasChipIcon(kind) ? 44 : nil, short: short, minimum: minimum)
+            return ComposerChipWidth(kind: kind, full: full, iconOnly: hasChipIcon(kind) ? 44 : nil, short: short, bare: bare, minimum: minimum)
         }
     }
 
@@ -537,7 +549,7 @@ struct ChatComposer: View {
     }
 
     @ViewBuilder private func planChip(_ kind: ComposerPicker, _ plan: ComposerChipPlan) -> some View {
-        let chip = settingButton(kind, compact: plan.icons.contains(kind), stretch: false, short: plan.short.contains(kind))
+        let chip = settingButton(kind, compact: plan.icons.contains(kind), stretch: false, short: plan.short.contains(kind), bare: plan.bare.contains(kind))
         if kind == .model, let cap = plan.modelCap { chip.frame(maxWidth: cap, alignment: .leading) } else { chip }
     }
 
@@ -731,12 +743,14 @@ struct ChatComposer: View {
         return composerPromptHeight(resizedHeight ?? natural, available: availableHeight, minimum: basePrompt)
     }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
-    private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true, short: Bool = false) -> some View {
+    private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true, short: Bool = false, bare: Bool = false) -> some View {
         Button { picker = kind } label: {
             HStack(spacing: 6) {
                 if kind == .model { ProviderGlyph(provider: model.displayedSelection?.provider) }
                 // S25: a bolt for Fast and a gauge for Standard, not a bare ring.
-                if kind == .speed {
+                if bare {
+                    EmptyView()
+                } else if kind == .speed {
                     Image(systemName: selectedID(kind) == "on" ? "bolt.fill" : "gauge.with.dots.needle.33percent")
                         .font(.system(size: 13, weight: .semibold)).frame(width: 16, height: 16).accessibilityHidden(true)
                 } else if let icon = settingIcon(kind) {
