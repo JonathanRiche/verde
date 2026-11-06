@@ -11,7 +11,8 @@ and [core toolchain](../client_core/docs/ios-toolchain.md).
   generate the project. Tests create and delete their own simulator.
 - Local Xcode is 16.2 (iOS 18.2 SDK); Swift must also compile on newer CI
   SDKs. Use iOS 17-compatible APIs; avoid deprecated APIs and SDK paths.
-  Verification is simulator-only and unsigned; no development team is needed.
+  Verification is simulator-only and needs no development team: `mobile-ios-build`
+  ad-hoc signs so the app's Keychain works in a simulator; `mobile-ios-test` is unsigned.
   Store signing and CI belong to I-12. Mobile versions are independent of desktop.
 - Link the static `VerdeClient.xcframework`; do not embed it. Its module map
   supplies `import VerdeClient`. Respect C ownership (`vc_version` is static).

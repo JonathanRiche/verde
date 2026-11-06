@@ -10,7 +10,11 @@ args=(-project Verde.xcodeproj -scheme Verde -configuration Debug
       -derivedDataPath "$PWD/build/DerivedData" -sdk iphonesimulator
       CODE_SIGNING_ALLOWED=NO ARCHS=arm64)
 if [[ $mode == build ]]; then
-    xcodebuild "${args[@]}" -destination 'generic/platform=iOS Simulator' build
+    # Ad-hoc sign ("-", no team) so the built app keeps its Keychain entitlement and
+    # actually runs in a simulator; an unsigned app fails every Keychain call.
+    xcodebuild "${args[@]}" -destination 'generic/platform=iOS Simulator' \
+        CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
+        DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= build
 else
     # Own a disposable device: never boot, erase or shut down a user's simulator.
     runtime=$(xcrun simctl list runtimes --json | python3 -c '
