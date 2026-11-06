@@ -37,6 +37,40 @@ func composerDefaultLabel(_ resolved: String?) -> String {
     return "Default · " + resolved
 }
 
+/// A chip's estimated widths: with its label, and as an icon (nil when it has no icon).
+struct ComposerChipWidth: Equatable {
+    let kind: ComposerPicker
+    let full: CGFloat
+    let iconOnly: CGFloat?
+}
+
+/// Which chips go where and which show only their icon.
+struct ComposerChipPlan: Equatable {
+    var first: [ComposerPicker]
+    var second: [ComposerPicker] = []
+    var icons: Set<ComposerPicker> = []
+    var twoRows: Bool { !second.isEmpty }
+}
+
+/// The chip row's layout for `available` points (the paperclip included): one row with full
+/// labels, then Access and Speed as icons, then Effort too; otherwise the model (and provider)
+/// beside the paperclip and the rest on a second row, iconified the same way if needed.
+func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> ComposerChipPlan {
+    let spacing: CGFloat = 4, attach: CGFloat = 44
+    let steps: [Set<ComposerPicker>] = [[], [.access, .speed], [.access, .speed, .effort]]
+    func width(_ items: [ComposerChipWidth], icons: Set<ComposerPicker>) -> CGFloat {
+        items.reduce(0) { $0 + spacing + (icons.contains($1.kind) ? ($1.iconOnly ?? $1.full) : $1.full) }
+    }
+    for icons in steps where attach + width(widths, icons: icons) <= available {
+        return ComposerChipPlan(first: widths.map(\.kind), icons: icons.filter { kind in widths.contains { $0.kind == kind && $0.iconOnly != nil } })
+    }
+    let lead = widths.filter { $0.kind == .model || $0.kind == .provider }
+    let rest = widths.filter { $0.kind != .model && $0.kind != .provider }
+    let icons = steps.first { width(rest, icons: $0) - spacing <= available + attach } ?? steps[steps.count - 1]
+    return ComposerChipPlan(first: lead.map(\.kind), second: rest.map(\.kind),
+                            icons: icons.filter { kind in rest.contains { $0.kind == kind && $0.iconOnly != nil } })
+}
+
 /// The model chip: the chosen model, else the one an unset choice runs (the catalog's first);
 /// the provider's default row reads "Default · <model>" when the core names it (S11).
 func composerModelLabel(_ models: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
@@ -201,7 +235,10 @@ func composerChipLabel(model: String, effort: String?) -> String {
 struct ChatComposer: View {
     let model: ComposerModel
     let availableHeight: CGFloat
+    /// The conversation's width; the chip row's layout is chosen from it (I7-1).
+    var availableWidth: CGFloat = 0
     var compact: CompactComposer? = nil
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
     /// Wide windows put the setting chips on the attach and send row. The text view keeps its
     /// place in the tree either way, so crossing the threshold keeps its text and keyboard focus.
@@ -353,27 +390,12 @@ struct ChatComposer: View {
                     }
                     .layoutPriority(1)
                 } else {
-                    // S18: one row at the default text size. Full labels when they fit, then Access
-                    // and Speed as icons, then Effort too; only large text wraps the chips.
-                    ViewThatFits(in: .horizontal) {
-                        phoneChipRow(icons: [])
-                        phoneChipRow(icons: [.access, .speed])
-                        phoneChipRow(icons: [.access, .speed, .effort])
-                        // Large text: two plain rows, the model beside the paperclip and the rest
-                        // below. Every candidate is a fixed-size stack, so the choice is made from
-                        // the proposed width alone (a measured flow layout here looped, I7-1).
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 4) {
-                                attachMenu
-                                if visiblePickers.contains(.model) { settingButton(.model, compact: false, stretch: false) }
-                            }
-                            ViewThatFits(in: .horizontal) {
-                                secondChipRow(icons: [])
-                                secondChipRow(icons: [.access, .speed])
-                                secondChipRow(icons: [.access, .speed, .effort])
-                            }
-                        }
-                    }
+                    // S18: one row at the default text size: full labels when they fit, then Access
+                    // and Speed as icons, then Effort too; large text puts the model on its own row.
+                    // The choice is computed from the conversation's width and the text size, never
+                    // from measuring the chips, so no layout pass can change it (I7-1: measured
+                    // fallbacks looped at 100% CPU).
+                    chipRows(composerChipPlan(widths: chipWidths(), available: chipRowWidth))
                 }
                 Spacer(minLength: 4)
                 if model.chat.state.turn != nil {
@@ -403,23 +425,44 @@ struct ChatComposer: View {
         .padding(8)
     }
 
-    /// The paperclip and the chips on one line; `icons` show only their glyph (labels stay in VoiceOver).
-    private func phoneChipRow(icons: Set<ComposerPicker>) -> some View {
-        HStack(spacing: 4) {
-            attachMenu
-            ForEach(visiblePickers) { kind in settingButton(kind, compact: icons.contains(kind) && settingIcon(kind) != nil, stretch: false) }
-        }
-        .fixedSize(horizontal: true, vertical: false)
+    /// Width left for the paperclip and chips: the composer card minus its margins, padding,
+    /// and Stop / Send at the end of the row.
+    private var chipRowWidth: CGFloat {
+        let actions: CGFloat = model.chat.state.turn != nil ? 92 : 48
+        return max(0, availableWidth - 16 - 24 - actions)
     }
 
-    /// Every chip but the model (large-text layout).
-    private func secondChipRow(icons: Set<ComposerPicker>) -> some View {
-        HStack(spacing: 4) {
-            ForEach(visiblePickers.filter { $0 != .model }) { kind in
-                settingButton(kind, compact: icons.contains(kind) && settingIcon(kind) != nil, stretch: false)
+    /// Estimated chip widths (full label, icon only) from font metrics at the current text size.
+    private func chipWidths() -> [ComposerChipWidth] {
+        let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(dynamicTypeSize))
+        let size = UIFontMetrics(forTextStyle: .body).scaledValue(for: 12, compatibleWith: traits)
+        let font = UIFont(name: "NotoSans-Regular", size: size) ?? .systemFont(ofSize: size)
+        return visiblePickers.map { kind in
+            let label = chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)
+            let text = ceil((label as NSString).size(withAttributes: [.font: font]).width)
+            let glyph: CGFloat = kind == .model || kind == .provider ? 24 : 0
+            let icon: CGFloat = settingIcon(kind) != nil ? 22 : 0
+            return ComposerChipWidth(kind: kind, full: glyph + icon + text + 20, iconOnly: settingIcon(kind) != nil ? 44 : nil)
+        }
+    }
+
+    @ViewBuilder private func chipRows(_ plan: ComposerChipPlan) -> some View {
+        if plan.twoRows {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    attachMenu
+                    ForEach(plan.first, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
+                }
+                HStack(spacing: 4) {
+                    ForEach(plan.second, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
+                }
+            }
+        } else {
+            HStack(spacing: 4) {
+                attachMenu
+                ForEach(plan.first, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
             }
         }
-        .fixedSize(horizontal: true, vertical: false)
     }
 
     private var attachMenu: some View {

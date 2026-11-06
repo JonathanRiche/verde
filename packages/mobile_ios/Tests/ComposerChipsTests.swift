@@ -75,3 +75,27 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerPromptHeight(2000, available: 800, minimum: 90), 480)
     }
 }
+
+/// I7-1: the chip layout is a pure function of the widths.
+final class ComposerChipPlanTests: XCTestCase {
+    private let chips = [ComposerChipWidth(kind: .model, full: 110, iconOnly: nil),
+                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44),
+                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44),
+                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44)]
+
+    func testOneRowWhileItFits() {
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 500), ComposerChipPlan(first: [.model, .effort, .speed, .access]))
+        let tight = composerChipPlan(widths: chips, available: 350)
+        XCTAssertFalse(tight.twoRows)
+        XCTAssertEqual(tight.icons, [.access, .speed])
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 305).icons, [.access, .speed, .effort])
+    }
+
+    func testLargeTextPutsTheModelOnItsOwnRow() {
+        let plan = composerChipPlan(widths: chips, available: 200)
+        XCTAssertTrue(plan.twoRows)
+        XCTAssertEqual(plan.first, [.model])
+        XCTAssertEqual(plan.second, [.effort, .speed, .access])
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 200), plan, "same input, same layout")
+    }
+}

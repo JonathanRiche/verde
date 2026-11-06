@@ -149,7 +149,7 @@ struct TranscriptBody: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let accessory { accessory }
-                ChatComposer(model: model.input, availableHeight: geometry.size.height, compact: compactComposer)
+                ChatComposer(model: model.input, availableHeight: geometry.size.height, availableWidth: geometry.size.width, compact: compactComposer)
                     // Lines up with the transcript's capped text (the card has 8 points of margin).
                     .frame(maxWidth: adaptive.tier.wide && compactComposer == nil ? transcriptTextWidth + 16 : .infinity)
             }
