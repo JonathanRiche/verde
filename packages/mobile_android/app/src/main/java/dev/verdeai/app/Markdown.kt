@@ -12,6 +12,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
@@ -198,8 +200,8 @@ internal fun MarkdownText(text: String, model: MarkdownSource, onCitation: (File
     }
     val colors = MaterialTheme.colorScheme
     val callback by rememberUpdatedState(onCitation)
-    val codeForeground = VerdeColors.Heading1
-    val blocks = remember(nodes, colors, codeForeground) { markdownBlocks(nodes, MdStyle(colors.primary, colors.surfaceVariant, codeForeground)) { callback(it) } }
+    // S3: inline code is one neutral token (surfaceVariant fill, onSurface text) on every platform.
+    val blocks = remember(nodes, colors) { markdownBlocks(nodes, MdStyle(colors.primary, colors.surfaceVariant, colors.onSurface)) { callback(it) } }
     MarkdownBlocks(blocks, model, modifier.testTag(MARKDOWN_TAG))
 }
 
@@ -232,16 +234,48 @@ private fun MdBlockView(block: MdBlock, model: HighlightSource) {
         }
         is MdBlock.Code -> CodeBlock(block.code, block.language, model)
         MdBlock.Rule -> HorizontalDivider()
-        is MdBlock.Table -> Column(Modifier.horizontalScroll(rememberScrollState())
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(4.dp))) {
-            block.rows.forEachIndexed { index, row ->
-                Row {
-                    row.forEach { cell ->
-                        Text(cell, Modifier.width(140.dp).padding(6.dp),
+        is MdBlock.Table -> MarkdownTable(block.rows)
+    }
+}
+
+internal const val MARKDOWN_TABLE_TAG = "markdown-table"
+private val TABLE_MIN_COLUMN = 72.dp
+private val TABLE_MAX_COLUMN = 240.dp
+private val TABLE_CELL_PADDING = 8.dp
+
+/**
+ * S3: a rounded container that never clips its border; columns take their content's width
+ * (within bounds, wrapping beyond the maximum) and the grid scrolls sideways with an edge fade.
+ */
+@Composable
+private fun MarkdownTable(rows: List<List<AnnotatedString>>) {
+    val type = MaterialTheme.typography
+    val colors = MaterialTheme.colorScheme
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val columns = rows.maxOfOrNull { it.size } ?: 0
+    val widths = remember(rows, type, density) {
+        List(columns) { c ->
+            val widest = rows.withIndex().maxOfOrNull { (r, row) ->
+                val cell = row.getOrNull(c) ?: return@maxOfOrNull 0
+                measurer.measure(cell, if (r == 0) type.labelLarge else type.bodySmall, softWrap = false).size.width
+            } ?: 0
+            with(density) { widest.toDp() + TABLE_CELL_PADDING * 2 + 1.dp }.coerceIn(TABLE_MIN_COLUMN, TABLE_MAX_COLUMN)
+        }
+    }
+    val scroll = rememberScrollState()
+    val shape = RoundedCornerShape(8.dp)
+    val container = VerdeColors.Assistant
+    Box(Modifier.fillMaxWidth().clip(shape).border(1.dp, colors.outlineVariant, shape).testTag(MARKDOWN_TABLE_TAG)) {
+        Column(Modifier.horizontalEdgeFade(scroll, container).horizontalScroll(scroll)) {
+            rows.forEachIndexed { index, row ->
+                Row(if (index == 0) Modifier.background(colors.surfaceVariant) else Modifier) {
+                    widths.forEachIndexed { c, width ->
+                        Text(row.getOrNull(c) ?: AnnotatedString(""), Modifier.width(width).padding(TABLE_CELL_PADDING),
                             style = if (index == 0) type.labelLarge else type.bodySmall)
                     }
                 }
-                if (index < block.rows.size - 1) HorizontalDivider(Modifier.width(140.dp * row.size))
+                if (index < rows.size - 1) HorizontalDivider(Modifier.width(widths.fold(0.dp) { a, w -> a + w }), color = colors.outlineVariant)
             }
         }
     }
@@ -258,13 +292,15 @@ internal fun CodeBlock(code: String, language: String?, model: HighlightSource) 
     val style = tokenStyle()
     // Spans index the exact code the core highlighted; only the trailing newline is dropped for display.
     val text = remember(code, spans, style) { highlighted(code, spans?.value.orEmpty(), style).let { if (code.endsWith("\n")) it.subSequence(0, code.length - 1) else it } }
-    Column(Modifier.fillMaxWidth().background(VerdeColors.Background, RoundedCornerShape(7.dp))
-        .border(1.dp, VerdeColors.Border, RoundedCornerShape(7.dp)).testTag(CODE_BLOCK_TAG)) {
-        Row(Modifier.fillMaxWidth().background(VerdeColors.PanelAlt, RoundedCornerShape(topStart = 7.dp, topEnd = 7.dp)).padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(VerdeColors.Background)
+        .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)).testTag(CODE_BLOCK_TAG)) {
+        Row(Modifier.fillMaxWidth().background(VerdeColors.PanelAlt).padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(language ?: "code", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             TextButton(onClick = { clipboard.setText(AnnotatedString(code.removeSuffix("\n"))) }) { Text("Copy code") }
         }
-        Text(text, Modifier.horizontalScroll(rememberScrollState()).padding(start = 10.dp, end = 10.dp, bottom = 10.dp),
+        val scroll = rememberScrollState()
+        Text(text, Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Background).horizontalScroll(scroll)
+            .padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 10.dp),
             style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
     }
 }

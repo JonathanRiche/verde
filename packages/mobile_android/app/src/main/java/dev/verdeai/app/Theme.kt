@@ -20,7 +20,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.util.Locale
+import androidx.compose.foundation.ScrollState
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.unit.Dp
 
 /** Semantic colors shared by Material controls and custom chrome. */
 internal data class VerdePalette(
@@ -134,12 +139,29 @@ internal fun VerdeListRow(headlineContent: @Composable () -> Unit, modifier: Mod
     }
 }
 
+/**
+ * The one section header: sentence case, 13sp semibold, onSurfaceVariant, inset like the rows below
+ * it (16dp). Callers inside an already padded column pass `inset = 0.dp`.
+ */
 @Composable
-internal fun VerdeSection(text: String, modifier: Modifier = Modifier) {
-    Text(text.uppercase(Locale.ROOT), modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 4.dp)
-        .semantics { heading() },
-        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = .8.sp, fontWeight = FontWeight.SemiBold),
-        color = VerdeColors.Subtle)
+internal fun VerdeSection(text: String, modifier: Modifier = Modifier, inset: Dp = 16.dp) {
+    Text(text, modifier.padding(start = inset, end = inset, top = 16.dp, bottom = 4.dp).semantics { heading() },
+        style = SectionHeaderStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+internal val SectionHeaderStyle = TextStyle(fontFamily = VerdeSans, fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold)
+
+/**
+ * Fades the edge(s) a horizontal scroller can still move toward into [color], so clipped tables,
+ * code and key rows read as "more this way" instead of cut off. Put it before `horizontalScroll`.
+ */
+internal fun Modifier.horizontalEdgeFade(state: ScrollState, color: Color, width: Dp = 24.dp) = drawWithContent {
+    drawContent()
+    val w = width.toPx().coerceAtMost(size.width / 3)
+    if (state.canScrollBackward) drawRect(Brush.horizontalGradient(listOf(color, Color.Transparent), startX = 0f, endX = w),
+        size = Size(w, size.height))
+    if (state.canScrollForward) drawRect(Brush.horizontalGradient(listOf(Color.Transparent, color), startX = size.width - w, endX = size.width),
+        topLeft = Offset(size.width - w, 0f), size = Size(w, size.height))
 }
 
 internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
