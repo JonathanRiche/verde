@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -221,10 +222,14 @@ internal fun TranscriptScreen(
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
-        Box(Modifier.weight(1f).fillMaxWidth()) {
+        // A-KB: a tap on the transcript (not taken by a control) or a scroll drag puts the keyboard away.
+        val dismissKeyboard = rememberKeyboardDismiss()
+        Box(Modifier.weight(1f).fillMaxWidth().dismissKeyboardOnTouch(dismissKeyboard)) {
+            CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard) {
             when (val placeholder = transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, renderers)
                 else -> Placeholder(placeholder, model)
+            }
             }
         }
         bottomBar(model, state)
@@ -338,6 +343,8 @@ private fun PageHeader(page: ChatPage?, model: TranscriptModel) {
 internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
+    var selecting by remember { mutableStateOf(false) }
+    val dismissKeyboard = LocalDismissKeyboard.current
     val mine = row.role == "user"
     // Steers from an orchestrating parent agent show only its words, labelled as the parent.
     val steer = remember(row.role, row.body) { parentSteerBody(row.role, row.body) }
@@ -348,7 +355,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             Modifier.fillMaxWidth()
                 .background(when { steer != null -> VerdeColors.Panel; mine -> VerdeColors.UserBubble; else -> VerdeColors.Assistant }, RoundedCornerShape(10.dp))
                 .border(1.dp, if (mine) VerdeColors.UserBubble else VerdeColors.Border, RoundedCornerShape(10.dp))
-                .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+                .combinedClickable(onClick = { dismissKeyboard?.invoke() }, onLongClickLabel = "Message actions", onLongClick = { menu = true })
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
@@ -370,7 +377,9 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(body)) })
+            DropdownMenuItem(text = { Text("Select text") }, onClick = { menu = false; selecting = true })
         }
+        if (selecting) SelectTextDialog(body) { selecting = false }
     }
 }
 
@@ -554,3 +563,15 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
     }
 }
 
+/** The whole message as selectable text, for copying part of it (long-press "Select text"). */
+@Composable
+private fun SelectTextDialog(text: String, onDismiss: () -> Unit) {
+    AlertDialog(onDismissRequest = onDismiss,
+        title = { Text("Select text") },
+        text = {
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                Text(text, Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodyMedium)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } })
+}
