@@ -141,8 +141,17 @@ fn hostCall(env: Env, token: i64, array: jobject, out_status: jobject, query: bo
         _ = setStatus(env, out_status, abi.status(err));
         return null;
     };
-    var staged: core.Host = .{ .allocator = host.allocator, .arena = tx.arena, .state = tx.state };
+    // Attachment bytes live outside the cloned state: move them into the staged
+    // host so queries see them and the event's blob ops apply to them, and hand
+    // them back unless a handled batch is adopted below.
+    var staged: core.Host = .{ .allocator = host.allocator, .arena = tx.arena, .state = tx.state, .blobs = host.blobs };
+    host.blobs = .empty;
+    var adopted = false;
     defer staged.deinit();
+    defer if (!adopted) {
+        host.blobs = staged.blobs;
+        staged.blobs = .empty;
+    };
     var buf: abi.Buf = .{};
     const code = if (query) abi.vcHostQuery(&staged, input.ptr, input.len, &buf) else abi.vcHostHandle(&staged, input.ptr, input.len, &buf);
     defer abi.vcBufFree(buf);
@@ -159,6 +168,7 @@ fn hostCall(env: Env, token: i64, array: jobject, out_status: jobject, query: bo
         const old = host.*;
         host.* = staged;
         staged = old;
+        adopted = true;
     }
     return result;
 }
