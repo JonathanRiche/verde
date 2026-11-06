@@ -4,6 +4,7 @@ import android.text.format.DateFormat
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -209,14 +210,19 @@ private fun EmptySchedules(name: String, canEdit: Boolean, onNew: () -> Unit, on
         Text("No scheduled tasks yet", style = MaterialTheme.typography.titleMedium)
         Text("A scheduled task sends a prompt to a chat at a set time, once or on repeat. The chat does the work and $name hears how it went.",
             style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Muted, textAlign = TextAlign.Center)
-        OutlinedCard(onClick = onExample, enabled = canEdit, modifier = Modifier.fillMaxWidth()
-            .semantics { contentDescription = "Use the example: every weekday at 9, check CI and summarize" }) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("For example", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
-                Text("“Every weekday at 9, check CI and summarize”", style = MaterialTheme.typography.bodyMedium)
-            }
+        // V: the example card and the button are clickable nodes with their own names.
+        val shape = RoundedCornerShape(12.dp)
+        Column(Modifier.fillMaxWidth().clip(shape).border(1.dp, VerdeColors.Border, shape)
+            .clickable(enabled = canEdit, role = Role.Button, onClick = onExample)
+            .nameOnly("Use the example: every weekday at 9, check CI and summarize")
+            .padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("For example", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
+            Text("“Every weekday at 9, check CI and summarize”", style = MaterialTheme.typography.bodyMedium)
         }
-        Button(onClick = onNew, enabled = canEdit, shape = MaterialTheme.shapes.small) {
+        NamedButton("New scheduled task", onNew, Modifier.heightIn(min = 48.dp), enabled = canEdit,
+            container = if (canEdit) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = .12f),
+            content = if (canEdit) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+            shape = MaterialTheme.shapes.small, padding = PaddingValues(horizontal = 24.dp)) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
             Text("New scheduled task")

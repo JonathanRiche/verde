@@ -26,6 +26,11 @@ class ScreenSpecTest {
         val names = (0 until 8).map { colorName(workspaceColor(it)) }
         assertEquals(8, names.distinct().size)
         assertEquals("Green", names[0])
+        // V: TalkBack's names are distinct in every theme (a repeat is numbered, as on iOS).
+        listOf(DarkPalette.Accent, LightPalette.Accent).forEach { accent ->
+            val spoken = workspaceColorNames(accent)
+            assertEquals(spoken.toString(), 8, spoken.distinct().size)
+        }
     }
 
     @Test fun versionLabelNamesBuild() {

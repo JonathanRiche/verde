@@ -150,7 +150,10 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHos
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(if (lockOn) "App lock is paused because this phone has no screen lock."
                             else "This phone has no screen lock. Set a PIN, pattern or password to use app lock.")
-                        Button(shape = MaterialTheme.shapes.small, onClick = { openScreenLockSetup(context) }) { Text("Set up screen lock") }
+                        // V: the button's own node is named.
+                        NamedButton("Set up screen lock", { openScreenLockSetup(context) }, Modifier.heightIn(min = 48.dp),
+                            container = MaterialTheme.colorScheme.primary, content = MaterialTheme.colorScheme.onPrimary,
+                            shape = MaterialTheme.shapes.small, padding = PaddingValues(horizontal = 24.dp))
                     }
                 }
             }

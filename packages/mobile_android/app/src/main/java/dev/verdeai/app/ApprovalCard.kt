@@ -81,7 +81,11 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(Modifier.size(9.dp).background(colors.tertiary, CircleShape))
             // Announced once when the card appears (TalkBack reads polite live regions on change).
-            Text(title, Modifier.weight(1f).semantics { heading(); liveRegion = LiveRegionMode.Polite; contentDescription = "Approval needed: $title" },
+            // V: the card's own description carries the request, once ("Approval needed: <request>").
+            val request = listOfNotNull(title.takeIf { !it.equals("Approval needed", ignoreCase = true) },
+                preview.command ?: preview.reason ?: approval.body.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() })
+                .distinct().joinToString(". ").ifEmpty { title }
+            Text(title, Modifier.weight(1f).semantics { heading(); liveRegion = LiveRegionMode.Polite; contentDescription = "Approval needed: $request" },
                 style = MaterialTheme.typography.titleSmall, color = colors.onSurface, maxLines = 3, overflow = TextOverflow.Ellipsis)
             if (approval.body.isNotBlank()) CopyIconButton("Copy request") { approval.body }
         }
@@ -99,16 +103,16 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
             val enabled = phase.canDecide()
             val sending = (phase as? ApprovalPhase.Sending)?.decision
             // S37: Deny and Approve are always the same height, even when one label wraps at large
-            // text; each button's own node carries "Deny: <request>" / "Approve: <request>".
+            // text; each button's own node is just "Deny" / "Approve" (the request is the card's).
             val colors = MaterialTheme.colorScheme
             Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                NamedButton("Deny: $title", {
+                NamedButton(if (sending == ApprovalDecision.Deny) "Denying…" else DENY_LABEL, {
                     if (controller.decide(approval, ApprovalDecision.Deny)) haptics.performHapticFeedback(HapticFeedbackType.Reject)
                 }, Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp), enabled = enabled,
                     container = colors.secondaryContainer, content = colors.onSecondaryContainer, shape = MaterialTheme.shapes.small) {
                     Text(if (sending == ApprovalDecision.Deny) "Denying…" else DENY_LABEL, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                 }
-                NamedButton("Approve: $title", {
+                NamedButton(if (sending == ApprovalDecision.Approve) "Approving…" else APPROVE_LABEL, {
                     if (controller.decide(approval, ApprovalDecision.Approve)) haptics.performHapticFeedback(HapticFeedbackType.Confirm)
                 }, Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp), enabled = enabled,
                     container = if (enabled) colors.primary else colors.onSurface.copy(alpha = .12f),
