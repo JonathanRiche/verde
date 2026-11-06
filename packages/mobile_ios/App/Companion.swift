@@ -743,7 +743,7 @@ enum SummaryTone: Equatable { case attention, busy, failure, quiet }
 /// The header's short status suffix ("· 3 need you").
 func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool) -> (text: String, tone: SummaryTone) {
     if !connected { return ("offline", .quiet) }
-    if needsYou > 0 { return ("\(needsYou) need you", .attention) }
+    if needsYou > 0 { return (needsYouCount(needsYou), .attention) }
     if failed { return ("needs a look", .failure) }
     if working { return ("working", .busy) }
     if crewRunning > 0 { return ("\(crewRunning) running", .busy) }
@@ -763,7 +763,10 @@ func companionHeaderPanel(needsYou: Int, running: Int, working: Bool, failed: Bo
 }
 
 /// The "needs you" capsule; nil hides it.
-func needsSummary(_ count: Int) -> String? { count > 0 ? "\(count) need you" : nil }
+func needsSummary(_ count: Int) -> String? { count > 0 ? needsYouCount(count) : nil }
+
+/// "1 needs you", "3 need you".
+func needsYouCount(_ count: Int) -> String { count == 1 ? "1 needs you" : "\(count) need you" }
 
 /// The crew capsule ("2 running · 1 done"); nil when there is no crew.
 func crewSummary(_ crew: [CrewLink]) -> String? { attentionSummary(crew.map(\.attention)) }
