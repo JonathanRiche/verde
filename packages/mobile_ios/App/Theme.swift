@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The web palette and the Android baseline, shared by every native screen.
 enum VerdeTheme {
@@ -246,4 +247,33 @@ struct BubbleReserve: ViewModifier {
             }
         }
     }
+}
+
+
+/// Makes the back button on the screens pushed from this one a plain chevron (Pass 16): the
+/// system otherwise labels it with this screen's title ("‹ Home") on wide windows, while the
+/// drawer footer marks the current screen's own section.
+struct MinimalBackTitle: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) {}
+
+    final class Controller: UIViewController {
+        override func didMove(toParent parent: UIViewController?) { super.didMove(toParent: parent); apply() }
+        override func viewWillAppear(_ animated: Bool) { super.viewWillAppear(animated); apply() }
+        private func apply() {
+            var current: UIViewController? = parent
+            while let controller = current {
+                if let navigation = controller.navigationController, navigation.viewControllers.contains(controller) {
+                    controller.navigationItem.backButtonDisplayMode = .minimal
+                    return
+                }
+                current = controller.parent
+            }
+        }
+    }
+}
+
+extension View {
+    /// Screens pushed from this one show a plain chevron back button.
+    func minimalBackTitle() -> some View { background(MinimalBackTitle().frame(width: 0, height: 0).accessibilityHidden(true)) }
 }

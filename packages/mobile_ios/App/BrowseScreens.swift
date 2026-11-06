@@ -131,9 +131,11 @@ private struct RowContent: View {
     var state: RowState? = nil
     var stateText: String? = nil
     var unread = false
+    /// Pass 16: the row's icon grows with its title at large text.
+    @ScaledMetric(relativeTo: .body) private var glyphSize: CGFloat = 20
     var body: some View {
         HStack(spacing: 12) {
-            if let provider { ProviderGlyph(provider: provider).frame(minWidth: 20, minHeight: 20) } else { dot }
+            if let provider { ProviderGlyph(provider: provider, size: min(glyphSize, 40)) } else { dot }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(VerdeTheme.ui(16)).lineLimit(2)
                 if let detail { subtitle(detail) }
@@ -257,6 +259,8 @@ private struct BrowseFrame<Content: View>: View {
     var large = true
     /// Home's "New chat" button already keeps the bottom band; it sits beside the bubble.
     var reservesBubble = true
+    /// Home and Workspaces (the stack's root), as opposed to a pushed workspace screen.
+    var isRoot = true
     @ViewBuilder let content: (BrowseState, Int64) -> Content
     @State private var addingHost = false
 
@@ -301,7 +305,8 @@ private struct BrowseFrame<Content: View>: View {
             if title == "Home" && !adaptive.slotVisible { ToolbarItem(placement: .principal) { VerdeWordmark() } }
             // I15-2: New chat is a compose button in the bar (Home and Workspaces), not a floating
             // pill; beside a visible sidebar its "+" already does this.
-            if (title == "Home" || title == "Workspaces") && !adaptive.slotVisible && gateOpen(model.state)
+            // Workspaces keeps its own New chat row (Android's choice), so only Home has the button.
+            if title == "Home" && !adaptive.slotVisible && gateOpen(model.state)
                 && model.state.workspaces?.items.contains(where: \.open) == true {
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink(value: BrowseRoute.newChat(nil)) {
@@ -313,7 +318,8 @@ private struct BrowseFrame<Content: View>: View {
             }
             ToolbarItem(placement: .topBarTrailing) { HostMenu(model: model.hosts) { addingHost = true } }
         }
-        .modifier(RootCompanionToolbar())
+        // Pushed screens (a workspace) already carry the avatar from the stack: one avatar per bar.
+        .modifier(RootCompanionToolbar(enabled: isRoot))
         .modifier(AddHostAlert(model: model.hosts, isPresented: $addingHost))
         .navigationBarTitleDisplayMode(.inline)
         .listStyle(.plain)
@@ -424,7 +430,7 @@ struct WorkspaceScreen: View {
         let hidden = model.companionThreads
         BrowseFrame(title: workspace?.label ?? "Workspace", model: model, actions: actions,
                     ticking: workspace?.panes.contains { $0.can_stop && $0.started_at_ms != nil } ?? false,
-                    large: false) { _, now in
+                    large: false, isRoot: false) { _, now in
             if let workspace {
                 ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
                 if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
@@ -491,7 +497,7 @@ struct BrowseStack<Root: View>: View {
     @Environment(\.adaptive) private var adaptive
     var body: some View {
         NavigationStack(path: $path) {
-            root().modifier(VerdeNavigation()).navigationDestination(for: BrowseRoute.self) { route in
+            root().modifier(VerdeNavigation()).minimalBackTitle().navigationDestination(for: BrowseRoute.self) { route in
                 Group { switch route {
                 case .history: ManageContainer(browse: model) { manage in HistoryScreen(browse: model, manage: manage) }
                 case .newChat(let id): ManageContainer(browse: model) { manage in NewChatScreen(browse: model, manage: manage, initialWorkspace: id) }
@@ -516,6 +522,7 @@ struct BrowseStack<Root: View>: View {
                 // chevron alone everywhere, so it never reads "Home" on one screen and "Back" on another.
                 .modifier(VerdeNavigation())
                 .toolbarRole(.editor)
+                .minimalBackTitle()
             }
         }
         .environment(\.openRoute, { route in path.append(route) })

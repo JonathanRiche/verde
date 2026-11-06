@@ -748,6 +748,8 @@ enum SummaryTone: Equatable { case attention, busy, failure, quiet }
 /// "needs you" capsule below, never in the header too (I11-3, U1 iPad).
 func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool) -> (text: String, tone: SummaryTone) {
     if !connected { return ("offline", .quiet) }
+    // Pass 16: the status says something waits; the strip's capsule carries the count.
+    if needsYou > 0 { return ("needs you", .attention) }
     if failed { return ("needs a look", .failure) }
     if working { return ("working", .busy) }
     if crewRunning > 0 { return ("\(crewRunning) running", .busy) }
@@ -761,6 +763,7 @@ enum CompanionPanel: Equatable { case needs, activity }
 /// `companionStatusSuffix`, so every count in the header has a capsule to expand.
 func companionHeaderPanel(needsYou: Int, running: Int, working: Bool, failed: Bool, connected: Bool) -> CompanionPanel? {
     if !connected { return nil }
+    if needsYou > 0 { return .needs }
     if failed || working { return nil }
     return running > 0 ? .activity : nil
 }

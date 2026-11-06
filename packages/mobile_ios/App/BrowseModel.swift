@@ -304,7 +304,7 @@ func browseBanner(_ state: BrowseState, _ nowMs: Int64) -> Banner? {
         return Banner(text: "Pair again — device authorization needs renewal.", action: .hosts, error: true)
     }
     if host.trust_proposal != nil { return Banner(text: "Review this host's identity before connecting.", action: .hosts, error: true) }
-    if host.update_required { return Banner(text: "Update required — update verde on this phone or host.", error: true) }
+    if host.update_required { return Banner(text: "Update required — update verde on this device or host.", error: true) }
     if !state.networkAvailable { return Banner(text: "You're offline.\(saved)", error: true) }
     if host.phase == "failed" || host.error?.failure_kind == "network" {
         return Banner(text: "Can't reach \(host.label). Is Tailscale on?\(saved)", action: .retry, error: true)

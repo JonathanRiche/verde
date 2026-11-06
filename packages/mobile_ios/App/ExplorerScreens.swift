@@ -95,7 +95,13 @@ struct ChangesRoute: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 4)
             }
             content(changes, repos, filter: filter).frame(maxWidth: .infinity, maxHeight: .infinity)
-            if repos.contains(where: { !$0.files.isEmpty }) { CommitBar(filter: filter, owners: owners, onCommit: commit) }
+            if repos.contains(where: { !$0.files.isEmpty }) {
+                // Pass 16: with no chat claiming the files, any of the workspace's chats can review
+                // and commit them (its Commit… sheet lists every changed file).
+                let chats: [ChangesFilter] = threads.filter { listed($0) && !browse.companionThreads.contains($0.thread_id) }
+                    .map { .chat(threadID: $0.thread_id, title: $0.title.isEmpty ? "New chat" : $0.title) }
+                CommitBar(filter: filter, owners: owners, chats: chats, onCommit: commit)
+            }
         }
         .background(VerdeTheme.background)
         .accessibilityIdentifier("changes-screen")
@@ -276,7 +282,21 @@ private struct ChangeRow: View {
 private struct CommitBar: View {
     let filter: ChangesFilter
     let owners: [ChangesFilter]
+    /// The workspace's chats, offered when no chat claimed the files.
+    var chats: [ChangesFilter] = []
     let onCommit: (String) -> Void
+    private var choices: [ChangesFilter] { owners.isEmpty ? chats : owners }
+
+    private var commitMenu: some View {
+        Menu {
+            Section(owners.isEmpty ? "Commit with a chat" : "") {
+                ForEach(choices, id: \.self) { owner in
+                    if case .chat(let id, let title) = owner { Button(title) { onCommit(id) }.accessibilityIdentifier("commit-as-" + id) }
+                }
+            }
+        } label: { Text("Commit…") }
+        .buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(choices.isEmpty).accessibilityIdentifier("changes-commit")
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -286,14 +306,9 @@ private struct CommitBar: View {
             case .chat(let id, _):
                 Button("Commit") { onCommit(id) }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).accessibilityIdentifier("changes-commit")
             case .all:
-                Menu {
-                    ForEach(owners, id: \.self) { owner in
-                        if case .chat(let id, let title) = owner { Button(title) { onCommit(id) }.accessibilityIdentifier("commit-as-" + id) }
-                    }
-                } label: { Text("Commit…") }
-                .buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(owners.isEmpty).accessibilityIdentifier("changes-commit")
+                commitMenu
             case .unassigned:
-                Button("Commit…") {}.buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(true).accessibilityIdentifier("changes-commit")
+                commitMenu
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 6)

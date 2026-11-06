@@ -141,6 +141,31 @@ private let bundledLicences: [(String, String)] = [
 
 /// Settings (S8): Appearance, Notifications, Security, Companion, Hosts, then About, in the same
 /// order as Android. Commit messages (read-only, set on the computer) sit after Companion.
+/// The Theme choices: the current one checked, in the same column and bar as Settings.
+private struct ThemeChoicePage: View {
+    @Bindable var appearance: AppearanceSettings
+    var body: some View {
+        List {
+            ForEach(AppearanceMode.allCases, id: \.self) { mode in
+                Button { appearance.mode = mode } label: {
+                    HStack {
+                        Text(mode.label).foregroundStyle(VerdeTheme.text)
+                        Spacer()
+                        if appearance.mode == mode { Image(systemName: "checkmark").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true) }
+                    }
+                    .frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(appearance.mode == mode ? .isSelected : [])
+            }
+        }
+        .scrollContentBackground(.hidden).background(VerdeTheme.background)
+        .modifier(ReadableListWidth())
+        .modifier(VerdeNavigation())
+        .navigationTitle("Theme").navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 /// The drawer button when Settings sits in the content pane and the sidebar is hidden.
 private struct EmbeddedNavigation: ViewModifier {
     let enabled: Bool
@@ -162,11 +187,12 @@ struct AppSettings: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("Theme", selection: $appearance.mode) {
-                        ForEach(AppearanceMode.allCases, id: \.self) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }.pickerStyle(.navigationLink)
+                    // Pass 16: our own page, so it keeps the 720-point column and the sidebar button.
+                    NavigationLink {
+                        ThemeChoicePage(appearance: appearance)
+                    } label: {
+                        LabeledContent("Theme", value: appearance.mode.label)
+                    }
                     if appearance.mode == .host {
                         Button("Reload host theme") { Task { await appearance.refresh(browse) } }
                         if let notice = appearance.notice { Text(notice).font(VerdeTheme.ui(13)) }
@@ -197,6 +223,7 @@ struct AppSettings: View {
             .toolbar { if !embedded { BarButton("Done", bold: true) { dismiss() } } }
             .modifier(EmbeddedNavigation(enabled: embedded))
             .modifier(RootCompanionToolbar())
+            .minimalBackTitle()
         }.preferredColorScheme(appearance.resolvedScheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
     }
 

@@ -43,7 +43,7 @@ struct PairingView: View {
                     }
                 } else {
                     Section {
-                        Text("Run Tailscale on this phone and your host. Create a pairing grant in verde on your computer, then scan or paste it here.")
+                        Text("Run Tailscale on this device and your host. Create a pairing grant in verde on your computer, then scan or paste it here.")
                     }
                     TitledSection("Pair a host") {
                         TextField("Device name", text: $model.deviceLabel)

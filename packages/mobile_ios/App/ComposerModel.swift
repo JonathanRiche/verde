@@ -84,6 +84,12 @@ enum ComposerPicker: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// A draft image's name in the strip, the same as Android: "Photo" alone, else "Photo 3".
+func composerImageName(index: Int, of count: Int) -> String { count > 1 ? "Photo \(index + 1)" : "Photo" }
+
+/// "16 photos" above the strip.
+func composerImageCount(_ count: Int) -> String { count == 1 ? "1 photo" : "\(count) photos" }
+
 /// Android's wording when a pick goes over the per-message limit.
 let composerImageLimitNotice = "Up to \(ComposerModel.maxImages) images per message."
 

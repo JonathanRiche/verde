@@ -19,6 +19,20 @@ struct LockSettings: Codable, Equatable {
     }
 }
 
+/// A system permission prompt (microphone, speech, camera) is on screen: the app turns inactive,
+/// but the privacy cover must not blank the screen behind the prompt (Pass 16). Backgrounding
+/// still covers it.
+@MainActor @Observable
+final class SystemPrompts {
+    static let shared = SystemPrompts()
+    private(set) var active = 0
+    func run<T>(_ body: () async -> T) async -> T {
+        active += 1
+        defer { active -= 1 }
+        return await body()
+    }
+}
+
 @MainActor @Observable
 final class AppLock {
     private(set) var settings = LockSettings()
@@ -32,7 +46,10 @@ final class AppLock {
     private let auth: DeviceAuthenticating
     private let now: () -> TimeInterval
     private let key = "ios/1/app-lock"
-    var covered: Bool { !loaded || locked || (inactive && settings.privacy) }
+    var covered: Bool {
+        let prompting = SystemPrompts.shared.active > 0 && backgroundAt == nil
+        return !loaded || locked || (inactive && settings.privacy && !prompting)
+    }
     init(storage: SecureStorage = KeychainStorage(), auth: DeviceAuthenticating? = nil, now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.storage = storage; self.auth = auth ?? DeviceAuthentication(); self.now = now
     }
@@ -60,7 +77,7 @@ final class AppLock {
         busy = true; notice = nil
         defer { busy = false }
         if await auth.authenticate() { locked = false }
-        else { notice = "Couldn't unlock. Make sure this phone has a device passcode, then try Face ID, Touch ID, or the passcode again." }
+        else { notice = "Couldn't unlock. Make sure this device has a passcode, then try Face ID, Touch ID, or the passcode again." }
     }
     func update(_ next: LockSettings) async {
         guard loaded, !busy, [0, 60, 300, 900].contains(next.timeout) else { return }

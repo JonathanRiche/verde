@@ -454,20 +454,26 @@ struct ChatComposer: View {
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
                 // Up to 16 images: one row that scrolls sideways, never taller than one thumbnail.
-                // A plain stack: 16 small items are cheap, and every Remove stays reachable.
+                // A plain stack: 16 small items are cheap, and every Remove stays reachable. Like
+                // Android, the chips are "Photo 1…16" with a count above.
+                if attachments.count > 1 {
+                    Text(composerImageCount(attachments.count)).font(VerdeTheme.ui(12, bold: true)).foregroundStyle(VerdeTheme.muted)
+                        .accessibilityIdentifier("composer-attachment-count")
+                }
                 ScrollView(.horizontal) {
                     HStack {
-                        ForEach(attachments, id: \.local_id) { item in
+                        ForEach(Array(attachments.enumerated()), id: \.element.local_id) { index, item in
+                            let name = composerImageName(index: index, of: attachments.count)
                             HStack {
                                 if let data = model.previews[item.local_id], let image = UIImage(data: data) {
-                                    Image(uiImage: image).resizable().scaledToFit().frame(width: 44, height: 44)
+                                    Image(uiImage: image).resizable().scaledToFit().frame(width: 44, height: 44).accessibilityHidden(true)
                                 }
-                                Text(item.name) .font(VerdeTheme.ui(12))
+                                Text(name).font(VerdeTheme.ui(12))
                                 Button { model.detach(item.local_id) } label: {
                                     Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.muted).minTarget()
                                 }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Remove \(item.name)").disabled(model.busy || model.pending)
+                                .accessibilityLabel("Remove \(name)").disabled(model.busy || model.pending)
                             }
                         }
                     }
@@ -663,18 +669,21 @@ struct ChatComposer: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(transcript.isEmpty ? "Listening" : "Heard: " + transcript)
             } else {
-                TextField(followupKind.map { $0.hint + "…" } ?? compact.placeholder,
-                          text: Binding(get: { model.text }, set: { value in
-                              model.edit(value, selection: NSRange(location: (value as NSString).length, length: 0))
-                          }), axis: .vertical)
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 1...3 : 1...6)
-                    .font(VerdeTheme.ui(15))
-                    // The field itself is the 44-point target, not only its pill.
-                    .frame(minHeight: 44).contentShape(Rectangle())
-                    .disabled(model.pending)
-                    .accessibilityLabel("Message")
-                    // I12-5: distinct from the chat's own composer when both are on screen.
-                    .accessibilityIdentifier("companion-composer-field")
+                // Pass 16: the same text view as the chat composer, so the field itself (not only
+                // its pill) is a 44-point target; it grows with its text up to a few lines.
+                // I12-5: its identifier is distinct from the chat's own composer.
+                ComposerText(text: model.text, selection: model.selection, editable: !model.pending, edit: model.edit,
+                             focus: { focused = $0 },
+                             height: { height in if abs(height - contentHeight) > 1 { contentHeight = height } },
+                             identifier: "companion-composer-field", verticalInset: 11)
+                    .frame(height: min(max(44, contentHeight), dynamicTypeSize.isAccessibilitySize ? 140 : 160))
+                    .overlay(alignment: .leading) {
+                        if model.text.isEmpty {
+                            Text(followupKind.map { $0.hint + "…" } ?? compact.placeholder)
+                                .font(VerdeTheme.ui(15)).foregroundStyle(VerdeTheme.subtle).lineLimit(1)
+                                .allowsHitTesting(false).accessibilityHidden(true)
+                        }
+                    }
             }
         }
         .padding(.horizontal, 14).padding(.vertical, compact.transcript == nil ? 2 : 10)
@@ -949,7 +958,7 @@ struct ChatComposer: View {
     private func openCamera() {
         guard UIImagePickerController.isSourceTypeAvailable(.camera) else { model.notice = "No camera is available."; return }
         Task {
-            let allowed = await AVCaptureDevice.requestAccess(for: .video)
+            let allowed = await SystemPrompts.shared.run { await AVCaptureDevice.requestAccess(for: .video) }
             if allowed { camera = true } else { model.notice = "Allow camera access in Settings to take a photo." }
         }
     }
@@ -1021,14 +1030,17 @@ private struct ComposerText: UIViewRepresentable {
     let focus: (Bool) -> Void
     /// The laid-out text height, reported after layout.
     var height: (CGFloat) -> Void = { _ in }
+    var identifier = "composer-field"
+    /// Space above and below the text inside the field (the companion's one-line field).
+    var verticalInset: CGFloat = 0
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIView(context: Context) -> UITextView {
         let view = MeasuredTextView()
         view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.parent.height(height) }
         view.delegate = context.coordinator; view.backgroundColor = .clear
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 15) ?? .systemFont(ofSize: 15)); view.textColor = UIColor(VerdeTheme.text); view.tintColor = UIColor(VerdeTheme.accent); view.adjustsFontForContentSizeCategory = true
-        view.textContainerInset = .zero; view.textContainer.lineFragmentPadding = 0
-        view.accessibilityLabel = "Message"; view.accessibilityIdentifier = "composer-field"
+        view.textContainerInset = UIEdgeInsets(top: verticalInset, left: 0, bottom: verticalInset, right: 0); view.textContainer.lineFragmentPadding = 0
+        view.accessibilityLabel = "Message"; view.accessibilityIdentifier = identifier
         view.text = text; view.selectedRange = selection
         context.coordinator.applied = text
         return view

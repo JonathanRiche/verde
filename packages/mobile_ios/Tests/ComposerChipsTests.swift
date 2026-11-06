@@ -179,5 +179,8 @@ final class ComposerImageLimitTests: XCTestCase {
         XCTAssertTrue(composerImagesThatFit(picked: 0, existing: 1) == (0, false))
         XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 2, max: 4) == (2, true))
         XCTAssertEqual(composerImageLimitNotice, "Up to 16 images per message.")
+        XCTAssertEqual(composerImageName(index: 0, of: 1), "Photo")
+        XCTAssertEqual(composerImageName(index: 15, of: 16), "Photo 16")
+        XCTAssertEqual(composerImageCount(16), "16 photos")
     }
 }

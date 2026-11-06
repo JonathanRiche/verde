@@ -74,7 +74,7 @@ final class PairingModel {
         switch error.code {
         case "trust_denied": return "Host was not trusted. Scan a new code when you are ready."
         case "auth_rejected": return "This pairing grant expired or was already used. Create a new grant on your host."
-        case "exchange_uncertain": return "The host may have paired this phone, but its reply was lost. Create a new grant."
+        case "exchange_uncertain": return "The host may have paired this device, but its reply was lost. Create a new grant."
         case "repair_required": return "This device's access was revoked. Pair again with a new grant."
         case "tls_rejected": return "The host's secure connection could not be verified. Check its certificate and address."
         case "network_unavailable": return "Could not reach the host. Check Tailscale and your network, then retry."

@@ -180,8 +180,10 @@ final class CompanionVoice {
     private func authorized() async -> Bool {
         var speech = SFSpeechRecognizer.authorizationStatus()
         if speech == .notDetermined {
-            speech = await withCheckedContinuation { continuation in
-                SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+            speech = await SystemPrompts.shared.run {
+                await withCheckedContinuation { continuation in
+                    SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+                }
             }
         }
         guard speech == .authorized else {
@@ -192,7 +194,7 @@ final class CompanionVoice {
         switch AVAudioApplication.shared.recordPermission {
         case .granted: return true
         case .undetermined:
-            if await AVAudioApplication.requestRecordPermission() { return true }
+            if await SystemPrompts.shared.run({ await AVAudioApplication.requestRecordPermission() }) { return true }
         default: break
         }
         notice = "Allow Microphone access for verde in Settings to talk to your companion."

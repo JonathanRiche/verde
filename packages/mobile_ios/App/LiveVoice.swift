@@ -129,7 +129,7 @@ final class LiveVoice {
         // The session activates on the audio queue while permission is checked and the host mints
         // the provider token; teardown hands it back on every path.
         audioToken = audioSession.begin()
-        guard await AVAudioApplication.requestRecordPermission() else {
+        guard await SystemPrompts.shared.run({ await AVAudioApplication.requestRecordPermission() }) else {
             if current == generation { fail("Allow Microphone access for verde in Settings to talk live.") }
             return
         }

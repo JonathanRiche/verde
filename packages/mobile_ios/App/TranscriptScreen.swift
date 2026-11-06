@@ -404,8 +404,16 @@ private struct TranscriptList: View {
                     }
                     // A resize reflows every row; keep the reader on the row they were reading.
                     .onChange(of: outer.size.width) {
-                        if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
-                        else if let position { proxy.scrollTo(position, anchor: .top) }
+                        // Pass 16: a reader at the end (the companion panel opening, a sidebar) stays at
+                        // the end once the rows reflow, even if the reflow briefly moved the offset.
+                        if follow || atBottom {
+                            follow = true
+                            proxy.scrollTo(bottomID, anchor: .bottom)
+                            Task { @MainActor in
+                                try? await Task.sleep(for: .milliseconds(250))
+                                if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
+                            }
+                        } else if let position { proxy.scrollTo(position, anchor: .top) }
                     }
                     .onPreferenceChange(BottomOffsetKey.self) { maxY in
                         // iOS 18 reads the scroll geometry instead (TailFollower).

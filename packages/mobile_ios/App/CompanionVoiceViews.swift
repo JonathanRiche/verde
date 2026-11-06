@@ -111,7 +111,7 @@ struct CompanionVoiceSettings: View {
             }
             Toggle("Allow server recognition", isOn: $serverRecognition)
         } header: { SectionTitle("Voice") } footer: {
-            Text("Speech is recognized on this iPhone. Server recognition sends audio to Apple only when on-device recognition isn't available for your language. Get better voices in iOS Settings › Accessibility › Spoken Content › Voices.")
+            Text("Speech is recognized on this device. Server recognition sends audio to Apple only when on-device recognition isn't available for your language. Get better voices in Settings › Accessibility › Spoken Content › Voices.")
         }
     }
 
