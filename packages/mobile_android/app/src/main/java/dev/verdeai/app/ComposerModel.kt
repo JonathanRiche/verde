@@ -515,7 +515,7 @@ internal class ComposerModel(
             existing = existing + added.copy(bytes_base64="")
         }
         notice = when {
-            rejected > 0 -> "Only images can be attached from the phone."
+            rejected > 0 -> if (accepted.isEmpty()) "Couldn't attach that file. Pick a photo or an image file." else "Some files weren't images, so they weren't attached."
             accepted.size < images.size -> "Up to $MAX_IMAGES images per message."
             else -> null
         }

@@ -32,19 +32,41 @@ internal object ImageAttachments {
             Prepared(images, rejected)
         }
 
+    /**
+     * A5-2: a picker or document URI is an image when its content decodes as one. Its reported type
+     * only rules out what clearly isn't (video, documents); the photo picker can report none, or a
+     * generic one, for a perfectly good image.
+     */
+    internal fun plausibleImageType(type: String?): Boolean =
+        type == null || type.startsWith("image/") || type == "application/octet-stream" || type == "*/*"
+
     private fun one(resolver: ContentResolver, uri: Uri, maxBytes: Int): PickedImage? {
-        val type = resolver.getType(uri)
-        if (type != null && !type.startsWith("image/")) return null
-        val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, uri)) { decoder, info, _ ->
-            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            val edge = maxOf(info.size.width, info.size.height)
-            if (edge > MAX_EDGE) {
-                val scale = MAX_EDGE.toFloat() / edge
-                decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1))
+        if (!plausibleImageType(resolver.getType(uri))) return null
+        val bitmap = try {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, uri)) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val edge = maxOf(info.size.width, info.size.height)
+                if (edge > MAX_EDGE) {
+                    val scale = MAX_EDGE.toFloat() / edge
+                    decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1))
+                }
             }
+        } catch (_: Exception) {
+            // Some providers' URIs can only be streamed: decode the stream instead (bounded below).
+            decodeStream(resolver, uri) ?: return null
         }
         val bytes = encode(bitmap, maxBytes) ?: return null
         return PickedImage(displayName(resolver, uri), "image/jpeg", bytes)
+    }
+
+    private fun decodeStream(resolver: ContentResolver, uri: Uri): Bitmap? {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_EDGE * 2) sample *= 2
+        val options = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        return resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, options) }
     }
 
     /** Steps quality, then size, down until the JPEG fits. */
