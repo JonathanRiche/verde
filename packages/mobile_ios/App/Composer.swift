@@ -70,9 +70,9 @@ struct ComposerChipPlan: Equatable {
 }
 
 /// The width for the paperclip and chips in a composer `column` points wide: minus the card's
-/// margins and padding (8 + 12 a side), the 44-point action slot, its 4-point gap and 4 points of
+/// margins and padding (8 + 10 a side), the 44-point action slot, its 4-point gap and 2 points of
 /// slack for estimates. The same in every state (idle, running, Steer).
-func composerChipRowWidth(_ column: CGFloat) -> CGFloat { max(0, column - 40 - 44 - 4 - 4) }
+func composerChipRowWidth(_ column: CGFloat) -> CGFloat { max(0, column - 36 - 44 - 4 - 2) }
 
 /// A chip's texts for width estimates.
 struct ComposerChipText {
@@ -81,7 +81,7 @@ struct ComposerChipText {
     var short: String? = nil
 }
 
-/// The chip widths at a text size, from font metrics alone (I7-1): 8 points of padding a side,
+/// The chip widths at a text size, from font metrics alone (I7-1): 6 points of padding a side,
 /// the glyph (provider 18, setting 16, both scaled), a 4-point gap and the label at 12 points.
 /// The model may truncate to "GPT…" before the row wraps.
 func composerChipWidths(_ chips: [ComposerChipText], size: DynamicTypeSize) -> [ComposerChipWidth] {
@@ -93,7 +93,7 @@ func composerChipWidths(_ chips: [ComposerChipText], size: DynamicTypeSize) -> [
     let setting = composerChipIconSize(UIFontMetrics(forTextStyle: .footnote).scaledValue(for: 16, compatibleWith: traits))
     return chips.map { chip in
         let glyph = chip.kind == .model || chip.kind == .provider ? provider : setting
-        let base = 16 + glyph + 4
+        let base = 12 + glyph + 4
         return ComposerChipWidth(kind: chip.kind, full: max(44, base + measure(chip.full)),
                                  short: chip.short.map { max(44, base + measure($0)) },
                                  minimum: chip.kind == .model ? base + measure("GPT…") : nil)
@@ -103,8 +103,8 @@ func composerChipWidths(_ chips: [ComposerChipText], size: DynamicTypeSize) -> [
 let composerChipSpacing: CGFloat = 4
 let composerAttachWidth: CGFloat = 44
 
-/// The chip rows for `available` points (the paperclip included), S31: one row with full labels;
-/// else short labels; else the model middle-truncated; else the chips wrap onto more rows in
+/// The chip rows for `available` points (the paperclip included), S31: one row with the short
+/// labels; else the model middle-truncated; else the chips wrap onto more rows in
 /// order (model · effort · speed · access). A chip never loses its glyph or its label, and the
 /// plan depends only on widths, so idle, running and Steer lay out alike.
 func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> ComposerChipPlan {
@@ -113,7 +113,7 @@ func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> Compos
     func w(_ c: ComposerChipWidth, short: Bool) -> CGFloat { short ? (c.short ?? c.full) : c.full }
     func total(_ items: [ComposerChipWidth], short: Bool) -> CGFloat { items.reduce(0) { $0 + spacing + w($1, short: short) } }
     let kinds = widths.map(\.kind)
-    if attach + total(widths, short: false) <= available { return ComposerChipPlan(rows: [kinds]) }
+    // The chips always use the shared short labels (Auto, Std, Full), as on Android (S25).
     if attach + total(widths, short: true) <= available { return ComposerChipPlan(rows: [kinds], short: shortKinds) }
     let model = widths.first { $0.kind == .model }
     if let model, let minimum = model.minimum {
@@ -512,7 +512,7 @@ struct ChatComposer: View {
                 Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).accessibilityIdentifier("composer-action-hint")
             }
         }
-        .padding(12)
+        .padding(.horizontal, 10).padding(.vertical, 12)
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
@@ -831,7 +831,7 @@ struct ChatComposer: View {
                     Text(short ? shortChipText(kind) : chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28))
                         .lineLimit(1).truncationMode(kind == .model ? .middle : .tail)
                 }
-            }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 8)
+            }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 6)
                 .frame(minWidth: 44, maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
                 .background(VerdeTheme.alternate, in: Capsule())

@@ -132,6 +132,14 @@ final class WorkspaceLabelTests: XCTestCase {
         XCTAssertEqual(workspaceDisplayLabel(c, among: all), "infra")
         let same = ws("d", "scripts", "/tmp/demo/scripts")
         XCTAssertTrue(workspaceDisplayLabel(same, among: [a, same]).hasPrefix("scripts · "))
+        // S34: the demo's three "scripts" folders, never a raw path.
+        let x = ws("x", "scripts", "/tmp/verde-mobile-review/demo/scripts")
+        let y = ws("y", "scripts", "/tmp/verde-mobile-review/demo/scripts/demo/scripts")
+        let z = ws("z", "scripts", "/tmp/does-not-exist /scripts/demo/scripts")
+        let names = [x, y, z].map { workspaceDisplayLabel($0, among: [x, y, z]) }
+        XCTAssertEqual(Set(names).count, 3, "\(names)")
+        XCTAssertFalse(names.contains { $0.contains("/") }, "\(names)")
+        XCTAssertEqual(names[2], "scripts · does-not-exist")
     }
 }
 

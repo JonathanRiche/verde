@@ -331,17 +331,24 @@ func dedupedWorkspaces(_ list: [Workspace]) -> [Workspace] {
 func workspaceDisplayLabel(_ workspace: Workspace, among all: [Workspace]) -> String {
     let twins = all.filter { $0.label == workspace.label && $0.workspace_id != workspace.workspace_id }
     guard !twins.isEmpty else { return workspace.label }
-    // S34: the label and its distinguishing parent ("scripts · demo"), never a raw path: the fewest
-    // trailing parent folders that tell it from its twins.
+    // S34: the label and one distinguishing parent folder ("scripts · demo"), never a raw path: the
+    // nearest parent if no twin shares it, else the nearest ancestor no twin has anywhere above it,
+    // else the nearest parent numbered among the twins that share it ("scripts · demo 2").
     func parents(_ path: String) -> [String] {
-        (path as NSString).deletingLastPathComponent.split(separator: "/").map(String.init)
+        (path as NSString).deletingLastPathComponent.split(separator: "/").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
     let mine = parents(workspace.path)
-    for count in 1...max(1, min(3, mine.count)) where count <= mine.count {
-        let tail = mine.suffix(count).joined(separator: "/")
-        if twins.allSatisfy({ parents($0.path).suffix(count).joined(separator: "/") != tail }) {
-            return workspace.label + " · " + tail
-        }
+    if let nearest = mine.last, twins.allSatisfy({ parents($0.path).last != nearest }) {
+        return workspace.label + " · " + nearest
+    }
+    let others = Set(twins.flatMap { parents($0.path) })
+    if let unique = mine.reversed().first(where: { !others.contains($0) }) {
+        return workspace.label + " · " + unique
+    }
+    if let nearest = mine.last {
+        let sharing = all.filter { $0.label == workspace.label && parents($0.path).last == nearest }
+        let index = (sharing.firstIndex { $0.workspace_id == workspace.workspace_id } ?? 0) + 1
+        return workspace.label + " · " + nearest + (index > 1 ? " \(index)" : "")
     }
     let index = (all.filter { $0.label == workspace.label }.firstIndex { $0.workspace_id == workspace.workspace_id } ?? 0) + 1
     return workspace.label + " · \(index)"

@@ -92,10 +92,10 @@ final class ComposerChipPlanTests: XCTestCase {
                          ComposerChipWidth(kind: .access, full: 110, short: 66)]
 
     func testLabelsShortenThenTheModelTruncatesThenTheRowWraps() {
-        // 44 + 114 + 94 + 94 + 114 = 460
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 460), ComposerChipPlan(rows: [[.model, .effort, .speed, .access]]))
-        // Short labels: 44 + 114 + 74 + 70 + 70 = 372
+        // Always the short labels: 44 + 114 + 74 + 70 + 70 = 372
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 460), ComposerChipPlan(rows: [[.model, .effort, .speed, .access]], short: [.effort, .speed, .access]))
         XCTAssertEqual(composerChipPlan(widths: chips, available: 372).short, [.effort, .speed, .access])
+        XCTAssertNil(composerChipPlan(widths: chips, available: 372).modelCap)
         let truncated = composerChipPlan(widths: chips, available: 340)
         XCTAssertEqual(truncated.rows, [[.model, .effort, .speed, .access]])
         XCTAssertEqual(truncated.modelCap, 340 - (44 + 74 + 70 + 70) - 4)
