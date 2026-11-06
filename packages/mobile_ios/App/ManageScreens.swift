@@ -156,8 +156,8 @@ struct NewChatScreen: View {
             Menu {
                 ForEach(choices, id: \.id) { item in
                     let current = item.id == (value ?? newChatDefault(label))
-                    // S25: the default effort reads "Auto · provider default", never "Default".
-                    let title = (label == "Effort" && isDefaultChoice(item.id) ? "Auto · provider default" : item.label) + (item.favorite ? " ★" : "")
+                    // S25 / I10-1: "Auto · provider default" for effort, the host default "(default)".
+                    let title = newChatMenuLabel(label, item, defaultModel: catalogs?.default_model_label) + (item.favorite ? " ★" : "")
                     Button { Task { await manage.select(workspace, update(item.id)) } } label: {
                         if current { Label(title, systemImage: "checkmark") } else { Text(title) }
                     }.disabled(!item.enabled)
@@ -181,15 +181,34 @@ struct NewChatScreen: View {
 }
 
 /// The host's default when a new chat leaves a setting unset (client_core manage.zig).
-func newChatDefault(_ setting: String) -> String? { setting == "Access" ? "full_access" : nil }
+func newChatDefault(_ setting: String) -> String? {
+    switch setting {
+    case "Access": return defaultAccessID
+    case "Speed": return "off"
+    default: return nil
+    }
+}
 
-/// A New chat row's value: the chosen label, or "Default" with what that resolves to when known.
+/// A New chat row's value (I10-1): the chosen label, else what the default resolves to ("Full
+/// access", "Standard", "Opus 5.5"), unset effort "Auto". Never a bare "Default".
 func newChatChoiceLabel(_ setting: String, value: String?, choices: [ChatChoice], defaultLabel: String? = nil) -> String {
     if setting == "Model" { return composerModelLabel(choices, value: value, defaultLabel: defaultLabel) }
     if setting == "Effort" { return composerEffortLabel(choices, value: value, defaultLabel: defaultLabel) }
+    if setting == "Speed" { return composerSpeedLabel(value?.isEmpty == false ? value : newChatDefault(setting)) }
+    if setting == "Access" { return composerAccessLabel(choices, value: value) }
     if let value, !value.isEmpty { return choices.first { $0.id == value }?.label ?? value }
-    if let id = newChatDefault(setting), let resolved = choices.first(where: { $0.id == id }) { return "Default · " + resolved.label }
-    return "Default"
+    return "Auto"
+}
+
+/// A New chat menu row, in the composer pickers' words.
+func newChatMenuLabel(_ setting: String, _ item: ChatChoice, defaultModel: String? = nil) -> String {
+    switch setting {
+    case "Effort": return isDefaultChoice(item.id) ? "Auto · provider default" : item.label
+    case "Model": return composerPickerLabel(.model, item, defaultModel: defaultModel)
+    case "Speed": return composerPickerLabel(.speed, item)
+    case "Access": return composerPickerLabel(.access, item)
+    default: return item.label
+    }
 }
 
 struct AddWorkspaceScreen: View {

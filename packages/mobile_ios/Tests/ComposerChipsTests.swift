@@ -8,7 +8,7 @@ final class ComposerChipsTests: XCTestCase {
     func testAccessChipShowsTheResolvedValue() {
         XCTAssertEqual(composerAccessLabel(access, value: "supervised"), "Supervised")
         XCTAssertEqual(composerAccessLabel(access, value: "full_access"), "Full access")
-        XCTAssertEqual(composerAccessLabel(access, value: nil), "Default · Full access")
+        XCTAssertEqual(composerAccessLabel(access, value: nil), "Full access")
         XCTAssertEqual(composerCurrentChoice(.access, value: nil), "full_access")
         XCTAssertEqual(composerCurrentChoice(.effort, value: nil), "")
         XCTAssertEqual(composerCurrentChoice(.model, value: "opus"), "opus")
@@ -29,7 +29,7 @@ final class ComposerChipsTests: XCTestCase {
     func testChipsDropTheDefaultPrefix() {
         let models = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
         XCTAssertEqual(composerResolvedModel(models, value: nil, defaultLabel: "Opus 5.5"), "Opus 5.5")
-        XCTAssertEqual(composerResolvedModel(models, value: nil, defaultLabel: nil), "Default")
+        XCTAssertEqual(composerResolvedModel(models, value: nil, defaultLabel: nil), "Auto")
         XCTAssertEqual(composerResolvedEffort([ChatChoice(id: "", label: "Default")], value: nil, defaultLabel: "High"), "High")
     }
 
@@ -42,10 +42,16 @@ final class ComposerChipsTests: XCTestCase {
         let models = [ChatChoice(id: "opus", label: "Opus 5.5"), ChatChoice(id: "haiku", label: "Haiku 5.5")]
         XCTAssertEqual(composerModelLabel(models, value: nil), "Opus 5.5")
         XCTAssertEqual(composerModelLabel(models, value: "haiku"), "Haiku 5.5")
-        XCTAssertEqual(composerModelLabel([], value: nil), "Default")
+        XCTAssertEqual(composerModelLabel([], value: nil), "Auto")
         let withDefault = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
-        XCTAssertEqual(composerModelLabel(withDefault, value: nil, defaultLabel: "Opus 5.5"), "Default · Opus 5.5")
-        XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Default")
+        XCTAssertEqual(composerModelLabel(withDefault, value: nil, defaultLabel: "Opus 5.5"), "Opus 5.5")
+        XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Auto")
+        XCTAssertEqual(composerPickerLabel(.model, withDefault[0], defaultModel: "Opus 5.5"), "Opus 5.5 (default)")
+        XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "off", label: "Normal")), "Standard (default)")
+        XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "on", label: "Fast")), "Fast")
+        XCTAssertEqual(composerPickerLabel(.access, access[1]), "Full access (default)")
+        XCTAssertEqual(composerPickerLabel(.effort, ChatChoice(id: "", label: "Default")), "Auto")
+        XCTAssertEqual(composerSpeedLabel(nil), "Standard")
         XCTAssertEqual(composerModelLabel(withDefault, value: "opus", defaultLabel: "Opus 5.5"), "Opus 5.5")
         let efforts = [ChatChoice(id: "", label: "Default"), ChatChoice(id: "high", label: "High")]
         XCTAssertEqual(composerEffortLabel(efforts, value: nil, defaultLabel: nil), "Auto")

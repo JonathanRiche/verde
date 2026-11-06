@@ -5,8 +5,15 @@ import AVFoundation
 
 func composerChoiceLabel(_ choices: [ChatChoice], value: String?) -> String {
     choices.first { $0.id == (value ?? "") }?.label
-        ?? value.flatMap { $0.isEmpty ? nil : $0 } ?? "Default"
+        ?? value.flatMap { $0.isEmpty ? nil : $0 } ?? "Auto"
 }
+
+/// The speed a label or picker names (I10-2): "Standard" or "Fast", never the core's "Normal".
+/// The chip abbreviates it to "Std" (the same words as Android).
+func composerSpeedLabel(_ id: String?) -> String { id == "on" ? "Fast" : "Standard" }
+
+/// A picker or menu row for a choice that is the host's default: "Full access (default)" (I10-1).
+func composerDefaultMarked(_ label: String) -> String { label + " (default)" }
 
 /// A new thread runs with full access unless the user picks otherwise (host default).
 let defaultAccessID = "full_access"
@@ -31,10 +38,11 @@ func chipDisplay(_ text: String, limit: Int) -> String {
 /// A catalog row that stands for the provider's own default.
 func isDefaultChoice(_ id: String) -> Bool { id.isEmpty || id == "default" }
 
-/// "Default · Opus 5.5" for a default choice whose model (or effort) the core names, else "Default".
+/// What a default choice runs (I10-1): the model the core names ("Opus 5.5"), else "Auto". Never a
+/// bare "Default"; pickers mark the default row instead.
 func composerDefaultLabel(_ resolved: String?) -> String {
-    guard let resolved, !resolved.isEmpty else { return "Default" }
-    return "Default · " + resolved
+    guard let resolved, !resolved.isEmpty else { return "Auto" }
+    return resolved
 }
 
 /// A chip's estimated widths: with its label, and as an icon (nil when it has no icon).
@@ -119,7 +127,7 @@ func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> Compos
 }
 
 /// The model chip: the chosen model, else the one an unset choice runs (the catalog's first);
-/// the provider's default row reads "Default · <model>" when the core names it (S11).
+/// the provider's default row reads the model the core names ("Opus 5.5"), else "Auto" (I10-1).
 func composerModelLabel(_ models: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
     let id = (value?.isEmpty == false ? value : nil) ?? models.first?.id
     guard let id else { return composerDefaultLabel(defaultLabel) }
@@ -127,13 +135,12 @@ func composerModelLabel(_ models: [ChatChoice], value: String?, defaultLabel: St
     return composerChoiceLabel(models, value: id)
 }
 
-/// The model a chip names: what runs, without the "Default ·" prefix ("Opus 5.5").
+/// The model a chip names: what runs ("Opus 5.5").
 func composerResolvedModel(_ models: [ChatChoice], value: String?, defaultLabel: String?) -> String {
-    let label = composerModelLabel(models, value: value, defaultLabel: defaultLabel)
-    return label.hasPrefix("Default · ") ? String(label.dropFirst("Default · ".count)) : label
+    composerModelLabel(models, value: value, defaultLabel: defaultLabel)
 }
 
-/// The effort a chip names: the chosen one, else the default's resolved effort ("High"), else "Default".
+/// The effort a chip names: the chosen one, else the default's resolved effort ("High"), else "Auto".
 func composerResolvedEffort(_ efforts: [ChatChoice], value: String?, defaultLabel: String?) -> String {
     let label = composerEffortLabel(efforts, value: value, defaultLabel: defaultLabel)
     return label.hasPrefix("Auto · ") ? String(label.dropFirst("Auto · ".count)) : label
@@ -172,17 +179,30 @@ func composerShortLabel(_ kind: ComposerPicker, id: String?, label: String) -> S
     }
 }
 
-/// The access mode in effect, without the "Default ·" prefix.
+/// The access mode in effect ("Full access" when unset).
 func composerResolvedAccess(_ choices: [ChatChoice], value: String?) -> String {
     let id = (value?.isEmpty == false ? value : nil) ?? defaultAccessID
     return composerChoiceLabel(choices, value: id)
 }
 
-/// The access chip's resolved value: "Supervised", "Full access", or "Default · Full access".
+/// The access label: "Supervised" or "Full access"; unset reads the host default it resolves to (I10-1).
 func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
     if let value, !value.isEmpty { return composerChoiceLabel(choices, value: value) }
-    let resolved = choices.first { $0.id == defaultAccessID }?.label ?? "Full access"
-    return "Default · " + resolved
+    return choices.first { $0.id == defaultAccessID }?.label ?? "Full access"
+}
+
+/// A picker row's label (I10-1, I10-2): effort's default row reads "Auto", the model's default row
+/// the model it runs, speed "Standard" / "Fast", and the host's default "(default)".
+func composerPickerLabel(_ kind: ComposerPicker, _ choice: ChatChoice, defaultModel: String? = nil) -> String {
+    switch kind {
+    case .effort: return isDefaultChoice(choice.id) ? "Auto" : choice.label
+    case .model: return isDefaultChoice(choice.id) ? composerDefaultMarked(composerDefaultLabel(defaultModel)) : choice.label
+    case .speed:
+        guard choice.id == "off" || choice.id == "on" else { return choice.label }
+        return choice.id == "off" ? composerDefaultMarked(composerSpeedLabel(choice.id)) : composerSpeedLabel(choice.id)
+    case .access: return choice.id == defaultAccessID ? composerDefaultMarked(choice.label) : choice.label
+    case .provider: return choice.label
+    }
 }
 
 /// The option a picker marks as current: the selection, else what an unset value means.
@@ -302,7 +322,7 @@ struct CompactComposer {
 
 /// "Haiku 5.5 · Low": the model and effort as one chip label.
 func composerChipLabel(model: String, effort: String?) -> String {
-    guard let effort, !effort.isEmpty, effort != "Default" else { return model }
+    guard let effort, !effort.isEmpty, effort != "Default", effort != "Auto" else { return model }
     return model + " · " + effort
 }
 
@@ -346,7 +366,7 @@ struct ChatComposer: View {
                         PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: pickerChoice(kind, choice), selected: choice.id == current,
                                   subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
                     }.disabled(!choice.enabled)
-                }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
+                }.navigationTitle(kind.rawValue.capitalized).toolbar { BarButton("Done", bold: true) { picker = nil } }
             }.presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $camera) { ComposerCamera { image in camera = false; if let image { prepare(image) } } }
@@ -494,7 +514,8 @@ struct ChatComposer: View {
         Button(action: model.chat.stopTurn) {
             Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background)
                 .frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle())
-                .modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4))
+                // I10-6: no pulse while the turn waits on an approval; nothing is working then.
+                .modifier(Pulse(active: !model.chat.state.stopping && model.chat.state.thread?.approval == nil, minimum: 0.74, period: 1.4))
         }
         .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
     }
@@ -811,28 +832,26 @@ struct ChatComposer: View {
         case .access: return composerAccessLabel(list, value: selectedID(kind))
         case .model: return composerModelLabel(list, value: selectedID(kind), defaultLabel: model.view?.catalogs.default_model_label)
         case .effort: return composerEffortLabel(list, value: selectedID(kind), defaultLabel: model.view?.catalogs.default_effort_label)
-        case .speed: return composerChoiceLabel(list, value: selectedID(kind) ?? "off")
+        case .speed: return composerSpeedLabel(selectedID(kind))
         default: return composerChoiceLabel(list, value: selectedID(kind))
         }
     }
     /// What the picker's Default row runs, under its label ("Opus 5.5"; effort: "provider default").
     private func defaultSubtitle(_ kind: ComposerPicker) -> String? {
         switch kind {
-        case .model: return model.view?.catalogs.default_model_label
         case .effort: return model.view?.catalogs.default_effort_label ?? "provider default"
         default: return nil
         }
     }
 
-    /// The effort picker's default row reads "Auto", never "Default" (S25).
+    /// Picker rows use the S25 words (I10-1, I10-2): effort's default row "Auto", the model's the
+    /// model it runs, speed "Standard" / "Fast", and the host default marked "(default)".
     private func pickerChoice(_ kind: ComposerPicker, _ choice: ChatChoice) -> ChatChoice {
-        guard kind == .effort, isDefaultChoice(choice.id) else { return choice }
         var renamed = choice
-        renamed.label = "Auto"
+        renamed.label = composerPickerLabel(kind, choice, defaultModel: model.view?.catalogs.default_model_label)
         return renamed
     }
-    /// The chip's own text: the resolved value alone ("Full access"); labels and menus keep
-    /// "Default · …" so the inheritance is still announced.
+    /// The chip's own text: the resolved value alone ("Full access").
     private func chipText(_ kind: ComposerPicker) -> String {
         let catalogs = model.view?.catalogs
         switch kind {

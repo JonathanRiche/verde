@@ -155,7 +155,7 @@ struct CompanionBrainScreen: View {
                 .disabled(!item.enabled)
             }
         } label: {
-            LabeledContent(title, value: label(choices, value) ?? "Default").frame(minHeight: 44)
+            LabeledContent(title, value: label(choices, value) ?? "Auto").frame(minHeight: 44)
         }
         .disabled(choices.isEmpty || working)
     }

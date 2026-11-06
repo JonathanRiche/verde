@@ -821,7 +821,7 @@ func classifyBrainChange(currentProvider: String, newProvider: String, thread: B
 
 /// "Claude · Opus 5.5 · High"; defaults are left out.
 func brainLabel(provider: String, model: String?, effort: String?) -> String {
-    let parts = [provider, model ?? "", effort ?? ""].filter { !$0.isEmpty && $0 != "Default" }
+    let parts = [provider, model ?? "", effort ?? ""].filter { !$0.isEmpty && $0 != "Default" && $0 != "Auto" }
     return parts.isEmpty ? "Default brain" : parts.joined(separator: " · ")
 }
 
