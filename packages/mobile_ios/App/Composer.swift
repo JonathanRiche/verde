@@ -516,16 +516,25 @@ private struct ComposerText: UIViewRepresentable {
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 15) ?? .systemFont(ofSize: 15)); view.textColor = UIColor(VerdeTheme.text); view.tintColor = UIColor(VerdeTheme.accent); view.adjustsFontForContentSizeCategory = true
         view.textContainerInset = .zero; view.textContainer.lineFragmentPadding = 0
         view.accessibilityLabel = "Message"; view.accessibilityIdentifier = "composer-field"
+        view.text = text; view.selectedRange = selection
+        context.coordinator.applied = text
         return view
     }
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.parent = self
-        view.isEditable = editable
+        if view.isEditable != editable { view.isEditable = editable }
+        // Only a change of the model's text (a suggestion, a restored draft, a send) is pushed in.
+        // An update rendered before the field reported its latest keystroke still carries the
+        // previous text; applying it erased the first character typed right after focusing.
+        guard text != context.coordinator.applied else { return }
+        context.coordinator.applied = text
         // Never replace marked text while an IME is composing.
         if view.markedTextRange == nil && view.text != text { view.text = text; view.selectedRange = selection }
     }
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: ComposerText
+        /// The model text the field was last updated with.
+        var applied = ""
         init(_ parent: ComposerText) { self.parent = parent }
         func textViewDidBeginEditing(_ view: UITextView) { parent.focus(true) }
         func textViewDidEndEditing(_ view: UITextView) { parent.focus(false) }
