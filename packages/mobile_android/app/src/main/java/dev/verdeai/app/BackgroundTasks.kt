@@ -7,12 +7,14 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -83,6 +85,8 @@ private fun BackgroundLine(row: ChatRow, task: ChatBackground, now: Long) {
             StatusGlyph(task.status, tint)
             Text(status, style = MaterialTheme.typography.labelSmall, color = tint, maxLines = 1)
             age?.let { Text("· $it", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle, maxLines = 1) }
+            // S41: rows get the chevron too (it opens the full command).
+            Chevron(disclosure.expanded)
         }
         if (disclosure.expanded && row.body.isNotBlank()) Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Top) {
@@ -114,8 +118,11 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
     if (tasks.isEmpty()) return
     val colors = MaterialTheme.colorScheme
     val title = runningTasksLabel(tasks.size)
-    val labels = tasks.joinToString(" · ") { it.label }
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).background(VerdeColors.Panel)
+    val labels = tasks.joinToString(" · ") { backgroundSpokenLabel(it.label) }
+    // S41: the iOS bar: full width, outlined, the task titles, a chevron to its row.
+    val shape = RoundedCornerShape(10.dp)
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(shape)
+        .background(VerdeColors.Panel, shape).border(1.dp, colors.outlineVariant, shape)
         .clickable(role = Role.Button, onClickLabel = "Show") { onJump(tasks.first().row_id) }
         .nameOnly("$title: " + tasks.joinToString(", ") { backgroundSpokenLabel(it.label) }).padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -123,6 +130,7 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
         Text(title, style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)
         Text(labels, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall.copy(fontFamily = VerdeMono),
             color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp))
     }
 }
 

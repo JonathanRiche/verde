@@ -62,6 +62,7 @@ import kotlinx.coroutines.launch
 
 internal const val TRANSCRIPT_LIST = "transcript-list"
 internal const val JUMP_TO_BOTTOM = "Jump to latest"
+internal const val LATEST_STRIP = "latest-strip"
 
 /** What every item renderer gets: the model (render queries, actions) and shared callbacks. */
 internal class TranscriptContext(
@@ -380,6 +381,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     val reversed = remember(items) { items.asReversed() }
     val list = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
     val atBottom by remember { derivedStateOf { list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset < 48 } }
     // Follow new output only while the reader is at the bottom; changed by user scrolls only.
     var follow by rememberSaveable { mutableStateOf(true) }
@@ -419,7 +421,8 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
         val index = reversed.indexOfFirst { item -> item is TranscriptItem.Background && item.rows.any { it.id == id } }
         if (index >= 0) {
             follow = false
-            list.animateScrollToItem(index)
+            // S41: the row lands clear of the Latest strip that appears once the list leaves the bottom.
+            list.animateScrollToItem(index, -with(density) { 72.dp.roundToPx() })
             // (a) Outline the task for a moment so the eye finds it, as on iOS.
             jump.highlight = id
             scope.launch { kotlinx.coroutines.delay(2_500); if (jump.highlight == id) jump.highlight = null }
@@ -454,14 +457,14 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
         }
         ApprovalBanner(reversed, list, ctx.model.approvals, Modifier.align(Alignment.TopCenter))
     }
-    if (!atBottom && reversed.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.End) {
-        FilledTonalButton(onClick = { follow = true; scope.launch { list.animateScrollToItem(0) } },
-            contentPadding = PaddingValues(start = 12.dp, end = 16.dp), modifier = Modifier.height(40.dp)
-                .semantics { contentDescription = JUMP_TO_BOTTOM }) {
-            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(4.dp))
-            Text("Latest", style = MaterialTheme.typography.labelLarge)
-        }
+    // S42: "Latest" is one full-width strip under the transcript (as on iOS), never a pill over it.
+    if (!atBottom && reversed.isNotEmpty()) Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).background(VerdeColors.AccentWash)
+        .clickable(role = androidx.compose.ui.semantics.Role.Button) { follow = true; scope.launch { list.animateScrollToItem(0) } }
+        .nameOnly(JUMP_TO_BOTTOM).testTag(LATEST_STRIP),
+        horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(4.dp))
+        Text("Latest", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
     }
     }
 }
