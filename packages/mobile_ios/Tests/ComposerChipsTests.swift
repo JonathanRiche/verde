@@ -23,6 +23,14 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerModelLabel(models, value: nil), "Opus 5.5")
         XCTAssertEqual(composerModelLabel(models, value: "haiku"), "Haiku 5.5")
         XCTAssertEqual(composerModelLabel([], value: nil), "Default")
+        let withDefault = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
+        XCTAssertEqual(composerModelLabel(withDefault, value: nil, defaultLabel: "Opus 5.5"), "Default · Opus 5.5")
+        XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Default")
+        XCTAssertEqual(composerModelLabel(withDefault, value: "opus", defaultLabel: "Opus 5.5"), "Opus 5.5")
+        let efforts = [ChatChoice(id: "", label: "Default"), ChatChoice(id: "high", label: "High")]
+        XCTAssertEqual(composerEffortLabel(efforts, value: nil, defaultLabel: nil), "Default")
+        XCTAssertEqual(composerEffortLabel(efforts, value: "", defaultLabel: "Medium"), "Default · Medium")
+        XCTAssertEqual(composerEffortLabel(efforts, value: "high"), "High")
         XCTAssertEqual(composerResolvedAccess(access, value: nil), "Full access")
         XCTAssertEqual(composerResolvedAccess(access, value: "supervised"), "Supervised")
     }

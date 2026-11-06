@@ -149,7 +149,9 @@ struct NewChatScreen: View {
     /// The whole row opens the menu (not only its value), and the menu marks the current choice.
     @ViewBuilder private func choice(_ label: String, value: String?, choices: [ChatChoice], update: @escaping (String) -> ChatSelection) -> some View {
         if !choices.isEmpty {
-            let shown = newChatChoiceLabel(label, value: value, choices: choices)
+            let catalogs = manage.view?.new_chat?.catalogs
+            let resolved = label == "Model" ? catalogs?.default_model_label : label == "Effort" ? catalogs?.default_effort_label : nil
+            let shown = newChatChoiceLabel(label, value: value, choices: choices, defaultLabel: resolved)
             Menu {
                 ForEach(choices, id: \.id) { item in
                     let current = item.id == (value ?? newChatDefault(label))
@@ -180,7 +182,9 @@ struct NewChatScreen: View {
 func newChatDefault(_ setting: String) -> String? { setting == "Access" ? "full_access" : nil }
 
 /// A New chat row's value: the chosen label, or "Default" with what that resolves to when known.
-func newChatChoiceLabel(_ setting: String, value: String?, choices: [ChatChoice]) -> String {
+func newChatChoiceLabel(_ setting: String, value: String?, choices: [ChatChoice], defaultLabel: String? = nil) -> String {
+    if setting == "Model" { return composerModelLabel(choices, value: value, defaultLabel: defaultLabel) }
+    if setting == "Effort" { return composerEffortLabel(choices, value: value, defaultLabel: defaultLabel) }
     if let value, !value.isEmpty { return choices.first { $0.id == value }?.label ?? value }
     if let id = newChatDefault(setting), let resolved = choices.first(where: { $0.id == id }) { return "Default · " + resolved.label }
     return "Default"

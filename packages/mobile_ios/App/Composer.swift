@@ -23,10 +23,28 @@ func composerHintLine(_ kind: FollowupKind?, text: String, followupShown: Bool) 
     return kind.hint + ". Long-press Send for other options."
 }
 
-/// The model chip: the chosen model, else the one an unset choice runs (the catalog's first).
-func composerModelLabel(_ models: [ChatChoice], value: String?) -> String {
-    if let value, !value.isEmpty { return composerChoiceLabel(models, value: value) }
-    return models.first?.label ?? "Default"
+/// A catalog row that stands for the provider's own default.
+func isDefaultChoice(_ id: String) -> Bool { id.isEmpty || id == "default" }
+
+/// "Default · Opus 5.5" for a default choice whose model (or effort) the core names, else "Default".
+func composerDefaultLabel(_ resolved: String?) -> String {
+    guard let resolved, !resolved.isEmpty else { return "Default" }
+    return "Default · " + resolved
+}
+
+/// The model chip: the chosen model, else the one an unset choice runs (the catalog's first);
+/// the provider's default row reads "Default · <model>" when the core names it (S11).
+func composerModelLabel(_ models: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
+    let id = (value?.isEmpty == false ? value : nil) ?? models.first?.id
+    guard let id else { return composerDefaultLabel(defaultLabel) }
+    if isDefaultChoice(id) { return composerDefaultLabel(defaultLabel) }
+    return composerChoiceLabel(models, value: id)
+}
+
+/// The effort chip: the chosen effort, else "Default · <effort>" when the core names it.
+func composerEffortLabel(_ efforts: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
+    guard let value, !isDefaultChoice(value) else { return composerDefaultLabel(defaultLabel) }
+    return composerChoiceLabel(efforts, value: value)
 }
 
 /// The access mode in effect, without the "Default ·" prefix.
@@ -223,7 +241,8 @@ struct ChatComposer: View {
                 let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
                 List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: {
-                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: choice, selected: choice.id == current)
+                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: choice, selected: choice.id == current,
+                                  subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
                     }.disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
             }.presentationDetents([.medium, .large])
@@ -624,9 +643,18 @@ struct ChatComposer: View {
         let list = choices(kind)
         switch kind {
         case .access: return composerAccessLabel(list, value: selectedID(kind))
-        case .model: return composerModelLabel(list, value: selectedID(kind))
+        case .model: return composerModelLabel(list, value: selectedID(kind), defaultLabel: model.view?.catalogs.default_model_label)
+        case .effort: return composerEffortLabel(list, value: selectedID(kind), defaultLabel: model.view?.catalogs.default_effort_label)
         case .speed: return composerChoiceLabel(list, value: selectedID(kind) ?? "off")
         default: return composerChoiceLabel(list, value: selectedID(kind))
+        }
+    }
+    /// What the picker's Default row runs, under its label ("Opus 5.5").
+    private func defaultSubtitle(_ kind: ComposerPicker) -> String? {
+        switch kind {
+        case .model: return model.view?.catalogs.default_model_label
+        case .effort: return model.view?.catalogs.default_effort_label
+        default: return nil
         }
     }
     /// The chip's own text: the resolved value alone ("Full access"); labels and menus keep
@@ -752,11 +780,15 @@ private struct PickerRow: View {
     let glyph: AnyView
     let choice: ChatChoice
     let selected: Bool
+    var subtitle: String? = nil
 
     var body: some View {
         HStack {
             glyph
-            Text(choice.label).font(VerdeTheme.ui(15, bold: selected))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(choice.label).font(VerdeTheme.ui(15, bold: selected))
+                if let subtitle, !subtitle.isEmpty { Text(subtitle).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted) }
+            }
             if choice.favorite { Image(systemName: "star.fill").accessibilityLabel("Favorite") }
             Spacer()
             if let reason = choice.reason { Text(reason).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted) }
