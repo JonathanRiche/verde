@@ -16,6 +16,13 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Menu
 import kotlinx.coroutines.launch
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.focusTarget
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.runtime.withFrameNanos
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -322,7 +329,19 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
-    Box(Modifier.fillMaxSize()) {
+    // A6-2: when no control has focus (a tap on the transcript, a closed dialog), the shell itself
+    // holds it, so a stray Space or Enter does nothing instead of giving the first control (Back,
+    // the drawer button) focus and pressing it. Tab still moves on to the first control.
+    val shellFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    var shellHolds by remember { mutableStateOf(false) }
+    LaunchedEffect(shellFocus) { withFrameNanos { }; runCatching { shellFocus.requestFocus() } }
+    Box(Modifier.fillMaxSize().focusRequester(shellFocus)
+        .onFocusChanged { shellHolds = it.isFocused }
+        .onPreviewKeyEvent { event ->
+            // Enter would otherwise "enter" the shell and land on its first control.
+            shellHolds && event.key in setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
+        }
+        .focusTarget()) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive && !tier.docked,
         drawerContent = {
             if (tier.docked) Spacer(Modifier.size(0.dp))
@@ -351,7 +370,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
-                    LocalCompanionHeader provides headerState,
+                    LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
                     LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {
                     Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
                 }

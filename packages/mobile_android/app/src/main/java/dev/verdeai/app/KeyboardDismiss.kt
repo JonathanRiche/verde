@@ -19,11 +19,17 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 /** Puts the keyboard away and drops focus from the composer; null outside a chat. */
 internal val LocalDismissKeyboard = compositionLocalOf<(() -> Unit)?> { null }
 
+/** The app shell's own focus target (A6-2): where focus rests when no control holds it. */
+internal val LocalShellFocus = compositionLocalOf<androidx.compose.ui.focus.FocusRequester?> { null }
+
 @Composable
 internal fun rememberKeyboardDismiss(): () -> Unit {
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
-    return remember(focus, keyboard) { { keyboard?.hide(); focus.clearFocus() } }
+    val shell = LocalShellFocus.current
+    // A6-2: focus rests on the shell, not nowhere, so a later Space or Enter can't wake the first
+    // control (Back) and press it.
+    return remember(focus, keyboard, shell) { { keyboard?.hide(); focus.clearFocus(); shell?.let { runCatching { it.requestFocus() } } } }
 }
 
 /**
