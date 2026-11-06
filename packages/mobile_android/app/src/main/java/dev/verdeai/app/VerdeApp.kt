@@ -69,6 +69,18 @@ internal object Routes {
 
 private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
 
+/**
+ * K: the drawer footer destination a screen belongs to, so the footer always marks where you are:
+ * Settings for settings, Workspaces for anything inside a workspace (chats, terminals, files,
+ * changes), Home for history and new chat.
+ */
+internal fun footerTab(route: String?): String = when (route) {
+    null -> ""
+    Routes.HOME, Routes.WORKSPACES, Routes.HOSTS, Routes.SECURITY -> route
+    ManageRoutes.HISTORY, ManageRoutes.NEW_CHAT, ManageRoutes.NEW_CHAT_IN -> Routes.HOME
+    else -> Routes.WORKSPACES
+}
+
 /** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
 internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() },
@@ -97,7 +109,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Terminals keep the full height and their own back bar.
     val immersive = route == Routes.TERMINAL || route == Routes.NEW_TERMINAL
     // Highlight only actual root destinations; detail routes select their own row.
-    val currentTab = route?.takeIf { r -> r in TABS }.orEmpty()
+    val currentTab = footerTab(route)
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val browseState by browse.state.collectAsState()

@@ -206,7 +206,7 @@ private fun DrawerFooter(currentTab: String, onTab: (String) -> Unit, onSettings
         FooterTab("Home", rememberVectorPainter(Icons.Filled.Home), currentTab == Routes.HOME, Modifier.weight(1f)) { onTab(Routes.HOME) }
         FooterTab("Workspaces", painterResource(R.drawable.ic_folder), currentTab == Routes.WORKSPACES, Modifier.weight(1f)) { onTab(Routes.WORKSPACES) }
         FooterTab("Hosts", painterResource(R.drawable.host_machine), currentTab == Routes.HOSTS, Modifier.weight(1f)) { onTab(Routes.HOSTS) }
-        onSettings?.let { open -> FooterTab("Settings", painterResource(R.drawable.ic_settings), false, Modifier.weight(1f), open) }
+        onSettings?.let { open -> FooterTab("Settings", painterResource(R.drawable.ic_settings), currentTab == Routes.SECURITY, Modifier.weight(1f), open) }
     }
 }
 
