@@ -7,6 +7,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -67,20 +69,24 @@ internal fun AppearanceSystemBars() {
 internal fun AppearanceSettingsSection() {
     val settings = LocalAppearanceSettings.current ?: return
     VerdeSection("Appearance")
-    Text("Theme", style = MaterialTheme.typography.titleSmall)
-    Text("System follows your phone’s Light or Dark appearance automatically.",
-        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     var choosing by remember { mutableStateOf(false) }
-    OutlinedButton(onClick = { choosing = true }, modifier = Modifier.fillMaxWidth().testTag("appearance-theme-picker")) {
-        Text(settings.mode.label, Modifier.weight(1f))
+    // A standard two-line row: Theme and its value, the palette as trailing preview.
+    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(role = Role.Button, onClickLabel = "Change theme") { choosing = true }
+        .semantics(mergeDescendants = true) {}.padding(vertical = 8.dp).testTag("appearance-theme-picker"),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Theme", style = MaterialTheme.typography.bodyLarge)
+            Text(settings.mode.label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+        }
         ThemeSwatch(VerdeColors)
     }
+    Text(themeHelperText(settings.mode), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (choosing) AlertDialog(onDismissRequest = { choosing = false }, title = { LiveOverModal(); Text("Theme") },
         text = {
             LazyColumn(Modifier.heightIn(max = 420.dp).testTag("appearance-theme-list").selectableGroup()) {
                 items(AppearanceMode.entries, key = { it.name }) { mode ->
                     Row(Modifier.fillMaxWidth().selectable(selected = settings.mode == mode, role = Role.RadioButton,
-                        onClick = { settings.select(mode); choosing = false }).padding(vertical = 8.dp),
+                        onClick = { settings.select(mode); choosing = false }).heightIn(min = 48.dp).padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = settings.mode == mode, onClick = null)
                         Text(mode.label, Modifier.weight(1f).padding(horizontal = 8.dp))
@@ -98,4 +104,12 @@ private fun ThemeSwatch(palette: VerdePalette) {
             Box(Modifier.size(12.dp).background(color, CircleShape).border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
         }
     }
+}
+
+/** S8: the helper under Theme describes the current choice. */
+internal fun themeHelperText(mode: AppearanceMode): String = when (mode) {
+    AppearanceMode.SYSTEM -> "Follows your phone’s Light or Dark appearance automatically."
+    AppearanceMode.LIGHT -> "Always light, whatever your phone’s appearance."
+    AppearanceMode.DARK -> "Always dark, whatever your phone’s appearance."
+    else -> "${mode.label} colours everywhere, whatever your phone’s appearance."
 }

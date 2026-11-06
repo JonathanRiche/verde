@@ -9,6 +9,8 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.*
@@ -117,7 +119,7 @@ internal fun LockScreen(state: AppLockState, onUnlock: () -> Unit) {
 /** Settings → App lock & privacy. Changes apply immediately and persist in the credential store. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBack: () -> Unit) {
+internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHosts: (() -> Unit)? = null, onBack: () -> Unit) {
     val state by model.state.collectAsState()
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -129,11 +131,15 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(title = { Text("Settings") },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+        // S8: Appearance, Notifications, Security, Companion, Hosts, About (iOS has the same order).
+        CompositionLocalProvider(LocalSectionInset provides 0.dp) {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             AppearanceSettingsSection()
             HorizontalDivider()
-            VerdeSection("App lock & privacy")
+            NotificationSettingsSection()
+            HorizontalDivider()
+            VerdeSection("Security")
             SettingSwitch("Require unlock",
                 "Ask for your fingerprint, face or screen lock when you open verde.",
                 checked = lockOn, enabled = state.loaded && !state.authenticating && (lockOn || state.available),
@@ -170,12 +176,46 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
             state.saveError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             HorizontalDivider()
             CompanionBubbleSetting()
-            NotificationSettingsSection()
             LocalGitChangesClient.current?.let { client ->
                 val git by client.snapshot.collectAsState()
                 HorizontalDivider(color = VerdeColors.Border)
                 GitCommitSettingsSection(git.settings)
             }
+            if (onHosts != null) {
+                HorizontalDivider()
+                VerdeSection("Hosts")
+                SettingLink("Manage hosts", "Pair, rename, switch or sign out of the computers this phone uses.", onHosts)
+            }
+            HorizontalDivider()
+            VerdeSection("About")
+            SettingValue("Version", appVersionLabel())
+        }
+        }
+    }
+}
+
+/** "0.1.0 (12)": the app's version name and build number. */
+internal fun appVersionLabel(name: String = BuildConfig.VERSION_NAME, code: Int = BuildConfig.VERSION_CODE) = "$name ($code)"
+
+@Composable
+private fun SettingLink(title: String, detail: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick).padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun SettingValue(title: String, value: String) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).semantics(mergeDescendants = true) {}.padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+        androidx.compose.foundation.text.selection.SelectionContainer {
+            Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

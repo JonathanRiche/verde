@@ -296,8 +296,8 @@ private fun GitFileRow(model: GitChangesModel, state: GitChangesState, repo: Git
 
 @Composable
 internal fun GitCommitSettingsSection(settings: GitSettings) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Commit messages", style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+    VerdeSection("Commit messages")
+    Column(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val provider = when (settings.provider.lowercase()) { "codex" -> "Codex"; "claude" -> "Claude"; "cursor" -> "Cursor"; "opencode" -> "OpenCode"; else -> "Auto" }
         Text("Provider · $provider", style = MaterialTheme.typography.bodyMedium)
         Text("Model · ${settings.model?.takeIf { it.isNotBlank() } ?: "Default (fast model)"}", style = MaterialTheme.typography.bodyMedium)

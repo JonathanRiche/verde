@@ -101,8 +101,7 @@ internal fun NotificationSettingsSection() {
     var denied by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val enable = rememberEnableNotifications(controls) { denied = true }
-    HorizontalDivider()
-    Text("Notifications", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp).semantics { heading() })
+    VerdeSection("Notifications")
     Row(Modifier.fillMaxWidth().toggleable(state.enabled, enabled = state.loaded && state.available, role = Role.Switch) { on ->
         if (on) enable() else scope.launch { controls.setEnabled(false) }
     }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {

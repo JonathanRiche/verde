@@ -398,7 +398,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
             HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }, onSecurity = security)
         }
         composable(Routes.SECURITY) {
-            LocalAppLockControls.current?.let { SecuritySettingsScreen(it.model, it.auth) { nav.popBackStack() } }
+            LocalAppLockControls.current?.let { SecuritySettingsScreen(it.model, it.auth, onHosts = { nav.tab(Routes.HOSTS) }) { nav.popBackStack() } }
         }
         composable(Routes.WORKSPACE) { entry ->
             val ws = entry.arguments?.getString("ws").orEmpty()
