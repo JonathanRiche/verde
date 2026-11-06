@@ -90,6 +90,19 @@ function claudeUnstreamedText(text, streamedText) {
 let nextApprovalRequestId = 1;
 const pendingApprovals = new Map();
 let activeClaudePromptChannel = null;
+let activeClaudeQuery = null;
+
+// Delivers a steer without waiting for the running tool. `now` makes the
+// steer its own user turn (as `next` it rides on the next tool result as a
+// reminder, which Claude may mistake for tool output). Backgrounding the
+// blocking Bash commands and subagents is the SDK's Ctrl+B: they keep running
+// and report through task notifications, so the steer is read in seconds,
+// not when a long command or wait loop finally returns.
+function steerClaude(prompt) {
+  if (!activeClaudePromptChannel?.push(prompt, "now")) return false;
+  activeClaudeQuery?.backgroundTasks?.()?.catch?.(() => {});
+  return true;
+}
 
 function handleInputLine(line) {
   let message;
@@ -102,7 +115,7 @@ function handleInputLine(line) {
     let accepted = false;
     try {
       const prompt = buildClaudePrompt(message);
-      accepted = activeClaudePromptChannel?.push(prompt, "next") ?? false;
+      accepted = steerClaude(prompt);
     } catch {
       accepted = false;
     }
@@ -196,6 +209,9 @@ function createClaudePromptChannel(initialPrompt) {
   const queued = [claudeUserMessage(initialPrompt)];
   let waiting = null;
   let closed = false;
+  // Counts accepted prompts so the caller can tell whether a steer arrived
+  // after Claude's last result.
+  let generation = 0;
 
   const next = () => {
     if (queued.length > 0) return Promise.resolve(queued.shift());
@@ -206,8 +222,12 @@ function createClaudePromptChannel(initialPrompt) {
   };
 
   return {
+    get generation() {
+      return generation;
+    },
     push(prompt, priority) {
       if (closed) return false;
+      generation += 1;
       const message = claudeUserMessage(prompt, priority);
       if (waiting) {
         const resolve = waiting;
@@ -886,6 +906,11 @@ function buildClaudeOptions(request) {
     // Child-agent text/thinking arrive as messages with parent_tool_use_id
     // set, so the subagent pane can render the nested conversation.
     forwardSubagentText: true,
+    // Forward `session_state_changed` to the bridge (the SDK otherwise
+    // consumes it). A `result` is not the end of the run: Claude Code can
+    // keep working until it reports `idle`, and closing input earlier makes
+    // every steer in that window fail.
+    env: { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
   };
 
   const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
@@ -1403,6 +1428,7 @@ async function handleClaudeSendPrompt(sdk, request) {
     prompt: promptChannel.messages(),
     options,
   });
+  activeClaudeQuery = query;
 
   try {
     let sessionId = request.thread_id ?? null;
@@ -1411,6 +1437,11 @@ async function handleClaudeSendPrompt(sdk, request) {
     let emittedText = "";
     let pendingBlockSeparator = "";
     const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [], taskToolUseIds: new Map(), liveBackgroundTasks: [], resumedSubagentIds: new Set() };
+    const backgroundWorkDone = () => backgroundState.trackedToolUseIds.size === 0 && backgroundState.liveBackgroundTasks.length === 0;
+    // With session state events, input closes on `idle` after a result that
+    // no later steer has superseded. Older CLIs fall back to the result.
+    let sessionStateSeen = false;
+    let resultInputGeneration = null;
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
@@ -1453,7 +1484,13 @@ async function handleClaudeSendPrompt(sdk, request) {
           await Promise.allSettled(backgroundState.pendingBackgrounds);
           backgroundState.pendingBackgrounds.length = 0;
         }
-        if (backgroundState.trackedToolUseIds.size === 0 && backgroundState.liveBackgroundTasks.length === 0) finishInput();
+        resultInputGeneration = promptChannel.generation;
+        if (!sessionStateSeen && backgroundWorkDone()) finishInput();
+        continue;
+      }
+      if (message?.type === "system" && message?.subtype === "session_state_changed") {
+        sessionStateSeen = true;
+        if (message.state === "idle" && resultInputGeneration === promptChannel.generation && backgroundWorkDone()) finishInput();
         continue;
       }
       if (emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState)) continue;
@@ -1488,6 +1525,7 @@ async function handleClaudeSendPrompt(sdk, request) {
   } finally {
     finishInput();
     if (activeClaudePromptChannel === promptChannel) activeClaudePromptChannel = null;
+    if (activeClaudeQuery === query) activeClaudeQuery = null;
   }
 }
 

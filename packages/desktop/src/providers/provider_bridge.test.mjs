@@ -123,6 +123,95 @@ test('one finished agent does not close input while another is running', { timeo
   } }, { prompt: 'test' });
 });
 
+const state = value => ({ type: 'system', subtype: 'session_state_changed', state: value });
+
+test('a result before idle keeps input open so steering still reaches Claude', { timeout: 2000 }, async () => {
+  const { context, events } = bridge();
+  await context.handleClaudeSendPrompt({ async *query({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield state('running');
+    yield turn;
+    // Claude Code keeps working after this result until it reports idle.
+    await new Promise(setImmediate);
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 1, prompt: 'change course' }));
+    assert.equal(events.find(e => e.request_id === 1)?.accepted, true);
+    assert.equal((await input.next()).value.message.content[0].text, 'change course');
+    yield turn;
+    yield state('idle');
+    assert.equal((await input.next()).done, true);
+  } }, { prompt: 'test' });
+});
+
+test('a steer between the result and idle keeps input open for its reply', { timeout: 2000 }, async () => {
+  const { context, events } = bridge();
+  await context.handleClaudeSendPrompt({ async *query({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield state('running');
+    yield turn;
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 2, prompt: 'one more thing' }));
+    assert.equal(events.find(e => e.request_id === 2)?.accepted, true);
+    // This idle predates the steer, so it must not end the input.
+    yield state('idle');
+    assert.equal((await input.next()).value.message.content[0].text, 'one more thing');
+    yield state('running');
+    yield turn;
+    yield state('idle');
+    assert.equal((await input.next()).done, true);
+  } }, { prompt: 'test' });
+});
+
+test('a steer backgrounds blocking tools and arrives as its own turn', { timeout: 2000 }, async () => {
+  const { context, events } = bridge();
+  let backgroundCalls = 0;
+  const run = (async function* ({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield state('running');
+    // A foreground wait loop is running; the steer must not queue behind it.
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 3, prompt: 'stop and answer me' }));
+    assert.equal(events.find(e => e.request_id === 3)?.accepted, true);
+    assert.equal(backgroundCalls, 1);
+    const steer = (await input.next()).value;
+    assert.equal(steer.priority, 'now');
+    assert.equal(steer.message.content[0].text, 'stop and answer me');
+    yield turn;
+    yield state('idle');
+    assert.equal((await input.next()).done, true);
+  });
+  await context.handleClaudeSendPrompt({ query(args) {
+    const generator = run(args);
+    generator.backgroundTasks = async () => { backgroundCalls += 1; return true; };
+    return generator;
+  } }, { prompt: 'test' });
+});
+
+test('a steer is still accepted when backgrounding fails', { timeout: 2000 }, async () => {
+  const { context, events } = bridge();
+  const run = (async function* ({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield state('running');
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 4, prompt: 'hello?' }));
+    assert.equal(events.find(e => e.request_id === 4)?.accepted, true);
+    assert.equal((await input.next()).value.message.content[0].text, 'hello?');
+    yield turn;
+    yield state('idle');
+    assert.equal((await input.next()).done, true);
+  });
+  await context.handleClaudeSendPrompt({ query(args) {
+    const generator = run(args);
+    generator.backgroundTasks = async () => { throw new Error('background tasks disabled'); };
+    return generator;
+  } }, { prompt: 'test' });
+});
+
+test('Claude is asked to report session state', () => {
+  const { context } = bridge();
+  assert.equal(context.buildClaudeOptions({}).env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1');
+});
+
 test('workspace roots reach Claude on resumed turns without widening permission mode', () => {
   const { context } = bridge();
   const options = context.buildClaudeOptions({
