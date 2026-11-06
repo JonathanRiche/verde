@@ -77,6 +77,9 @@ class CoreHost private constructor(
     val operations = mutableOperations.asStateFlow()
     private val mutableHome = MutableStateFlow<HomeQuery?>(null)
     val home = mutableHome.asStateFlow()
+    /** The core's one "needs you" set (A5-9): every badge reads `needs_you` / `needs` from here. */
+    private val mutableAttention = MutableStateFlow<AttentionQuery?>(null)
+    val attention = mutableAttention.asStateFlow()
     private val mutableWorkspaces = MutableStateFlow<WorkspacesQuery?>(null)
     val workspaces = mutableWorkspaces.asStateFlow()
     private val mutableFailure = MutableStateFlow<Boolean>(false)
@@ -209,9 +212,11 @@ class CoreHost private constructor(
         try {
             val home = read("home")
             val workspaces = read("workspaces")
+            val attention = read("attention")
             mutableHome.value = CoreJson.decodeFromJsonElement<HomeQuery>(home)
             mutableWorkspaces.value = CoreJson.decodeFromJsonElement<WorkspacesQuery>(workspaces)
-            mutableViews.value = mutableViews.value + mapOf("home" to home, "workspaces" to workspaces)
+            mutableAttention.value = CoreJson.decodeFromJsonElement<AttentionQuery>(attention)
+            mutableViews.value = mutableViews.value + mapOf("home" to home, "workspaces" to workspaces, "attention" to attention)
         } catch (_: Exception) { }
     }
 
@@ -282,12 +287,14 @@ class CoreHost private constructor(
                                 updated[it] = snapshot
                                 executor.files.clear()
                                 mutableHome.value = null
+                                mutableAttention.value = null
                                 mutableWorkspaces.value = null
                             }
                             mutableHosts.value = hosts
                         }
                         "operations" -> mutableOperations.value = CoreJson.decodeFromJsonElement<OperationsQuery>(snapshot)
                         "home" -> mutableHome.value = CoreJson.decodeFromJsonElement<HomeQuery>(snapshot)
+                        "attention" -> mutableAttention.value = try { CoreJson.decodeFromJsonElement<AttentionQuery>(snapshot) } catch (_: Exception) { mutableAttention.value }
                         "workspaces" -> mutableWorkspaces.value = CoreJson.decodeFromJsonElement<WorkspacesQuery>(snapshot)
                     }
                 }

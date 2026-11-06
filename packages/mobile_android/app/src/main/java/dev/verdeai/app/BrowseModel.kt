@@ -18,6 +18,8 @@ internal data class BrowseState(
     val networkAvailable: Boolean = true,
     val fatal: Boolean = false,
     val hasSynced: Boolean = false,
+    /** The core's attention view: `needs_you` / `needs` are the only "needs you" source. */
+    val attention: AttentionView? = null,
 ) {
     val host get() = row?.view
     val hasData get() = home != null || workspaces != null
@@ -64,6 +66,11 @@ internal class BrowseModel(
         if (core == null) { mutableState.update { it.copy(fatal=true) }; return@coroutineScope }
         val live = combine(core.hosts, core.home, core.workspaces) { h, home, ws -> Triple(h?.data?.items?.firstOrNull(), home?.data, ws?.data) }
         launch { saveLive(id, live) }
+        launch {
+            // Seed once (the view appears in state changes only after its first change), then follow.
+            if (core.attention.value == null) try { core.refreshShared() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            core.attention.collect { q -> mutableState.update { it.copy(attention = q?.data) } }
+        }
         // The cache stays visible until this session's core has synced once; afterwards the
         // core's own (possibly stale) projection is always at least as new as the cache.
         var synced = false

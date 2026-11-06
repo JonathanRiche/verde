@@ -94,14 +94,19 @@ internal data class CompanionSnapshot(
 internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
     val active = state.active
     val panes = browse.home?.items.orEmpty()
-    val needs = panes.filter { it.attention || it.status == "waiting_approval" }
+    // A5-9: the core's one needs-you set (C8); panes only for the sheet's lists.
+    val needs = panes.filter { it.needs_you }
     val crew = visibleCrew(state.view?.crew?.takeIf { active != null && it.workspace_id == active.home_workspace_id && it.thread_id == active.thread_id })
     val thread = active?.takeIf { it.thread_id.isNotEmpty() }?.let { a ->
         browse.workspaces?.items?.find { it.workspace_id == a.home_workspace_id }?.threads?.find { it.thread_id == a.thread_id }
     }
     val hidden = companionThreadIds(state.roster)
-    return CompanionSnapshot(active, needs, crew, companionPulse(panes, crew, hidden),
-        bubbleNeedKeys(needs, crew, thread), crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
+    val attention = browse.attention
+    val keys = attention?.needs?.map { chatKey(it.workspace_id, it.thread_id) }?.toCollection(LinkedHashSet())
+        ?: bubbleNeedKeys(needs, crew, thread)
+    val pulse = companionPulse(panes, crew, hidden).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
+    return CompanionSnapshot(active, needs, crew, pulse,
+        keys, crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
         companionActivity(panes, crew, hidden))
 }
 

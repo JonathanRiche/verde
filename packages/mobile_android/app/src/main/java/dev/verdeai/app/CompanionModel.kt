@@ -133,7 +133,7 @@ internal data class CompanionActivity(val workspaceId: String, val threadId: Str
     val key get() = linkId?.let { "l:$it" } ?: "c:$workspaceId\u001f$threadId"
 }
 
-private fun runningChatPane(pane: Pane) = pane.kind == "chat" && !pane.attention && pane.thread_id != null && activeStatus(pane.status)
+private fun runningChatPane(pane: Pane) = pane.kind == "chat" && !pane.needs_you && pane.thread_id != null && activeStatus(pane.status)
 
 /**
  * The activity panel: the companion's crew plus every other chat running machine-wide (chats
@@ -164,7 +164,8 @@ internal fun companionActivity(panes: List<Pane>, crew: List<CompanionLink>, hid
  * running count always matches the activity panel.
  */
 internal fun companionPulse(panes: List<Pane>, crew: List<CompanionLink>, hidden: Set<String> = emptySet()): CompanionPulse {
-    val flagged = panes.filter { it.attention || it.status == "waiting_approval" }
+    // Without the core's attention view (older hosts' first frames): panes the core marks needs_you.
+    val flagged = panes.filter { it.needs_you }
     val flaggedChats = flagged.mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
     val needs = flagged.size + crew.count { crewStatus(it).needsYou && (it.workspace_id to it.local_thread_id) !in flaggedChats }
     return CompanionPulse(needs, companionActivity(panes, crew, hidden).count { it.status.running })

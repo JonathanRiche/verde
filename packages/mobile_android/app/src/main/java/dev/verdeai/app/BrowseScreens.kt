@@ -308,7 +308,8 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
         if (canOpen) add("Open" to { onOpen(pane) })
         add("Copy title" to { clipboard.setText(AnnotatedString(pane.title)) })
     }
-    val kind = rowState(pane.status, pane.attention)
+    // A5-9: "needs you" is the core's call (C8); an unread finished chat just gets its Unread badge.
+    val kind = rowState(pane.status, pane.needs_you)
     val kindLabel = when (pane.kind) { "terminal" -> "Terminal"; "browser" -> "Browser"; else -> "Chat" }
     val timer = pane.started_at_ms?.takeIf { pane.can_stop }?.let { elapsedLabel(it, now) }
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
@@ -451,8 +452,8 @@ internal fun HomeScreen(
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
-            val attention = panes.filter { it.attention }
-            val running = panes.filterNot { it.attention || hiddenPane(it, hidden) }
+            val attention = panes.filter { it.needs_you }
+            val running = panes.filterNot { it.needs_you || hiddenPane(it, hidden) }
             if (attention.isNotEmpty()) {
                 header("Needs attention")
                 items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
@@ -494,8 +495,8 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val chats = workspace.threads.count { listed(it) && !it.archived }
     val terminals = workspace.panes.count { it.kind == "terminal" && it.terminal_id != null }
-    val active = workspace.panes.count { it.attention || it.can_stop || it.status == "working" }
-    val flagged = workspace.panes.count { it.attention_kind != null }
+    val active = workspace.panes.count { it.needs_you || it.can_stop || it.status == "working" }
+    val flagged = workspace.panes.count { it.needs_you }
     val summary = listOfNotNull(
         "$chats chat${if (chats == 1) "" else "s"}",
         terminals.takeIf { it > 0 }?.let { "$it terminal${if (it == 1) "" else "s"}" },
