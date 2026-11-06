@@ -562,7 +562,7 @@ private struct PatchScreen: View {
                     Text(signed(UInt64(result.additions), UInt64(result.deletions)) + (result.truncated ? " · truncated" : ""))
                         .font(VerdeTheme.mono(11)).foregroundStyle(VerdeTheme.muted)
                     Spacer()
-                    Button(wrap ? "No wrap" : "Wrap") { wrap.toggle() }.font(VerdeTheme.ui(13))
+                    Button(wrap ? "No wrap" : "Wrap") { wrap.toggle() }.font(VerdeTheme.ui(13)).minTarget()
                 }
                 .padding(.horizontal, 16).padding(.vertical, 4)
             }
@@ -581,7 +581,7 @@ private struct PatchScreen: View {
                         switch render {
                         case .parsed(let parsed): PatchLines(model: parsed, wrap: wrap)
                         case .source(let source):
-                            ScrollView([.vertical, .horizontal]) {
+                            TopLeadingScroll(axes: [.vertical, .horizontal]) {
                                 Text(source).font(selectableLineFont).fixedSize().padding(8)
                             }
                         case nil: ExplorerMessage(text: "No diff to show.")
@@ -661,7 +661,7 @@ private struct PatchLines: View {
         let columns = model.hunks.flatMap(\.rows).map { $0.text.count }.max() ?? 0
         let contentWidth = CGFloat(columns + model.numberWidth * 2 + 4) * charWidth + 16
         let gutter = 8 + CGFloat(model.numberWidth * 2 + 4) * charWidth
-        ScrollView(wrap ? .vertical : [.vertical, .horizontal]) {
+        TopLeadingScroll(axes: wrap ? .vertical : [.vertical, .horizontal]) {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(entries, id: \.self) { item in
                     switch item {
@@ -692,6 +692,23 @@ private struct PatchLines: View {
     private func bind() {
         let rows = model.hunks.flatMap(\.rows)
         selection?.source = { diffLines(rows, range: $0) }
+    }
+}
+
+/// A scroll view whose content starts at the top-left even when it is smaller than the view: a
+/// two-axis `ScrollView` centres short content, which left a blank band above a short file.
+private struct TopLeadingScroll<Content: View>: View {
+    let axes: Axis.Set
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView(axes) {
+                content()
+                    .frame(minWidth: axes.contains(.horizontal) ? geometry.size.width : nil,
+                           minHeight: geometry.size.height, alignment: .topLeading)
+            }
+        }
     }
 }
 
