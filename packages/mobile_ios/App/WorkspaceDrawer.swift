@@ -112,9 +112,10 @@ struct WorkspaceDrawer: View {
                 }
             }.padding(.horizontal, 12).padding(.vertical, 8)
             if let target, search.isEmpty {
-                // No stray workspace caption in All Workspaces (I3-9); the chips' VoiceOver labels name it.
+                // S27 (Android parity): under All Workspaces the chips say which workspace they open,
+                // the open chat's (S21) or the most recent one.
                 ExplorerLinks(onChanges: { open(.changes(target.workspace_id)) }, onFiles: { open(.files(target.workspace_id)) },
-                              spoken: scoped == nil ? target.label : nil)
+                              workspace: scoped == nil ? target.label : nil)
                     .padding(.horizontal, 12).padding(.bottom, 8)
             }
             Rectangle().fill(VerdeTheme.border).frame(height: 1)
@@ -139,16 +140,17 @@ struct WorkspaceDrawer: View {
             if permanent && verticalSize == .compact {
                 // A short window (a phone on its side) needs its height for the list.
                 HStack(spacing: 0) {
-                    footerIcon("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
-                    footerIcon("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                    footerIcon("Home", icon: "house", selected: tab == .home) { root(.home) }
+                    footerIcon("Workspaces", icon: "square.stack", selected: tab == .workspaces) { root(.workspaces) }
                     footerIcon("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
                     footerIcon("Settings", icon: "gearshape", selected: false, action: settings)
                 }.padding(.horizontal, 8)
             } else {
-                // S22: the same four destinations as Android, in the same order.
+                // S22: the same four destinations as Android, in the same order; the current one
+                // stays marked inside a chat too (S27).
                 HStack(spacing: 4) {
-                    footerTab("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
-                    footerTab("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                    footerTab("Home", icon: "house", selected: tab == .home) { root(.home) }
+                    footerTab("Workspaces", icon: "square.stack", selected: tab == .workspaces) { root(.workspaces) }
                     footerTab("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
                         .accessibilityIdentifier("drawer-hosts")
                     footerTab("Settings", icon: "gearshape", selected: false, action: settings)

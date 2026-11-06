@@ -117,6 +117,7 @@ private struct RowContent: View {
     /// The state word inside `detail`, coloured; the spinner marks a working row.
     var state: RowState? = nil
     var stateText: String? = nil
+    var unread = false
     var body: some View {
         HStack(spacing: 12) {
             if let provider { ProviderGlyph(provider: provider).frame(width: 20, height: 20) } else { dot }
@@ -126,6 +127,9 @@ private struct RowContent: View {
             }
             Spacer(minLength: 4)
             if state == .working { ProgressView().controlSize(.mini).accessibilityHidden(true) }
+            if unread {
+                Circle().fill(VerdeTheme.muted).frame(width: 8, height: 8).accessibilityLabel("Unread")
+            }
             if let badge { AttentionBadge(text: badge) }
         }
         .accessibilityElement(children: .combine)
@@ -172,7 +176,7 @@ private struct PaneItem: View {
         MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
                                     dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.needs_you), label: paneLabel(pane)),
                                     provider: pane.kind == "terminal" ? pane.provider : nil,
-                                    badge: attentionLabel(pane.attention_kind),
+                                    badge: pane.attention_kind == "unread" ? nil : attentionLabel(pane.attention_kind),
                                     state: RowState(status: pane.status, attention: pane.needs_you), stateText: paneLabel(pane)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
             .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }
@@ -184,6 +188,8 @@ private struct ThreadItem: View {
     let thread: ThreadSummary
     let now: Int64
     var workspaceLabel: String?
+    /// A finished chat not yet read: a neutral dot, never amber (S26).
+    var unread = false
     var body: some View {
         let state = RowState(status: thread.status)
         let stateText = state == nil ? nil : statusLabel(thread.status)
@@ -193,7 +199,7 @@ private struct ThreadItem: View {
         MenuRow(content: RowContent(title: thread.title, detail: detail,
                                     dot: Dot(color: VerdeTheme.status(thread.status, attention: thread.status == "waiting_approval"),
                                              label: statusLabel(thread.status)), provider: thread.provider,
-                                    state: state, stateText: stateText),
+                                    state: state, stateText: stateText, unread: unread),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
             .overlay(alignment: .topTrailing) { GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id).padding(8) }
@@ -340,10 +346,14 @@ struct HomeScreen: View {
             if attention.isEmpty && running.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
             let workspaces = state.workspaces?.items ?? []
             let labels = Dictionary(workspaces.map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
-            let recent = recentThreads(state.workspaces, hidden: hidden)
+            // S26: "Needs you" / "Running" / "Recent"; wide windows keep five recents beside the sidebar.
+            let recent = recentThreads(state.workspaces, limit: adaptive.tier.wide ? 5 : 8, hidden: hidden)
+            let unread = Set(panes.filter { $0.attention_kind == "unread" }.compactMap(\.thread_id))
             if !recent.isEmpty {
-                TitledSection("Recent chats") {
-                    ForEach(recent, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
+                TitledSection("Recent") {
+                    ForEach(recent, id: \.thread_id) {
+                        ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id], unread: unread.contains($0.thread_id))
+                    }
                 }
             }
             let open = workspaces.filter(\.open)

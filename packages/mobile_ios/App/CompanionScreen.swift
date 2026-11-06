@@ -50,7 +50,7 @@ struct CompanionSheet: View {
         .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain, focusLiveVoice: settingsLive) }
         .sheet(isPresented: $brainPicker) { CompanionBrainSheet(model: model, browse: browse) }
         .sheet(isPresented: $conversations) {
-            CompanionConversations(model: model, browse: browse)
+            CompanionConversations(model: model, browse: browse, startNew: { conversations = false; confirmNew = true })
                 .presentationDetents([.medium, .large])
         }
         .alert("Start a new conversation?", isPresented: $confirmNew) {
@@ -98,6 +98,19 @@ struct CompanionSheet: View {
             if let notice = model.notice {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
+            }
+            // S27: a visible Connecting state in the sheet, cancellable, until the call is live.
+            if live.phase == .connecting {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Connecting…").font(VerdeTheme.ui(14)).frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Cancel") { live.end() }.font(VerdeTheme.ui(14, bold: true)).frame(minHeight: 44)
+                }
+                .padding(.horizontal, 12)
+                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 12).padding(.bottom, 6)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("live-connecting")
             }
             if !live.active, let failure = live.failure {
                 LiveFailureCard(message: failure, needsSetup: live.failureNeedsSetup,
@@ -567,6 +580,8 @@ private struct CompanionConversation: View {
 private struct CompanionConversations: View {
     let model: CompanionModel
     let browse: BrowseModel
+    /// Starts a new conversation (the empty state's action).
+    var startNew: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -582,8 +597,17 @@ private struct CompanionConversations: View {
                 }
                 Section {
                     if entry?.history.isEmpty != false {
-                        Text("Earlier conversations appear here after you start a new one.")
-                            .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                        // S30: the Schedules empty-state pattern: icon, one line, one action.
+                        VStack(spacing: 10) {
+                            Image(systemName: "bubble.left.and.bubble.right").font(.system(size: 28)).foregroundStyle(VerdeTheme.muted)
+                                .accessibilityHidden(true)
+                            Text("Earlier conversations appear here after you start a new one.")
+                                .font(VerdeTheme.ui(14)).foregroundStyle(VerdeTheme.muted).multilineTextAlignment(.center)
+                            Button("New conversation", action: startNew)
+                                .buttonStyle(PrimaryButtonStyle(fullWidth: false))
+                                .disabled(model.conversation == nil || model.saving)
+                        }
+                        .frame(maxWidth: .infinity).padding(.vertical, 12)
                     }
                     ForEach(entry?.history ?? []) { item in
                         Button {

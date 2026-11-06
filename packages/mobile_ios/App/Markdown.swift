@@ -438,16 +438,20 @@ struct OverflowScroll<Content: View>: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal) {
                 HStack(spacing: 0) {
+                    Color.clear.frame(width: 1, height: 1).id(overflowStartID)
                     content()
                     Color.clear.frame(width: 1, height: 1).id(overflowEndID)
                 }
             }
             .modifier(OverflowTracker(edges: $edges))
             .mask(OverflowFade(leading: edges.leading, trailing: edges.trailing))
-            .overlay(alignment: .trailing) {
-                // Tapping the hint scrolls to the last columns (I6-8).
-                if let moreLabel, edges.trailing {
-                    MoreBadge(label: moreLabel) { withAnimation { proxy.scrollTo(overflowEndID, anchor: .trailing) } }
+            // S27: Android's link under the table, never a disc over its cells: "More columns ›"
+            // while columns are hidden to the right, "‹ First columns" once scrolled to the end.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if moreLabel != nil, edges.trailing || edges.leading {
+                    OverflowLink(more: edges.trailing) {
+                        withAnimation { proxy.scrollTo(edges.trailing ? overflowEndID : overflowStartID, anchor: edges.trailing ? .trailing : .leading) }
+                    }
                 }
             }
         }
@@ -488,28 +492,27 @@ private struct OverflowFade: View {
 
 /// "More columns": a chevron on the faded edge that says the content scrolls on.
 private let overflowEndID = "overflow-end"
+private let overflowStartID = "overflow-start"
 
-private struct MoreBadge: View {
-    let label: String
+/// The table's column link under it (44 points tall, accent text), as on Android.
+private struct OverflowLink: View {
+    let more: Bool
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: "chevron.right")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(VerdeTheme.muted)
-                .frame(width: 22, height: 22)
-                .background(VerdeTheme.panel, in: Circle())
-                .overlay(Circle().stroke(VerdeTheme.border))
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
+        HStack {
+            Spacer(minLength: 0)
+            Button(action: action) {
+                Text(more ? "More columns ›" : "‹ First columns")
+                    .font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.accent)
+                    .padding(.horizontal, 10).frame(minHeight: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(more ? "More columns" : "First columns")
+            .accessibilityHint(more ? "Scrolls the table to its last columns." : "Scrolls the table back to its first columns.")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
-        .accessibilityHint("Scrolls the table to its last columns.")
     }
 }
-
 
 struct CodeBlock: View {
     let code: String
