@@ -166,7 +166,11 @@ struct RootView: View {
             .environment(\.adaptive, AdaptiveContext(tier: panes.tier, slotVisible: panes.contentLeading > 0))
             .onChange(of: geometry.size.width, initial: true) { _, width in windowWidth = width }
             .onChange(of: panes.tier.docked) { _, docked in if docked { drawer = false } }
-            .onChange(of: companionSheet) { _, open in if !open { chatsPeek = false } }
+            .onChange(of: companionSheet) { _, open in
+                if !open { chatsPeek = false }
+                // A Live error shown in the Companion goes away with it.
+                if !open && live.failure != nil { live.dismissFailure() }
+            }
             .onChange(of: browse.hostID) { workspaceScope = nil }
             .onChange(of: browse.state.workspaces?.items.map(\.workspace_id)) { _, ids in
                 if let scope = workspaceScope, let ids, !ids.contains(scope) { workspaceScope = nil }
@@ -257,7 +261,7 @@ struct RootView: View {
         .environment(\.defaultMinListRowHeight, 44)
         .accessibilityHidden(lock.covered)
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
-        .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.phase != .idle, covered: lock.covered,
+        .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.active || (live.failure != nil && !companionSheet), covered: lock.covered,
                                 prepare: prepareLiveTarget, present: presentLiveTarget).frame(width: 0, height: 0))
         .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
     }

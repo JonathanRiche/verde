@@ -95,8 +95,11 @@ struct CompanionSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
             if !live.active, let failure = live.failure {
-                Text(failure).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
+                LiveFailureCard(message: failure, needsSetup: live.failureNeedsSetup,
+                                retry: { Task { await live.start() } },
+                                setup: { live.dismissFailure(); settingsBrain = false; settings = true },
+                                close: { live.dismissFailure() })
+                    .padding(.horizontal, 12).padding(.bottom, 6)
             }
             CompanionSummary(model: model, open: open, expanded: $panel)
             Divider().overlay(VerdeTheme.border)
@@ -798,5 +801,33 @@ struct CompanionSettings: View {
         guard await save(), let home = model.defaultHome else { return }
         await model.update { $0.add(character, home: home) != nil }
         load()
+    }
+}
+
+/// A Live call that couldn't start, inside the Companion sheet (S9): why, and the one action
+/// that helps: Companion settings for a missing or rejected key, otherwise Try again.
+private struct LiveFailureCard: View {
+    let message: String
+    let needsSetup: Bool
+    let retry: () -> Void
+    let setup: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(VerdeTheme.warning).accessibilityHidden(true)
+                Text(message).font(VerdeTheme.ui(13)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                Button(action: close) { Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)).foregroundStyle(VerdeTheme.muted).minTarget() }
+                    .buttonStyle(.plain).accessibilityLabel("Dismiss")
+            }
+            Button(needsSetup ? "Open Companion settings" : "Try again", action: needsSetup ? setup : retry)
+                .buttonStyle(TonalButtonStyle(fullWidth: false))
+        }
+        .padding(10)
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.warning.opacity(0.6)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("live-failure")
     }
 }

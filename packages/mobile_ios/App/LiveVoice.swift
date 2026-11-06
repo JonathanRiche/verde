@@ -59,6 +59,8 @@ final class LiveVoice {
 
     var active: Bool { phase == .connecting || phase == .live }
     var failure: String? { if case .failed(let message) = phase { return message }; return nil }
+    /// The failure is fixed in Companion settings (no voice key, or a rejected one), not by retrying.
+    private(set) var failureNeedsSetup = false
 
     @ObservationIgnored let companion: CompanionModel
     @ObservationIgnored let speech: CompanionVoice
@@ -137,7 +139,9 @@ final class LiveVoice {
             guard current == generation else { return }
             try connect(session, generation: current)
         } catch LiveVoiceError.failed(let code) {
-            if current == generation { fail(code == "audio" ? "Couldn't start the microphone." : liveVoiceMessage(code)) }
+            if current == generation {
+                fail(code == "audio" ? "Couldn't start the microphone." : liveVoiceMessage(code), needsSetup: liveVoiceNeedsSetup(code))
+            }
         } catch {
             if current == generation { fail(liveVoiceMessage(nil)) }
         }
@@ -156,9 +160,10 @@ final class LiveVoice {
         if failure != nil { phase = .idle }
     }
 
-    private func fail(_ message: String) {
+    private func fail(_ message: String, needsSetup: Bool = false) {
         flushTranscript(final: true)
         teardown()
+        failureNeedsSetup = needsSetup
         phase = .failed(message)
         resumeSpeechIfIdle()
     }

@@ -208,6 +208,9 @@ func liveVoiceMessage(_ code: String?) -> String {
     }
 }
 
+/// Failures only Companion settings can repair (a voice provider key), so they offer that, not Retry.
+func liveVoiceNeedsSetup(_ code: String?) -> Bool { code == "voice_not_configured" || code == "voice_key_rejected" }
+
 enum LiveVoiceError: Error, Equatable { case failed(String) }
 
 /// Sends live-voice intents and follows their receipts and the `voice` view.

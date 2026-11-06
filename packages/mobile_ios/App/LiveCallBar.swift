@@ -53,7 +53,8 @@ struct LiveCallBarContent: View {
                              captionsShown: $pill.captionsShown, expand: { open(.fullView) },
                              openSettings: { open(.voiceSettings) })
                 } else if let failure = live.failure {
-                    LiveFailureBar(message: failure, retry: { Task { await live.start() } }, close: { live.dismissFailure() })
+                    LiveFailureBar(message: failure, needsSetup: live.failureNeedsSetup, retry: { Task { await live.start() } },
+                                   setup: { live.dismissFailure(); open(.voiceSettings) }, close: { live.dismissFailure() })
                 }
             }
             .padding(.top, 4)
@@ -77,7 +78,9 @@ struct LiveCallBarContent: View {
 /// A call that failed: the reason, Try again and Close.
 private struct LiveFailureBar: View {
     let message: String
+    let needsSetup: Bool
     let retry: () -> Void
+    let setup: () -> Void
     let close: () -> Void
 
     var body: some View {
@@ -88,17 +91,19 @@ private struct LiveFailureBar: View {
             Text(message).font(VerdeTheme.ui(13)).lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-            Button(action: retry) {
-                Text("Try again").font(VerdeTheme.ui(13, bold: true)).padding(.horizontal, 10).frame(minHeight: 40)
+            Button(action: needsSetup ? setup : retry) {
+                Text(needsSetup ? "Open Companion settings" : "Try again").font(VerdeTheme.ui(13, bold: true))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 10).frame(minHeight: 44)
                     .background(VerdeTheme.accent.opacity(0.19), in: Capsule())
                     .overlay(Capsule().stroke(VerdeTheme.accent))
             }
             .buttonStyle(.plain)
             .foregroundStyle(VerdeTheme.accent)
-            .accessibilityHint("Starts the live conversation again.")
+            .accessibilityHint(needsSetup ? "Add a live voice provider key." : "Starts the live conversation again.")
             Button(action: close) {
                 Image(systemName: "xmark").font(.system(size: 16, weight: .semibold)).foregroundStyle(VerdeTheme.muted)
-                    .frame(width: 40, height: 40)
+                    .frame(width: 44, height: 44)
                     .background(VerdeTheme.panel, in: Circle())
                     .overlay(Circle().stroke(VerdeTheme.border))
             }
