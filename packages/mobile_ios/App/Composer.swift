@@ -336,7 +336,7 @@ struct ChatComposer: View {
                     }.disabled(model.busy)
                 }.accessibilityIdentifier("composer-followup")
             }
-            if let notice = model.notice ?? model.view?.error?.message {
+            if let notice = (model.notice ?? model.view?.error?.message).map({ $0 + " [TMP " + (model.view?.error?.rpc_code ?? "-") + "/" + (model.view?.error?.code ?? "-") + "/" + (model.chat.thread?.error?.rpc_code ?? "-") + "]" }) {
                 Text(notice) .font(VerdeTheme.ui(12)).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
             }
             if let token = model.token {
