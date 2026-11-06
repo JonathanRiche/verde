@@ -368,9 +368,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             contentWindowInsets = contentWindowInsets(tier, panes),
             topBar = {
                 if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()) {
-                    VerdeTopBar(title = { VerdeWordmark() },
-                        navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }) {
-                            Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer")
+                    // S28: one logo: beside the full sidebar (which carries it) the content bar has none.
+                    VerdeTopBar(title = { if (panes.sidebar != SidebarMode.Full) VerdeWordmark() },
+                        navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.named("Open workspace drawer")) {
+                            Icon(Icons.Filled.Menu, contentDescription = null)
                         } }, actions = {
                             HostSwitcher(hosts,
                                 // Hosts lists the machines; after a switch, land on the new host's Home.
@@ -432,7 +433,10 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
                 // Docked windows have it in the sidebar, not floating over content.
                 onNewChat = if (LocalWindowTier.current.docked) null else ({ nav.navigate(ManageRoutes.newChat(null)) }), onHistory = { nav.navigate(ManageRoutes.HISTORY) })
         }
-        composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
+        composable(Routes.WORKSPACES) {
+            WorkspacesScreen(browse, openWorkspace, showHosts, pair, onNewChat = { nav.navigate(ManageRoutes.newChat(null)) },
+                onHistory = { nav.navigate(ManageRoutes.HISTORY) }) { nav.navigate(ManageRoutes.ADD_WORKSPACE) }
+        }
         composable(Routes.HOSTS) {
             val security = LocalAppLockControls.current?.let { { nav.navigate(Routes.SECURITY) } }
             HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }, onSecurity = security)
@@ -461,7 +465,9 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments
-            TerminalScreen(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("terminal").orEmpty()) { nav.popBackStack() }
+            val ws = args?.getString("ws").orEmpty()
+            TerminalScreen(hosts, browse, ws, args?.getString("terminal").orEmpty(),
+                onRelaunch = { nav.navigate(Routes.newTerminal(ws)) { popUpTo(Routes.TERMINAL) { inclusive = true } } }) { nav.popBackStack() }
         }
         composable(Routes.FILE) { entry ->
             val args = entry.arguments
@@ -493,7 +499,9 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
                 onOpenFile = { openFile(ws, it) }, onOpenThread = openAsked) { nav.popBackStack() }
         }
         composable(Routes.NEW_TERMINAL) { entry ->
-            TerminalScreen(hosts, browse, entry.arguments?.getString("ws").orEmpty(), null) { nav.popBackStack() }
+            val ws = entry.arguments?.getString("ws").orEmpty()
+            TerminalScreen(hosts, browse, ws, null,
+                onRelaunch = { nav.navigate(Routes.newTerminal(ws)) { popUpTo(Routes.NEW_TERMINAL) { inclusive = true } } }) { nav.popBackStack() }
         }
     }
 }
@@ -505,9 +513,10 @@ private fun androidx.navigation.NavGraphBuilder.manageRoutes(nav: NavHostControl
     val created: (String, String) -> Unit = { ws, thread ->
         nav.navigate(Routes.thread(ws, thread)) { popUpTo(nav.currentBackStackEntry?.destination?.id ?: 0) { inclusive = true } }
     }
-    composable(ManageRoutes.NEW_CHAT) { NewChatScreen(browse, manage, null, created) { nav.popBackStack() } }
+    val addWorkspace = { nav.navigate(ManageRoutes.ADD_WORKSPACE) }
+    composable(ManageRoutes.NEW_CHAT) { NewChatScreen(browse, manage, null, created, addWorkspace) { nav.popBackStack() } }
     composable(ManageRoutes.NEW_CHAT_IN) { entry ->
-        NewChatScreen(browse, manage, entry.arguments?.getString("ws"), created) { nav.popBackStack() }
+        NewChatScreen(browse, manage, entry.arguments?.getString("ws"), created, addWorkspace) { nav.popBackStack() }
     }
     composable(ManageRoutes.ADD_WORKSPACE) {
         AddWorkspaceScreen(browse, manage, onCreated = { ws ->

@@ -2,6 +2,7 @@ package dev.verdeai.app
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.border
@@ -260,7 +261,7 @@ internal fun CompanionSheet(
         text = { Text("${active.name.ifBlank { "Your companion" }} starts fresh. This one stays in Conversations, so you can go back to it.") },
         confirmButton = { TextButton(onClick = { confirmNew = false; companion.newConversation(currentTitle) }) { Text("New conversation") } },
         dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } })
-    if (conversations && active != null) ConversationsSheet(active, currentTitle, companion) { conversations = false }
+    if (conversations && active != null) ConversationsSheet(active, currentTitle, companionBrainLabel(active, transcriptState), companion, onNew = { conversations = false; confirmNew = true }) { conversations = false }
     if (scheduled && active != null) ScheduledSheet(companion, manage, browseState, active,
         onOpenChat = { ws, chat ->
             scheduled = false
@@ -305,10 +306,10 @@ private fun CompanionPaneControls(onChats: (() -> Unit)?, onClose: (() -> Unit)?
 }
 
 @Composable
-private fun ChatsButton(onClick: () -> Unit) = IconButton(onClick = onClick) { Icon(Icons.Filled.Menu, contentDescription = "Show chats") }
+private fun ChatsButton(onClick: () -> Unit) = IconButton(onClick = onClick, modifier = Modifier.named("Show chats")) { Icon(Icons.Filled.Menu, contentDescription = null) }
 
 @Composable
-private fun CloseButton(onClick: () -> Unit) = IconButton(onClick = onClick) { Icon(Icons.Filled.Close, contentDescription = "Close companion") }
+private fun CloseButton(onClick: () -> Unit) = IconButton(onClick = onClick, modifier = Modifier.named("Close companion")) { Icon(Icons.Filled.Close, contentDescription = null) }
 
 @Composable
 private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean) {
@@ -340,9 +341,10 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
         onChats?.let { ChatsButton(it) }
         CompanionAvatar(character, pose, size = 28.dp, description = "$name, ${character.label}")
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            Text(name, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // S28: the name keeps its width ("Sprout", never "S…"); the status after it gives way.
+            Text(name, Modifier.widthIn(max = 160.dp), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (suffix != null) Text("  \u00b7 $suffix",
-                (if (onSuffix != null) Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity",
+                Modifier.weight(1f, fill = false).then(if (onSuffix != null) Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity",
                     role = Role.Button, onClick = onSuffix).wrapContentHeight(Alignment.CenterVertically).padding(end = 8.dp) else Modifier)
                     .semantics { if (onSuffix != null) this.selected = suffixExpanded },
                 style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -352,7 +354,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
         onLive?.let { LiveButton(liveActive, it) }
         Box {
             var menu by remember { mutableStateOf(false) }
-            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Companion menu") }
+            IconButton(onClick = { menu = true }, modifier = Modifier.named("Companion menu")) { Icon(Icons.Filled.MoreVert, contentDescription = null) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 LiveOverMenu()
                 DropdownMenuItem(text = { Text("New conversation") }, enabled = enabled && active.thread_id.isNotEmpty(),
@@ -449,9 +451,11 @@ private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun StripPill(text: String, dot: androidx.compose.ui.graphics.Color, selected: Boolean, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(12.dp), color = if (selected) VerdeColors.PanelAlt else VerdeColors.Panel,
-        border = androidx.compose.foundation.BorderStroke(1.dp, if (selected) dot else VerdeColors.Border),
-        modifier = Modifier.semantics { contentDescription = "$text. ${if (selected) "Collapse" else "Show"} list"; this.selected = selected }) {
+    // S29: the pill's clickable node carries its name and selection (no unnamed wrapper).
+    val shape = RoundedCornerShape(12.dp)
+    Box(Modifier.minimumInteractiveComponentSize().clip(shape).background(if (selected) VerdeColors.PanelAlt else VerdeColors.Panel, shape)
+        .border(1.dp, if (selected) dot else VerdeColors.Border, shape)
+        .clickable(role = Role.Button, onClick = onClick).nameOnly("$text. ${if (selected) "Collapse" else "Show"} list", selected = selected)) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Box(Modifier.size(7.dp).background(dot, CircleShape))
@@ -468,7 +472,7 @@ private fun StripItem(row: StripRow) {
         StripTone.Running -> VerdeColors.Accent
         StripTone.Quiet -> VerdeColors.Subtle
     }
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = "Open chat", onClick = row.open).padding(horizontal = 16.dp),
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = "Open chat", onClick = row.open).nameOnly(listOfNotNull(row.title, row.where).joinToString(", ")).padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         StatusPip(color, null, active = row.tone == StripTone.Running, size = 7.dp)
         Text(row.title, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -528,8 +532,8 @@ private fun MicButton(voice: CompanionVoice, model: TranscriptModel, name: Strin
     val listening = talk !is TalkState.Idle
     // Recognition problems surface where the user is looking: the composer's notice line.
     LaunchedEffect(error) { error?.let { model.composer.showNotice(it); voice.clearError() } }
-    if (talk is TalkState.Listening) IconButton(onClick = voice::cancel) {
-        Icon(Icons.Filled.Close, contentDescription = "Cancel recording", tint = VerdeColors.Muted)
+    if (talk is TalkState.Listening) IconButton(onClick = voice::cancel, modifier = Modifier.named("Cancel recording")) {
+        Icon(Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Muted)
     }
     val ring = (2f + 4f * level.coerceIn(0f, 1f)).dp
     Box(Modifier.size(48.dp)
@@ -590,7 +594,7 @@ private fun VoiceSettings(voice: CompanionVoice) {
         Text("Read replies aloud", style = MaterialTheme.typography.titleSmall)
         ReadAloud.entries.forEach { option ->
             Row(Modifier.fillMaxWidth().selectable(selected = policy == option, role = Role.RadioButton) { prefs.chooseReadAloud(option) }
-                .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                .nameOnly(option.label).heightIn(min = 48.dp).padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 RadioButton(selected = policy == option, onClick = null)
                 Text(option.label, Modifier.padding(start = 12.dp))
             }
@@ -616,6 +620,7 @@ private fun VoiceSettings(voice: CompanionVoice) {
         }
     }
     Row(Modifier.fillMaxWidth().toggleable(prefs.preferOnDevice, role = Role.Switch) { prefs.choosePreferOnDevice(it) }
+        .nameOnly("Prefer on-device recognition, Keep speech on this phone when it supports your language.")
         .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp)) {
             Text("Prefer on-device recognition", style = MaterialTheme.typography.bodyLarge)
@@ -653,6 +658,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     /** A2-8: opened to repair live voice: scroll to its API keys and highlight them. */
     focusLive: Boolean = false, onDismiss: () -> Unit) {
     var brain by remember { mutableStateOf(startOnBrain) }
+    val transcriptState = transcript?.state?.collectAsState()?.value
     val sheetScroll = rememberScrollState()
     var liveTop by remember { mutableStateOf<Int?>(null) }
     var liveHighlight by remember { mutableStateOf(focusLive) }
@@ -696,7 +702,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
                     leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp)) })
             }
             if (adding) AddCompanion(companion, state, roster) { adding = false }
-            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, onRemove = { confirmRemove = true }, onDone = onDismiss,
+            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, companionBrainLabel(active, transcriptState), onRemove = { confirmRemove = true }, onDone = onDismiss,
                 onBrain = { brain = true }) }
             if (voice != null) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
@@ -760,7 +766,7 @@ private fun AddCompanion(companion: CompanionModel, state: CompanionUiState, ros
 
 @Composable
 private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state: CompanionUiState, browse: BrowseState,
-    roster: CompanionRoster, active: CompanionEntry, onRemove: () -> Unit, onDone: () -> Unit, onBrain: () -> Unit) {
+    roster: CompanionRoster, active: CompanionEntry, brain: String, onRemove: () -> Unit, onDone: () -> Unit, onBrain: () -> Unit) {
     var name by rememberSaveable { mutableStateOf(active.name) }
     var character by rememberSaveable { mutableStateOf(CompanionCharacter.of(active.character)) }
     var orders by rememberSaveable { mutableStateOf(active.orders) }
@@ -780,11 +786,11 @@ private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state:
     VerdeSection("Brain")
     // Hermes-style: the brain has its own page; here, its summary.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = "Change brain", onClick = onBrain)
+        .nameOnly("Brain: $brain")
         .padding(horizontal = 16.dp, vertical = 8.dp).testTag("companion-brain-row"), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         ProviderGlyph(active.provider.ifEmpty { null })
-        Text(brainLabel(PROVIDERS.find { it.first == active.provider }?.second ?: active.provider.ifEmpty { "Workspace default" },
-            active.model.ifEmpty { null }, null), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1,
+        Text(brain, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1,
             overflow = TextOverflow.Ellipsis)
         Text("\u203a", style = MaterialTheme.typography.titleMedium, color = VerdeColors.Subtle)
     }
@@ -810,7 +816,7 @@ private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state:
 /** The companion's conversations: the current one, then earlier ones (tap to resume, long-press to remove from the list). */
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, companion: CompanionModel, onDismiss: () -> Unit) {
+private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, currentBrain: String, companion: CompanionModel, onNew: () -> Unit, onDismiss: () -> Unit) {
     val state by companion.state.collectAsState()
     val now = rememberNow(false)
     val enabled = state.view?.can_edit == true && !state.saving
@@ -819,10 +825,11 @@ private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, com
         LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Text("Conversations", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleLarge)
-            if (active.thread_id.isNotEmpty()) ConversationRow(currentTitle, brainLabel(providerName(active.provider), active.model.ifEmpty { null }, null),
+            if (active.thread_id.isNotEmpty()) ConversationRow(currentTitle, currentBrain,
                 "Current", current = true, enabled = false, onOpen = {}, onRemove = null)
-            if (active.history.isEmpty()) Text("Earlier conversations appear here when you start a new one.",
-                Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+            // S30: the Schedules empty-state pattern: icon, one line, one action.
+            if (active.history.isEmpty()) QuietEmptyState(R.drawable.ic_conversations, "Earlier conversations appear here after you start a new one.",
+                "New conversation", enabled = enabled && active.thread_id.isNotEmpty(), onAction = onNew)
             active.history.forEach { past ->
                 key(past.thread_id) {
                     ConversationRow(past.title.ifBlank { "Conversation" }, brainLabel(providerName(past.provider), past.model.ifEmpty { null }, null),
@@ -838,6 +845,18 @@ private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, com
 
 internal const val COMPANION_CONVERSATIONS = "companion-conversations"
 
+/**
+ * S27: the companion's brain as one label everywhere (composer chip, settings, Conversations):
+ * "Codex · GPT-6.1 Sol", resolved from the live composer when the conversation is loaded.
+ */
+internal fun companionBrainLabel(active: CompanionEntry, state: TranscriptState?): String {
+    state?.composer?.let { v ->
+        val provider = state.thread?.thread?.provider?.takeIf { it.isNotEmpty() } ?: v.selection.provider ?: active.provider.ifEmpty { null }
+        return compactSettingsLabel(v.catalogs, v.selection, provider)
+    }
+    return brainLabel(providerName(active.provider), active.model.ifEmpty { null }, null)
+}
+
 private fun providerName(id: String): String? = id.takeIf { it.isNotEmpty() }?.let { p -> PROVIDERS.find { it.first == p }?.second ?: p }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
@@ -848,6 +867,7 @@ private fun ConversationRow(title: String, brain: String, detail: String?, curre
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp)
             .combinedClickable(enabled = enabled || onRemove != null, onClickLabel = "Resume", onLongClickLabel = "More",
                 onClick = { if (enabled) onOpen() }, onLongClick = { if (onRemove != null) menu = true })
+            .nameOnly(listOfNotNull(title, brain, detail).joinToString(", "), selected = current.takeIf { it })
             .padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Column(Modifier.weight(1f)) {

@@ -73,8 +73,26 @@ private fun connected(state: BrowseState) = state.host?.phase == "ready" && stat
 private fun ManageFrame(title: String, onBack: () -> Unit, content: LazyListScope.() -> Unit) {
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
         LazyColumn(Modifier.fillMaxSize().testTag(MANAGE_LIST), content = content)
+    }
+}
+
+/**
+ * S30: the Schedules empty-state pattern shared by quiet lists (New chat with no workspace, the
+ * companion's Conversations): an icon, one line, one primary action.
+ */
+@Composable
+internal fun QuietEmptyState(icon: Int, text: String, action: String?, enabled: Boolean = true, modifier: Modifier = Modifier, onAction: () -> Unit = {}) {
+    Column(modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 24.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Icon(painterResource(icon), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(32.dp))
+        Text(text, style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Muted,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        if (action != null) NamedButton(action, onAction, Modifier.heightIn(min = 40.dp), enabled = enabled,
+            container = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = .12f),
+            content = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+            shape = MaterialTheme.shapes.small, padding = PaddingValues(horizontal = 24.dp))
     }
 }
 
@@ -193,7 +211,11 @@ internal fun Picker(label: String, value: String, choices: List<ChatChoice>, ena
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Text(label, style = MaterialTheme.typography.labelMedium)
         Box {
-            OutlinedButton(shape = MaterialTheme.shapes.small, onClick = { open = true }, enabled = enabled && choices.isNotEmpty(), modifier = Modifier.fillMaxWidth().testTag("picker:$label")) {
+            // S29: the field's own node reads "Label: value. Change".
+            val on = enabled && choices.isNotEmpty()
+            NamedButton("$label: $value. Change", { open = true }, Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("picker:$label"), enabled = on,
+                shape = MaterialTheme.shapes.small, padding = PaddingValues(horizontal = 24.dp, vertical = 8.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, if (on) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.outline.copy(alpha = .12f))) {
                 if (providerIcons) {
                     ProviderGlyph(choices.find { it.label == value }?.id ?: value)
                     Spacer(Modifier.width(8.dp))
@@ -220,6 +242,7 @@ internal fun NewChatScreen(
     manage: ManageModel,
     initialWorkspace: String?,
     onCreated: (workspaceId: String, threadId: String) -> Unit,
+    onAddWorkspace: () -> Unit = {},
     onBack: () -> Unit,
 ) {
     val state by browse.state.collectAsState()
@@ -247,7 +270,10 @@ internal fun NewChatScreen(
     ManageFrame("New chat", onBack) {
         if (!ready(state)) return@ManageFrame
         if (open.isEmpty()) {
-            line("no-workspaces", "Add a workspace first.")
+            item(key = "no-workspaces") {
+                QuietEmptyState(R.drawable.ic_folder, "Chats run in a workspace. Add one to start.", "Add workspace",
+                    modifier = Modifier.testTag("no-workspaces"), onAction = onAddWorkspace)
+            }
             return@ManageFrame
         }
         val ws = workspaceId ?: return@ManageFrame
@@ -265,17 +291,20 @@ internal fun NewChatScreen(
             }
         }
         item(key = "model") {
-            Picker("Model", label(catalogs.models, selection.model, "Default"), catalogs.models, chat != null && !busy) {
+            // S25: no bare "Default": the default model names what it resolves to.
+            val models = catalogs.models.map { if (isDefaultChoice(it.id)) it.copy(label = catalogs.default_model_label?.takeIf { l -> l.isNotBlank() }?.let { l -> "Default \u00b7 $l" } ?: "Provider default") else it }
+            Picker("Model", modelValueLabel(catalogs, selection), models, chat != null && !busy) {
                 manage.select(ws, selection.copy(model=it))
             }
         }
         if (catalogs.efforts.isNotEmpty()) item(key = "effort") {
-            Picker("Effort", label(catalogs.efforts, selection.effort, "Default"), catalogs.efforts, chat != null && !busy) {
+            val efforts = catalogs.efforts.map { if (isDefaultChoice(it.id)) it.copy(label = "Auto \u00b7 provider default") else it }
+            Picker("Effort", effortValueLabel(catalogs, selection), efforts, chat != null && !busy) {
                 manage.select(ws, selection.copy(effort=it))
             }
         }
         if (catalogs.access.isNotEmpty()) item(key = "access") {
-            Picker("Access", label(catalogs.access, selection.access, "Default"), catalogs.access, chat != null && !busy) {
+            Picker("Access", accessChipLabel(catalogs.access, selection.access), catalogs.access, chat != null && !busy) {
                 manage.select(ws, selection.copy(access=it))
             }
         }
@@ -288,7 +317,7 @@ internal fun NewChatScreen(
         }
         item(key = "create") {
             Button(shape = MaterialTheme.shapes.small, onClick = { createIntent = manage.createThread(ws, selection) }, enabled = chat?.can_create == true && !busy,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp).heightIn(min = 48.dp)) {
                 Text(if (busy) "Creating…" else "Start chat")
             }
         }
@@ -353,7 +382,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
                     leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
                     trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
                     modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }
-                        .semantics(mergeDescendants = true) { contentDescription = "Browse $root" })
+                        .semantics { contentDescription = "Browse $root" })
             }
         }
         if (directory.path.isNotEmpty()) item(key = "current") {
@@ -534,7 +563,7 @@ internal fun ActionRow(icon: androidx.compose.ui.graphics.painter.Painter, title
     val colors = MaterialTheme.colorScheme
     val ink = (if (tint == Color.Unspecified) colors.onSurface else tint).let { if (enabled) it else it.copy(alpha = .38f) }
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-        .padding(horizontal = inset, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+        .nameOnly(title).padding(horizontal = inset, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         Icon(icon, contentDescription = null, tint = if (tint == Color.Unspecified) colors.onSurfaceVariant.let { if (enabled) it else it.copy(alpha = .38f) } else ink,
             modifier = Modifier.size(22.dp))

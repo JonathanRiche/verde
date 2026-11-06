@@ -59,7 +59,7 @@ private fun ExplorerTopBar(title: String, subtitle: String?, onBack: () -> Unit,
                 subtitle?.let { Text(it, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted) }
             }
         },
-        navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
+        navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } },
         actions = actions)
 }
 
@@ -125,7 +125,7 @@ internal fun ChangesScreen(
     Column(Modifier.fillMaxSize().testTag(CHANGES_TAG)) {
         ExplorerTopBar("Changes", label, onBack) {
             if (changes?.loading == true) CircularProgressIndicator(Modifier.padding(12.dp).size(20.dp), strokeWidth = 2.dp)
-            else IconButton(onClick = model::openChanges) { Icon(Icons.Filled.Refresh, contentDescription = "Refresh changes") }
+            else IconButton(onClick = model::openChanges, modifier = Modifier.named("Refresh changes")) { Icon(Icons.Filled.Refresh, contentDescription = null) }
         }
         if (repos.isNotEmpty()) LazyRow(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentPadding = PaddingValues(horizontal = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -191,7 +191,11 @@ private fun RepoHeader(repo: GitWorkspaceRepo, showName: Boolean) {
 private fun ChangeRow(file: GitWorkspaceFile, onClick: () -> Unit) {
     val letter = changeLetter(file)
     val color = when (letter) { "A", "U" -> VerdeColors.DiffAdd; "D" -> VerdeColors.Danger; else -> VerdeColors.Warning }
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp).testTag("change-${file.path}"),
+    val kind = when (letter) { "A" -> "added"; "U" -> "untracked"; "D" -> "deleted"; "R" -> "renamed"; else -> "modified" }
+    val counts = if (file.binary) "binary" else "${file.additions} added, ${file.deletions} removed lines"
+    val owner = file.owners.firstOrNull()?.let { ownerTitle(it) }
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).nameOnly(listOfNotNull(file.path, kind, owner, counts).joinToString(", "))
+        .padding(horizontal = 16.dp, vertical = 8.dp).testTag("change-${file.path}"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(letter, Modifier.width(14.dp), color = color, style = MaterialTheme.typography.labelLarge.copy(fontFamily = VerdeMono))
         Column(Modifier.weight(1f)) {
@@ -317,7 +321,7 @@ internal fun FilesScreen(model: ExplorerModel, label: String?, onOpenFile: (root
     val rows = remember(files, expanded) { treeRows(files, expanded) }
     Column(Modifier.fillMaxSize().testTag(FILES_TAG)) {
         ExplorerTopBar("Files", label, onBack) {
-            IconButton(onClick = { model.loadRoots(); expanded.forEach(::list) }) { Icon(Icons.Filled.Refresh, contentDescription = "Refresh files") }
+            IconButton(onClick = { model.loadRoots(); expanded.forEach(::list) }, modifier = Modifier.named("Refresh files")) { Icon(Icons.Filled.Refresh, contentDescription = null) }
         }
         when {
             state.unavailable -> ExplorerMessage("Connect to a host to browse files.")
@@ -355,7 +359,7 @@ internal fun FilesScreen(model: ExplorerModel, label: String?, onOpenFile: (root
 private fun TreeLine(depth: Int, open: Boolean, folder: Boolean, name: String, detail: String?, ignored: Boolean, modifier: Modifier, onClick: () -> Unit) {
     // S4: 48dp rows, one TalkBack stop: "name, folder, expanded" / "name, size".
     Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClick = onClick, onClickLabel = if (!folder) "Open" else if (open) "Collapse" else "Expand")
-        .semantics(mergeDescendants = true) {
+        .clearAndSetSemantics {
             contentDescription = listOfNotNull(name, if (folder) "folder" else null, detail).joinToString(", ")
             if (folder) stateDescription = if (open) "Expanded" else "Collapsed"
         }
@@ -477,7 +481,19 @@ private fun PatchLines(model: DiffFileModel, wrap: Boolean) {
                     }
                 }
             }
+            // S30: the diff says where it ends instead of trailing into blank space.
+            item(key = "end", contentType = "end") { EndOfChanges() }
         }
+    }
+}
+
+@Composable
+private fun EndOfChanges() {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp).testTag("patch-end"),
+        horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.width(24.dp).height(1.dp).background(VerdeColors.Border))
+        Text("End of changes", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted)
+        Box(Modifier.width(24.dp).height(1.dp).background(VerdeColors.Border))
     }
 }
 
@@ -527,13 +543,16 @@ internal fun ExplorerLinks(onChanges: () -> Unit, onFiles: () -> Unit, workspace
         // In All Workspaces scope the target is named ("in demo-app"), on screen and for TalkBack.
         val target = workspace?.let { " in $it" }.orEmpty()
         // S16: tonal 48dp chips with an icon (iOS's Changes / Files).
-        FilledTonalButton(onClick = onChanges, shape = RoundedCornerShape(10.dp), contentPadding = PaddingValues(start = 12.dp, end = 14.dp),
-            modifier = Modifier.heightIn(min = 48.dp).testTag(EXPLORER_CHANGES_LINK).semantics { contentDescription = "Changes$target" }) {
+        val colors = MaterialTheme.colorScheme
+        NamedButton("Changes$target", onChanges, Modifier.heightIn(min = 48.dp).testTag(EXPLORER_CHANGES_LINK),
+            container = colors.secondaryContainer, content = colors.onSecondaryContainer, shape = RoundedCornerShape(10.dp),
+            padding = PaddingValues(start = 12.dp, end = 14.dp)) {
             Icon(painterResource(R.drawable.ic_changes), contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp)); Text("Changes")
         }
-        FilledTonalButton(onClick = onFiles, shape = RoundedCornerShape(10.dp), contentPadding = PaddingValues(start = 12.dp, end = 14.dp),
-            modifier = Modifier.heightIn(min = 48.dp).testTag(EXPLORER_FILES_LINK).semantics { contentDescription = "Files$target" }) {
+        NamedButton("Files$target", onFiles, Modifier.heightIn(min = 48.dp).testTag(EXPLORER_FILES_LINK),
+            container = colors.secondaryContainer, content = colors.onSecondaryContainer, shape = RoundedCornerShape(10.dp),
+            padding = PaddingValues(start = 12.dp, end = 14.dp)) {
             Icon(painterResource(R.drawable.ic_folder), contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp)); Text("Files")
         }

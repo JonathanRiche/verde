@@ -93,7 +93,8 @@ private val KEY_ROW_HEIGHT = 48.dp
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId: String, terminalId: String?, onBack: () -> Unit) {
+internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId: String, terminalId: String?,
+    onRelaunch: (() -> Unit)? = null, onBack: () -> Unit) {
     val hostId = rememberSaveable { browse.state.value.hostId ?: "" }
     val model = viewModel { TerminalModel(hosts, browse, createSavedStateHandle(), hostId.ifEmpty { null }, workspaceId, terminalId) }
     val state by model.state.collectAsState()
@@ -113,7 +114,7 @@ internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId:
 
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
         // Overlays (notice, "Latest") never change the measured grid, so they cause no host resize.
         Box(Modifier.weight(1f).fillMaxWidth()) {
             TerminalCanvas(state, fontSp, selection,
@@ -134,6 +135,9 @@ internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId:
                     Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(notice, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).testTag("terminal-notice"))
                         if (state.replayGap && notice.startsWith("Reconnected")) TextButton(onClick = model::dismissGap) { Text("Dismiss") }
+                        // An ended session offers the obvious next step instead of a dead end.
+                        if (onRelaunch != null && writable && state.view?.session_status == "exited")
+                            NamedButton("Relaunch", onRelaunch, Modifier.testTag("terminal-relaunch"))
                     }
                 }
             }
@@ -174,7 +178,7 @@ private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermIn
             .clip(RoundedCornerShape(8.dp))
             .then(if (latched != null) Modifier.toggleable(latched, enabled = enabled, role = Role.Switch) { onClick() }
                 else Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick))
-            .semantics { contentDescription = description }, contentAlignment = Alignment.Center) {
+            .nameOnly(description), contentAlignment = Alignment.Center) {
             Box(Modifier.sizeIn(minWidth = 44.dp).height(36.dp).background(fill, RoundedCornerShape(8.dp))
                 .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)).padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
                 Text(label, style = MaterialTheme.typography.labelLarge.copy(fontFamily = VerdeMono),
