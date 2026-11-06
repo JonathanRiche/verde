@@ -292,7 +292,7 @@ internal fun NewChatScreen(
         }
         item(key = "model") {
             // S25: no bare "Default": the default model names what it resolves to.
-            val models = catalogs.models.map { if (isDefaultChoice(it.id)) it.copy(label = catalogs.default_model_label?.takeIf { l -> l.isNotBlank() }?.let { l -> "Default \u00b7 $l" } ?: "Provider default") else it }
+            val models = catalogs.models.map { it.copy(label = pickerRowLabel(ComposerPicker.Model, it, catalogs)) }
             Picker("Model", modelValueLabel(catalogs, selection), models, chat != null && !busy) {
                 manage.select(ws, selection.copy(model=it))
             }

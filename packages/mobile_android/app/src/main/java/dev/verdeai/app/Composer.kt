@@ -629,9 +629,26 @@ internal fun chipShort(picker: ComposerPicker, value: String): String = when (pi
     else -> value
 }
 
-/** S25: picker rows never say a bare "Default": effort's reads "Auto", with what it resolves to beneath. */
-internal fun pickerRowLabel(kind: ComposerPicker, choice: ChatChoice): String =
-    if (kind == ComposerPicker.Effort && isDefaultChoice(choice.id)) "Auto" else choice.label
+/**
+ * S25 / A8-3: picker rows never say a bare "Default": effort's reads "Auto"; the model's names what
+ * it resolves to ("Default · Opus 5.5"), or "Auto" when the core doesn't say.
+ */
+internal fun pickerRowLabel(kind: ComposerPicker, choice: ChatChoice, c: ChatCatalogs? = null): String = when {
+    !isDefaultChoice(choice.id) -> choice.label
+    kind == ComposerPicker.Effort -> "Auto"
+    kind == ComposerPicker.Model -> c?.default_model_label?.takeIf { it.isNotBlank() }?.let { "Default \u00b7 $it" } ?: "Auto"
+    else -> choice.label
+}
+
+/** A8-3: what each access mode does, under its row; the one an unset chat runs with is marked. */
+internal fun accessSubtitle(id: String): String? {
+    val what = when (id) {
+        "full_access" -> "Runs commands without asking"
+        "supervised" -> "Asks before running commands"
+        else -> return null
+    }
+    return if (id == DEFAULT_ACCESS) "$what (default)" else what
+}
 
 /** S18: the access chip names the mode the chat runs with; an unset one is [DEFAULT_ACCESS]. */
 internal fun accessChipLabel(access: List<ChatChoice>, selected: String?): String =
@@ -663,11 +680,11 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
         add(Chip("Model", model, model, provider, null, 1f, ComposerPicker.Model, Int.MAX_VALUE))
         if (c.efforts.isNotEmpty()) add(Chip("Effort", effortValue, chipShort(ComposerPicker.Effort, effortValue), null, R.drawable.composer_reasoning,
             (c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size, ComposerPicker.Effort, 3))
-        if (c.access.isNotEmpty()) add(Chip("Access", accessValue, chipShort(ComposerPicker.Access, accessValue), null,
-            if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked, 1f, ComposerPicker.Access, 2))
-        // Speed: a bolt for Fast, a gauge for Standard.
+        // A8-2: model · effort · speed · access on both platforms. Speed: a bolt for Fast, a gauge for Standard.
         if (c.speeds.size > 1) add(Chip("Speed", speedValue, chipShort(ComposerPicker.Speed, s.speed ?: speedValue), null,
             if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard, 1f, ComposerPicker.Speed, 1))
+        if (c.access.isNotEmpty()) add(Chip("Access", accessValue, chipShort(ComposerPicker.Access, accessValue), null,
+            if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked, 1f, ComposerPicker.Access, 2))
     }
     val large = LocalDensity.current.fontScale > 1.15f
     if (large) {
@@ -774,7 +791,9 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
         Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 7.dp, end = if (iconOnly) 12.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             leading?.invoke()
-            if (!iconOnly) Text(shown, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // A8-2: a long model name keeps both ends ("GPT…Sol"), like iOS.
+            if (!iconOnly) Text(shown, style = MaterialTheme.typography.labelMedium, maxLines = 1,
+                overflow = if (name == "Model") TextOverflow.MiddleEllipsis else TextOverflow.Ellipsis)
         }
     }
 }
@@ -824,13 +843,14 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                 // The Default row names what it resolves to, when the core knows (iOS wording).
                 val subtitle = when {
                     !choice.enabled -> choice.reason ?: "Unavailable"
-                    kind == ComposerPicker.Model && isDefaultChoice(choice.id) -> c.default_model_label?.takeIf { it.isNotBlank() } ?: "provider default"
+                    kind == ComposerPicker.Model && isDefaultChoice(choice.id) ->
+                        if (c.default_model_label.isNullOrBlank()) "provider default" else null
                     kind == ComposerPicker.Effort && isDefaultChoice(choice.id) -> c.default_effort_label?.takeIf { it.isNotBlank() } ?: "provider default"
-                    kind == ComposerPicker.Access && choice.id == DEFAULT_ACCESS -> "Default"
+                    kind == ComposerPicker.Access -> accessSubtitle(choice.id)
                     else -> null
                 }
                 VerdeListRow(
-                    headlineContent = { Text(pickerRowLabel(kind, choice)) },
+                    headlineContent = { Text(pickerRowLabel(kind, choice, c)) },
                     supportingContent = subtitle?.let { { Text(it) } },
                     leadingContent = {
                         when (kind) {
@@ -851,7 +871,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                     // TalkBack hears "Selected" on the current choice (a radio group), not just a check glyph.
                     modifier = Modifier.fillMaxWidth().selectable(selected = selected, enabled = choice.enabled,
                         role = Role.RadioButton) { if (!selected) onPick(choice.id) }
-                        .nameOnly(listOfNotNull(pickerRowLabel(kind, choice), subtitle, "Favourite".takeIf { choice.favorite }).joinToString(", "),
+                        .nameOnly(listOfNotNull(pickerRowLabel(kind, choice, c), subtitle, "Favourite".takeIf { choice.favorite }).joinToString(", "),
                             selected = selected),
                 )
             }

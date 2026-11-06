@@ -66,5 +66,10 @@ class ComposerLabelsTest {
         assertEquals("Full", chipShort(ComposerPicker.Access, "Full access"))
         assertEquals("GPT-6.1 Sol", chipShort(ComposerPicker.Model, "GPT-6.1 Sol"))
         assertEquals("Auto", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
+        // A8-3: the model's default row names what it resolves to, else "Auto"; access rows say what they do.
+        assertEquals("Default \u00b7 Opus 5.5", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs(default_model_label = "Opus 5.5")))
+        assertEquals("Auto", pickerRowLabel(ComposerPicker.Model, ChatChoice("", "Default"), dev.verdeai.core.ChatCatalogs()))
+        assertEquals("Runs commands without asking (default)", accessSubtitle("full_access"))
+        assertEquals("Asks before running commands", accessSubtitle("supervised"))
     }
 }
