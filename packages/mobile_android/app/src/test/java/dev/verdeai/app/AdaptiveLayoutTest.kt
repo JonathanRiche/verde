@@ -207,7 +207,7 @@ class AdaptiveLayoutTest {
     /** Laid out on one line, not ellipsized, and within its measured box. */
     private fun overflows(text: String): Boolean {
         val results = mutableListOf<TextLayoutResult>()
-        compose.onNodeWithText(text).fetchSemanticsNode().config[SemanticsActions.GetTextLayoutResult].action?.invoke(results)
+        compose.onNode(hasText(text), useUnmergedTree = true).fetchSemanticsNode().config[SemanticsActions.GetTextLayoutResult].action?.invoke(results)
         val layout = results.single()
         return layout.lineCount != 1 || layout.isLineEllipsized(0) || layout.getLineRight(0) > layout.size.width + 1f
     }
@@ -244,7 +244,7 @@ class AdaptiveLayoutTest {
 
     @Test fun wideComposerKeepsEveryControlOnOneRow() {
         composerRow(700)
-        val top = { label: String -> compose.onNodeWithText(label).getUnclippedBoundsInRoot().let { (it.top + it.bottom) / 2 } }
+        val top = { label: String -> compose.onNode(hasText(label), useUnmergedTree = true).getUnclippedBoundsInRoot().let { (it.top + it.bottom) / 2 } }
         val center = top(longModel)
         listOf("Attach", "High", "Ask first", "Send").forEach { label ->
             assertTrue("$label centered with the model", (top(label) - center).value.let { kotlin.math.abs(it) < 2f })
@@ -254,9 +254,9 @@ class AdaptiveLayoutTest {
     @Test fun modelChipNeitherTruncatesWithRoomNorStretches() {
         composerRow(700)
         assertFalse(overflows(longModel))
-        val text = compose.onNodeWithText(longModel).getUnclippedBoundsInRoot()
+        val text = compose.onNode(hasText(longModel), useUnmergedTree = true).getUnclippedBoundsInRoot()
         val send = compose.onNodeWithText("Send").getUnclippedBoundsInRoot()
-        val access = compose.onNodeWithText("Ask first").getUnclippedBoundsInRoot()
+        val access = compose.onNode(hasText("Ask first"), useUnmergedTree = true).getUnclippedBoundsInRoot()
         // Unused room stays after the chips, before send, rather than inside the model chip.
         assertTrue("room was left for send", send.left - access.right > 40.dp)
         assertTrue("label starts the chip", text.left < access.left)

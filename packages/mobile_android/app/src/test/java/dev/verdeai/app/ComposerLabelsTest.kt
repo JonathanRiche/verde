@@ -48,10 +48,23 @@ class ComposerLabelsTest {
         assertEquals("Default", modelValueLabel(unknown, none))
         assertEquals("Sonnet 5.5", modelValueLabel(known, dev.verdeai.core.ChatSelection(model = "sonnet")))
         assertEquals("High", effortValueLabel(known, none))
-        assertEquals("Default", effortValueLabel(unknown, none))
+        assertEquals("Auto", effortValueLabel(unknown, none))
         assertEquals("High", effortValueLabel(known, dev.verdeai.core.ChatSelection(effort = "high")))
-        assertEquals("Opus 5.5 \u00b7 High", compactSettingsLabel(known, none))
+        assertEquals("Opus 5.5", compactSettingsLabel(known, none))
+        assertEquals("Codex \u00b7 Opus 5.5", compactSettingsLabel(known, none, "codex"))
         assertEquals("Full access", accessChipLabel(access, null))
         assertEquals("Supervised", accessChipLabel(access, "supervised"))
+    }
+
+    @Test fun chipsShareOneAbbreviationTable() {
+        assertEquals("Med", chipShort(ComposerPicker.Effort, "Medium"))
+        assertEquals("Auto", chipShort(ComposerPicker.Effort, "Auto"))
+        assertEquals("High", chipShort(ComposerPicker.Effort, "High"))
+        assertEquals("Fast", chipShort(ComposerPicker.Speed, "on"))
+        assertEquals("Std", chipShort(ComposerPicker.Speed, "off"))
+        assertEquals("Ask", chipShort(ComposerPicker.Access, "Supervised"))
+        assertEquals("Full", chipShort(ComposerPicker.Access, "Full access"))
+        assertEquals("GPT-6.1 Sol", chipShort(ComposerPicker.Model, "GPT-6.1 Sol"))
+        assertEquals("Auto", pickerRowLabel(ComposerPicker.Effort, ChatChoice("", "Default")))
     }
 }
