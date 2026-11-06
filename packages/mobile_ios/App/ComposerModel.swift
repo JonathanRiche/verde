@@ -101,7 +101,10 @@ final class ComposerModel {
     /// Per photo after re-encoding. Each `draft_set` carries only the newly added photo (earlier
     /// ones go by reference), so this keeps that event's base64 inside the core's 1 MiB input.
     static let maxImageBytes = 700 * 1024
-    static let maxImages = 4
+    /// The host's own limit: packages/headless/src/attachment_protocol.zig MAX_ATTACHMENTS_PER_TURN
+    /// (16; the sessionizer rejects more). At `maxImageBytes` each, a full turn stays far below the
+    /// host's 256 MB pending cap.
+    static let maxImages = 16
 
     let chat: TranscriptModel
     private(set) var text = ""
@@ -380,12 +383,19 @@ final class ComposerModel {
             let fit = composerImagesThatFit(picked: images.count, existing: existing.count)
             let usable = images.prefix(fit.take).filter { $0.count <= Self.maxImageBytes }
             let tooLarge = fit.take - usable.count
-            var added: [(AttachmentInput, Data)] = []
-            for bytes in usable {
-                let id = "img-" + UUID().uuidString
-                added.append((AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString()), bytes))
-            }
-            if !added.isEmpty, await setDraft(text, existing + added.map(\.0)) {
+            // Added a few at a time, one draft update after another, so no single update carries
+            // more than four images' bytes.
+            var attached = existing
+            for batch in stride(from: 0, to: usable.count, by: 4).map({ Array(usable[$0..<min($0 + 4, usable.count)]) }) {
+                let added = batch.map { bytes in
+                    (AttachmentInput(local_id: "img-" + UUID().uuidString, name: "Photo.jpg", mime: "image/jpeg",
+                                     byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString()), bytes)
+                }
+                guard await setDraft(text, attached + added.map(\.0)) else { break }
+                // Later batches refer to these by id only; the core already holds their bytes.
+                attached += added.map { input, _ in
+                    AttachmentInput(local_id: input.local_id, name: input.name, mime: input.mime, byte_size: input.byte_size, bytes_base64: "")
+                }
                 for (input, bytes) in added {
                     previews[input.local_id] = bytes
                     // The sent row shows these bytes right away (keyed by the draft's local id).

@@ -439,8 +439,9 @@ struct ChatComposer: View {
                 if !items.isEmpty { ComposerSuggestionList(items: items, files: token.marker == "@") { model.accept($0) } }
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
+                // Up to 16 images: one row that scrolls sideways, never taller than one thumbnail.
                 ScrollView(.horizontal) {
-                    HStack {
+                    LazyHStack {
                         ForEach(attachments, id: \.local_id) { item in
                             HStack {
                                 if let data = model.previews[item.local_id], let image = UIImage(data: data) {
@@ -456,6 +457,7 @@ struct ChatComposer: View {
                         }
                     }
                 }
+                .frame(height: 48)
             }
     }
 

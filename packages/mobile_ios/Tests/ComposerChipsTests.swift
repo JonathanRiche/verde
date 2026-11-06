@@ -166,12 +166,15 @@ final class ComposerChipPlanTests: XCTestCase {
 /// Multi-select attach: what fits under the per-message limit, and Android's notice for the rest.
 final class ComposerImageLimitTests: XCTestCase {
     func testPicksFillTheRoomLeftAndFlagTheRest() {
+        // The host's limit (attachment_protocol.zig MAX_ATTACHMENTS_PER_TURN).
+        XCTAssertEqual(ComposerModel.maxImages, 16)
         XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 0) == (3, false))
-        XCTAssertTrue(composerImagesThatFit(picked: 4, existing: 0) == (4, false))
-        XCTAssertTrue(composerImagesThatFit(picked: 6, existing: 0) == (4, true))
-        XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 2) == (2, true))
-        XCTAssertTrue(composerImagesThatFit(picked: 1, existing: 4) == (0, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 16, existing: 0) == (16, false))
+        XCTAssertTrue(composerImagesThatFit(picked: 20, existing: 0) == (16, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 5, existing: 14) == (2, true))
+        XCTAssertTrue(composerImagesThatFit(picked: 1, existing: 16) == (0, true))
         XCTAssertTrue(composerImagesThatFit(picked: 0, existing: 1) == (0, false))
-        XCTAssertEqual(composerImageLimitNotice, "Up to 4 images per message.")
+        XCTAssertTrue(composerImagesThatFit(picked: 3, existing: 2, max: 4) == (2, true))
+        XCTAssertEqual(composerImageLimitNotice, "Up to 16 images per message.")
     }
 }
