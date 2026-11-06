@@ -32,6 +32,9 @@ const forwarded_client = "192.0.2.7";
 const workspace_id = "contract-ws";
 const thread_id = "contract-thread";
 const approval_prompt = "orchestration approval";
+const photo_prompt = "describe this photo";
+/// A 1x1 PNG.
+const photo_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 const step_timeout_ms = 30_000;
 const watchdog_ms = 240_000;
 
@@ -1379,6 +1382,38 @@ test "K-14 contract: real core pairs, syncs, runs an approval turn, and signs ou
         const read = try core.rpcCall("chat.thread.get", .{ .workspace_id = workspace_id, .local_thread_id = thread_id }, false);
         try std.testing.expectEqualStrings("K-14 renamed", str(get(read, "thread"), "title"));
     }
+
+    // A photo on a thread created without repository metadata: the host stages uploads only for
+    // repository routes, so the core routes the turn through the workspace manifest.
+    try core.intent("draft_set", .{ .intent_id = "k14-photo-draft", .workspace_id = workspace_id, .thread_id = thread_id, .text = photo_prompt, .attachments = .{.{ .local_id = "k14-photo", .name = "dot.png", .mime = "image/png", .byte_size = "70", .bytes_base64 = photo_png }} });
+    try core.waitFor("photo draft saved", step_timeout_ms, {}, struct {
+        fn pred(k: *Core, _: void) !bool {
+            try k.requireNotFailed("k14-photo-draft");
+            return h.eq(str(get(try k.query(try composerSelector(k)), "draft"), "text"), photo_prompt);
+        }
+    }.pred);
+    const photo_revision = try gpa.dupe(u8, str(get(try core.query(try composerSelector(&core)), "draft"), "revision"));
+    defer gpa.free(photo_revision);
+    try core.intent("send", .{ .intent_id = "k14-photo-send", .workspace_id = workspace_id, .thread_id = thread_id, .draft_revision = photo_revision });
+    try core.waitFor("photo turn committed with its image", step_timeout_ms, {}, struct {
+        fn pred(k: *Core, _: void) !bool {
+            try k.requireNotFailed("k14-photo-send");
+            const view = try k.query(try threadSelector(k));
+            if (!h.eq(str(get(view, "turn"), "status"), "completed")) return false;
+            for (items(get(view, "rows"))) |row| {
+                if (h.eq(str(row, "role"), "user") and std.mem.indexOf(u8, str(row, "body"), photo_prompt) != null and h.eq(str(row, "delivery"), "committed")) return items(get(row, "attachments")).len == 1;
+            }
+            return false;
+        }
+    }.pred);
+    try std.testing.expectEqualStrings("succeeded", core.operationState("k14-photo-send"));
+    // Sign-out refuses to race a secure-store write: let the cleared draft's write finish.
+    try core.waitFor("draft write settled", step_timeout_ms, {}, struct {
+        fn pred(k: *Core, _: void) !bool {
+            for (k.host.state.pending) |pending| if (pending.kind == .store_put or pending.kind == .store_get or pending.kind == .store_delete) return false;
+            return true;
+        }
+    }.pred);
 
     // D-04 sign_out: the core revokes this device with targeted
     // device.self.revoke over its authenticated RPC, then wipes the

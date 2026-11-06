@@ -20,7 +20,8 @@ const Request = struct { id: u64, thread: usize, kind: Kind, intent: []const u8 
 /// `orchestration_note` for a `send`/queued follow-up with `voice: true` (exact text is a
 /// cross-platform contract; the daemon appends it to the provider prompt only).
 pub const VOICE_NOTE = "<voice_turn>The user spoke this message aloud from their phone and will hear your reply read aloud. Start with one short spoken acknowledgement sentence before using tools. Keep the reply brief and conversational: plain sentences, no markdown, no code blocks, no tables, no lists of file paths; say numbers and names naturally. Put anything long in a follow-up chat instead of reading it out.</voice_turn>";
-const Send = struct { intent: []const u8, revision: u64, text: []const u8, inputs: []const wire.AttachmentInput, settings: store.Thread, turn_id: []const u8, message_id: []const u8, attachments: []const m.Attachment = &.{}, index: usize = 0, offset: usize = 0, chunk: usize = 0, sent_bytes: usize = 0, followup: bool = false, voice: bool = false };
+/// `route`: the manifest route `chat.turn.start` used for a thread without repository metadata.
+const Send = struct { intent: []const u8, revision: u64, text: []const u8, inputs: []const wire.AttachmentInput, settings: store.Thread, turn_id: []const u8, message_id: []const u8, attachments: []const m.Attachment = &.{}, index: usize = 0, offset: usize = 0, chunk: usize = 0, sent_bytes: usize = 0, followup: bool = false, voice: bool = false, route: ?ManifestRoute = null };
 const Saved = struct { version: u32 = 1, revision: u64 = 0, text: []const u8 = "", inputs: []const wire.AttachmentInput = &.{}, selection: m.Selection = .{}, selection_base: ?m.Selection = null, followup: ?m.Followup = null, followup_inputs: []const wire.AttachmentInput = &.{}, followup_settings: ?store.Thread = null, route: []const u8 = "" };
 pub const Thread = struct {
     workspace_id: []const u8,
@@ -301,17 +302,71 @@ fn uploadNext(tx: *h.Transaction, i: usize) E!void {
         for (send.attachments) |item| try add([]const u8, tx.allocator(), &ids, item.attachment_id.?);
         const meta = send.settings;
         var params = try value(tx.allocator(), .{ .turn_id = send.turn_id, .workspace_id = t.workspace_id, .local_thread_id = t.id, .message_id = send.message_id, .prompt = send.text, .thread_title = meta.title, .provider = meta.provider, .harness = meta.harness, .provider_thread_id = meta.provider_thread_id, .model_ref = meta.model_ref, .reasoning_effort = meta.reasoning_effort, .opencode_reasoning_variant = meta.reasoning_variant, .fast_mode = eq(meta.fast_mode orelse "off", "on"), .access_mode = meta.access_mode, .attachments = ids });
-        try addRoute(tx.allocator(), t, &params);
+        send.route = try addRoute(tx.allocator(), &tx.state, t, &params, ids.len > 0);
         // Spoken turns ask the agent for a short, speakable reply; the daemon hides the note.
         if (send.voice) try params.object.put(tx.allocator(), "orchestration_note", .{ .string = VOICE_NOTE });
         try call(tx, i, .start, "chat.turn.start", params, true, send.intent);
     }
 }
-fn addRoute(a: A, t: *const Thread, params: *V) E!void {
+/// Turn and shell routes. Like the web client, a remote turn runs on a repository route: the host
+/// stages uploaded attachments only there. A thread without repository metadata (legacy or
+/// desktop-created) takes the workspace manifest repository that holds its cwd.
+/// Returns the manifest route it chose, which the host records on the thread once a turn starts.
+fn addRoute(a: A, state: *const h.State, t: *const Thread, params: *V, staged: bool) E!?ManifestRoute {
     if (t.metadata.repository_id != null or t.metadata.repository_cwd != null) {
         try params.object.put(a, "repository_id", .{ .string = t.metadata.repository_id orelse "primary" });
         try params.object.put(a, "relative_cwd", if (t.metadata.repository_cwd) |v| .{ .string = v } else .null);
+    } else if (manifestRoute(state, t, staged)) |found| {
+        try params.object.put(a, "repository_id", .{ .string = found.repository_id });
+        try params.object.put(a, "relative_cwd", if (found.relative_cwd) |v| .{ .string = v } else .null);
+        return found;
     } else try params.object.put(a, "project_path", .{ .string = t.cwd });
+    return null;
+}
+pub const ManifestRoute = struct { repository_id: []const u8, relative_cwd: ?[]const u8 };
+/// The listed repository whose checkout on this runtime holds the thread's cwd (the deepest one;
+/// the workspace default on a tie or without a cwd), with the cwd relative to its root. Null when
+/// the cwd lies outside every checkout, or sync lists no manifest and nothing is `staged`: the
+/// project path then stays. An empty manifest is a legacy one-path workspace whose stable
+/// `primary` repository is its path; staged uploads need that route even on such a listing.
+pub fn manifestRoute(state: *const h.State, t: *const Thread, staged: bool) ?ManifestRoute {
+    var ws: V = .null;
+    for (p.rows(p.get(p.get(state.sync.snapshot, "snapshot"), "workspaces"))) |w| if (eq(p.s(w, "workspace_id"), t.workspace_id)) {
+        ws = w;
+    };
+    if (ws == .null) return null;
+    const listed = p.rows(p.get(ws, "repositories"));
+    if (listed.len == 0 and !staged) return null;
+    const legacy = [_]V{V{ .object = .empty }};
+    const repositories = if (listed.len > 0) listed else &legacy;
+    const default_id = if (p.s(ws, "default_repository_id").len > 0) p.s(ws, "default_repository_id") else store.PRIMARY_REPOSITORY_ID;
+    const runtime = t.metadata.runtime_id orelse state.rpc.runtime_id orelse "";
+    const cwd = std.mem.trimEnd(u8, t.cwd, "/");
+    var best: ?ManifestRoute = null;
+    var best_len: usize = 0;
+    for (repositories) |repo| {
+        const id = if (listed.len > 0) p.s(repo, "repository_id") else store.PRIMARY_REPOSITORY_ID;
+        if (id.len == 0) continue;
+        const bindings = p.rows(p.get(repo, "bindings"));
+        var root: ?[]const u8 = if (listed.len > 0) null else std.mem.trimEnd(u8, p.s(ws, "path"), "/");
+        // Only this runtime's checkout routes here; a lone binding counts when the runtime is unknown.
+        for (bindings) |b| if (eq(p.s(b, "runtime_id"), runtime) or (runtime.len == 0 and bindings.len == 1)) {
+            root = std.mem.trimEnd(u8, p.s(b, "root_path"), "/");
+        };
+        const is_default = eq(id, default_id);
+        if (cwd.len == 0) {
+            if (is_default) return .{ .repository_id = id, .relative_cwd = null };
+            continue;
+        }
+        const r = root orelse continue;
+        if (r.len == 0) continue;
+        const relative: ?[]const u8 = if (eq(cwd, r)) null else if (std.mem.startsWith(u8, cwd, r) and cwd.len > r.len and cwd[r.len] == '/') cwd[r.len + 1 ..] else continue;
+        if (best == null or r.len > best_len or (r.len == best_len and is_default)) {
+            best = .{ .repository_id = id, .relative_cwd = relative };
+            best_len = r.len;
+        }
+    }
+    return best;
 }
 fn uploadChunk(tx: *h.Transaction, i: usize) E!void {
     const send = &tx.state.chat.threads[i].send.?;
@@ -366,7 +421,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
                 return true;
             }
             var params = try value(tx.allocator(), .{ .workspace_id = t.workspace_id, .local_thread_id = t.id, .command = confirmation.command, .confirmed = true });
-            try addRoute(tx.allocator(), t, &params);
+            _ = try addRoute(tx.allocator(), &tx.state, t, &params, false);
             try call(tx, i, .shell, "chat.shell.run", params, true, id);
             return true;
         }
@@ -1057,6 +1112,14 @@ fn receiveResult(tx: *h.Transaction, request: Request, result: V) E!void {
             if (!eq(p.s(result, "turn_id"), send.turn_id)) return failed(tx, request, rpc.failure(.protocol, "unconfirmed_turn", true), false);
             t.turn = .{ .turn_id = send.turn_id, .status = "running", .started_at_ms = tx.state.wall_time_ms };
             t.activity_ms = tx.state.wall_time_ms;
+            // Acceptance commits the route on the host thread, which then refuses an upsert that
+            // clears it; adopt it now rather than wait for sync to list it.
+            if (send.route) |used| {
+                t.metadata.profile_id = t.metadata.profile_id orelse "local";
+                t.metadata.runtime_id = t.metadata.runtime_id orelse tx.state.rpc.runtime_id;
+                t.metadata.repository_id = used.repository_id;
+                t.metadata.repository_cwd = used.relative_cwd;
+            }
             t.events = &.{};
             t.after_seq = 0;
             t.retry_at = 0;
@@ -1226,7 +1289,14 @@ pub fn pump(tx: *h.Transaction) E!void {
     for (s.threads, 0..) |*t, i| {
         for (tx.state.sync.catalog) |item| {
             if (!eq(p.s(item, "workspace_id"), t.workspace_id) or !eq(p.s(item, "local_thread_id"), t.id)) continue;
-            const latest = std.json.parseFromValueLeaky(store.Thread, tx.allocator(), item, .{ .ignore_unknown_fields = true }) catch |e| return h.mapError(e);
+            var latest = std.json.parseFromValueLeaky(store.Thread, tx.allocator(), item, .{ .ignore_unknown_fields = true }) catch |e| return h.mapError(e);
+            // A listing from before our accepted turn still lacks its committed route; keep it.
+            if (latest.profile_id == null and latest.runtime_id == null and latest.repository_id == null and latest.repository_cwd == null) {
+                latest.profile_id = t.metadata.profile_id;
+                latest.runtime_id = t.metadata.runtime_id;
+                latest.repository_id = t.metadata.repository_id;
+                latest.repository_cwd = t.metadata.repository_cwd;
+            }
             // The host learns a stable runtime identity when the first turn starts.
             // Retain it on subsequent upserts: committed routes cannot be cleared.
             if (!eq(latest.profile_id orelse "", t.metadata.profile_id orelse "") or !eq(latest.runtime_id orelse "", t.metadata.runtime_id orelse "") or !eq(latest.cwd orelse "", t.metadata.cwd orelse "") or !eq(latest.repository_id orelse "", t.metadata.repository_id orelse "") or !eq(latest.repository_cwd orelse "", t.metadata.repository_cwd orelse "")) {

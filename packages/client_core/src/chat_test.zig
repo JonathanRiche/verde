@@ -605,3 +605,73 @@ test "thread activity follows turns this device observes until the host catches 
     // Once the host's value is newer, it wins.
     try expect(p.num(p.get(try listedThread(&f, 1790363200, none), "last_activity_at_ms")).? == 1790363200000);
 }
+
+const runtime = "0123456789abcdef0123456789abcdef";
+/// Lists the fixture workspace with `repositories` and points the open thread at `cwd`.
+fn manifest(f: *Fixture, repositories: anytype, cwd: []const u8) !void {
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    tx.state.rpc.runtime_id = runtime;
+    tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{ .snapshot = .{ .workspaces = .{.{ .workspace_id = ws, .label = "Fixture", .path = "/repo", .default_repository_id = "primary", .repositories = repositories }} } }));
+    const threads = try tx.allocator().dupe(chat.Thread, tx.state.chat.threads);
+    threads[0].cwd = cwd;
+    tx.state.chat.threads = threads;
+    f.a().free(try tx.commit(&f.host, f.a()));
+}
+fn routeOf(f: *Fixture, staged: bool) ?chat.ManifestRoute {
+    return chat.manifestRoute(&f.host.state, &f.host.state.chat.threads[0], staged);
+}
+
+test "turns without repository metadata route through the workspace manifest so photos are staged" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const repos = .{
+        .{ .repository_id = "primary", .label = "Fixture", .bindings = .{ .{ .runtime_id = "ffffffffffffffffffffffffffffffff", .root_path = "/elsewhere" }, .{ .runtime_id = runtime, .root_path = "/repo/" } } },
+        .{ .repository_id = "api", .label = "API", .bindings = .{.{ .runtime_id = runtime, .root_path = "/repo/services/api" }} },
+    };
+    // The deepest checkout holding the cwd wins; the root itself has no relative cwd.
+    try manifest(&f, repos, "/repo/services/api/src");
+    var r = routeOf(&f, false).?;
+    try eql("api", r.repository_id);
+    try eql("src", r.relative_cwd.?);
+    try manifest(&f, repos, "/repo");
+    r = routeOf(&f, false).?;
+    try eql("primary", r.repository_id);
+    try expect(r.relative_cwd == null);
+    try manifest(&f, repos, "/repo/docs/");
+    try eql("docs", routeOf(&f, false).?.relative_cwd.?);
+    // Another runtime's checkout and folders outside every checkout keep the project path.
+    try manifest(&f, repos, "/elsewhere/x");
+    try expect(routeOf(&f, true) == null);
+    // A legacy one-path workspace routes staged uploads through its `primary` path only.
+    try manifest(&f, .{}, "/repo/app");
+    try expect(routeOf(&f, false) == null);
+    r = routeOf(&f, true).?;
+    try eql("primary", r.repository_id);
+    try eql("app", r.relative_cwd.?);
+
+    // End to end: the photo turn carries the repository route, never `project_path`.
+    try manifest(&f, repos, "/repo/services/api");
+    _ = try f.intent("draft_set", .{ .text = "look", .attachments = .{.{ .local_id = "image", .name = "a.png", .mime = "image/png", .byte_size = "3", .bytes_base64 = "YWJj" }} });
+    _ = try f.storage(null, false);
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("send", .{ .draft_revision = revision });
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    try f.reply("chat.attachment.create", .{ .attachment_id = "abc", .max_chunk_bytes = 16 });
+    try f.reply("chat.attachment.append", .{ .received_bytes = 3 });
+    try f.reply("chat.attachment.commit", .{ .attachment_id = "abc" });
+    const start = try f.params("chat.turn.start");
+    try eql("api", p.s(start, "repository_id"));
+    try expect(p.get(start, "relative_cwd") == .null);
+    try expect(p.get(start, "project_path") == .null);
+    try eql("abc", p.rows(p.get(start, "attachments"))[0].string);
+    // Acceptance commits that route on the host thread; the next upsert must carry it.
+    try f.reply("chat.turn.start", .{ .turn_id = p.s(start, "turn_id") });
+    const meta = f.host.state.chat.threads[0].metadata;
+    try eql("api", meta.repository_id.?);
+    try expect(meta.repository_cwd == null);
+    try eql("local", meta.profile_id.?);
+    try eql(runtime, meta.runtime_id.?);
+}

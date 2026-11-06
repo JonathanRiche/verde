@@ -391,7 +391,7 @@ fn createThread(tx: *h.Transaction, base: Job, event: V) E!void {
         .harness = "local_cli",
         // The daemon rejects a partial route: profile and repository travel together.
         .profile_id = "local",
-        .repository_id = "primary",
+        .repository_id = if (p.s(ws, "default_repository_id").len > 0) p.s(ws, "default_repository_id") else store.PRIMARY_REPOSITORY_ID,
     };
     try advance(tx, i);
 }
