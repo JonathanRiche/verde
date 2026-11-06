@@ -101,7 +101,13 @@ func historySections(_ items: [ThreadSummary]) -> [(String, [ThreadSummary])] {
         if sections.last?.0 == item.history_bucket { sections[sections.count - 1].1.append(item) }
         else { sections.append((item.history_bucket, [item])) }
     }
-    return sections
+    // I10-5: newest activity first inside each bucket (undated last, ties keep the host's order).
+    return sections.map { bucket, rows in
+        (bucket, rows.enumerated().sorted {
+            let (l, r) = ($0.element.last_activity_at_ms ?? .min, $1.element.last_activity_at_ms ?? .min)
+            return l != r ? l > r : $0.offset < $1.offset
+        }.map(\.element))
+    }
 }
 
 /// Management projections and intents stay in the core. Pending mutations are never replayed.

@@ -30,12 +30,25 @@ struct DrawerItem: Identifiable {
     let pane: Pane?
     var id: String { workspace.workspace_id + ":" + (thread?.thread_id ?? pane?.terminal_id ?? "") }
     var title: String { thread.map { $0.title.isEmpty ? "New chat" : $0.title } ?? pane?.title ?? "" }
-    var active: Bool {
-        if let thread { return activeTurn(thread.status) || thread.status == "failed" || pane?.attention_kind != nil }
-        return pane?.attention == true
-    }
+    /// One rule with Home (I10-3): running (a live turn or process) or needing you per the core.
+    /// A failed chat counts only while unacknowledged, which the core's `needs_you` already says.
+    var active: Bool { drawerRowActive(threadStatus: thread?.status, pane: pane) }
     /// A chat's last activity; terminals carry no synced status-change time yet.
     var activityMs: Int64? { thread?.last_activity_at_ms }
+}
+
+/// The footer tab to mark (I10-4, Android parity): a chat, Files, Changes or any pushed screen is
+/// under Workspaces; Home and Hosts only when they are what's on screen.
+func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
+    guard tab != .hosts, route != nil else { return tab }
+    return .workspaces
+}
+
+/// Active = running or needs_you, the same rule as Home's "Needs you" and "Running" sections.
+func drawerRowActive(threadStatus: String?, pane: Pane?) -> Bool {
+    if pane?.needs_you == true { return true }
+    if let threadStatus { return activeTurn(threadStatus) || pane?.can_stop == true }
+    return pane.map { activeTurn($0.status) } ?? false
 }
 
 /// Flat Active/Open rows by workspace recency. Both follow the scope (nil = All Workspaces):
@@ -89,6 +102,7 @@ struct WorkspaceDrawer: View {
         // else the most recently used one (S21).
         let current = routeWorkspaceID(selected).flatMap { id in all.first { $0.workspace_id == id && $0.open } }
         let target = scoped.flatMap { $0.open ? $0 : nil } ?? current ?? mostRecentOpenWorkspace(all)
+        let here = drawerFooterDestination(tab: tab, route: selected)
         VStack(spacing: 0) {
             HStack {
                 VerdeWordmark(); Spacer()
@@ -130,7 +144,7 @@ struct WorkspaceDrawer: View {
                     rows("Open", sections.open, chip: scope == nil)
                     if !search.isEmpty { row("Search all chat history", icon: "clock") { open(.history) } }
                     if all.isEmpty { Text("Pair with a host to see your workspaces.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).padding(16) }
-                }.padding(.horizontal, 8)
+                }.padding(.horizontal, 8).padding(.bottom, 16)
             }
             Divider().overlay(VerdeTheme.border)
             if let dock {
@@ -140,18 +154,18 @@ struct WorkspaceDrawer: View {
             if permanent && verticalSize == .compact {
                 // A short window (a phone on its side) needs its height for the list.
                 HStack(spacing: 0) {
-                    footerIcon("Home", icon: "house", selected: tab == .home) { root(.home) }
-                    footerIcon("Workspaces", icon: "square.stack", selected: tab == .workspaces) { root(.workspaces) }
-                    footerIcon("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
+                    footerIcon("Home", icon: "house", selected: here == .home) { root(.home) }
+                    footerIcon("Workspaces", icon: "square.stack", selected: here == .workspaces) { root(.workspaces) }
+                    footerIcon("Hosts", icon: "desktopcomputer", selected: here == .hosts) { root(.hosts) }
                     footerIcon("Settings", icon: "gearshape", selected: false, action: settings)
                 }.padding(.horizontal, 8)
             } else {
                 // S22: the same four destinations as Android, in the same order; the current one
                 // stays marked inside a chat too (S27).
                 HStack(spacing: 4) {
-                    footerTab("Home", icon: "house", selected: tab == .home) { root(.home) }
-                    footerTab("Workspaces", icon: "square.stack", selected: tab == .workspaces) { root(.workspaces) }
-                    footerTab("Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
+                    footerTab("Home", icon: "house", selected: here == .home) { root(.home) }
+                    footerTab("Workspaces", icon: "square.stack", selected: here == .workspaces) { root(.workspaces) }
+                    footerTab("Hosts", icon: "desktopcomputer", selected: here == .hosts) { root(.hosts) }
                         .accessibilityIdentifier("drawer-hosts")
                     footerTab("Settings", icon: "gearshape", selected: false, action: settings)
                 }.padding(.horizontal, 8).padding(.vertical, 6)

@@ -83,10 +83,39 @@ final class ManageTests: XCTestCase {
         XCTAssertFalse(line.hasSuffix(" · "))
     }
 
+    func testHistoryBucketsAreNewestFirst() {
+        func t(_ id: String, _ ms: Int64?, _ bucket: String) -> ThreadSummary {
+            ThreadSummary(workspace_id: "w", thread_id: id, title: id, provider: "codex", model: nil, cwd: "",
+                          open: true, archived: false, last_activity_at_ms: ms, status: "idle", history_bucket: bucket)
+        }
+        let sections = historySections([t("sprout", 1_000, "Today"), t("rotate", 5_000, "Today"), t("undated", nil, "Today"), t("old", 9_000, "Earlier")])
+        XCTAssertEqual(sections.map(\.0), ["Today", "Earlier"])
+        XCTAssertEqual(sections[0].1.map(\.thread_id), ["rotate", "sprout", "undated"])
+    }
+
+    func testDrawerActiveIsRunningOrNeedsYou() {
+        var pane = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate")
+        XCTAssertFalse(drawerRowActive(threadStatus: "failed", pane: pane), "an acknowledged failure is not Active")
+        pane.needs_you = true
+        XCTAssertTrue(drawerRowActive(threadStatus: "failed", pane: pane))
+        XCTAssertTrue(drawerRowActive(threadStatus: "working", pane: nil))
+        XCTAssertFalse(drawerRowActive(threadStatus: "idle", pane: nil))
+        XCTAssertEqual(drawerFooterDestination(tab: .home, route: nil), .home)
+        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .workspaces)
+        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .thread(workspace: "w", thread: "t")), .workspaces)
+        XCTAssertEqual(drawerFooterDestination(tab: .hosts, route: .changes("w")), .hosts)
+    }
+
     func testNewChatRowsNameTheResolvedDefault() {
         let access = [ChatChoice(id: "supervised", label: "Supervised"), ChatChoice(id: "full_access", label: "Full access")]
-        XCTAssertEqual(newChatChoiceLabel("Access", value: nil, choices: access), "Default · Full access")
+        XCTAssertEqual(newChatChoiceLabel("Access", value: nil, choices: access), "Full access")
         XCTAssertEqual(newChatChoiceLabel("Access", value: "supervised", choices: access), "Supervised")
-        XCTAssertEqual(newChatChoiceLabel("Model", value: nil, choices: []), "Default")
+        XCTAssertEqual(newChatChoiceLabel("Model", value: nil, choices: []), "Auto")
+        let speeds = [ChatChoice(id: "off", label: "Normal"), ChatChoice(id: "on", label: "Fast")]
+        XCTAssertEqual(newChatChoiceLabel("Speed", value: nil, choices: speeds), "Standard")
+        XCTAssertEqual(newChatChoiceLabel("Speed", value: "on", choices: speeds), "Fast")
+        XCTAssertEqual(newChatMenuLabel("Speed", speeds[0]), "Standard (default)")
+        XCTAssertEqual(newChatMenuLabel("Access", access[1]), "Full access (default)")
+        XCTAssertEqual(newChatMenuLabel("Access", access[0]), "Supervised")
     }
 }
