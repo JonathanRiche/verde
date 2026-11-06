@@ -115,11 +115,16 @@ private fun ui(size: Int, line: Int, weight: FontWeight = FontWeight.Normal) =
     TextStyle(fontFamily = VerdeSans, fontSize = size.sp, lineHeight = line.sp, fontWeight = weight)
 private fun display(size: Int) = TextStyle(fontFamily = VerdeDisplay, fontSize = size.sp,
     lineHeight = (size + 6).sp, letterSpacing = (-size * .03).sp)
+/** S23: page and section titles use the body family, semibold, as on desktop. */
+private fun title(size: Int) = ui(size, size + 6, FontWeight.SemiBold)
+
+/** Cal Sans is only for the verde wordmark (S23). */
+internal val WordmarkStyle = display(24)
 
 private val VerdeTypography = Typography(
-    displayLarge = display(36), displayMedium = display(32), displaySmall = display(28),
-    headlineLarge = display(28), headlineMedium = display(24), headlineSmall = display(22),
-    titleLarge = display(20), titleMedium = ui(15, 21, FontWeight.SemiBold), titleSmall = ui(14, 20, FontWeight.SemiBold),
+    displayLarge = title(36), displayMedium = title(32), displaySmall = title(28),
+    headlineLarge = title(28), headlineMedium = title(24), headlineSmall = title(22),
+    titleLarge = title(20), titleMedium = ui(15, 21, FontWeight.SemiBold), titleSmall = ui(14, 20, FontWeight.SemiBold),
     bodyLarge = ui(15, 22), bodyMedium = ui(14, 21), bodySmall = ui(12, 18),
     labelLarge = ui(13, 18, FontWeight.Medium), labelMedium = ui(12, 16), labelSmall = ui(10, 14),
 )
