@@ -14,11 +14,15 @@ class ComposerLabelsTest {
     @Test fun accessChipShowsTheResolvedMode() {
         assertEquals("Supervised", accessValueLabel(access, "supervised"))
         assertEquals("Full access", accessValueLabel(access, "full_access"))
-        assertEquals("Default · Supervised", accessValueLabel(access, null))
-        assertEquals("Default · Supervised", accessValueLabel(access, ""))
+        // Unset access runs as full access on the host (the core sends none; thread_create defaults to full_access).
+        assertEquals("Default · Full access", accessValueLabel(access, null))
+        assertEquals("Default · Full access", accessValueLabel(access, ""))
+        assertEquals("full_access", effectiveAccess(null))
+        assertEquals("supervised", effectiveAccess("supervised"))
         assertEquals("Default", accessValueLabel(emptyList(), null))
         assertTrue(accessIsFull(access, "full_access"))
-        assertFalse(accessIsFull(access, null))
+        assertTrue(accessIsFull(access, null))
+        assertFalse(accessIsFull(access, "supervised"))
     }
 
     @Test fun slashCommandsAreDeduplicatedAndFiltered() {

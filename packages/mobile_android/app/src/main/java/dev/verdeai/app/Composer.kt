@@ -553,14 +553,23 @@ internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choic
 
 /**
  * S5: what the Access chip says — the chosen mode ("Supervised", "Full access"), or the mode a
- * chat without a choice resolves to ("Default · Supervised"). Never just "Access".
+ * chat without a choice resolves to ("Default · Full access"). Never just "Access".
  */
 internal fun accessValueLabel(access: List<ChatChoice>, selected: String?): String {
     val chosen = selected?.takeIf { it.isNotEmpty() }
     if (chosen != null) return composerChoiceLabel(access, chosen) ?: chosen
-    val fallback = access.firstOrNull()?.label ?: return "Default"
-    return "Default \u00b7 $fallback"
+    if (access.isEmpty()) return "Default"
+    return "Default \u00b7 ${composerChoiceLabel(access, DEFAULT_ACCESS) ?: "Full access"}"
 }
+
+/**
+ * What an unset access runs as: the core sends no access_mode (chat.zig) and the host falls back to
+ * full access, as the core's own thread_create does (manage.zig `selection.access orelse "full_access"`).
+ */
+internal const val DEFAULT_ACCESS = "full_access"
+
+/** The access a chat effectively has: its own choice, else [DEFAULT_ACCESS]. */
+internal fun effectiveAccess(selected: String?) = selected?.takeIf { it.isNotEmpty() } ?: DEFAULT_ACCESS
 
 /** The provider's own default model/effort choice ("default" or the empty id). */
 internal fun isDefaultChoice(id: String?) = id.isNullOrEmpty() || id == "default"
@@ -580,7 +589,7 @@ internal fun effortValueLabel(c: ChatCatalogs, s: ChatSelection): String {
     return if (isDefaultChoice(s.effort) && resolved != null) "$label \u00b7 $resolved" else label
 }
 
-internal fun accessIsFull(access: List<ChatChoice>, selected: String?) = (selected?.takeIf { it.isNotEmpty() } ?: access.firstOrNull()?.id) == "full_access"
+internal fun accessIsFull(@Suppress("UNUSED_PARAMETER") access: List<ChatChoice>, selected: String?) = effectiveAccess(selected) == "full_access"
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -689,7 +698,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         // Desktop favourites first, otherwise in catalog order.
         ComposerPicker.Model -> Triple("Model", c.models.sortedByDescending { it.favorite }, s.model ?: c.models.firstOrNull()?.id)
         ComposerPicker.Effort -> Triple("Reasoning effort", c.efforts, s.effort ?: "")
-        ComposerPicker.Access -> Triple("Access", c.access, s.access ?: c.access.firstOrNull()?.id)
+        ComposerPicker.Access -> Triple("Access", c.access, effectiveAccess(s.access))
         ComposerPicker.Speed -> Triple("Speed", c.speeds, s.speed ?: c.speeds.firstOrNull()?.id)
     }
     ModalBottomSheet(onDismissRequest = onDismiss, modifier = Modifier.testTag(COMPOSER_PICKER)) {
