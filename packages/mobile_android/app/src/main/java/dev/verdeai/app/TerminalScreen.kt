@@ -185,7 +185,7 @@ private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermIn
     @Composable fun keyButton(label: String, description: String = label, input: TermInput) = keycap(label, description) { send(input) }
     @Composable fun toggle(label: String, on: Boolean, action: () -> Unit) = keycap(label, label, latched = on, onClick = action)
     val scroll = rememberScrollState()
-    Row(Modifier.fillMaxSize().testTag("terminal-keys").horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).padding(horizontal = 4.dp),
+    Row(Modifier.fillMaxSize().testTag("terminal-keys").horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).padding(start = 4.dp, end = 16.dp),
         verticalAlignment = Alignment.CenterVertically) {
         keyButton("Esc", "Escape", TermInput.Key("Escape"))
         keyButton("Tab", input = TermInput.Key("Tab"))
