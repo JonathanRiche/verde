@@ -96,6 +96,22 @@ struct ApprovalCard: View {
 
 private struct ApprovalSummary: View {
     let preview: ApprovalPreview
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private func changeLines(wrap: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(preview.changes.enumerated()), id: \.offset) { _, line in
+                Text(changePrefix(line.kind) + line.text).font(VerdeTheme.mono())
+                    .fixedSize(horizontal: !wrap, vertical: true)
+                    .frame(maxWidth: wrap ? .infinity : nil, alignment: .leading)
+                    .foregroundStyle(line.kind == .hunk ? Color.secondary : Color.primary)
+                    .padding(.horizontal, 10)
+                    .background(changeBackground(line.kind))
+            }
+            if preview.changesTruncated { Text("…").font(VerdeTheme.mono()).foregroundStyle(.secondary).padding(.horizontal, 10) }
+        }
+        .padding(.vertical, 6)
+    }
 
     var body: some View {
         if preview.tool != nil || preview.path != nil {
@@ -120,17 +136,11 @@ private struct ApprovalSummary: View {
                 .accessibilityLabel("Command: \(command)")
         }
         if !preview.changes.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(preview.changes.enumerated()), id: \.offset) { _, line in
-                        Text(changePrefix(line.kind) + line.text).font(VerdeTheme.mono()).fixedSize()
-                            .foregroundStyle(line.kind == .hunk ? Color.secondary : Color.primary)
-                            .padding(.horizontal, 10)
-                            .background(changeBackground(line.kind))
-                    }
-                    if preview.changesTruncated { Text("…").font(VerdeTheme.mono()).foregroundStyle(.secondary).padding(.horizontal, 10) }
-                }
-                .padding(.vertical, 6)
+            // Plain request text, and everything at the accessibility sizes, wraps; only a diff
+            // keeps its lines whole and scrolls sideways (U1: the request was one clipped line).
+            let wrap = dynamicTypeSize.isAccessibilitySize || !preview.changes.contains { $0.kind == .add || $0.kind == .remove }
+            Group {
+                if wrap { changeLines(wrap: true) } else { ScrollView(.horizontal, showsIndicators: false) { changeLines(wrap: false) } }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))

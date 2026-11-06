@@ -110,8 +110,12 @@ private struct HistorySearchField: View {
             TextField("Search chats", text: $query).textInputAutocapitalization(.never).autocorrectionDisabled()
                 .submitLabel(.search).accessibilityIdentifier("history-search")
             if !query.isEmpty {
-                Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.subtle).frame(width: 44, height: 44) }
-                    .buttonStyle(.plain).accessibilityLabel("Clear search")
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(VerdeTheme.subtle)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless).frame(width: 44, height: 44)
+                .accessibilityLabel("Clear search")
             }
         }
         .padding(.horizontal, 12).frame(minHeight: 44)
@@ -182,7 +186,7 @@ struct NewChatScreen: View {
             let shown = newChatChoiceLabel(label, value: value, choices: choices, defaultLabel: resolved)
             Menu {
                 ForEach(choices, id: \.id) { item in
-                    let current = item.id == (value ?? newChatDefault(label))
+                    let current = newChatIsCurrent(label, item: item, value: value, choices: choices)
                     // S25 / I10-1: "Auto · provider default" for effort, the host default "(default)".
                     let title = newChatMenuLabel(label, item, defaultModel: catalogs?.default_model_label) + (item.favorite ? " ★" : "")
                     Button { Task { await manage.select(workspace, update(item.id)) } } label: {
@@ -225,6 +229,16 @@ func newChatChoiceLabel(_ setting: String, value: String?, choices: [ChatChoice]
     if setting == "Access" { return composerAccessLabel(choices, value: value) }
     if let value, !value.isEmpty { return choices.first { $0.id == value }?.label ?? value }
     return "Auto"
+}
+
+/// The menu row to check: the chosen one, else the row an unset setting means (effort's and
+/// model's default row, access's and speed's host default).
+func newChatIsCurrent(_ setting: String, item: ChatChoice, value: String?, choices: [ChatChoice]) -> Bool {
+    if let value, !value.isEmpty { return item.id == value }
+    if let id = newChatDefault(setting) { return item.id == id }
+    let picker: ComposerPicker = setting == "Model" ? .model : .effort
+    let unset = composerCurrentChoice(picker, value: nil, choices: choices)
+    return item.id == unset || (isDefaultChoice(unset) && isDefaultChoice(item.id))
 }
 
 /// A New chat menu row, in the composer pickers' words.

@@ -108,12 +108,19 @@ extension TranscriptScreen {
 }
 
 private struct CompactChatKey: EnvironmentKey { static let defaultValue = false }
+private struct CompanionSpeakerKey: EnvironmentKey { static let defaultValue: String? = nil }
 
 extension EnvironmentValues {
     /// Denser transcript rows (smaller type, tighter spacing, flat tool rows) for the Companion sheet.
     var compactChat: Bool {
         get { self[CompactChatKey.self] }
         set { self[CompactChatKey.self] = newValue }
+    }
+    /// The companion's name in its own conversation: its replies are spoken as "Sprout", not by
+    /// the brain's provider ("Codex").
+    var companionSpeaker: String? {
+        get { self[CompanionSpeakerKey.self] }
+        set { self[CompanionSpeakerKey.self] = newValue }
     }
 }
 
@@ -810,6 +817,7 @@ private struct CompactMessageRow: View {
     let model: TranscriptModel
     let mine: Bool
     let shown: String
+    @Environment(\.companionSpeaker) private var speaker
     @State private var selecting = false
 
     var body: some View {
@@ -843,7 +851,7 @@ private struct CompactMessageRow: View {
             if !mine { Spacer(minLength: 32) }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
+        .accessibilityLabel((mine ? "You: " : (speaker ?? (row.author.isEmpty ? "Reply" : row.author)) + ": ") + shown)
         .accessibilityIdentifier("message-row")
     }
 }

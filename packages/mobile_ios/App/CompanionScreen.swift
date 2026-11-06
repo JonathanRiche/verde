@@ -504,6 +504,7 @@ private struct CompanionConversation: View {
             if let model {
                 TranscriptBody(model: model, browse: browse, onHosts: onHosts, compactComposer: composer(model))
                     .environment(\.compactChat, true)
+                    .environment(\.companionSpeaker, name)
                     .overlay(alignment: .top) {
                         if let thread = model.thread, thread.rows.isEmpty, !thread.page.loading, thread.error == nil {
                             SuggestionList(enabled: true) { model.input.ask($0) }.padding(14)

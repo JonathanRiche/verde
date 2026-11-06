@@ -37,9 +37,13 @@ struct DrawerItem: Identifiable {
     var activityMs: Int64? { thread?.last_activity_at_ms }
 }
 
-/// The footer tab to mark (I12-2): the tab whose list the back button returns to, so the
-/// highlight and the back label always agree (a chat opened from Home is under Home).
-func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab { tab }
+/// The footer tab to mark: the current screen, as on Android. A chat, Files, Changes or any pushed
+/// screen is under Workspaces; Home, Hosts and Settings only when they are on screen. The back
+/// button is the chevron alone, so it never names a different section.
+func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
+    guard tab.showsBrowse, route != nil else { return tab }
+    return .workspaces
+}
 
 /// Active = running or needs_you, the same rule as Home's "Needs you" and "Running" sections.
 func drawerRowActive(threadStatus: String?, pane: Pane?) -> Bool {

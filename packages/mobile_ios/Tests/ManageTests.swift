@@ -101,7 +101,7 @@ final class ManageTests: XCTestCase {
         XCTAssertTrue(drawerRowActive(threadStatus: "working", pane: nil))
         XCTAssertFalse(drawerRowActive(threadStatus: "idle", pane: nil))
         XCTAssertEqual(drawerFooterDestination(tab: .home, route: nil), .home)
-        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .home, "Back says Home, so Home is marked")
+        XCTAssertEqual(drawerFooterDestination(tab: .home, route: .files("w")), .workspaces, "the current screen, as on Android")
         XCTAssertEqual(drawerFooterDestination(tab: .workspaces, route: .thread(workspace: "w", thread: "t")), .workspaces)
         XCTAssertEqual(drawerFooterDestination(tab: .hosts, route: .changes("w")), .hosts)
         XCTAssertEqual(drawerFooterDestination(tab: .settings, route: .changes("w")), .settings)
@@ -118,5 +118,10 @@ final class ManageTests: XCTestCase {
         XCTAssertEqual(newChatMenuLabel("Speed", speeds[0]), "Standard (default)")
         XCTAssertEqual(newChatMenuLabel("Access", access[1]), "Full access (default)")
         XCTAssertEqual(newChatMenuLabel("Access", access[0]), "Supervised")
+        let efforts = [ChatChoice(id: "", label: "Default"), ChatChoice(id: "high", label: "High")]
+        XCTAssertTrue(newChatIsCurrent("Effort", item: efforts[0], value: nil, choices: efforts), "Auto is checked when unset")
+        XCTAssertFalse(newChatIsCurrent("Effort", item: efforts[1], value: nil, choices: efforts))
+        XCTAssertTrue(newChatIsCurrent("Speed", item: speeds[0], value: nil, choices: speeds))
+        XCTAssertTrue(newChatIsCurrent("Access", item: access[1], value: nil, choices: access))
     }
 }

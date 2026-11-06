@@ -45,6 +45,9 @@ func composerDefaultLabel(_ resolved: String?) -> String {
     return resolved
 }
 
+/// The composer chip glyph's size for a scaled 16-point metric, capped so chips keep their plan.
+func composerChipIconSize(_ scaled: CGFloat) -> CGFloat { min(24, max(16, scaled)) }
+
 /// A chip's estimated widths: with its label, and as an icon (nil when it has no icon).
 struct ComposerChipWidth: Equatable {
     let kind: ComposerPicker
@@ -353,6 +356,9 @@ struct ChatComposer: View {
     @State private var dragStart: CGFloat?
     /// The text's own height; the field grows with it (a few lines) unless resized by hand.
     @State private var contentHeight: CGFloat = 0
+    /// The chip glyphs grow with text, 16 up to 24 points (U1: they stayed 12-13 at AX-L).
+    @ScaledMetric(relativeTo: .footnote) private var chipIconScaled: CGFloat = 16
+    private var chipIcon: CGFloat { composerChipIconSize(chipIconScaled) }
     /// Two lines at the default size, more with larger text so glyphs are never cut off.
     @ScaledMetric(relativeTo: .body) private var basePrompt: CGFloat = 56
 
@@ -545,7 +551,7 @@ struct ChatComposer: View {
             // The provider glyph grows with text (ProviderGlyph), plus its 6-point gap.
             let providerGlyph = providerGlyphSize(UIFontMetrics(forTextStyle: .footnote).scaledValue(for: 18, compatibleWith: traits)) + 6
             let glyph: CGFloat = kind == .model || kind == .provider ? providerGlyph : 0
-            let icon: CGFloat = hasChipIcon(kind) ? 22 : 0
+            let icon: CGFloat = hasChipIcon(kind) ? composerChipIconSize(UIFontMetrics(forTextStyle: .footnote).scaledValue(for: 16, compatibleWith: traits)) + 6 : 0
             let full = glyph + icon + measure(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)) + 20
             let short = [.effort, .speed, .access].contains(kind) ? glyph + icon + measure(shortChipText(kind)) + 20 : nil
             let bare = short != nil && icon > 0 ? max(44, measure(shortChipText(kind)) + 20) : nil
@@ -820,14 +826,14 @@ struct ChatComposer: View {
                     EmptyView()
                 } else if kind == .speed {
                     Image(systemName: selectedID(kind) == "on" ? "bolt.fill" : "gauge.with.dots.needle.33percent")
-                        .font(.system(size: 13, weight: .semibold)).frame(width: 16, height: 16).accessibilityHidden(true)
+                        .font(.system(size: chipIcon * 0.8, weight: .semibold)).frame(width: chipIcon, height: chipIcon).accessibilityHidden(true)
                 } else if let icon = settingIcon(kind) {
                     ComposerGlyph(name: icon).opacity(0.32)
                         .overlay(alignment: .bottom) {
                             ComposerGlyph(name: icon).mask(alignment: .bottom) {
-                                Rectangle().frame(height: 16 * settingFill(kind))
+                                Rectangle().frame(height: chipIcon * settingFill(kind))
                             }
-                        }.frame(width: 16, height: 16).accessibilityHidden(true)
+                        }.frame(width: chipIcon, height: chipIcon).accessibilityHidden(true)
                 }
                 if !compact {
                     Text(short ? shortChipText(kind) : chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28))
@@ -861,9 +867,9 @@ struct ChatComposer: View {
             ComposerGlyph(name: name).opacity(0.32)
                 .overlay(alignment: .bottom) {
                     ComposerGlyph(name: name).mask(alignment: .bottom) {
-                        Rectangle().frame(height: 16 * settingFill(kind, value: value))
+                        Rectangle().frame(height: chipIcon * settingFill(kind, value: value))
                     }
-                }.frame(width: 16, height: 16).accessibilityHidden(true)
+                }.frame(width: chipIcon, height: chipIcon).accessibilityHidden(true)
         }
     }
     private func selectedID(_ kind: ComposerPicker) -> String? {
