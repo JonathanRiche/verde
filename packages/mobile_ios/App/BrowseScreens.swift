@@ -329,14 +329,15 @@ struct HomeScreen: View {
                     ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }, reservesBubble: !showsNewChat) { state, now in
             // "Needs you" is the core's set (C8); unread completions stay with the rest.
             let attention = panes.filter(\.needs_you)
-            let running = panes.filter { !$0.needs_you }
+            // Only live turns and running processes are "Running" (I8-5); a finished, unread chat is not.
+            let running = panes.filter { !$0.needs_you && (activeTurn($0.status) || $0.can_stop) }
             if !attention.isEmpty {
                 TitledSection("Needs you") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if !running.isEmpty {
                 TitledSection("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
-            if panes.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
+            if attention.isEmpty && running.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
             let workspaces = state.workspaces?.items ?? []
             let labels = Dictionary(workspaces.map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             let recent = recentThreads(state.workspaces, hidden: hidden)

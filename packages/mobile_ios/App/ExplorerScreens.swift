@@ -605,11 +605,11 @@ private struct PatchScreen: View {
         .toolbar {
             ExplorerTitle(title: basename(path), subtitle: (path as NSString).deletingLastPathComponent)
             ToolbarItemGroup(placement: .primaryAction) {
-                Button("Open") {
+                Button {
                     var line: UInt64?
                     if case .parsed(let parsed) = render { line = firstNewLine(parsed) }
                     viewer = ViewerRequest(citation: FileCitation(path: trimmedRoot(root) + "/" + path, line: line))
-                }
+                } label: { Text("Open").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
                 .disabled(result?.status == "deleted")
             }
         }
