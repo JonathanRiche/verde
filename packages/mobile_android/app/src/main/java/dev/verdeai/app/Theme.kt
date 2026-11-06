@@ -21,22 +21,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.ScrollState
-import androidx.compose.foundation.IndicationNodeFactory
-import androidx.compose.foundation.LocalIndication
-import androidx.compose.foundation.interaction.FocusInteraction
-import androidx.compose.foundation.interaction.InteractionSource
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.onFocusedBoundsChanged
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.InputMode
-import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
-import androidx.compose.ui.node.DelegatableNode
-import androidx.compose.ui.node.DelegatingNode
-import androidx.compose.ui.node.DrawModifierNode
-import androidx.compose.ui.node.currentValueOf
-import androidx.compose.ui.node.invalidateDraw
 import androidx.compose.ui.platform.LocalInputModeManager
-import kotlinx.coroutines.launch
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -133,9 +125,8 @@ internal fun VerdeTheme(content: @Composable () -> Unit) {
         MaterialTheme(colorScheme = verdeScheme(palette), typography = VerdeTypography,
             shapes = Shapes(extraSmall = RoundedCornerShape(7.dp), small = RoundedCornerShape(7.dp),
                 medium = RoundedCornerShape(10.dp), large = RoundedCornerShape(14.dp), extraLarge = RoundedCornerShape(14.dp))) {
-            // S4: every foundation clickable gets the ripple plus a keyboard-only focus ring.
-            val indication = remember(palette.Accent) { FocusRingIndication(ripple(), palette.Accent) }
-            CompositionLocalProvider(LocalIndication provides indication, content = content)
+            // S4: whatever has keyboard focus (rows, icon buttons, buttons, chips) gets one 2dp ring.
+            KeyboardFocusRing(palette.Accent, content)
         }
     }
 }
@@ -187,40 +178,33 @@ internal fun Modifier.horizontalEdgeFade(state: ScrollState, color: Color, width
 }
 
 /**
- * Ripple plus a 2dp accent ring drawn only while focus came from a keyboard (Tab, D-pad); touch
- * never leaves a ring behind. Installed as [LocalIndication] for every foundation clickable.
+ * A 2dp accent ring around the focused control, drawn only while focus came from a keyboard (Tab,
+ * D-pad) and never after touch. It follows the focused node's bounds, so Material buttons and icon
+ * buttons, which bring their own ripple, get the same ring as plain clickables.
  */
-internal class FocusRingIndication(private val ripple: IndicationNodeFactory, private val color: Color) : IndicationNodeFactory {
-    override fun create(interactionSource: InteractionSource): DelegatableNode = object : DelegatingNode() {
-        init {
-            delegate(ripple.create(interactionSource))
-            delegate(FocusRingNode(interactionSource, color))
-        }
-    }
-    override fun equals(other: Any?) = other is FocusRingIndication && other.ripple == ripple && other.color == color
-    override fun hashCode() = 31 * ripple.hashCode() + color.hashCode()
-}
-
-private class FocusRingNode(private val interactions: InteractionSource, private val color: Color) :
-    Modifier.Node(), DrawModifierNode, CompositionLocalConsumerModifierNode {
-    private var focused = false
-    override fun onAttach() {
-        coroutineScope.launch {
-            interactions.interactions.collect { interaction ->
-                when (interaction) {
-                    is FocusInteraction.Focus -> { focused = true; invalidateDraw() }
-                    is FocusInteraction.Unfocus -> { focused = false; invalidateDraw() }
-                }
-            }
-        }
-    }
-    override fun ContentDrawScope.draw() {
-        drawContent()
-        if (!focused || currentValueOf(LocalInputModeManager).inputMode != InputMode.Keyboard) return
-        val stroke = 2.dp.toPx()
-        drawRoundRect(color, topLeft = Offset(stroke / 2, stroke / 2), size = Size(size.width - stroke, size.height - stroke),
-            cornerRadius = CornerRadius(8.dp.toPx()), style = Stroke(stroke))
-    }
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun KeyboardFocusRing(color: Color, content: @Composable () -> Unit) {
+    var focused by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var moved by remember { mutableIntStateOf(0) }
+    var root by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val keyboard = LocalInputModeManager.current.inputMode == InputMode.Keyboard
+    Box(Modifier.onGloballyPositioned { root = it; moved++ }
+        .onFocusedBoundsChanged { focused = it; moved++ }
+        .drawWithContent {
+            drawContent()
+            moved.let { }
+            val target = focused?.takeIf { it.isAttached } ?: return@drawWithContent
+            val host = root?.takeIf { it.isAttached } ?: return@drawWithContent
+            if (!keyboard) return@drawWithContent
+            val box = host.localBoundingBoxOf(target, clipBounds = false)
+            if (box.width <= 0f || box.height <= 0f) return@drawWithContent
+            val stroke = 2.dp.toPx()
+            val square = kotlin.math.abs(box.width - box.height) < 4.dp.toPx()
+            val radius = if (square) box.width / 2f else 8.dp.toPx()
+            drawRoundRect(color, topLeft = Offset(box.left + stroke / 2, box.top + stroke / 2),
+                size = Size(box.width - stroke, box.height - stroke), cornerRadius = CornerRadius(radius), style = Stroke(stroke))
+        }) { content() }
 }
 
 internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
