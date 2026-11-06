@@ -37,7 +37,7 @@ struct TranscriptState {
 }
 
 /// Transcript-level banner: host gates first (shared with browse), then this thread's own error.
-func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64) -> Banner? {
+func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64, sendError: LocalError? = nil, sendNotice: String? = nil) -> Banner? {
     let browse = state.browse
     if state.unavailable { return Banner(text: "Connection unavailable — reopen verde.", error: true) }
     if needsPairing(browse) {
@@ -49,10 +49,22 @@ func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64) -> Banner? {
     gates.savedAtMs = nil
     if let banner = browseBanner(gates, nowMs) { return banner }
     // A failed approval decision is also mirrored into the thread error; the approval card reports it.
-    if let error = state.thread?.error, state.thread?.page.loading != true, !sameError(error, state.thread?.approval?.error) {
-        return Banner(text: "Couldn't load this chat. \(error.message)".trimmingCharacters(in: .whitespaces), action: .retry, error: true)
+    if let error = state.thread?.error, state.thread?.page.loading != true, !sameError(error, state.thread?.approval?.error),
+       !isSendFailure(error, thread: state.thread, sendError: sendError, sendNotice: sendNotice) {
+        // A loaded chat didn't fail to load; only an empty one gets that wording.
+        let loaded = state.thread?.rows.isEmpty == false
+        let lead = loaded ? "Something went wrong in this chat." : "Couldn't load this chat."
+        return Banner(text: "\(lead) \(error.message)".trimmingCharacters(in: .whitespaces), action: .retry, error: true)
     }
     return nil
+}
+
+/// The thread's error is a send's (an attachment upload or a message the host refused): the
+/// composer already reports it next to the draft, so the transcript shows no banner (I6-3).
+func isSendFailure(_ error: LocalError, thread: ChatThreadView?, sendError: LocalError?, sendNotice: String?) -> Bool {
+    if let sendError, sameError(error, sendError) { return true }
+    if let sendNotice, sendNotice == error.message { return true }
+    return thread?.rows.last(where: { $0.role == "user" })?.delivery == "failed"
 }
 
 enum TranscriptPlaceholder: Equatable { case loading, missing, offline, empty, error }
