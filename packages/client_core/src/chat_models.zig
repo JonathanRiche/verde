@@ -3,7 +3,14 @@ const h = @import("host.zig");
 const p = @import("projection.zig");
 /// `index` is the image's position within its stored message (for `attachment_fetch`); null for drafts.
 pub const Attachment = struct { local_id: []const u8, name: []const u8, mime: []const u8, byte_size: []const u8, attachment_id: ?[]const u8 = null, reference: ?[]const u8 = null, uploaded_bytes: []const u8 = "0", status: []const u8 = "local", @"error": ?h.LocalError = null, index: ?u32 = null };
-pub const Tool = struct { id: []const u8, kind: []const u8, status: []const u8 };
+/// Display fields parsed from the row body (desktop tool-row parity); `row.body` stays the raw text.
+/// `title`: the "Tool:" section's first line without backticks, else the row author; a trailing copy
+/// of the summary is dropped ("Edit `src/x.ts`" → "Edit"), and a title that was only the summary
+/// becomes the author ("Ran command"). `summary`: one plain line (≤240 bytes) naming what the call
+/// acts on (execute: command; read/edit/delete/move: path; search: pattern; fetch: url; mcp: tool
+/// name; else a telling input field or the first input line); never raw JSON, never equal to the
+/// title. `input`/`output`/`error`: the trimmed "Input:"/"Output:"/"Error:" sections. Null when absent.
+pub const Tool = struct { id: []const u8, kind: []const u8, status: []const u8, title: ?[]const u8 = null, summary: ?[]const u8 = null, input: ?[]const u8 = null, output: ?[]const u8 = null, @"error": ?[]const u8 = null };
 /// `message_id` is the stored message's ID (null for optimistic rows or legacy rows without one).
 pub const Row = struct { id: []const u8, role: []const u8, kind: []const u8 = "message", author: []const u8 = "", body: []const u8, created_at_ms: ?i64 = null, delivery: []const u8 = "committed", attachments: []const Attachment = &.{}, tool: ?Tool = null, message_id: ?[]const u8 = null };
 pub const Turn = struct { turn_id: []const u8, status: []const u8, after_seq: []const u8 = "0", started_at_ms: ?i64 = null, elapsed_ms: i64 = 0, stop_pending: bool = false };

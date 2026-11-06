@@ -103,6 +103,11 @@ data class ChatTool(
     val `id`: String,
     val `kind`: String,
     val `status`: String,
+    val `title`: String? = null,
+    val `summary`: String? = null,
+    val `input`: String? = null,
+    val `output`: String? = null,
+    val `error`: String? = null,
 )
 
 @Serializable

@@ -427,3 +427,70 @@ test "chat discovers externally started turn after a completed turn without repl
     try eql("running", t.turn.?.status);
     try expect(t.overlay.len > 0);
 }
+
+test "tool rows parse title, one-line summary and body sections without changing the body" {
+    const tb = @import("tool_body.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const edit = try tb.parse(a, "edit", "Edit", "Tool:\nEdit `src/x.ts`\n\nInput:\n{\"file_path\":\"src/x.ts\",\"old_string\":\"a\",\"new_string\":\"b\"}\n\nOutput:\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b");
+    try eql("Edit", edit.title.?);
+    try eql("src/x.ts", edit.summary.?);
+    try eql("{\"file_path\":\"src/x.ts\",\"old_string\":\"a\",\"new_string\":\"b\"}", edit.input.?);
+    try eql("--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b", edit.output.?);
+    try expect(edit.@"error" == null);
+    const bare = try tb.parse(a, "execute", "Ran command", "Input:\nbun test\n\nOutput:\n3 pass\n\n0 fail");
+    try eql("Ran command", bare.title.?);
+    try eql("bun test", bare.summary.?);
+    try eql("3 pass\n\n0 fail", bare.output.?);
+    // A command that is its own title reads as the author plus the command.
+    const titled = try tb.parse(a, "execute", "Command failed", "Tool:\n`git status --short`\n\nInput:\n{\"command\":[\"bash\",\"-lc\",\"git status --short\"]}\n\nError:\nexit 128\n\nTranscript:\n{\"type\":\"text\"}");
+    try eql("Command failed", titled.title.?);
+    try eql("git status --short", titled.summary.?);
+    try eql("exit 128", titled.@"error".?);
+    try expect(titled.output == null);
+    const mcp = try tb.parse(a, "mcp", "MCP tool", "Tool:\nverde.report_chat_blocked\n\nInput:\n{\n  \"turn_id\": \"t-1\",\n  \"reason\": \"Need a decision\"\n}");
+    try eql("MCP tool", mcp.title.?);
+    try eql("verde.report_chat_blocked", mcp.summary.?);
+    const search = try tb.parse(a, "search", "Search", "Tool:\nFind files\n\nInput:\n{\"pattern\":\"**/*.zig\\nignored\"}");
+    try eql("Find files", search.title.?);
+    try eql("**/*.zig", search.summary.?);
+    const fetch = try tb.parse(a, "fetch", "Fetch", "Input:\n{\"url\":\"https://example.com/a\",\"prompt\":\"x\"}");
+    try eql("Fetch", fetch.title.?);
+    try eql("https://example.com/a", fetch.summary.?);
+    const read = try tb.parse(a, "read", "Read", "Tool:\nRead File\n\nInput:\n{\"limit\":20}\n\nLocations:\nsrc/main.zig:1");
+    try eql("Read File", read.title.?);
+    try eql("src/main.zig:1", read.summary.?);
+    // JSON noise never becomes the summary; unknown objects fall back to telling keys or nothing.
+    const other = try tb.parse(a, "other", "Tool", "Input:\n{\"description\":\"Explore the repo\",\"n\":1}");
+    try eql("Explore the repo", other.summary.?);
+    const opaque_ = try tb.parse(a, "other", "Tool", "Input:\n{\"n\":1}");
+    try expect(opaque_.summary == null);
+    const broken = try tb.parse(a, "other", "Tool", "Input:\n{\"n\":");
+    try expect(broken.summary == null);
+    // Unstructured legacy bodies keep only the author as title.
+    const legacy = try tb.parse(a, "execute", "Ran command", "git status --short");
+    try eql("Ran command", legacy.title.?);
+    try expect(legacy.summary == null and legacy.input == null and legacy.output == null);
+    const long = try tb.parse(a, "execute", "Ran command", "Input:\n" ++ "é" ** 200);
+    try expect(long.summary.?.len <= tb.MAX_SUMMARY and std.unicode.utf8ValidateSlice(long.summary.?));
+}
+
+test "streamed and stored tool rows expose parsed tool fields in the thread view" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.tail(.{ .status = "running", .events = .{.{ .seq = 1, .kind = "tool_call", .payload_json = "{\"call_id\":\"edit-1\",\"title\":\"Edit `src/x.ts`\",\"kind\":\"edit\",\"status\":\"completed\",\"input\":\"{\\\"file_path\\\":\\\"src/x.ts\\\"}\",\"output\":\"+b\"}" }} });
+    const view = try std.json.parseFromValueLeaky(wire.Query(m.ThreadView), f.a(), try f.query("thread"), .{ .ignore_unknown_fields = true });
+    var found = false;
+    for (view.data.?.rows) |row| if (row.tool) |tool| if (h.eq(tool.id, "edit-1")) {
+        try expect(std.mem.indexOf(u8, row.body, "Input:\n") != null);
+        try eql("Edit", tool.title.?);
+        try eql("src/x.ts", tool.summary.?);
+        try eql("{\"file_path\":\"src/x.ts\"}", tool.input.?);
+        try eql("+b", tool.output.?);
+        found = true;
+    };
+    try expect(found);
+}

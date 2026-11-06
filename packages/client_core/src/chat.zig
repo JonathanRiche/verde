@@ -9,6 +9,7 @@ const c = @import("chat_catalogs.zig");
 const store = @import("headless").store_protocol;
 const apply = @import("verde_remote").transcript_apply;
 const wire = @import("wire.zig");
+const tool_body = @import("tool_body.zig");
 const V = std.json.Value;
 const E = h.ApiError;
 const eq = h.eq;
@@ -713,7 +714,12 @@ fn messageRow(a: A, message: store.Message, fallback: []const u8, delivery: []co
     if (message.image) |image| if (images.len == 0) {
         try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = 0 });
     };
-    return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| .{ .id = id, .kind = message.tool_call_kind orelse "unknown", .status = message.tool_call_status orelse "unknown" } else null };
+    return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| try toolView(a, id, message) else null };
+}
+fn toolView(a: A, id: []const u8, message: store.Message) E!m.Tool {
+    const kind = message.tool_call_kind orelse "unknown";
+    const fields = try tool_body.parse(a, kind, message.author, message.body);
+    return .{ .id = id, .kind = kind, .status = message.tool_call_status orelse "unknown", .title = fields.title, .summary = fields.summary, .input = fields.input, .output = fields.output, .@"error" = fields.@"error" };
 }
 fn receivePage(tx: *h.Transaction, request: Request, result: V) E!void {
     const t = &tx.state.chat.threads[request.thread];

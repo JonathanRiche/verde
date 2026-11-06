@@ -395,6 +395,11 @@ struct ChatTool: Codable {
     var `id`: String
     var `kind`: String
     var `status`: String
+    var `title`: String? = nil
+    var `summary`: String? = nil
+    var `input`: String? = nil
+    var `output`: String? = nil
+    var `error`: String? = nil
 }
 
 extension ChatTool {
@@ -402,18 +407,43 @@ extension ChatTool {
         case `id`
         case `kind`
         case `status`
+        case `title`
+        case `summary`
+        case `input`
+        case `output`
+        case `error`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.`id` = try c.decode(String.self, forKey: .`id`)
         self.`kind` = try c.decode(String.self, forKey: .`kind`)
         self.`status` = try c.decode(String.self, forKey: .`status`)
+        if !c.contains(.`title`) { self.`title` = nil } else {
+        self.`title` = try c.decodeIfPresent(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`summary`) { self.`summary` = nil } else {
+        self.`summary` = try c.decodeIfPresent(String.self, forKey: .`summary`)
+        }
+        if !c.contains(.`input`) { self.`input` = nil } else {
+        self.`input` = try c.decodeIfPresent(String.self, forKey: .`input`)
+        }
+        if !c.contains(.`output`) { self.`output` = nil } else {
+        self.`output` = try c.decodeIfPresent(String.self, forKey: .`output`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(String.self, forKey: .`error`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(self.`id`, forKey: .`id`)
         try c.encode(self.`kind`, forKey: .`kind`)
         try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`summary`, forKey: .`summary`)
+        try c.encode(self.`input`, forKey: .`input`)
+        try c.encode(self.`output`, forKey: .`output`)
+        try c.encode(self.`error`, forKey: .`error`)
     }
 }
 
