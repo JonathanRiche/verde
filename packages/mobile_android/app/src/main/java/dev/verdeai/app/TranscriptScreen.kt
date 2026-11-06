@@ -263,6 +263,7 @@ internal fun TranscriptScreen(
         // on to the composer instead of wrapping back to the header.
         val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
         val newestFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val groupTab = remember { GroupTabHolder() }
         val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
         val tabScope = rememberCoroutineScope()
         var transcriptFocused by remember { mutableStateOf(false) }
@@ -275,7 +276,9 @@ internal fun TranscriptScreen(
                     // list's "next"), Tab down to newer ones; leaving the top goes to the header,
                     // leaving the bottom to the composer, never the other way round.
                     val back = event.isShiftPressed
-                    focusManager.moveFocus(if (back) androidx.compose.ui.focus.FocusDirection.Next else androidx.compose.ui.focus.FocusDirection.Previous)
+                    // S49: inside an expanded tool group, Tab walks its children top to bottom first.
+                    val inGroup = groupTab.owner?.tab(back) == true
+                    if (!inGroup) focusManager.moveFocus(if (back) androidx.compose.ui.focus.FocusDirection.Next else androidx.compose.ui.focus.FocusDirection.Previous)
                     tabScope.launch {
                         withFrameNanos { }
                         withFrameNanos { }
@@ -292,7 +295,7 @@ internal fun TranscriptScreen(
                     else androidx.compose.ui.focus.FocusRequester.Default
                 }
             }.focusGroup()) {
-            CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard, LocalNewestFocus provides newestFocus) {
+            CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard, LocalNewestFocus provides newestFocus, LocalGroupTab provides groupTab) {
             when (val placeholder = transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, renderers, jump = jump)
                 else -> Placeholder(placeholder, model)

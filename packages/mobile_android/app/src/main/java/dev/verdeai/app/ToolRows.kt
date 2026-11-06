@@ -24,6 +24,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
@@ -415,12 +418,13 @@ private fun DiffOutput(text: String) {
 internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContext) {
     val counts = remember(item.rows) { toolCounts(item.rows) }
     val disclosure = rememberDisclosure(item.key, counts.failed > 0)
+    val tabbing = rememberGroupTab(disclosure.expanded)
     val colors = MaterialTheme.colorScheme
     val elapsed = ctx.turnStartedAt?.let { elapsedLabel(it, ctx.now) }
     val summary = toolGroupSummary(item.rows, item.subagent, elapsed)
     val kinds = remember(item.rows) { item.rows.map(::toolKind).distinct().take(3) }
     val shape = RoundedCornerShape(10.dp)
-    Column(Modifier.fillMaxWidth().border(1.dp, colors.outlineVariant, shape).background(colors.surfaceContainerLow, shape)) {
+    Column(Modifier.fillMaxWidth().border(1.dp, colors.outlineVariant, shape).background(colors.surfaceContainerLow, shape).then(tabbing)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
             .clearAndSetSemantics {
@@ -448,3 +452,45 @@ internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContex
     }
 }
 
+
+/**
+ * S49: Tab inside an expanded tool group. The transcript walks its reversed list newest-first, which
+ * inside a group read the children bottom to top; while focus is in an open group the transcript
+ * asks the group first, and Tab / Shift+Tab move through its children in reading order. Past the
+ * last (or before the first) child, focus leaves to the row below (or above).
+ */
+internal fun interface GroupTab { fun tab(back: Boolean): Boolean }
+
+internal class GroupTabHolder { var owner: GroupTab? = null }
+
+internal val LocalGroupTab = staticCompositionLocalOf<GroupTabHolder?> { null }
+
+@Composable
+internal fun rememberGroupTab(expanded: Boolean): Modifier {
+    val holder = LocalGroupTab.current ?: return Modifier
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val capturing = remember { BooleanArray(2) } // [0] a Tab is moving focus, [1] it tried to leave the group
+    val owner = remember(focusManager) {
+        GroupTab { back ->
+            capturing[0] = true; capturing[1] = false
+            focusManager.moveFocus(if (back) androidx.compose.ui.focus.FocusDirection.Previous else androidx.compose.ui.focus.FocusDirection.Next)
+            capturing[0] = false
+            // At the first or last child: out of the group, to the row above or below.
+            if (capturing[1]) focusManager.moveFocus(if (back) androidx.compose.ui.focus.FocusDirection.Up else androidx.compose.ui.focus.FocusDirection.Down)
+            true
+        }
+    }
+    DisposableEffect(holder, owner, expanded) { onDispose { if (holder.owner === owner) holder.owner = null } }
+    if (!expanded) return Modifier
+    return Modifier.onFocusChanged { if (it.hasFocus) holder.owner = owner else if (holder.owner === owner) holder.owner = null }
+        .focusProperties {
+            @Suppress("DEPRECATION") @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+            exit = { direction ->
+                if (capturing[0] && (direction == androidx.compose.ui.focus.FocusDirection.Next || direction == androidx.compose.ui.focus.FocusDirection.Previous)) {
+                    capturing[1] = true
+                    androidx.compose.ui.focus.FocusRequester.Cancel
+                } else androidx.compose.ui.focus.FocusRequester.Default
+            }
+        }
+        .focusGroup()
+}
