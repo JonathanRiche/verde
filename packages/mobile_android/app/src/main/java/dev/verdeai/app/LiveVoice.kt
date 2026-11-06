@@ -36,9 +36,15 @@ internal data class LiveUi(
     val muted: Boolean = false,
     val error: String? = null,
     val captions: List<LiveCaption> = emptyList(),
+    /** The failure's code, so the UI can offer its repair instead of Retry. */
+    val errorCode: String? = null,
 ) {
     val active get() = phase == LivePhase.Connecting || phase == LivePhase.Live || phase == LivePhase.Reconnecting
+    /** S9: a missing or rejected provider key is fixed in Companion settings, not by trying again. */
+    val needsSettings get() = phase == LivePhase.Failed && liveNeedsSettings(errorCode)
 }
+
+internal fun liveNeedsSettings(code: String?) = code == "voice_not_configured" || code == "voice_key_rejected"
 
 internal const val LIVE_CAPTIONS = 8
 internal const val LIVE_SILENCE_MS = 120_000L
@@ -71,8 +77,8 @@ internal fun liveCaptions(captions: List<LiveCaption>, event: LiveEvent): List<L
 }
 
 internal fun liveError(code: String?): String = when (code) {
-    "voice_not_configured" -> "Add an API key for live voice in companion settings."
-    "voice_key_rejected" -> "The voice provider rejected the API key. Replace it in companion settings."
+    "voice_not_configured" -> "Live voice needs an API key for a voice provider. Add one in Companion settings."
+    "voice_key_rejected" -> "The voice provider rejected its API key. Replace it in Companion settings."
     "voice_provider_unavailable" -> "Couldn't reach the voice provider. Try again."
     "unsupported", "unknown_method" -> "Update verde on the computer to use live voice."
     "offline", "unavailable" -> "Connect to the host first."
@@ -313,7 +319,7 @@ internal class LiveVoice(
 
     fun dismissError() { if (ui.value.phase == LivePhase.Failed) mutableUi.value = LiveUi() }
 
-    private fun fail(code: String?) { mutableUi.update { it.copy(phase = LivePhase.Failed, error = liveError(code)) } }
+    private fun fail(code: String?) { mutableUi.update { it.copy(phase = LivePhase.Failed, error = liveError(code), errorCode = code) } }
 
     private suspend fun createSession(): VoiceSession? {
         val sent = dispatch { n, w, id -> EventVoiceSessionCreate(now_ms = n, wall_time_ms = w, intent_id = id,

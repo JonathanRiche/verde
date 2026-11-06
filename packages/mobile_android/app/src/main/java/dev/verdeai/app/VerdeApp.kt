@@ -188,7 +188,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     fun toggleLive() {
         when {
             live.ui.value.active -> live.stop()
-            !mic.granted() -> mic.request()
+            // Granting the microphone carries straight on into the call.
+            !mic.granted() -> mic.request { if (!live.ui.value.active) { voice.pause(); live.start() } }
             else -> { voice.pause(); live.start() }
         }
     }
@@ -201,7 +202,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Live's call bar stays up until the call is ended (or a failed one closed), floating over the
     // top of every screen. Dialogs, sheets (the companion's too) and menus are windows over all that:
     // LiveOverModal and LiveOverMenu keep the bar on top of them.
-    val callUp = liveUi.active || liveUi.phase == LivePhase.Failed
+    // S9: the call bar only during a call; a failed call's reason and repair live in the companion
+    // sheet, which opens to show them and clears them when it closes.
+    val callUp = liveUi.active
+    LaunchedEffect(liveUi.phase) {
+        if (liveUi.phase == LivePhase.Failed && !companionOpen) { companionSettings = false; companionOpen = true }
+    }
     var liveSettings by remember { mutableStateOf(false) }
     val callBarUi: @Composable (Dp) -> Unit = { top ->
         val character = CompanionCharacter.of(companionActive?.character)
@@ -269,7 +275,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             live = live, onLive = ::toggleLive,
             liveExpanded = liveExpanded, onLiveExpanded = { liveExpanded = it },
             placement = placement,
-            onDismiss = { companionOpen = false; companionSettings = false })
+            onDismiss = { companionOpen = false; companionSettings = false; live.dismissError() })
     }
     CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
     // Moss on a docked window: in the sidebar, or its rail, rather than floating over the content.

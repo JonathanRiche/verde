@@ -275,7 +275,7 @@ internal fun LivePanel(live: LiveVoice, name: String, onCollapse: (() -> Unit)? 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             if (ui.phase == LivePhase.Failed) {
                 OutlinedButton(onClick = live::dismissError) { Text("Close") }
-                Button(onClick = live::start) { Text("Try again") }
+                if (!ui.needsSettings) Button(onClick = live::start) { Text("Try again") }
             } else {
                 OutlinedButton(onClick = live::toggleMute, enabled = ui.phase == LivePhase.Live,
                     modifier = Modifier.semantics { contentDescription = if (ui.muted) "Unmute microphone" else "Mute microphone" }) {
@@ -309,7 +309,14 @@ internal fun LivePill(ui: LiveUi, input: Float, output: Float, character: Compan
                     .border(1.dp, if (speaking) VerdeColors.Accent else VerdeColors.Border, CircleShape), contentAlignment = Alignment.Center) {
                     CompanionAvatar(character, CompanionPose.Idle, size = 30.dp, description = name)
                 }
-                LiveDots(ui, if (speaking) output else if (ui.muted) 0f else input, speaking, Modifier.weight(1f).height(40.dp)
+                // S9: connecting reads as connecting, not as a silent row of dots.
+                if (ui.phase == LivePhase.Connecting || ui.phase == LivePhase.Reconnecting) Row(Modifier.weight(1f).height(40.dp)
+                    .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = VerdeColors.Accent)
+                    Text(liveStatusLabel(ui, false, name), style = MaterialTheme.typography.labelLarge, color = VerdeColors.Muted, maxLines = 1)
+                }
+                else LiveDots(ui, if (speaking) output else if (ui.muted) 0f else input, speaking, Modifier.weight(1f).height(40.dp)
                     .semantics { liveRegion = LiveRegionMode.Polite; contentDescription = liveStatusLabel(ui, speaking, name) })
             }
             PillButton(R.drawable.ic_settings, "Voice settings", PillTone.Plain, onSettings)
@@ -547,5 +554,29 @@ private fun ProviderRow(live: LiveVoice, provider: VoiceProvider, isDefault: Boo
 internal fun LiveButton(active: Boolean, onClick: () -> Unit) {
     IconButton(onClick = onClick, modifier = Modifier.semantics { contentDescription = if (active) "End live voice" else "Start live voice" }) {
         Icon(painterResource(R.drawable.ic_waveform), contentDescription = null, tint = if (active) VerdeColors.Accent else VerdeColors.Text)
+    }
+}
+
+internal const val LIVE_FAILURE = "live-failure"
+
+/**
+ * S9: a failed call inside the companion sheet: its reason, then the repair. A missing or rejected
+ * key opens Companion settings; anything else can be tried again. It goes away with the sheet.
+ */
+@Composable
+internal fun LiveFailureCard(ui: LiveUi, onSettings: () -> Unit, onRetry: () -> Unit, onClose: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+        .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp))
+        .border(1.dp, MaterialTheme.colorScheme.error, RoundedCornerShape(12.dp))
+        .padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 4.dp).testTag(LIVE_FAILURE),
+        verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text("Live voice stopped", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
+        Text(ui.error ?: liveError(ui.errorCode), Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onClose) { Text("Close") }
+            if (ui.needsSettings) Button(onClick = onSettings, shape = MaterialTheme.shapes.small) { Text("Open Companion settings") }
+            else Button(onClick = onRetry, shape = MaterialTheme.shapes.small) { Text("Try again") }
+        }
     }
 }

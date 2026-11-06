@@ -294,22 +294,30 @@ private fun doNotDisturb(context: Context): Boolean {
 
 // ---- Microphone permission ----
 
-internal class MicPermission(val granted: () -> Boolean, val request: () -> Unit)
+/** [request]'s optional action runs once the permission is granted (Live starts without a second tap). */
+internal class MicPermission(val granted: () -> Boolean, val request: (onGranted: (() -> Unit)?) -> Unit) {
+    fun request() = request(null)
+}
 
-/** RECORD_AUDIO with a short rationale first; the user retries the gesture once it is granted. */
+/** RECORD_AUDIO with a short rationale first; a pending action carries on once it is granted. */
 @Composable
 internal fun rememberMicPermission(): MicPermission {
     val context = LocalContext.current
     val rationale = remember { mutableStateOf(false) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val pending = remember { mutableStateOf<(() -> Unit)?>(null) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val action = pending.value
+        pending.value = null
+        if (granted) action?.invoke()
+    }
     if (rationale.value) AlertDialog(onDismissRequest = { rationale.value = false },
         title = { Text("Talk to your companion") },
         text = { Text("verde listens only while you hold the bubble or the mic. Your phone's speech service turns what you say into text (on the device when it can), and verde sends that text as a message. verde doesn't record or keep audio.") },
         confirmButton = { TextButton(onClick = { rationale.value = false; launcher.launch(Manifest.permission.RECORD_AUDIO) }) { Text("Continue") } },
-        dismissButton = { TextButton(onClick = { rationale.value = false }) { Text("Not now") } })
+        dismissButton = { TextButton(onClick = { rationale.value = false; pending.value = null }) { Text("Not now") } })
     return remember(context, launcher) {
         MicPermission(granted = { ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED },
-            request = { rationale.value = true })
+            request = { action -> pending.value = action; rationale.value = true })
     }
 }
 

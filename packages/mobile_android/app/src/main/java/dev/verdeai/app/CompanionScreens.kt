@@ -185,6 +185,9 @@ internal fun CompanionSheet(
                 onScheduled = if (schedules.view?.supported != false) ({ scheduled = true }) else null,
                 scheduledCount = schedules.enabledCount.takeIf { schedules.loaded })
             SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
+            // S9: a failed call explains itself here and offers its repair; it goes away with the sheet.
+            if (live != null && liveUi?.phase == LivePhase.Failed) LiveFailureCard(liveUi,
+                onSettings = { live.dismissError(); settings = true }, onRetry = onLive, onClose = live::dismissError)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 val liveName = active.name.ifBlank { "your companion" }

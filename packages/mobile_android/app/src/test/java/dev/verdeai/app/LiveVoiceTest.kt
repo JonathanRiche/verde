@@ -149,4 +149,12 @@ class LiveVoiceTest {
         assertEquals(LIVE_USER_AUTHOR, saved[1].author)
         assertEquals(1, t.all.count { it.role == "user" })
     }
+
+    @Test fun missingOrRejectedKeysOfferSettingsNotRetry() {
+        assertTrue(LiveUi(phase = LivePhase.Failed, errorCode = "voice_not_configured").needsSettings)
+        assertTrue(LiveUi(phase = LivePhase.Failed, errorCode = "voice_key_rejected").needsSettings)
+        assertFalse(LiveUi(phase = LivePhase.Failed, errorCode = "dropped").needsSettings)
+        assertFalse(LiveUi(phase = LivePhase.Live, errorCode = "voice_not_configured").needsSettings)
+        assertTrue(liveError("voice_not_configured").contains("Companion settings"))
+    }
 }
