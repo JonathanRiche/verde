@@ -383,10 +383,11 @@ final class ComposerModel {
             let fit = composerImagesThatFit(picked: images.count, existing: existing.count)
             let usable = images.prefix(fit.take).filter { $0.count <= Self.maxImageBytes }
             let tooLarge = fit.take - usable.count
-            // Added a few at a time, one draft update after another, so no single update carries
-            // more than four images' bytes.
+            // One image per draft update, one after another: a core event is at most 1 MB
+            // (client_core host.zig MAX_INPUT), about one image's base64; earlier images ride along
+            // by id with empty bytes.
             var attached = existing
-            for batch in stride(from: 0, to: usable.count, by: 4).map({ Array(usable[$0..<min($0 + 4, usable.count)]) }) {
+            for batch in usable.map({ [$0] }) {
                 let added = batch.map { bytes in
                     (AttachmentInput(local_id: "img-" + UUID().uuidString, name: "Photo.jpg", mime: "image/jpeg",
                                      byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString()), bytes)
