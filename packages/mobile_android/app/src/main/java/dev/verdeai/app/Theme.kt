@@ -22,7 +22,9 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.selected
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.input.pointer.pointerInput
@@ -326,8 +328,21 @@ internal fun Modifier.named(label: String): Modifier = semantics { contentDescri
  * node; TalkBack still offers the long-press action by [label].
  */
 internal fun Modifier.longPressMenu(label: String, onLongPress: () -> Unit): Modifier =
-    pointerInput(Unit) { detectTapGestures(onLongPress = { onLongPress() }) }
-        .semantics { onLongClick(label) { onLongPress(); true } }
+    pointerInput(Unit) {
+        // A8-1: a plain tap is left unconsumed, so the transcript's tap-to-dismiss still puts the
+        // keyboard away; only a held press is taken (and its release swallowed).
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            var released = false
+            withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) { waitForUpOrCancellation(); released = true }
+            if (released) return@awaitEachGesture
+            onLongPress()
+            do {
+                val event = awaitPointerEvent()
+                event.changes.forEach { it.consume() }
+            } while (event.changes.any { it.pressed })
+        }
+    }.semantics { onLongClick(label) { onLongPress(); true } }
 
 /**
  * S29: the clickable node carries the whole name and its children add none, so TalkBack and dumps

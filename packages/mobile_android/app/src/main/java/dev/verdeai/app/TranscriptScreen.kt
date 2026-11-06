@@ -41,6 +41,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -244,10 +245,12 @@ internal fun TranscriptScreen(
         }
         // A-KB: a tap on the transcript (not taken by a control) or a scroll drag puts the keyboard away.
         val dismissKeyboard = rememberKeyboardDismiss()
-        // A5-3 / S29: Tab walks every control in the transcript (Copy code, row actions, disclosure
-        // headers). The reversed lazy list can't hand focus on past its last composed row, so when a
-        // Tab would wrap back to the header it goes on to the composer instead (its chips and Send).
+        // A8-6: a long chat doesn't stand between the header and the composer. Tab from the header
+        // skips to the composer; Shift+Tab from the composer comes back into the transcript at the
+        // newest row. Inside, Tab walks every control (Copy code, tool rows, Copy output) and goes
+        // on to the composer instead of wrapping back to the header.
         val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val newestFocus = remember { androidx.compose.ui.focus.FocusRequester() }
         val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
         val tabScope = rememberCoroutineScope()
         var transcriptFocused by remember { mutableStateOf(false) }
@@ -264,15 +267,41 @@ internal fun TranscriptScreen(
                     }
                 }
                 tab
-            }.onFocusChanged { transcriptFocused = it.hasFocus }.focusGroup()) {
-            CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard) {
+            }
+            .onFocusChanged { transcriptFocused = it.hasFocus }
+            .focusProperties {
+                @Suppress("DEPRECATION") @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                enter = { direction ->
+                    if (direction == androidx.compose.ui.focus.FocusDirection.Next) composerFocus
+                    else androidx.compose.ui.focus.FocusRequester.Default
+                }
+            }.focusGroup()) {
+            CompositionLocalProvider(LocalDismissKeyboard provides dismissKeyboard, LocalNewestFocus provides newestFocus) {
             when (val placeholder = transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, renderers)
                 else -> Placeholder(placeholder, model)
             }
             }
         }
-        CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
+        // A8-6: Shift+Tab from the composer's first control goes into the transcript at the newest
+        // message (not the oldest one on screen); within the composer it moves back as usual.
+        val backScope = rememberCoroutineScope()
+        var composerFocused by remember { mutableStateOf(false) }
+        Box(Modifier.fillMaxWidth().onFocusChanged { composerFocused = it.hasFocus }.onPreviewKeyEvent { event ->
+            val back = event.key == androidx.compose.ui.input.key.Key.Tab && event.isShiftPressed &&
+                event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
+            if (back) {
+                focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Previous)
+                backScope.launch {
+                    withFrameNanos { }
+                    withFrameNanos { }
+                    if (!composerFocused) runCatching { newestFocus.requestFocus() }
+                }
+            }
+            back
+        }.focusGroup()) {
+            CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
+        }
     }
     gitChanges?.let { GitChangesLayer(it) }
     }
@@ -351,7 +380,13 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST).keepTopRowOnResize(list) { atBottom }, state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->
-                CompositionLocalProvider(LocalTranscriptIndex provides index) { TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
+                val newest = LocalNewestFocus.current
+                CompositionLocalProvider(LocalTranscriptIndex provides index) {
+                    // A8-6: the newest row takes focus when Shift+Tab comes back from the composer.
+                    Box(if (index == 0 && newest != null) Modifier.focusRequester(newest) else Modifier) {
+                        TranscriptItemFrame(item) { renderers.Render(item, ctx) }
+                    }
+                }
             }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
         }
@@ -384,6 +419,9 @@ private fun PageHeader(page: ChatPage?, model: TranscriptModel) {
         }
     }
 }
+
+/** A8-6: focus for the newest transcript row (Shift+Tab from the composer lands there). */
+internal val LocalNewestFocus = staticCompositionLocalOf<androidx.compose.ui.focus.FocusRequester?> { null }
 
 // ---- Default renderers ----
 
