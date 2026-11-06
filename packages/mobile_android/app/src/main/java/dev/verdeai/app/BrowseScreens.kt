@@ -35,14 +35,18 @@ internal const val BROWSE_LIST = "browse-list"
 internal val LocalUiClock = staticCompositionLocalOf { UiClock() }
 
 @Composable
-internal fun rememberNow(enabled: Boolean): Long {
+internal fun rememberNow(enabled: Boolean, everyMs: Long = 1_000): Long {
     val clock = LocalUiClock.current
-    val now by produceState(clock.now(), enabled, clock) {
+    val now by produceState(clock.now(), enabled, everyMs, clock) {
         value = clock.now()
-        while (enabled && clock.ticking) { delay(1_000); value = clock.now() }
+        while (enabled && clock.ticking) { delay(everyMs); value = clock.now() }
     }
     return now
 }
+
+/** A2-9: list screens tick each second while a timer runs, else every 30 s so "12 min ago" stays true. */
+@Composable
+internal fun rememberListNow(timers: Boolean): Long = rememberNow(true, if (timers) 1_000 else 30_000)
 
 // ---- Pure presentation rules (unit tested) ----
 
@@ -413,7 +417,7 @@ internal fun HomeScreen(
     val state by model.state.collectAsState()
     val hidden = LocalHiddenThreads.current
     val panes = state.home?.items.orEmpty()
-    val now = rememberNow(panes.any { it.can_stop && it.started_at_ms != null })
+    val now = rememberListNow(panes.any { it.can_stop && it.started_at_ms != null })
     val docked = LocalWindowTier.current.docked
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
@@ -514,7 +518,7 @@ internal fun WorkspaceScreen(
     val state by model.state.collectAsState()
     val workspace = state.workspaces?.items?.find { it.workspace_id == workspaceId }
     val hidden = LocalHiddenThreads.current
-    val now = rememberNow(workspace?.panes.orEmpty().any { it.can_stop && it.started_at_ms != null })
+    val now = rememberListNow(workspace?.panes.orEmpty().any { it.can_stop && it.started_at_ms != null })
     var showArchived by rememberSaveable(workspaceId) { mutableStateOf(false) }
     BrowseFrame(workspace?.label ?: "Workspace", state, now, model::refresh, onHosts, onBack) {
         if (!gate(state, onPair)) return@BrowseFrame

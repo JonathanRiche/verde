@@ -122,7 +122,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
     // Home's recent chats read the same list, so leave it unfiltered.
     val reset by rememberUpdatedState { if (applied != ("" to null)) manage.searchHistory("", null) }
     DisposableEffect(Unit) { onDispose { reset() } }
-    val now = rememberNow(false)
+    val now = rememberListNow(false)
     ManageFrame("History", onBack) {
         if (!ready(state)) return@ManageFrame
         item(key = "search") {
