@@ -106,7 +106,7 @@ struct PairingView: View {
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .toolbar {
                 if let onClose {
-                    ToolbarItem(placement: .cancellationAction) { Button("Back to hosts", action: onClose) }
+                    ToolbarItem(placement: .cancellationAction) { BarButton("Back to hosts", action: onClose) }
                 }
             }
             .task { await model.start() }
@@ -126,7 +126,7 @@ struct PairingView: View {
                     }
                     .ignoresSafeArea(edges: .bottom)
                     .navigationTitle("Scan pairing code")
-                    .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
+                    .toolbar { ToolbarItem(placement: .cancellationAction) { BarButton("Cancel") { scanning = false } } }
                 }
             }
         }.tint(VerdeTheme.accent).font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.text).preferredColorScheme(AppearanceSettings.shared.resolvedScheme)

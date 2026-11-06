@@ -638,7 +638,7 @@ private struct CompanionConversations: View {
             .background(VerdeTheme.background)
             .navigationTitle("Conversations")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { BarButton("Done", bold: true) { dismiss() } } }
         }
         .tint(VerdeTheme.accent)
     }
@@ -711,9 +711,9 @@ struct CompanionSettings: View {
             .navigationTitle("Companion")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { BarButton("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { Task { if await save() { dismiss() } } }.disabled(model.saving)
+                    BarButton("Done", bold: true) { Task { if await save() { dismiss() } } }.disabled(model.saving)
                 }
             }
             .navigationDestination(for: CompanionSettingsPage.self) { page in
@@ -904,7 +904,7 @@ private struct CompanionBrainSheet: View {
     var body: some View {
         NavigationStack {
             CompanionBrainScreen(model: model, browse: browse)
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                .toolbar { ToolbarItem(placement: .confirmationAction) { BarButton("Done", bold: true) { dismiss() } } }
         }
         .presentationDetents([.medium, .large])
         .tint(VerdeTheme.accent)

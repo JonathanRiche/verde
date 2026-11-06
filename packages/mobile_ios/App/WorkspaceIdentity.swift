@@ -140,8 +140,8 @@ struct WorkspaceIdentitySheet: View {
             }
             .navigationTitle("Icon and color").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Save") { save(icon, color); dismiss() }.disabled(!changed) }
+                ToolbarItem(placement: .cancellationAction) { BarButton("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { BarButton("Save", bold: true) { save(icon, color); dismiss() }.disabled(!changed) }
             }
         }
     }

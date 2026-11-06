@@ -160,6 +160,8 @@ struct ChangesRoute: View {
                 .foregroundStyle(selected ? VerdeTheme.accent : VerdeTheme.text)
                 .background(selected ? VerdeTheme.accent.opacity(0.16) : VerdeTheme.alternate, in: Capsule())
                 .overlay(Capsule().stroke(selected ? VerdeTheme.accent : VerdeTheme.border))
+                // I10-8: the pill stays compact; its target is 44 points tall.
+                .frame(minHeight: 44).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? .isSelected : [])

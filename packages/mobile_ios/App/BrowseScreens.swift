@@ -67,7 +67,7 @@ private struct Dot: View {
     let color: Color
     let label: String
     var body: some View {
-        Circle().fill(color).frame(width: 6, height: 6).modifier(Pulse(active: ["Working", "Running", "Waiting", "Active"].contains(label))).accessibilityLabel(label)
+        Circle().fill(color).frame(width: 6, height: 6).modifier(Pulse(active: ["Working", "Running", "Active"].contains(label))).accessibilityLabel(label)
     }
 }
 

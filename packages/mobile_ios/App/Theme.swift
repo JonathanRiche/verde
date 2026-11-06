@@ -82,9 +82,25 @@ struct Pulse: ViewModifier {
     var period = 1.6
     @Environment(\.accessibilityReduceMotion) private var reduced
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: !active || reduced || AppearanceSettings.shared.reducedMotion)) { context in
+        // 12 frames a second is smooth for a 1.6 s fade and keeps idle screens cheap (I10-6).
+        TimelineView(.animation(minimumInterval: 1 / 12, paused: !active || reduced || AppearanceSettings.shared.reducedMotion)) { context in
             let phase = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period
             content.opacity(active && !reduced && !AppearanceSettings.shared.reducedMotion ? minimum + (1 - minimum) * (1 - cos(phase * 2 * .pi)) / 2 : 1)
+        }
+    }
+}
+/// A sheet's toolbar text button with a 44-point target (I10-8); the bar's own buttons draw a
+/// 29-point one.
+struct BarButton: View {
+    let title: String
+    var bold = false
+    let action: () -> Void
+    init(_ title: String, bold: Bool = false, action: @escaping () -> Void) {
+        self.title = title; self.bold = bold; self.action = action
+    }
+    var body: some View {
+        Button(action: action) {
+            Text(title).fontWeight(bold ? .semibold : .regular).frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
         }
     }
 }
@@ -94,7 +110,7 @@ struct StatusPip: View {
     var failed = false
     var body: some View {
         Circle().fill(failed ? VerdeTheme.danger : attention ? VerdeTheme.warning : active ? VerdeTheme.accent : VerdeTheme.subtle)
-            .frame(width: 6, height: 6).modifier(Pulse(active: active)).accessibilityLabel(failed ? "Failed" : attention ? "Needs attention" : active ? "Working" : "Idle")
+            .frame(width: 6, height: 6).modifier(Pulse(active: active && !attention && !failed)).accessibilityLabel(failed ? "Failed" : attention ? "Needs attention" : active ? "Working" : "Idle")
     }
 }
 private struct DrawerActionKey: EnvironmentKey { static let defaultValue: () -> Void = {} }

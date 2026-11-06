@@ -295,7 +295,7 @@ struct FileViewer: View {
         }
         .navigationTitle((citation.path as NSString).lastPathComponent).navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if !embedded { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            if !embedded { ToolbarItem(placement: .cancellationAction) { BarButton("Done", bold: true) { dismiss() } } }
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
                 if canDownload {

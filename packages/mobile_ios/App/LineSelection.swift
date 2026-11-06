@@ -323,7 +323,7 @@ struct AskAgentSheet: View {
             .background(VerdeTheme.panel)
             .navigationTitle("Ask agent").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel", action: onCancel).disabled(sending) }
+                ToolbarItem(placement: .cancellationAction) { BarButton("Cancel", action: onCancel).disabled(sending) }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(sending ? "Sending…" : "Send") { if let chat { onSend(chat, instruction) } }
                         .disabled(sending || chat == nil || instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

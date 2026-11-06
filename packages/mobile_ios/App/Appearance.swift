@@ -181,7 +181,7 @@ struct AppSettings: View {
             .textCase(nil)
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Done") { dismiss() } }
+            .toolbar { BarButton("Done", bold: true) { dismiss() } }
         }.preferredColorScheme(appearance.resolvedScheme).tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
     }
 

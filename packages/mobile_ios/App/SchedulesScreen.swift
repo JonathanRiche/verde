@@ -64,7 +64,7 @@ struct ScheduledScreen: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                    BarButton("Done", bold: true) { dismiss() }.keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button { form = .new } label: { Image(systemName: "plus").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
@@ -395,11 +395,11 @@ struct ScheduleForm: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    BarButton("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button { Task { await save() } } label: {
-                        if saving { ProgressView() } else { Text("Save").bold() }
+                        if saving { ProgressView() } else { Text("Save").bold().frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
                     }
                     .disabled(saving || !draft.canSave || !model.canEdit)
                     .keyboardShortcut("s", modifiers: .command)
@@ -441,7 +441,7 @@ struct ScheduleForm: View {
                     draft.model = ""
                     Task { await selectCatalog() }
                 }
-                choice("Model", value: draft.model, empty: "Default", choices: catalog?.catalogs.models ?? [], allowsDefault: true) { id in
+                choice("Model", value: draft.model, empty: "Auto", choices: catalog?.catalogs.models ?? [], allowsDefault: true) { id in
                     draft.model = id
                 }
                 if catalog?.loading == true { ProgressView("Loading models…") }
@@ -502,7 +502,7 @@ struct ScheduleForm: View {
         Menu {
             if allowsDefault {
                 Button { pick("") } label: {
-                    if value.isEmpty { Label("Default", systemImage: "checkmark") } else { Text("Default") }
+                    if value.isEmpty { Label("Auto", systemImage: "checkmark") } else { Text("Auto") }
                 }
             }
             ForEach(choices, id: \.id) { item in

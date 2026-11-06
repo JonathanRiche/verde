@@ -585,8 +585,8 @@ struct SelectTextSheet: View {
                 .navigationTitle("Select text")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                    ToolbarItem(placement: .primaryAction) { Button("Copy all") { UIPasteboard.general.string = text } }
+                    ToolbarItem(placement: .cancellationAction) { BarButton("Done", bold: true) { dismiss() } }
+                    ToolbarItem(placement: .primaryAction) { BarButton("Copy all") { UIPasteboard.general.string = text } }
                 }
         }
         .presentationDetents([.medium, .large])
