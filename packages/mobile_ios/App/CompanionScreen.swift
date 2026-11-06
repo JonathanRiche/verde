@@ -626,12 +626,21 @@ struct CompanionSettings: View {
     /// Opens straight on Brain (from the sheet composer's brain label).
     var startAtBrain = false
     @Environment(\.dismiss) private var dismiss
-    @State private var path: [CompanionSettingsPage] = []
+    @State private var path: [CompanionSettingsPage]
     @State private var editingID = ""
     @State private var name = ""
     @State private var character = CompanionCharacter.sprout
     @State private var orders = ""
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
+
+    init(model: CompanionModel, browse: BrowseModel, startAtBrain: Bool = false) {
+        self.model = model
+        self.browse = browse
+        self.startAtBrain = startAtBrain
+        // Open on Brain from the first frame. Pushing it from `onAppear` was dropped on first show
+        // and re-pushed every time the root reappeared, so Back from Brain did nothing.
+        _path = State(initialValue: startAtBrain ? [.brain] : [])
+    }
 
     private var dirty: Bool {
         guard let active = model.active, active.id == editingID else { return false }
@@ -677,7 +686,6 @@ struct CompanionSettings: View {
             }
             .onAppear {
                 load()
-                if startAtBrain && path.isEmpty { path = [.brain] }
             }
             .onChange(of: name) { _, value in let clipped = utf8Prefix(value, RosterEntry.nameLimit); if clipped != value { name = clipped } }
             .onChange(of: orders) { _, value in let clipped = utf8Prefix(value, RosterEntry.ordersLimit); if clipped != value { orders = clipped } }
