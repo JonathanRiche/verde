@@ -199,6 +199,22 @@ class CoreHost private constructor(
         catch (_: Exception) { throw CoreFailure(-1) }
     }
 
+    /**
+     * Re-reads Home and Workspaces after an open chat's turn or approval changes. The core folds the
+     * live chat turn into those projections (a resolved approval clears "needs you" at once), but
+     * only announces them on sync changes, so a focused chat would otherwise leave them stale.
+     */
+    suspend fun refreshShared() = withContext(dispatcher) {
+        if (closed) return@withContext
+        try {
+            val home = read("home")
+            val workspaces = read("workspaces")
+            mutableHome.value = CoreJson.decodeFromJsonElement<HomeQuery>(home)
+            mutableWorkspaces.value = CoreJson.decodeFromJsonElement<WorkspacesQuery>(workspaces)
+            mutableViews.value = mutableViews.value + mapOf("home" to home, "workspaces" to workspaces)
+        } catch (_: Exception) { }
+    }
+
     private fun read(selector: String): JsonElement {
         val trace = traceMetadata != null
         val started = System.nanoTime()

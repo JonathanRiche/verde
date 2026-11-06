@@ -106,6 +106,12 @@ internal class TranscriptModel(
                     mutableState.update { it.copy(thread=thread, composer=composer) }
                 }
         }
+        // A2-2: the turn or approval settling here updates Home's panes (and the companion's
+        // needs-you badge) now, not on the next sync.
+        launch {
+            mutableState.map { s -> s.thread?.let { t -> Triple(t.turn?.turn_id, t.turn?.status, t.approval?.call_id to t.approval?.resolution) } }
+                .distinctUntilChanged().drop(1).collect { host.refreshShared() }
+        }
         launch { host.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal=true) } } }
         var lastReady = false
         combine(visible, host.hosts, host.operations, browse.map { it.networkAvailable }) { shown, query, operations, network ->
