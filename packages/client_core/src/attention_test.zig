@@ -347,3 +347,53 @@ test "sign out wipes chat drafts, push key, attention and the chat index" {
     for (want, deleted.items) |w, d| try eql(w, d);
     try expect(f.host.state.chat.threads.len == 0 and f.host.state.attention.entries.len == 0 and f.host.state.chat_index.digests.len == 0);
 }
+
+/// Sets the sync snapshot's turn for `ws`/`t` and the engine's loaded thread, then reads `selector`.
+fn listed(f: *Fixture, selector: []const u8, sync_status: []const u8, live_status: []const u8, approval: bool, focused: bool) !V {
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{
+        .snapshot = .{ .workspaces = .{.{ .workspace_id = "ws", .label = "Repo", .path = "/repo", .threads = .{.{ .local_thread_id = "t", .title = "Rotate keys" }} }} },
+        .turns = .{.{ .workspace_id = "ws", .local_thread_id = "t", .turn_id = "turn-1", .status = sync_status, .started_at_ms = 10 }},
+    }));
+    var threads = try tx.allocator().alloc(chat.Thread, 1);
+    threads[0] = .{ .workspace_id = "ws", .id = "t", .metadata = .{ .local_thread_id = "t", .title = "Rotate keys" }, .cwd = "/repo", .loaded = true, .focused = focused, .turn = .{ .turn_id = "turn-1", .status = live_status, .started_at_ms = 10 }, .approval = if (approval) .{ .turn_id = "turn-1", .call_id = "call-1", .title = "Approve?", .body = "Run it" } else null };
+    tx.state.chat.threads = threads;
+    f.a().free(try tx.commit(&f.host, f.a()));
+    const out = try h.parse(f.a(), try f.host.query(selector, f.a()));
+    return p.get(out, "data");
+}
+/// Home's "needs you" panes, counted the way the apps badge them.
+fn needsYou(home: V) usize {
+    var n: usize = 0;
+    for (p.rows(p.get(home, "items"))) |pane| {
+        if (p.yes(p.get(pane, "attention")) or h.eq(p.s(pane, "status"), "waiting_approval")) n += 1;
+    }
+    return n;
+}
+
+test "needs-you clears as soon as an open chat's approval resolves or its turn completes" {
+    var f = try Fixture.init(&.{"chat:read"});
+    defer f.deinit();
+    // Pending approval: sync and the open chat agree.
+    var home = try listed(&f, "home", "waiting_approval", "waiting_approval", true, true);
+    try expect(needsYou(home) == 1);
+    // Approved in the open chat; sync still reports the approval wait.
+    home = try listed(&f, "home", "waiting_approval", "running", false, true);
+    try expect(needsYou(home) == 0);
+    const pane = p.rows(p.get(home, "items"))[0];
+    try eql("running", p.s(pane, "status"));
+    try expect(p.yes(p.get(pane, "can_stop")));
+    var workspaces = try listed(&f, "workspaces", "waiting_approval", "running", false, true);
+    const ws = p.rows(p.get(workspaces, "items"))[0];
+    try eql("running", p.s(p.rows(p.get(ws, "threads"))[0], "status"));
+    try expect(!p.yes(p.get(p.rows(p.get(ws, "panes"))[0], "attention")));
+    // The turn completed: the chat leaves Home and nothing needs the user.
+    home = try listed(&f, "home", "waiting_approval", "completed", false, true);
+    try expect(needsYou(home) == 0 and p.rows(p.get(home, "items")).len == 0);
+    workspaces = try listed(&f, "workspaces", "running", "completed", false, false);
+    try eql("completed", p.s(p.rows(p.get(p.rows(p.get(workspaces, "items"))[0], "threads"))[0], "status"));
+    // An unfocused chat is not tailed: sync's newer approval wait still counts.
+    home = try listed(&f, "home", "waiting_approval", "running", false, false);
+    try expect(needsYou(home) == 1);
+}

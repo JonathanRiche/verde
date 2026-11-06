@@ -136,36 +136,40 @@ fn observable(state: *const h.State) bool {
     return true;
 }
 
-fn observe(tx: *h.Transaction, ws: []const u8, thread_id: []const u8) Entry {
-    var turn_id: []const u8 = "";
-    var status: []const u8 = "";
+/// A thread's current turn: the newest sync turn, led by the chat engine's turn
+/// for a loaded thread. `live` is set when the engine's turn won.
+const Current = struct { turn_id: []const u8 = "", status: []const u8 = "", approval: bool = false, live: bool = false };
+fn current(state: *const h.State, ws: []const u8, thread_id: []const u8) Current {
+    var out: Current = .{};
     var started: i64 = std.math.minInt(i64);
-    for (p.rows(p.get(tx.state.sync.snapshot, "turns"))) |turn| {
+    for (p.rows(p.get(state.sync.snapshot, "turns"))) |turn| {
         if (!eq(p.s(turn, "workspace_id"), ws) or !eq(p.s(turn, "local_thread_id"), thread_id)) continue;
         const at = p.num(p.get(turn, "started_at_ms")) orelse 0;
-        if (turn_id.len > 0 and at <= started) continue;
+        if (out.turn_id.len > 0 and at <= started) continue;
         started = at;
-        turn_id = p.s(turn, "turn_id");
-        status = p.s(turn, "status");
+        out.turn_id = p.s(turn, "turn_id");
+        out.status = p.s(turn, "status");
     }
-    var approval = false;
-    for (tx.state.chat.threads) |t| {
+    for (state.chat.threads) |t| {
         if (!eq(t.workspace_id, ws) or !eq(t.id, thread_id)) continue;
         const live = t.turn orelse break;
         // The engine's tail usually leads sync for its own turn, but an idle
         // or stalled tail must not mask a turn sync already saw settle, nor a
-        // newer turn started elsewhere.
-        const same_turn = eq(live.turn_id, turn_id);
-        const settled_by_sync = same_turn and notificationStatus(status, false) != .working and notificationStatus(live.status, false) == .working;
+        // newer turn started elsewhere. A focused thread is tailed live, so
+        // its resolved approval wins over sync's stale `waiting_approval`.
+        const same_turn = eq(live.turn_id, out.turn_id);
+        const settled_by_sync = same_turn and !t.focused and notificationStatus(out.status, false) != .working and notificationStatus(live.status, false) == .working;
         const later = if (live.started_at_ms) |at| at > started else false;
-        if (turn_id.len == 0 or (same_turn and !settled_by_sync) or (!same_turn and later)) {
-            turn_id = live.turn_id;
-            status = live.status;
-            approval = if (t.approval) |pending| eq(pending.turn_id, live.turn_id) else false;
+        if (out.turn_id.len == 0 or (same_turn and !settled_by_sync) or (!same_turn and later)) {
+            out = .{ .turn_id = live.turn_id, .status = live.status, .approval = if (t.approval) |pending| eq(pending.turn_id, live.turn_id) else false, .live = true };
         }
         break;
     }
-    return .{ .workspace_id = ws, .thread_id = thread_id, .turn_id = turn_id, .status = notificationStatus(status, approval), .since_ms = tx.state.wall_time_ms };
+    return out;
+}
+fn observe(tx: *h.Transaction, ws: []const u8, thread_id: []const u8) Entry {
+    const turn = current(&tx.state, ws, thread_id);
+    return .{ .workspace_id = ws, .thread_id = thread_id, .turn_id = turn.turn_id, .status = notificationStatus(turn.status, turn.approval), .since_ms = tx.state.wall_time_ms };
 }
 
 pub fn pump(tx: *h.Transaction) E!void {
@@ -365,28 +369,40 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
 }
 
 /// Mark chat panes with their attention kind; Home also lists unread panes.
+/// Chat panes and thread rows show the current turn (`current`), so an approval
+/// resolved or a turn finished in an open chat stops counting at once.
 pub fn annotate(a: A, state: *const h.State, selector: []const u8, data: *V) E!void {
-    if (state.attention.entries.len == 0) return;
     if (eq(selector, "workspaces")) {
-        for (p.rows(p.get(data.*, "items"))) |ws| for (@constCast(p.rows(p.get(ws, "panes")))) |*pane| {
-            _ = try mark(a, state, pane);
-        };
+        for (p.rows(p.get(data.*, "items"))) |ws| {
+            for (@constCast(p.rows(p.get(ws, "panes")))) |*pane| _ = try mark(a, state, pane);
+            for (@constCast(p.rows(p.get(ws, "threads")))) |*thread| try relive(a, state, thread);
+        }
         return;
     }
     if (!eq(selector, "home")) return;
     var items = p.get(data.*, "items");
     if (items != .array) return;
-    for (items.array.items) |*pane| _ = try mark(a, state, pane);
-    const all = try @import("sync.zig").query(a, state, "workspaces");
-    for (p.rows(p.get(all, "items"))) |ws| {
-        if (!p.yes(p.get(ws, "open"))) continue;
-        for (@constCast(p.rows(p.get(ws, "panes")))) |*pane| {
-            if (!try mark(a, state, pane)) continue;
-            var listed = false;
-            for (items.array.items) |existing| if (eq(p.s(existing, "id"), p.s(pane.*, "id"))) {
-                listed = true;
-            };
-            if (!listed) try items.array.append(pane.*);
+    var kept: usize = 0;
+    for (items.array.items) |*pane| {
+        _ = try mark(a, state, pane);
+        // Home lists active panes; one the engine saw finish leaves with its turn.
+        if (eq(p.s(pane.*, "kind"), "chat") and !p.yes(p.get(pane.*, "attention")) and !p.yes(p.get(pane.*, "can_stop")) and !eq(p.s(pane.*, "status"), "working")) continue;
+        items.array.items[kept] = pane.*;
+        kept += 1;
+    }
+    items.array.shrinkRetainingCapacity(kept);
+    if (state.attention.entries.len > 0) {
+        const all = try @import("sync.zig").query(a, state, "workspaces");
+        for (p.rows(p.get(all, "items"))) |ws| {
+            if (!p.yes(p.get(ws, "open"))) continue;
+            for (@constCast(p.rows(p.get(ws, "panes")))) |*pane| {
+                if (!try mark(a, state, pane)) continue;
+                var listed = false;
+                for (items.array.items) |existing| if (eq(p.s(existing, "id"), p.s(pane.*, "id"))) {
+                    listed = true;
+                };
+                if (!listed) try items.array.append(pane.*);
+            }
         }
     }
     std.mem.sort(V, items.array.items, {}, struct {
@@ -398,8 +414,30 @@ pub fn annotate(a: A, state: *const h.State, selector: []const u8, data: *V) E!v
     }.less);
     try data.object.put(a, "items", items);
 }
+/// Projection `active` statuses (a stop button shows for these).
+fn activeStatus(status: []const u8) bool {
+    for ([_][]const u8{ "working", "waiting", "accepted", "running", "waiting_approval" }) |item| if (eq(status, item)) return true;
+    return false;
+}
+/// The engine's status for a loaded thread when it leads sync; null otherwise.
+fn liveStatus(state: *const h.State, ws: []const u8, thread_id: []const u8) ?[]const u8 {
+    const turn = current(state, ws, thread_id);
+    if (!turn.live or turn.status.len == 0) return null;
+    return if (turn.approval) "waiting_approval" else turn.status;
+}
+fn relive(a: A, state: *const h.State, thread: *V) E!void {
+    if (thread.* != .object) return;
+    const status = liveStatus(state, p.s(thread.*, "workspace_id"), p.s(thread.*, "thread_id")) orelse return;
+    try thread.object.put(a, "status", .{ .string = status });
+}
+/// Applies the live turn and the attention entry; true when the pane has an attention kind.
 fn mark(a: A, state: *const h.State, pane: *V) E!bool {
     if (pane.* != .object or !eq(p.s(pane.*, "kind"), "chat")) return false;
+    if (liveStatus(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id"))) |status| {
+        try pane.object.put(a, "status", .{ .string = status });
+        try pane.object.put(a, "can_stop", .{ .bool = activeStatus(status) });
+        try pane.object.put(a, "attention", .{ .bool = eq(status, "waiting_approval") });
+    }
     const i = find(state.attention.entries, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id")) orelse return false;
     const kind = state.attention.entries[i].attention orelse return false;
     try pane.object.put(a, "attention", .{ .bool = true });
