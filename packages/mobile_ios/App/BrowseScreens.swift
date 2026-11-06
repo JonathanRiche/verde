@@ -67,22 +67,66 @@ struct AttentionBadge: View {
     }
 }
 
+/// How a row's state reads (S7): working is accent with a spinner, waiting / needs you amber,
+/// failed the error colour; idle and done show no state at all.
+enum RowState: Equatable {
+    case working, attention, failed
+
+    init?(status: String, attention: Bool = false) {
+        if status == "failed" { self = .failed }
+        else if attention || ["waiting_approval", "waiting", "blocked"].contains(status) { self = .attention }
+        else if ["working", "running", "accepted"].contains(status) { self = .working }
+        else { return nil }
+    }
+
+    var color: Color {
+        switch self {
+        case .working: return VerdeTheme.accent
+        case .attention: return VerdeTheme.warning
+        case .failed: return VerdeTheme.danger
+        }
+    }
+}
+
+/// "workspace · state · age" with only the parts that exist (no dangling separators).
+func rowSubtitle(_ parts: [String?]) -> String? {
+    let shown = parts.compactMap { $0?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    return shown.isEmpty ? nil : shown.joined(separator: " · ")
+}
+
 private struct RowContent: View {
     let title: String
     let detail: String?
     let dot: Dot
     var provider: String?
     var badge: String?
+    /// The state word inside `detail`, coloured; the spinner marks a working row.
+    var state: RowState? = nil
+    var stateText: String? = nil
     var body: some View {
         HStack(spacing: 12) {
-            if let provider { ProviderGlyph(provider: provider) } else { dot }
+            if let provider { ProviderGlyph(provider: provider).frame(width: 20, height: 20) } else { dot }
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).lineLimit(1)
-                if let detail { Text(detail) .font(VerdeTheme.ui(14)).foregroundStyle(.secondary).lineLimit(2) }
+                Text(title).font(VerdeTheme.ui(16)).lineLimit(2)
+                if let detail { subtitle(detail) }
             }
             Spacer(minLength: 4)
+            if state == .working { ProgressView().controlSize(.mini).accessibilityHidden(true) }
             if let badge { AttentionBadge(text: badge) }
         }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func subtitle(_ detail: String) -> some View {
+        Text(styledSubtitle(detail)).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
+    }
+
+    private func styledSubtitle(_ detail: String) -> AttributedString {
+        var text = AttributedString(detail)
+        if let state, let stateText, let range = text.range(of: stateText) {
+            text[range].foregroundColor = state.color
+        }
+        return text
     }
 }
 
@@ -114,7 +158,8 @@ private struct PaneItem: View {
         MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
                                     dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.attention), label: paneLabel(pane)),
                                     provider: pane.kind == "terminal" ? pane.provider : nil,
-                                    badge: attentionLabel(pane.attention_kind)),
+                                    badge: attentionLabel(pane.attention_kind),
+                                    state: RowState(status: pane.status, attention: pane.attention), stateText: paneLabel(pane)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
             .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }
     }
@@ -126,11 +171,13 @@ private struct ThreadItem: View {
     let now: Int64
     var workspaceLabel: String?
     var body: some View {
-        let parts = [workspaceLabel, thread.status == "idle" ? nil : statusLabel(thread.status),
-                     thread.last_activity_at_ms.map { agoLabel($0, now) }].compactMap { $0 }
-        MenuRow(content: RowContent(title: thread.title, detail: parts.isEmpty ? nil : parts.joined(separator: " · "),
+        let state = RowState(status: thread.status)
+        let stateText = state == nil ? nil : statusLabel(thread.status)
+        let detail = rowSubtitle([workspaceLabel, stateText, thread.last_activity_at_ms.map { agoLabel($0, now) }])
+        MenuRow(content: RowContent(title: thread.title, detail: detail,
                                     dot: Dot(color: VerdeTheme.status(thread.status, attention: thread.status == "waiting_approval"),
-                                             label: statusLabel(thread.status)), provider: thread.provider),
+                                             label: statusLabel(thread.status)), provider: thread.provider,
+                                    state: state, stateText: stateText),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
             .overlay(alignment: .topTrailing) { GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id).padding(8) }
@@ -232,10 +279,10 @@ private struct Gate: View {
     var body: some View {
         if state.hostID == nil {
             Text("No host selected.")
-            Button("Choose a host", action: pair)
+            Button("Choose a host", action: pair).modifier(PrimaryRow())
         } else if needsPairing(state) {
             Text("This phone isn't paired with \(state.row?.saved.label ?? "this host") yet.")
-            Button("Pair with this host", action: pair).accessibilityIdentifier("pairHost")
+            Button("Pair with this host", action: pair).modifier(PrimaryRow()).accessibilityIdentifier("pairHost")
         } else if showSpinner(state) {
             HStack { Spacer(); ProgressView("Loading workspaces…"); Spacer() }.padding(.vertical, 24)
         } else {
@@ -265,23 +312,23 @@ struct HomeScreen: View {
             let attention = panes.filter(\.attention)
             let running = panes.filter { !$0.attention }
             if !attention.isEmpty {
-                Section("Needs attention") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
+                TitledSection("Needs attention") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if !running.isEmpty {
-                Section("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
+                TitledSection("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if panes.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
             let workspaces = state.workspaces?.items ?? []
             let labels = Dictionary(workspaces.map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             let recent = recentThreads(state.workspaces, hidden: hidden)
             if !recent.isEmpty {
-                Section("Recent chats") {
+                TitledSection("Recent chats") {
                     ForEach(recent, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
                 }
             }
             let open = workspaces.filter(\.open)
             if !open.isEmpty {
-                Section("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
+                TitledSection("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
             } else if state.workspaces != nil {
                 Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
             }
@@ -315,13 +362,15 @@ struct WorkspacesScreen: View {
                 NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace)
             } else {
                 Section {
-                    NavigationLink("Add workspace", value: BrowseRoute.addWorkspace)
-                    NavigationLink("New chat", value: BrowseRoute.newChat(nil))
-                    NavigationLink("History", value: BrowseRoute.history)
+                    NavigationLink(value: BrowseRoute.newChat(nil)) { Label("New chat", systemImage: "square.and.pencil") }
+                    NavigationLink(value: BrowseRoute.history) { Label("History", systemImage: "clock") }
+                    NavigationLink(value: BrowseRoute.addWorkspace) { Label("Add workspace", systemImage: "folder.badge.plus") }
+                }
+                TitledSection("Open") {
                     ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
                 let closed = all.filter { !$0.open }
                 if !closed.isEmpty {
-                    Section("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
+                    TitledSection("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
                 }
             }
         }
@@ -344,7 +393,7 @@ struct WorkspaceScreen: View {
                 ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
                 if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
                 ExplorerLinks(onChanges: { openRoute(.changes(workspaceID)) }, onFiles: { openRoute(.files(workspaceID)) })
-                Section("Panes") {
+                TitledSection("Panes") {
                     let panes = visiblePanes(workspace.panes, hidden: hidden)
                     if panes.isEmpty { Text("No open panes.") }
                     ForEach(panes, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
@@ -357,7 +406,7 @@ struct WorkspaceScreen: View {
                 let threads = workspaceThreads(workspace, hidden: hidden).filter(listed)
                 let current = threads.filter { !$0.archived }
                 let archived = threads.filter(\.archived)
-                Section("Chats") {
+                TitledSection("Chats") {
                     if current.isEmpty { Text("No chats in this workspace yet.") }
                     ForEach(current, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now) }
                     if !archived.isEmpty {
@@ -372,6 +421,17 @@ struct WorkspaceScreen: View {
             }
         }
     }
+}
+
+/// A list section under a sentence-case `SectionTitle` (S7).
+struct TitledSection<Content: View>: View {
+    let title: String
+    let content: Content
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+    var body: some View { Section { content } header: { SectionTitle(title) } }
 }
 
 private func isThreadRoute(_ route: BrowseRoute) -> Bool {

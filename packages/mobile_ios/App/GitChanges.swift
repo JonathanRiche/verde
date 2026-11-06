@@ -222,7 +222,7 @@ struct CommitSettingsSection: View {
     let browse: BrowseModel
     @State private var config: GitConfigCommitSnapshot?
     var body: some View {
-        Section("Commit messages") {
+        TitledSection("Commit messages") {
             LabeledContent("Provider", value: ["auto": "Auto", "codex": "Codex", "claude": "Claude", "cursor": "Cursor", "opencode": "OpenCode"][config?.commit_message_provider ?? "auto"] ?? "Auto")
             LabeledContent("Model", value: config?.commit_message_model ?? "Default (provider’s fast model)")
             LabeledContent("Default action", value: config?.commit_default_action == "commit_and_push" ? "Commit & push" : "Commit")

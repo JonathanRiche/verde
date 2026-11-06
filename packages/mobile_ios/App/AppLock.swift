@@ -127,7 +127,7 @@ struct SecurityShield: UIViewRepresentable {
 struct SecuritySettings: View {
     let lock: AppLock
     var body: some View {
-        Section("Security") {
+        TitledSection("Security") {
             Toggle("Require Face ID or passcode", isOn: Binding(get: { lock.settings.enabled }, set: { enabled in var next = lock.settings; next.enabled = enabled; Task { await lock.update(next) } }))
             Picker("Lock after backgrounding", selection: Binding(get: { lock.settings.timeout }, set: { timeout in var next = lock.settings; next.timeout = timeout; Task { await lock.update(next) } })) {
                 Text("Immediately").tag(0.0); Text("1 minute").tag(60.0); Text("5 minutes").tag(300.0); Text("15 minutes").tag(900.0)

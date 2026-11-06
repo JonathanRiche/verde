@@ -198,7 +198,7 @@ struct NotificationSettingsSection: View {
     @Environment(\.openURL) private var openURL
 
     var body: some View {
-        Section("Notifications") {
+        TitledSection("Notifications") {
             if !registry.available {
                 Text("Push notifications aren't available in this build.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
             } else {

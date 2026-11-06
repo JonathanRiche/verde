@@ -378,7 +378,7 @@ struct ScheduleForm: View {
                     TextField("Name (optional)", text: $draft.name)
                         .font(VerdeTheme.ui(15))
                         .accessibilityIdentifier("schedule-name")
-                } header: { Text("Task") } footer: {
+                } header: { SectionTitle("Task") } footer: {
                     Text("Without a name, the first line of the prompt is used.")
                 }
                 sendTo
@@ -453,7 +453,7 @@ struct ScheduleForm: View {
                     Text(notice).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.warning).textSelection(.enabled)
                 }
             }
-        } header: { Text("Send to") } footer: {
+        } header: { SectionTitle("Send to") } footer: {
             switch draft.sendTo {
             case .companion: Text("Each run arrives in \(companionName)'s chat as a new message.")
             case .existing: Text("Each run arrives in the chat this task already uses.")
@@ -484,7 +484,7 @@ struct ScheduleForm: View {
                 DatePicker("At", selection: timeBinding, displayedComponents: .hourAndMinute)
                 WeekdayChips(selection: $draft.weekdays)
             }
-        } header: { Text("Repeat") } footer: {
+        } header: { SectionTitle("Repeat") } footer: {
             Text(draft.repeatText() + ". Times follow the computer's clock; the shortest repeat is 5 minutes.")
         }
     }

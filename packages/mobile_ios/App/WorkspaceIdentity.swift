@@ -104,7 +104,7 @@ struct WorkspaceIdentitySheet: View {
             || color != (workspace.color_custom ? Int(workspace.color_index) : nil)
         NavigationStack {
             Form {
-                Section("Icon") {
+                TitledSection("Icon") {
                     automatic(icon == nil) { icon = nil }
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
                         ForEach(0..<16, id: \.self) { k in
@@ -120,7 +120,7 @@ struct WorkspaceIdentitySheet: View {
                         }
                     }.padding(.vertical, 6)
                 }
-                Section("Color") {
+                TitledSection("Color") {
                     automatic(color == nil) { color = nil }
                     HStack(spacing: 6) {
                         ForEach(0..<8, id: \.self) { k in

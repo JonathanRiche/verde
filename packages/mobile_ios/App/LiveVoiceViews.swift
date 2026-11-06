@@ -276,7 +276,7 @@ struct LiveVoiceSettings: View {
             } else {
                 Text("Loading providers…").foregroundStyle(VerdeTheme.muted)
             }
-        } header: { Text("Live voice") } footer: {
+        } header: { SectionTitle("Live voice") } footer: {
             Text("Talk with your companion in real time (double-tap the bubble or use Live in the companion sheet). Uses your own xAI, OpenAI or Google API key, kept on your desktop. ChatGPT, SuperGrok and Gemini app subscriptions don't include API access.")
         }
         .task(id: browse.hostID) { await client.refresh() }
@@ -302,11 +302,11 @@ private struct LiveProviderEditor: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("live-api-key")
-            } header: { Text("API key") } footer: {
+            } header: { SectionTitle("API key") } footer: {
                 Text("\(provider.keyDescription). A new key is sent to your desktop and stored only there; it never stays on this phone. Subscriptions like ChatGPT, SuperGrok or Gemini don't include API access — create a key in the provider's developer console.")
             }
             if !provider.voices.isEmpty {
-                Section("Voice") {
+                TitledSection("Voice") {
                     Picker("Voice", selection: $voice) {
                         ForEach(provider.voices, id: \.self) { Text($0).tag($0) }
                     }
@@ -314,7 +314,7 @@ private struct LiveProviderEditor: View {
             }
             Section {
                 TextField("Model", text: $model).textInputAutocapitalization(.never).autocorrectionDisabled()
-            } header: { Text("Advanced") } footer: { Text("Leave as is unless you need a specific realtime model.") }
+            } header: { SectionTitle("Advanced") } footer: { Text("Leave as is unless you need a specific realtime model.") }
             Section {
                 Toggle("Use for live voice by default", isOn: $makeDefault)
             }

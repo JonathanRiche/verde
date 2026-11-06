@@ -558,7 +558,7 @@ private struct CompanionConversations: View {
         NavigationStack {
             List {
                 if let entry, !entry.thread_id.isEmpty {
-                    Section("Current") {
+                    TitledSection("Current") {
                         row(title: model.conversationTitle, provider: entry.provider, modelID: entry.model, detail: "Now", current: true)
                     }
                 }
@@ -588,7 +588,7 @@ private struct CompanionConversations: View {
                             }
                         }
                     }
-                } header: { Text("Earlier") } footer: {
+                } header: { SectionTitle("Earlier") } footer: {
                     Text("Removing only takes a conversation off this list; the chat stays in your history.")
                 }
             }
@@ -661,7 +661,7 @@ struct CompanionSettings: View {
                 Section {
                     TextEditor(text: $orders).frame(minHeight: 120).font(VerdeTheme.ui(14))
                         .accessibilityIdentifier("companion-orders")
-                } header: { Text("Standing orders") } footer: {
+                } header: { SectionTitle("Standing orders") } footer: {
                     Text("Sent with every turn, e.g. \u{201C}Always run the tests before calling work done.\u{201D}")
                 }
                 brain
@@ -697,7 +697,7 @@ struct CompanionSettings: View {
     }
 
     private var identity: some View {
-        Section("Identity") {
+        TitledSection("Identity") {
             TextField("Name", text: $name).accessibilityIdentifier("companion-name")
             HStack(spacing: 8) {
                 ForEach(CompanionCharacter.allCases) { option in
@@ -727,7 +727,7 @@ struct CompanionSettings: View {
                 LabeledContent("Brain", value: active?.provider.isEmpty == false ? label : "Default brain")
             }
             .accessibilityIdentifier("companion-brain")
-        } header: { Text("Brain") } footer: {
+        } header: { SectionTitle("Brain") } footer: {
             Text("Choose the provider and model that do \(name.isEmpty ? "your companion" : name)'s work.")
         }
     }
@@ -762,7 +762,7 @@ struct CompanionSettings: View {
                 } label: { Label("Add companion", systemImage: "plus") }
                 .disabled(model.saving || model.defaultHome == nil)
             }
-        } header: { Text("Companions") } footer: {
+        } header: { SectionTitle("Companions") } footer: {
             Text("Each companion has its own chat and crew. Swipe to remove one; you always keep at least one.")
         }
     }

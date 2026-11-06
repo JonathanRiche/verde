@@ -73,9 +73,9 @@ struct CompanionBrainScreen: View {
                 }
                 .padding(.vertical, 4)
                 .accessibilityElement(children: .combine)
-            } header: { Text("Current brain") }
+            } header: { SectionTitle("Current brain") }
 
-            Section("Provider") {
+            TitledSection("Provider") {
                 if providers.isEmpty { ProgressView("Loading providers…") }
                 ForEach(providers, id: \.id) { choice in
                     Button { Task { await pickProvider(choice.id) } } label: {
