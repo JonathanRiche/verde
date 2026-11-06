@@ -12,6 +12,10 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerCurrentChoice(.access, value: nil), "full_access")
         XCTAssertEqual(composerCurrentChoice(.effort, value: nil), "")
         XCTAssertEqual(composerCurrentChoice(.model, value: "opus"), "opus")
+        let models = [ChatChoice(id: "default", label: "Default"), ChatChoice(id: "opus", label: "Opus 5.5")]
+        XCTAssertEqual(composerCurrentChoice(.model, value: nil, choices: models), "default")
+        XCTAssertEqual(composerCurrentChoice(.speed, value: nil, choices: [ChatChoice(id: "off", label: "Off")]), "")
+        XCTAssertEqual(composerCurrentChoice(.effort, value: nil, choices: [ChatChoice(id: "", label: "Default"), ChatChoice(id: "low", label: "Low")]), "")
     }
 
     func testSlashSuggestionsAreOneDeduplicatedList() {

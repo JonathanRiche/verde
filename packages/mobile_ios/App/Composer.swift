@@ -31,9 +31,13 @@ func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
 }
 
 /// The option a picker marks as current: the selection, else what an unset value means.
-func composerCurrentChoice(_ picker: ComposerPicker, value: String?) -> String {
+func composerCurrentChoice(_ picker: ComposerPicker, value: String?, choices: [ChatChoice] = []) -> String {
     if let value, !value.isEmpty { return value }
-    return picker == .access ? defaultAccessID : ""
+    if picker == .access { return defaultAccessID }
+    // Unset means the catalog's default row: the "" choice, else (models) the first one, which the
+    // core sends when nothing is picked (I3-11).
+    if choices.isEmpty || choices.contains(where: { $0.id.isEmpty }) { return "" }
+    return picker == .model ? choices[0].id : ""
 }
 
 /// One row of the "/" or "@" suggestion list.
@@ -204,7 +208,7 @@ struct ChatComposer: View {
         .onDisappear { model.flushNow() }
         .sheet(item: $picker) { kind in
             NavigationStack {
-                let current = composerCurrentChoice(kind, value: selectedID(kind))
+                let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
                 List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: {
                         PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: choice, selected: choice.id == current)
