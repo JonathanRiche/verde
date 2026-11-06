@@ -192,6 +192,12 @@ struct RootView: View {
                 if !open && live.failure != nil { live.dismissFailure() }
             }
             .onChange(of: browse.hostID) { workspaceScope = nil }
+            // The companion's own chats stay out of Home, the drawer and History only once the core
+            // holds the roster; read it as soon as the host is ready, not only when the bubble polls
+            // (a hidden bubble never polls, and the first poll can come seconds after launch).
+            .task(id: (browse.hostID ?? "") + "/" + (browse.state.host?.phase ?? "")) {
+                if browse.state.host?.phase == "ready" { await companion.refresh() }
+            }
             .onChange(of: browse.state.workspaces?.items.map(\.workspace_id)) { _, ids in
                 if let scope = workspaceScope, let ids, !ids.contains(scope) { workspaceScope = nil }
             }
