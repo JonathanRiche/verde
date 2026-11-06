@@ -41,6 +41,8 @@ final class CompanionVoice {
     var listening: Bool { phase == .starting || phase == .listening }
 
     private let engine = AVAudioEngine()
+    /// The input tap is installed (the engine reached its microphone input).
+    @ObservationIgnored private var tapped = false
     @ObservationIgnored private var request: SFSpeechAudioBufferRecognitionRequest?
     @ObservationIgnored private var task: SFSpeechRecognitionTask?
     @ObservationIgnored private var finalText: String?
@@ -102,6 +104,7 @@ final class CompanionVoice {
             let format = input.outputFormat(forBus: 0)
             guard format.sampleRate > 0, format.channelCount > 0 else { return fail("No microphone is available.") }
             input.removeTap(onBus: 0)
+            tapped = true
             input.installTap(onBus: 0, bufferSize: 1024, format: format, block: Self.tap(request: request) { [weak self] value in
                 Task { @MainActor in if let self, self.session == current, self.listening { self.level = value } }
             })
@@ -158,7 +161,9 @@ final class CompanionVoice {
 
     private func stopAudio() {
         if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
+        // Only an engine that got as far as its input has a tap; touching `inputNode` again
+        // without a microphone would abort (I3-2).
+        if tapped { engine.inputNode.removeTap(onBus: 0); tapped = false }
     }
 
     private func reset() {
