@@ -39,6 +39,21 @@ final class ToolRowTests: XCTestCase {
         XCTAssertEqual(toolSymbol("unknown"), "wrench")
     }
 
+    func testCoreToolFieldsWinOverTheBody() {
+        var edit = row("Edit", "Tool:\nEdit\n\nInput:\n{\"path\":\"a.ts\"}", kind: "edit")
+        edit.tool = ChatTool(id: "t", kind: "edit", status: "completed", title: "Edit file", summary: "src/a.ts",
+                             input: "{\"path\":\"src/a.ts\"}", output: "@@ -1 +1 @@\n-a\n+b", error: nil)
+        let parts = toolParts(edit)
+        XCTAssertEqual(parts.title, "Edit file")
+        XCTAssertEqual(parts.summary, "src/a.ts")
+        XCTAssertEqual(parts.output, "@@ -1 +1 @@\n-a\n+b")
+        XCTAssertTrue(toolOutputIsDiff(parts))
+        // Empty core fields fall back to the author and body.
+        edit.tool = ChatTool(id: "t", kind: "edit", status: "completed", title: "", summary: nil)
+        XCTAssertEqual(toolParts(edit).title, "Edit")
+        XCTAssertEqual(toolParts(edit).summary, "a.ts")
+    }
+
     func testGroupSummaryNamesOnlyWhatDidntFinish() {
         let rows = [row("Read", "x", kind: "read"), row("Edit", "x", kind: "edit", status: "failed"),
                     row("Search", "x", kind: "search"), row("Ran command", "x", kind: "execute")]

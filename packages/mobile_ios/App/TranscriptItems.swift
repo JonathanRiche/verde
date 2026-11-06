@@ -259,7 +259,21 @@ func toolParts(_ row: ChatRow) -> ToolParts {
 
 /// The core's parsed tool fields, where present, over the local fallback.
 private func coreToolParts(_ row: ChatRow, _ fallback: ToolParts) -> ToolParts {
-    fallback
+    guard let tool = row.tool else { return fallback }
+    func present(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
+    }
+    var parts = fallback
+    if let title = present(tool.title) { parts.title = title }
+    if let summary = present(tool.summary) { parts.summary = summary }
+    // Sections come together from one parse; mixing the core's with the fallback's could repeat one.
+    if present(tool.input) != nil || present(tool.output) != nil || present(tool.error) != nil {
+        parts.input = present(tool.input)
+        parts.output = present(tool.output)
+        parts.error = present(tool.error)
+    }
+    return parts
 }
 
 /// The text Copy puts on the pasteboard: the whole tool body.
