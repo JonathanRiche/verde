@@ -103,6 +103,14 @@ final class CompanionModel {
 
     /// The bubble badge: everything in "Needs you" plus the companion's own pending approval.
     /// Every badge (bubble, header avatar, docked row, sheet) is the core's one "needs you" count (C8).
+    /// The brain's name as the open conversation's composer resolves it; nil until it has loaded.
+    var resolvedBrainName: String?
+    /// One name for the brain on the chip, in settings and in Conversations (I6-6).
+    var brainName: String {
+        if let resolvedBrainName { return resolvedBrainName }
+        let provider = threadSummary?.provider ?? active?.provider ?? ""
+        return companionBrainName(provider: provider, models: [], model: threadSummary?.model ?? active?.model)
+    }
     var badgeCount: Int { needsYouBadge(attention: browse.state.attention, items: needsYou) }
 
     /// Changes when the companion finishes a turn (its chat went quiet with newer activity); the

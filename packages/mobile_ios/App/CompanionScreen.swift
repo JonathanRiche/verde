@@ -123,7 +123,7 @@ struct CompanionSheet: View {
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
                                       threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts,
-                                      openBrain: { brainPicker = true })
+                                      openBrain: { brainPicker = true }, brainResolved: { model.resolvedBrainName = $0 })
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
                 CompanionStarter(busy: model.creatingThread, name: active.name, voice: voice, send: { prompt in
@@ -476,6 +476,8 @@ private struct CompanionConversation: View {
     let onHosts: () -> Void
     /// The composer's brain label opens Settings → Brain.
     let openBrain: () -> Void
+    /// Reports the brain's resolved name so settings and Conversations use the same one.
+    var brainResolved: (String?) -> Void = { _ in }
     @State private var model: TranscriptModel?
     @AppStorage(CompanionVoiceStore.readAloudKey) private var readAloud = ""
 
@@ -514,10 +516,15 @@ private struct CompanionConversation: View {
         }
         .onDisappear {
             model?.setVisible(false)
-            // Leaving the companion stops listening and speaking.
+            // Leaving the companion stops listening and speaking; a mic notice ("No microphone
+            // is available.") goes with the sheet (I6-4).
             voice.cancel()
             voice.leave()
+            voice.notice = nil
         }
+        .onChange(of: model.flatMap(brainName), initial: true) { _, name in brainResolved(name) }
+        // The next message (typed or spoken) retires an old mic notice.
+        .onChange(of: model?.thread?.rows.last?.id) { _, _ in if !voice.listening { voice.notice = nil } }
     }
 
     /// The live transcript replaces the field while listening; the mic sits next to send.
@@ -527,7 +534,14 @@ private struct CompanionConversation: View {
                         level: voice.level,
                         notice: voice.listening ? nil : voice.notice,
                         trailing: AnyView(CompanionMicButton(voice: voice, name: name) { sendVoice($0, model) }),
-                        openBrain: openBrain)
+                        openBrain: openBrain, brainName: brainName(model))
+    }
+
+    private func brainName(_ model: TranscriptModel) -> String? {
+        guard let view = model.input.view else { return nil }
+        let selection = model.input.displayedSelection
+        return companionBrainName(provider: selection?.provider ?? model.thread?.thread.provider ?? "", models: view.catalogs.models,
+                                  model: selection?.model, defaultLabel: view.catalogs.default_model_label)
     }
 
     /// A transcript handed over from the bubble (or the starter) goes out as a voice turn.
@@ -562,7 +576,8 @@ private struct CompanionConversations: View {
             List {
                 if let entry, !entry.thread_id.isEmpty {
                     TitledSection("Current") {
-                        row(title: model.conversationTitle, provider: entry.provider, modelID: entry.model, detail: "Now", current: true)
+                        row(title: model.conversationTitle, provider: entry.provider, modelID: entry.model, detail: "Now", current: true,
+                            brain: model.brainName)
                     }
                 }
                 Section {
@@ -604,12 +619,12 @@ private struct CompanionConversations: View {
         .tint(VerdeTheme.accent)
     }
 
-    private func row(title: String, provider: String, modelID: String, detail: String, current: Bool) -> some View {
+    private func row(title: String, provider: String, modelID: String, detail: String, current: Bool, brain: String? = nil) -> some View {
         HStack(spacing: 10) {
             ProviderGlyph(provider: provider.isEmpty ? nil : provider)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(VerdeTheme.ui(14)).lineLimit(1)
-                Text(brainLabel(provider: providerDisplayName(provider), model: modelID, effort: nil))
+                Text(brain ?? brainLabel(provider: providerDisplayName(provider), model: modelID, effort: nil))
                     .font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle).lineLimit(1)
             }
             Spacer(minLength: 6)
@@ -746,11 +761,9 @@ struct CompanionSettings: View {
 
     /// Brain: provider, model, effort and speed on their own page.
     private var brain: some View {
-        let active = model.active
-        let label = brainLabel(provider: providerDisplayName(active?.provider ?? ""), model: active?.model, effort: nil)
         return Section {
             NavigationLink(value: CompanionSettingsPage.brain) {
-                LabeledContent("Brain", value: active?.provider.isEmpty == false ? label : "Default brain")
+                LabeledContent("Brain", value: model.brainName)
             }
             .accessibilityIdentifier("companion-brain")
         } header: { SectionTitle("Brain") } footer: {

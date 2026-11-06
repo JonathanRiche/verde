@@ -18,6 +18,14 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerCurrentChoice(.effort, value: nil, choices: [ChatChoice(id: "", label: "Default"), ChatChoice(id: "low", label: "Low")]), "")
     }
 
+    func testFileSuggestionsMatchTheQuery() {
+        let all = [ChatMention(path: "README.md", label: "README.md"), ChatMention(path: "src/reconnect.ts", label: "reconnect.ts"),
+                   ChatMention(path: "docs/CHANGELOG.md", label: "CHANGELOG.md"), ChatMention(path: "src/theme.ts", label: "theme.ts"),
+                   ChatMention(path: "tests/reconnect.test.ts", label: "reconnect.test.ts"), ChatMention(path: "src/r_e_c.ts", label: "r_e_c.ts")]
+        XCTAssertEqual(rankedMentions(all, query: "rec").map(\.label), ["reconnect.ts", "reconnect.test.ts", "r_e_c.ts"])
+        XCTAssertEqual(rankedMentions(all, query: "").count, all.count)
+    }
+
     func testLongChipLabelsAreCut() {
         XCTAssertEqual(chipDisplay("Opus 5.5", limit: 22), "Opus 5.5")
         XCTAssertEqual(chipDisplay("Opus 5.5 (1M context) preview", limit: 10), "Opus 5.5 …")

@@ -825,6 +825,13 @@ func brainLabel(provider: String, model: String?, effort: String?) -> String {
     return parts.isEmpty ? "Default brain" : parts.joined(separator: " · ")
 }
 
+/// The companion's brain as one name everywhere (I6-6): "Codex · GPT-6.1 Sol", using the
+/// composer catalog's model label when known (an unset model is the catalog's first).
+func companionBrainName(provider: String, models: [ChatChoice], model: String?, defaultLabel: String? = nil) -> String {
+    let modelName = models.isEmpty ? model : composerModelLabel(models, value: model, defaultLabel: defaultLabel)
+    return brainLabel(provider: providerDisplayName(provider), model: modelName, effort: nil)
+}
+
 /// A provider id as people know it, preferring the host's own label.
 func providerDisplayName(_ id: String, choices: [ChatChoice] = []) -> String {
     if let label = choices.first(where: { $0.id == id })?.label, !label.isEmpty { return label }

@@ -90,7 +90,9 @@ func composerSuggestions(_ token: ComposerToken, mentions: [ChatMention], slash:
     var seen = Set<String>()
     var out: [ComposerSuggestion] = []
     if token.marker == "@" {
-        for item in mentions where seen.insert(item.path).inserted {
+        // The host's search may return everything (I6-7): keep the files the query matches,
+        // substring matches first, then those whose letters appear in order.
+        for item in rankedMentions(mentions, query: token.query) where seen.insert(item.path).inserted {
             let folder = (item.path as NSString).deletingLastPathComponent
             out.append(ComposerSuggestion(id: item.path, label: item.label, value: item.path, detail: folder.isEmpty ? nil : folder, enabled: true))
         }
@@ -101,6 +103,20 @@ func composerSuggestions(_ token: ComposerToken, mentions: [ChatMention], slash:
         }
     }
     return out
+}
+
+/// Files matching `query` (case-insensitive): name or path containing it, then fuzzy matches.
+func rankedMentions(_ mentions: [ChatMention], query: String) -> [ChatMention] {
+    let q = query.lowercased()
+    guard !q.isEmpty else { return mentions }
+    func contains(_ m: ChatMention) -> Bool { m.label.lowercased().contains(q) || m.path.lowercased().contains(q) }
+    func fuzzy(_ m: ChatMention) -> Bool {
+        var rest = Substring(q)
+        for ch in m.path.lowercased() where ch == rest.first { rest = rest.dropFirst(); if rest.isEmpty { return true } }
+        return false
+    }
+    let direct = mentions.filter(contains)
+    return direct + mentions.filter { !contains($0) && fuzzy($0) }
 }
 
 /// Chips at their natural width, wrapping onto further lines when a row is full (large text).
@@ -211,6 +227,8 @@ struct CompactComposer {
     /// Set for the Companion: the brain chip is a read-only label that opens its settings, and
     /// the "+" menu keeps only attach and access.
     var openBrain: (() -> Void)? = nil
+    /// The brain's one name (I6-6); the chip shows it instead of the model alone.
+    var brainName: String? = nil
 }
 
 /// "Haiku 5.5 · Low": the model and effort as one chip label.
@@ -439,7 +457,7 @@ struct ChatComposer: View {
                 plusMenu(brainLocked: compact.openBrain != nil)
                 if model.view != nil {
                     Group {
-                        if let openBrain = compact.openBrain { brainLabelChip(openBrain) } else { settingsChip }
+                        if let openBrain = compact.openBrain { brainLabelChip(openBrain, name: compact.brainName) } else { settingsChip }
                     }
                     .frame(maxWidth: 160, alignment: .leading)
                 }
@@ -522,8 +540,8 @@ struct ChatComposer: View {
     }
 
     /// The Companion's brain, read-only here: changing it lives in Settings → Brain.
-    private func brainLabelChip(_ open: @escaping () -> Void) -> some View {
-        let label = composerChipLabel(model: selectionLabel(.model), effort: visiblePickers.contains(.effort) ? selectionLabel(.effort) : nil)
+    private func brainLabelChip(_ open: @escaping () -> Void, name: String?) -> some View {
+        let label = name ?? composerChipLabel(model: selectionLabel(.model), effort: visiblePickers.contains(.effort) ? selectionLabel(.effort) : nil)
         return Button(action: open) {
             HStack(spacing: 5) {
                 ProviderGlyph(provider: model.displayedSelection?.provider).scaleEffect(0.8)

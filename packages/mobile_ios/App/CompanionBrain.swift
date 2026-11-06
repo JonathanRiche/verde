@@ -56,8 +56,10 @@ struct CompanionBrainScreen: View {
     private var currentLabel: String {
         let catalogs = transcript?.input.view?.catalogs
         let chosen = transcript?.input.displayedSelection
-        return brainLabel(provider: providerDisplayName(currentProvider, choices: providers),
-                          model: label(catalogs?.models, chosen?.model ?? summary?.model ?? active?.model),
+        // The same model name as the composer's brain chip (I6-6).
+        let modelName = catalogs.map { composerModelLabel($0.models, value: chosen?.model, defaultLabel: $0.default_model_label) }
+            ?? label(catalogs?.models, chosen?.model ?? summary?.model ?? active?.model)
+        return brainLabel(provider: providerDisplayName(currentProvider, choices: providers), model: modelName,
                           effort: label(catalogs?.efforts, chosen?.effort))
     }
 
