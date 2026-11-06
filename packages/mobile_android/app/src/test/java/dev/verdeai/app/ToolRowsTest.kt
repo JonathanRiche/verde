@@ -25,7 +25,7 @@ class ToolRowsTest {
     @Test fun legacyRowsFallBackToAuthorAndBody() {
         val display = toolDisplay(row("Ran command", "git status\n\n M a.txt"))
         assertEquals("Ran command", display.title)
-        assertEquals("git status M a.txt", display.summary)
+        assertEquals("git status", display.summary)
         assertFalse(display.sectioned)
         assertEquals("Tool", toolDisplay(row("", "x")).title)
     }
@@ -41,9 +41,9 @@ class ToolRowsTest {
         assertTrue(display.sectioned)
         assertEquals("@@ -1 +1 @@\n-a\n+b", toolCopyText(display, r))
         assertEquals("Completed, Edit, src/a.ts", toolRowLabel(display, r))
-        // A titled row without a summary never falls back to the raw body.
+        // Without a summary: the body's first line that isn't a section label.
         val titled = r.copy(tool = r.tool!!.copy(summary = null))
-        assertNull(toolDisplay(titled).summary)
+        assertEquals("Edit `src/a.ts`", toolDisplay(titled).summary)
     }
 
     @Test fun labelsPairStatusWithTitleAndSummary() {

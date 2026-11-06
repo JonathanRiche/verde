@@ -107,11 +107,16 @@ internal fun toolDisplay(row: ChatRow): ToolDisplay {
     val tool = row.tool
     val kind = toolKind(row)
     val title = tool?.title?.takeIf { it.isNotBlank() } ?: row.author.ifBlank { "Tool" }
-    val sectioned = tool != null && (tool.input != null || tool.output != null || tool.error != null)
-    val summary = tool?.summary?.takeIf { it.isNotBlank() }
-        ?: if (sectioned || tool?.title != null) null else commandPreview(row.body, 240).ifEmpty { null }
+    val summary = tool?.summary?.takeIf { it.isNotBlank() } ?: firstBodyLine(row.body)?.takeIf { it != title }
     return ToolDisplay(kind, title, summary, tool?.input, tool?.output, tool?.error)
 }
+
+private val SECTION_LABELS = setOf("Tool:", "Input:", "Output:", "Error:", "Locations:", "Transcript:")
+
+/** The body's first meaningful line, skipping section labels ("Tool:", "Input:", …); bounded for huge bodies. */
+internal fun firstBodyLine(body: String, max: Int = 240): String? =
+    body.take(4_000).lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && it !in SECTION_LABELS }
+        ?.let { if (it.length > max) it.take(max - 1) + "…" else it }
 
 /** TalkBack: "status, title, summary". */
 internal fun toolRowLabel(display: ToolDisplay, row: ChatRow): String =
