@@ -1132,4 +1132,3 @@ func composerPromptHeight(_ requested: CGFloat, available: CGFloat, minimum: CGF
     let maximum = max(minimum, min(available * 0.6, available - 200))
     return min(maximum, max(minimum, requested))
 }
-
