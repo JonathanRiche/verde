@@ -417,7 +417,13 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     LaunchedEffect(jump?.target) {
         val id = jump?.target ?: return@LaunchedEffect
         val index = reversed.indexOfFirst { item -> item is TranscriptItem.Background && item.rows.any { it.id == id } }
-        if (index >= 0) { follow = false; list.animateScrollToItem(index) }
+        if (index >= 0) {
+            follow = false
+            list.animateScrollToItem(index)
+            // (a) Outline the task for a moment so the eye finds it, as on iOS.
+            jump.highlight = id
+            scope.launch { kotlinx.coroutines.delay(2_500); if (jump.highlight == id) jump.highlight = null }
+        }
         jump.target = null
     }
     val page = state.thread?.page
@@ -431,7 +437,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     // A2-6: "Jump to latest" takes its own strip under the transcript instead of floating over text.
     Column(Modifier.fillMaxSize()) {
     Box(Modifier.weight(1f).fillMaxWidth()) {
-        CompositionLocalProvider(LocalDisclosureAnchor provides anchor, LocalDisclosureStore provides disclosures) {
+        CompositionLocalProvider(LocalDisclosureAnchor provides anchor, LocalDisclosureStore provides disclosures, LocalTranscriptJump provides jump) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST).keepTopRowOnResize(list) { atBottom }, state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->

@@ -65,10 +65,14 @@ private fun BackgroundLine(row: ChatRow, task: ChatBackground, now: Long) {
         "failed" -> colors.error
         else -> VerdeColors.Muted
     }
-    Column(Modifier.fillMaxWidth()) {
+    // (a) Reached from the running bar: outlined for a moment, as on iOS.
+    val highlighted = LocalTranscriptJump.current?.highlight == row.id
+    val outline = if (highlighted) Modifier.border(2.dp, colors.primary, RoundedCornerShape(8.dp)) else Modifier
+    Column(Modifier.fillMaxWidth().then(outline)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = Role.Button, onClickLabel = if (disclosure.expanded) "Hide command" else "Show command") { disclosure.toggle() }
-            .nameOnly(listOfNotNull("Background command: ${task.label}", status, age).joinToString(", "),
+            // (a) TalkBack names the task by its label's first line (at most 80 characters), never the whole command.
+            .nameOnly(listOfNotNull("Background command: ${backgroundSpokenLabel(task.label)}", status, age).joinToString(", "),
                 state = if (disclosure.expanded) "Expanded" else "Collapsed")
             .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(painterResource(R.drawable.ic_tool_terminal), contentDescription = null, tint = colors.onSurfaceVariant,
@@ -113,7 +117,7 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
     val labels = tasks.joinToString(" · ") { it.label }
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).background(VerdeColors.Panel)
         .clickable(role = Role.Button, onClickLabel = "Show") { onJump(tasks.first().row_id) }
-        .nameOnly("$title: $labels").padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
+        .nameOnly("$title: " + tasks.joinToString(", ") { backgroundSpokenLabel(it.label) }).padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         RunningDot(colors.primary)
         Text(title, style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)
@@ -124,7 +128,16 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
 
 internal const val RUNNING_TASKS_BAR = "running-tasks-bar"
 
-/** A one-shot scroll request for the transcript list (by row id). */
+/** A one-shot scroll request for the transcript list (by row id), and the row it outlines afterwards. */
 internal class TranscriptJump {
     var target by mutableStateOf<String?>(null)
+    var highlight by mutableStateOf<String?>(null)
+}
+
+internal val LocalTranscriptJump = staticCompositionLocalOf<TranscriptJump?> { null }
+
+/** A task's spoken name: its label's first line, at most 80 characters. */
+internal fun backgroundSpokenLabel(label: String): String {
+    val line = label.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+    return if (line.length <= 80) line else line.take(79).trimEnd() + "…"
 }

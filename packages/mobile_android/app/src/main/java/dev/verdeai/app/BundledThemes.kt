@@ -16,8 +16,11 @@ internal data class BundledTheme(val id: String, val name: String, val colors: M
         val accent = color("accent")
         val warning = color("warning")
         val dark = background.red * .2126f + background.green * .7152f + background.blue * .0722f < .5f
+        // (b) Outlines and dividers are a neutral outline-variant: the packages' `border` is tinted
+        // with the accent (Matte Black's is orange), so cards and dividers use `border_muted`.
+        val border = if (colors.containsKey("border_muted")) color("border_muted") else color("border")
         return VerdePalette(dark = dark, Background = background, Panel = color("panel"),
-            PanelAlt = color("panel_alt"), PanelMuted = color("panel_muted"), Border = color("border"),
+            PanelAlt = color("panel_alt"), PanelMuted = color("panel_muted"), Border = border,
             Text = text, Muted = color("text_muted"), Subtle = color("text_subtle"),
             Accent = accent, AccentHi = accent, Warning = warning, Danger = color("diff_remove"),
             UserBubble = color("selection"), Assistant = color("panel"), DiffAdd = color("diff_add"),
