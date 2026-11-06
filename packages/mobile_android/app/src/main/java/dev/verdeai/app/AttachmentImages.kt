@@ -192,7 +192,7 @@ private fun AttachmentChip(row: ChatRow, a: ChatAttachment, ctx: TranscriptConte
         else -> ImageStatus.Unavailable
     }
     val file = target?.let { images.files[it.key] }
-    val label = (if (image) "Image · " else "") + basename(a.name)
+    val label = (if (image) "Image · " else "") + attachmentDisplayName(a.name)
     var viewing by remember { mutableStateOf(false) }
     Surface(color = VerdeColors.PanelAlt, shape = RoundedCornerShape(10.dp)) {
         Column(Modifier.padding(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -276,4 +276,15 @@ private fun shareImage(context: Context, file: File, mime: String) {
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         context.startActivity(Intent.createChooser(send, "Share image").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     } catch (_: Exception) { }
+}
+
+/**
+ * A6-3: what an attachment is called on screen: its file name, or "Photo" when the name is only an
+ * internal reference ("verde-attachment:<id>") or a photo picker's numeric id ("1000000025.jpg").
+ */
+internal fun attachmentDisplayName(name: String): String {
+    val base = basename(name.trim())
+    if (base.isEmpty() || base.startsWith("verde-attachment:") || name.startsWith("verde-attachment:")) return "Photo"
+    if (Regex("^\\d+(\\.(jpe?g|png|gif|webp|heic|heif))?$", RegexOption.IGNORE_CASE).matches(base)) return "Photo"
+    return base
 }

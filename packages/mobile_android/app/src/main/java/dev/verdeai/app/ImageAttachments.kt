@@ -92,7 +92,8 @@ internal object ImageAttachments {
                 if (c.moveToFirst()) c.getString(0) else null
             }
         } catch (_: Exception) { null }
-        val base = name?.substringBeforeLast('.')?.takeIf { it.isNotBlank() }?.take(80) ?: "image"
+        // The photo picker names files by a numeric id: the host gets "photo.jpg" instead (A6-3).
+        val base = name?.substringBeforeLast('.')?.takeIf { it.isNotBlank() && !it.all(Char::isDigit) }?.take(80) ?: "photo"
         return "$base.jpg"
     }
 

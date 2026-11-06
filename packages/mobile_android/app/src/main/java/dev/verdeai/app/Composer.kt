@@ -168,6 +168,9 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     }
 
     val fieldFocus = LocalComposerFocus.current ?: remember { FocusRequester() }
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val imeVisibleNow = WindowInsets.isImeVisible
+    val shellFocus = LocalShellFocus.current
     LaunchedEffect(composer.focusRequest) { if (composer.focusRequest > 0) fieldFocus.requestFocus() }
     var picker by remember { mutableStateOf<ComposerPicker?>(null) }
     val running = state.turn != null
@@ -181,7 +184,12 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
         val label = if (view?.send_operation?.state == "pending" || composer.busy) "Sending…" else sendLabel(composer.field.text, state.turn != null, kind)
         val followup = state.turn != null && composerAction(composer.field.text).let { it == ComposerAction.Prompt || it is ComposerAction.Literal }
         Box {
-            SendControl(label = label, enabled = canSend, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND),
+            SendControl(label = label, enabled = canSend, onClick = {
+                // A6-5: a send keeps the keyboard as it was: closed stays closed.
+                val keyboardWasUp = imeVisibleNow
+                composer.submit()
+                if (!keyboardWasUp) { focusManager.clearFocus(); shellFocus?.let { runCatching { it.requestFocus() } } }
+            }, modifier = Modifier.testTag(COMPOSER_SEND),
                 onLongClick = if (followup) ({ sendMenu = true }) else null)
             DropdownMenu(expanded = sendMenu, onDismissRequest = { sendMenu = false }) {
                 LiveOverMenu()
@@ -541,16 +549,23 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
             val size = a.byte_size.toLongOrNull() ?: 0L
             val uploaded = a.uploaded_bytes.toLongOrNull() ?: 0L
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                composer.imagePreviews[a.local_id]?.let { DraftImagePreview(it, a.name) }
+                // A6-4: a draft image restored without its preview (the core still has its bytes)
+                // shows a photo glyph instead of a blank square.
+                val preview = composer.imagePreviews[a.local_id]
+                if (preview != null) DraftImagePreview(preview, attachmentDisplayName(a.name))
+                else Box(Modifier.padding(end = 8.dp).size(64.dp).background(VerdeColors.PanelAlt, RoundedCornerShape(8.dp)),
+                    contentAlignment = Alignment.Center) {
+                    Icon(painterResource(R.drawable.composer_attach), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(22.dp))
+                }
                 Column(Modifier.weight(1f)) {
-                    Text("${a.name} · ${attachmentSize(size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                    Text("${attachmentDisplayName(a.name)} · ${attachmentSize(size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                     if (a.status == "uploading" || (locked && uploaded in 1 until size)) {
                         LinearProgressIndicator(progress = { if (size > 0) (uploaded.toFloat() / size).coerceIn(0f, 1f) else 0f },
-                            modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Uploading ${a.name}" })
+                            modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Uploading ${attachmentDisplayName(a.name)}" })
                     }
                     composerError(a.error)?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                 }
-                if (!locked) IconButton(onClick = { composer.detach(a.local_id) }) { Icon(Icons.Filled.Close, contentDescription = "Remove ${a.name}") }
+                if (!locked) IconButton(onClick = { composer.detach(a.local_id) }) { Icon(Icons.Filled.Close, contentDescription = "Remove ${attachmentDisplayName(a.name)}") }
             }
         }
     }
@@ -615,16 +630,23 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
 
     val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
-    data class Chip(val name: String, val value: String, val provider: String?, val icon: Int?, val fill: Float, val picker: ComposerPicker, val iconOnly: Int)
+    // A6-6: labels first. A chip shortens its label at level 1 ("Full", "Std", "Med"), and goes
+    // icon-only only at its own later level: speed, then a "Default" effort, then access, then effort.
+    data class Chip(val name: String, val value: String, val short: String, val provider: String?, val icon: Int?, val fill: Float,
+        val picker: ComposerPicker, val iconOnly: Int)
+    val effortValue = effortValueLabel(c, s)
+    val accessValue = accessChipLabel(c.access, s.access)
+    val speedValue = composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Normal"
     val chips = buildList {
-        if (fresh) add(Chip("Provider", providerLabel, provider, null, 1f, ComposerPicker.Provider, Int.MAX_VALUE))
-        add(Chip("Model", modelValueLabel(c, s), provider, null, 1f, ComposerPicker.Model, Int.MAX_VALUE))
-        if (c.efforts.isNotEmpty()) add(Chip("Effort", effortValueLabel(c, s), null, R.drawable.composer_reasoning,
-            (c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size, ComposerPicker.Effort, 3))
-        if (c.access.isNotEmpty()) add(Chip("Access", accessChipLabel(c.access, s.access), null,
-            if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked, 1f, ComposerPicker.Access, 2))
-        if (c.speeds.size > 1) add(Chip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Normal", null,
-            if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard, 1f, ComposerPicker.Speed, 1))
+        if (fresh) add(Chip("Provider", providerLabel, providerLabel, provider, null, 1f, ComposerPicker.Provider, Int.MAX_VALUE))
+        add(Chip("Model", modelValueLabel(c, s), modelValueLabel(c, s), provider, null, 1f, ComposerPicker.Model, Int.MAX_VALUE))
+        if (c.efforts.isNotEmpty()) add(Chip("Effort", effortValue, shortChipLabel(effortValue), null, R.drawable.composer_reasoning,
+            (c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size, ComposerPicker.Effort,
+            if (isDefaultChoice(s.effort) && c.default_effort_label.isNullOrBlank()) 3 else 5))
+        if (c.access.isNotEmpty()) add(Chip("Access", accessValue, shortChipLabel(accessValue), null,
+            if (accessIsFull(c.access, s.access)) R.drawable.composer_unlocked else R.drawable.composer_locked, 1f, ComposerPicker.Access, 4))
+        if (c.speeds.size > 1) add(Chip("Speed", speedValue, shortChipLabel(speedValue), null,
+            if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard, 1f, ComposerPicker.Speed, 2))
     }
     val large = LocalDensity.current.fontScale > 1.15f
     if (large) {
@@ -636,28 +658,38 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
         }
         return
     }
-    // S18: one row at default text size. When the values don't all fit, speed, then access, then
-    // effort show only their icon (TalkBack still reads the value); past that the row scrolls.
+    // S18: one row at default text size; past the last level the row scrolls sideways.
     val measurer = androidx.compose.ui.text.rememberTextMeasurer()
     val labelStyle = MaterialTheme.typography.labelMedium
     val density = LocalDensity.current
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        // Icon-only chips keep their 48dp target; labelled ones measure their text.
-        fun width(chip: Chip, iconOnly: Boolean): Dp = if (iconOnly) 48.dp else
-            with(density) { measurer.measure(chip.value, labelStyle).size.width.toDp() } + CHIP_CHROME
-        val available = maxWidth - (if (leading != null) 52.dp else 0.dp)
-        val level = (0..3).firstOrNull { lvl -> chips.sumOf { width(it, it.iconOnly <= lvl).value.toDouble() } + chips.size * 4 <= available.value } ?: 3
+        fun label(chip: Chip, level: Int) = if (level >= 1) chip.short else chip.value
+        fun width(chip: Chip, level: Int): Float = if (chip.iconOnly <= level) 48f else
+            with(density) { measurer.measure(label(chip, level), labelStyle).size.width.toDp().value } + CHIP_CHROME.value
+        val available = (maxWidth - (if (leading != null) 52.dp else 0.dp)).value
+        val level = (0..5).firstOrNull { lvl -> chips.sumOf { width(it, lvl).toDouble() } + chips.size * 4 <= available } ?: 5
         val scroll = rememberScrollState()
         Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll),
             horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
             leading?.invoke()
-            chips.forEach { SettingChip(it.name, it.value, it.provider, it.icon, it.fill, iconOnly = it.iconOnly <= level) { open(it.picker) } }
+            chips.forEach {
+                SettingChip(it.name, it.value, it.provider, it.icon, it.fill, iconOnly = it.iconOnly <= level, shown = label(it, level)) { open(it.picker) }
+            }
         }
     }
 }
 
+/** A6-6: the short chip form of a value: "Full access" → "Full", "Normal" → "Std", "Medium" → "Med". */
+internal fun shortChipLabel(value: String): String = when (value) {
+    "Full access" -> "Full"
+    "Normal", "Standard" -> "Std"
+    "Medium" -> "Med"
+    "Xhigh" -> "XHigh"
+    else -> value
+}
+
 /** A compact chip's padding, icon and gap around its label. */
-private val CHIP_CHROME = 36.dp
+private val CHIP_CHROME = 34.dp
 
 /**
  * The wide-window composer's single row: attach, the settings chips, then send. The model chip takes
@@ -696,6 +728,8 @@ internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?,
 @Composable
 private fun SettingChip(name: String, value: String, provider: String? = null,
     icon: Int? = null, fill: Float = 1f, compact: Boolean = false, iconOnly: Boolean = false,
+    /** The label to draw (a short form of [value]); TalkBack always reads [value]. */
+    shown: String = value,
     modifier: Modifier = Modifier, maxWidth: Dp = 220.dp, onClick: () -> Unit) {
     val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
@@ -713,10 +747,10 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
     // A 32dp chip inside a 48dp target; icon-only when the row is short of room (S18).
     Surface(onClick = onClick, shape = RoundedCornerShape(14.dp), color = VerdeColors.PanelAlt, contentColor = VerdeColors.Muted,
         modifier = controlModifier.widthIn(max = maxWidth)) {
-        Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 8.dp, end = if (iconOnly) 12.dp else 10.dp),
+        Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 7.dp, end = if (iconOnly) 12.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             leading?.invoke()
-            if (!iconOnly) Text(value, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (!iconOnly) Text(shown, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
