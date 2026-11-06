@@ -267,6 +267,9 @@ struct FileViewer: View {
             else if let blocks = model.blocks, !source { ScrollView { MarkdownBlocks(blocks: blocks, source: model).padding() } }
             else if lineSelection != nil, let split = model.split() { SelectableFileText(split: split, target: citeLines) }
             else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
+            // Before the first load starts nothing above applies. An empty Group would drop this
+            // page's title and `.task`, so a pushed viewer stayed blank and never loaded.
+            else { ProgressView("Loading file…") }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).background(VerdeTheme.background)
         .safeAreaInset(edge: .top, spacing: 0) {
