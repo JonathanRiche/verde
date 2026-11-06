@@ -184,10 +184,11 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                     SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
                     SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
                 }
-            } else Row {
-                DrawerRow("Home", currentTab == Routes.HOME, Modifier.weight(1f)) { onTab(Routes.HOME) }
-                DrawerRow("Workspaces", currentTab == Routes.WORKSPACES, Modifier.weight(1f)) { onTab(Routes.WORKSPACES) }
-                DrawerRow("Hosts", currentTab == Routes.HOSTS, Modifier.weight(1f)) { onTab(Routes.HOSTS) }
+            } else Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                // Content-sized tabs: "Workspaces" never truncates (equal weights cut it to "Workspa…").
+                SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
+                SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
+                SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
             }
         } else Spacer(Modifier.fillMaxHeight())
     }
@@ -200,7 +201,7 @@ private fun SidebarTab(label: String, active: Boolean, onClick: () -> Unit) {
     Text(label, Modifier.padding(vertical = 4.dp).clip(RoundedCornerShape(7.dp))
         .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
         .semantics { selected = active }.clickable(role = Role.Tab, onClick = onClick)
-        .heightIn(min = 40.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 10.dp),
+        .heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 12.dp),
         color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.bodyMedium, maxLines = 1, softWrap = false)
 }
 
@@ -286,7 +287,9 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
         } },
         trailingContent = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
-            StatusPip(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), active = activeStatus(thread.status))
+            // S7: done and idle chats carry no dot; the others pair theirs with a label.
+            if (rowState(thread.status, false) != RowState.Quiet)
+                StatusPip(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), active = activeStatus(thread.status))
         } },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))

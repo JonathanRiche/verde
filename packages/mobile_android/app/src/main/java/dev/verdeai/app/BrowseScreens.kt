@@ -24,6 +24,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.withStyle
 import dev.verdeai.core.*
 import kotlinx.coroutines.delay
 
@@ -191,15 +193,20 @@ private fun MenuRow(
     menu: List<Pair<String, () -> Unit>>,
     leading: (@Composable () -> Unit)? = null,
     badge: String? = null,
+    styledSupporting: AnnotatedString? = null,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         VerdeListRow(
-            headlineContent = { Text(headline, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            supportingContent = supporting?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis) } },
+            // S7: 16sp titles that take a second line rather than cut off; 13sp "workspace · state · age".
+            headlineContent = { Text(headline, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_TITLE) },
+            supportingContent = (styledSupporting ?: supporting?.let(::AnnotatedString))?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_SUBTITLE) } },
             leadingContent = leading,
             trailingContent = badge?.let { { AttentionBadge(it) } },
-            modifier = Modifier.fillMaxWidth().combinedClickable(
+            // S4: one TalkBack stop that reads "title, subtitle".
+            modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
+                contentDescription = listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '), badge).joinToString(", ")
+            }.combinedClickable(
                 enabled = enabled || menu.isNotEmpty(),
                 onClickLabel = "Open", onLongClickLabel = "More actions",
                 onClick = { if (enabled) onOpen() else if (menu.isNotEmpty()) expanded = true },
@@ -225,8 +232,40 @@ private fun paneProvider(state: BrowseState, pane: Pane): String? =
     state.workspaces?.items?.find { it.workspace_id == pane.workspace_id }
         ?.let(::workspaceThreads)?.find { it.thread_id == pane.thread_id }?.provider
 
-/** Glyph plus two dots: titles line up whether or not a row has the git dot. */
-private val HOME_LEADING_WIDTH = 49.dp
+/** Provider glyph plus the git dot: titles line up whether or not a row has the dot. */
+private val HOME_LEADING_WIDTH = 34.dp
+private val ROW_TITLE = androidx.compose.ui.text.TextStyle(fontFamily = VerdeSans, fontSize = 16.sp, lineHeight = 22.sp)
+private val ROW_SUBTITLE = androidx.compose.ui.text.TextStyle(fontFamily = VerdeSans, fontSize = 13.sp, lineHeight = 18.sp)
+
+/** S7 state colour: working = accent, needs you / waiting = amber, failed = error; done and idle say nothing. */
+internal enum class RowState { Working, NeedsYou, Failed, Quiet }
+
+internal fun rowState(status: String, attention: Boolean): RowState = when {
+    status == "failed" -> RowState.Failed
+    attention || status == "waiting_approval" || status == "waiting" -> RowState.NeedsYou
+    status in setOf("working", "running", "accepted") -> RowState.Working
+    else -> RowState.Quiet
+}
+
+/** "workspace · state · age", leaving out empty parts (no dangling separators); the state is coloured. */
+@Composable
+private fun stateLine(parts: List<String?>, state: String?, kind: RowState): AnnotatedString {
+    val colors = MaterialTheme.colorScheme
+    val tint = when (kind) { RowState.Working -> colors.primary; RowState.NeedsYou -> colors.tertiary; RowState.Failed -> colors.error; RowState.Quiet -> null }
+    return androidx.compose.ui.text.buildAnnotatedString {
+        val shown = parts.filterNotNull().filter { it.isNotBlank() }
+        shown.forEachIndexed { i, part ->
+            if (i > 0) append(" · ")
+            if (part == state && tint != null) withStyle(androidx.compose.ui.text.SpanStyle(color = tint)) { append(part) } else append(part)
+        }
+    }
+}
+
+/** Working rows spin; everything else has no dot (the coloured state text carries it). */
+@Composable
+private fun RowStateMark(kind: RowState) {
+    if (kind == RowState.Working) CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = MaterialTheme.colorScheme.primary)
+}
 
 @Composable
 private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: String? = null) {
@@ -236,10 +275,16 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
         if (canOpen) add("Open" to { onOpen(pane) })
         add("Copy title" to { clipboard.setText(AnnotatedString(pane.title)) })
     }
+    val kind = rowState(pane.status, pane.attention)
+    val kindLabel = when (pane.kind) { "terminal" -> "Terminal"; "browser" -> "Browser"; else -> "Chat" }
+    val timer = pane.started_at_ms?.takeIf { pane.can_stop }?.let { elapsedLabel(it, now) }
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
-        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (pane.kind == "chat") ProviderGlyph(provider) else if (pane.provider != null) ProviderGlyph(pane.provider)
-            Dot(statusColor(pane.status, pane.attention), paneLabel(pane), activeStatus(pane.status))
+        styledSupporting = stateLine(listOf(kindLabel, paneLabel(pane), timer), paneLabel(pane), kind),
+        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            val glyph = Modifier.size(20.dp)
+            if (pane.kind == "chat") ProviderGlyph(provider, glyph) else if (pane.provider != null) ProviderGlyph(pane.provider, glyph)
+            else Spacer(glyph)
+            RowStateMark(kind)
         } },
         badge = attentionLabel(pane.attention_kind))
 }
@@ -247,14 +292,16 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
 @Composable
 private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?, onOpen: (ThreadSummary) -> Unit) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    val parts = listOfNotNull(workspaceLabel, statusLabel(thread.status).takeIf { thread.status != "idle" },
-        thread.last_activity_at_ms?.let { agoLabel(it, now) })
-    MenuRow(thread.title, parts.joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
+    val kind = rowState(thread.status, false)
+    val state = statusLabel(thread.status).takeIf { thread.status !in setOf("idle", "completed") }
+    val parts = listOf(workspaceLabel, state, thread.last_activity_at_ms?.let { agoLabel(it, now) })
+    MenuRow(thread.title, parts.filterNotNull().joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
-        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            ProviderGlyph(thread.provider)
+        styledSupporting = stateLine(parts, state, kind).takeIf { it.isNotEmpty() },
+        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            ProviderGlyph(thread.provider, Modifier.size(20.dp))
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
-            Dot(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), activeStatus(thread.status))
+            RowStateMark(kind)
         } })
 }
 
@@ -367,6 +414,7 @@ internal fun HomeScreen(
     val hidden = LocalHiddenThreads.current
     val panes = state.home?.items.orEmpty()
     val now = rememberNow(panes.any { it.can_stop && it.started_at_ms != null })
+    val docked = LocalWindowTier.current.docked
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
@@ -382,7 +430,11 @@ internal fun HomeScreen(
             }
             if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
-            val recent = recentThreads(state.workspaces, hidden = hidden)
+            // Beside the docked sidebar (foldable, tablet) the chats are already listed there: no second copy.
+            val recent = if (docked) emptyList() else recentThreads(state.workspaces, hidden = hidden)
+            if (docked && onHistory != null) item(key = "history") {
+                TextButton(onClick = onHistory, modifier = Modifier.padding(horizontal = 8.dp)) { Text("All chats") }
+            }
             if (recent.isNotEmpty()) {
                 header("Recent chats")
                 items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) { ThreadItem(it, now, labels[it.workspace_id], onOpenThread) }
@@ -420,7 +472,6 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
     MenuRow(workspace.label, listOf(summary, workspace.path).filter { it.isNotEmpty() }.joinToString("\n"), true,
         { onOpen(workspace.workspace_id) },
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
-        leading = { Dot(if (active > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline, if (active > 0) "Active" else "Idle") },
         badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} attention" })
 }
 
