@@ -160,8 +160,9 @@ internal fun SidebarRail(onExpand: () -> Unit, onNewChat: () -> Unit, dock: (@Co
 }
 
 /**
- * One transcript item. Reading text stops at [TRANSCRIPT_TEXT_MAX_WIDTH]; diffs and tool output use
- * the pane. One call path at every width keeps each row's saved expansion across a fold.
+ * One transcript item. S17: on wide windows the transcript stops at [TRANSCRIPT_TEXT_MAX_WIDTH], centred
+ * (tool rows included); only diffs use the pane. One call path at every width keeps each
+ * row's saved expansion across a fold.
  */
 @Composable
 internal fun TranscriptItemFrame(item: TranscriptItem, content: @Composable () -> Unit) {
@@ -170,5 +171,4 @@ internal fun TranscriptItemFrame(item: TranscriptItem, content: @Composable () -
         .widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH).fillMaxWidth() else Modifier.fillMaxWidth()) { content() }
 }
 
-internal fun transcriptItemGoesWide(item: TranscriptItem): Boolean =
-    item is TranscriptItem.Diff || item is TranscriptItem.Tool || item is TranscriptItem.ToolGroup
+internal fun transcriptItemGoesWide(item: TranscriptItem): Boolean = item is TranscriptItem.Diff

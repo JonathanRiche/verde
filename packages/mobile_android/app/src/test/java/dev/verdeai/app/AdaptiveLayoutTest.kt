@@ -173,13 +173,13 @@ class AdaptiveLayoutTest {
         }
     }
 
-    @Test fun transcriptTextIsCappedButDiffsAndToolsGoWide() {
+    @Test fun transcriptTextAndToolsAreCappedButDiffsGoWide() {
         val message = TranscriptItem.Message(ChatRow("m", "assistant", body = "hello"))
         val diff = TranscriptItem.Diff(ChatRow("d", "tool", kind = "diff", body = "@@"))
         val tool = TranscriptItem.Tool(ChatRow("t", "tool", kind = "tool", body = "ls"))
         assertFalse(transcriptItemGoesWide(message))
         assertTrue(transcriptItemGoesWide(diff))
-        assertTrue(transcriptItemGoesWide(tool))
+        assertFalse(transcriptItemGoesWide(tool))
         compose.setContent {
             CompositionLocalProvider(LocalWindowTier provides WindowTier.ThreePane) {
                 Box(Modifier.requiredWidth(1200.dp)) {
