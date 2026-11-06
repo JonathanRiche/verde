@@ -8,8 +8,11 @@ import UIKit
 /// there is none (the simulator, some routes), so callers check this first.
 func microphoneAvailable() -> Bool {
     let audio = AVAudioSession.sharedInstance()
-    guard audio.isInputAvailable else { return false }
-    return !audio.currentRoute.inputs.isEmpty || !(audio.availableInputs ?? []).isEmpty
+    guard audio.isInputAvailable, audio.inputNumberOfChannels > 0 else { return false }
+    guard !audio.currentRoute.inputs.isEmpty || !(audio.availableInputs ?? []).isEmpty else { return false }
+    // The simulator reports an input route even when its host has no microphone, and the IO unit
+    // then times out and aborts; a capture device only exists when there is one to record from.
+    return AVCaptureDevice.default(for: .audio) != nil
 }
 
 /*
