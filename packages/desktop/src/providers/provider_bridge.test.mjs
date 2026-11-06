@@ -207,6 +207,33 @@ test('a steer is still accepted when backgrounding fails', { timeout: 2000 }, as
   } }, { prompt: 'test' });
 });
 
+test('a turn cut by back-to-back steers is not a failure', { timeout: 2000 }, async () => {
+  const { context, events } = bridge();
+  const preempted = { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null'] };
+  await context.handleClaudeSendPrompt({ async *query({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield state('running');
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 5, prompt: 'child A finished' }));
+    context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 6, prompt: 'child B finished' }));
+    yield { type: 'result', subtype: 'success', result: '' };
+    yield preempted;
+    yield { type: 'result', subtype: 'success', result: 'both children are done' };
+    yield state('idle');
+  } }, { prompt: 'test' });
+  assert.equal(events.at(-1).type, 'result');
+  assert.equal(events.at(-1).reply_text, 'both children are done');
+});
+
+test('a diagnostic-only error with no steer still fails the turn', { timeout: 2000 }, async () => {
+  const { context } = bridge();
+  await assert.rejects(context.handleClaudeSendPrompt({ async *query({ prompt }) {
+    const input = prompt[Symbol.asyncIterator]();
+    await input.next();
+    yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null'] };
+  } }, { prompt: 'test' }), /ede_diagnostic/);
+});
+
 test('Claude is asked to report session state', () => {
   const { context } = bridge();
   assert.equal(context.buildClaudeOptions({}).env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1');

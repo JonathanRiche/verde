@@ -195,6 +195,14 @@ function buildClaudePrompt(request) {
   return lines.join("\n");
 }
 
+// The steer that cuts the turn may have been accepted before the previous
+// result, so any steer in this run qualifies; a diagnostic-only error in a run
+// that was never steered is still a failure.
+function claudePreemptedBySteer(message, errors, steerCount) {
+  if (message?.subtype !== "error_during_execution" || steerCount === 0) return false;
+  return errors.length > 0 && errors.every((item) => item.startsWith("[ede_diagnostic]"));
+}
+
 function claudeUserMessage(prompt, priority) {
   return {
     type: "user",
@@ -1476,6 +1484,12 @@ async function handleClaudeSendPrompt(sdk, request) {
         sessionId = message.session_id ?? sessionId;
         if (message.is_error) {
           const errors = Array.isArray(message.errors) ? message.errors.filter((item) => typeof item === "string" && item.length > 0) : [];
+          // A `now` steer that lands before Claude answers the previous one
+          // (child completions often arrive together) cuts a turn that ends
+          // on a user message. Claude Code reports that as
+          // error_during_execution with only an `[ede_diagnostic]` line, then
+          // carries on with the steers, so it is not a failure of this run.
+          if (claudePreemptedBySteer(message, errors, promptChannel.generation)) continue;
           const detail = errors.join("\n") || (typeof message.result === "string" ? message.result.trim() : "");
           throw new Error(detail || "Claude request failed during execution.");
         }
