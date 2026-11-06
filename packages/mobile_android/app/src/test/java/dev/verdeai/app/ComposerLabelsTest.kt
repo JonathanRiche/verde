@@ -75,4 +75,10 @@ class ComposerLabelsTest {
         assertEquals("Supervised", pickerRowLabel(ComposerPicker.Access, ChatChoice("supervised", "Supervised")))
         assertEquals("Standard", speedLabel(null))
     }
+
+    /** The host takes 16 attachments per turn (MAX_ATTACHMENTS_PER_TURN); 16 bounded images stay far under its 256 MB. */
+    @Test fun sixteenImagesPerMessage() {
+        assertEquals(16, ComposerModel.MAX_IMAGES)
+        assertTrue(ComposerModel.MAX_IMAGES.toLong() * ComposerModel.MAX_IMAGE_BYTES < 256L * 1024 * 1024)
+    }
 }

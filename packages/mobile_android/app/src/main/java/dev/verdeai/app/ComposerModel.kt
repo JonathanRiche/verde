@@ -505,7 +505,7 @@ internal class ComposerModel(
      * New images go to the core with bytes; the draft's existing ones by reference. One `draft_set`
      * per image keeps each event's base64 inside the core's 1 MiB input.
      */
-    fun attach(images: List<PickedImage>, rejected: Int = 0) = action {
+    fun attach(images: List<PickedImage>, rejected: Int = 0, overflow: Int = 0) = action {
         if (!flush()) return@action
         var existing = references()
         val room = MAX_IMAGES - existing.size
@@ -522,7 +522,7 @@ internal class ComposerModel(
         }
         notice = when {
             rejected > 0 -> if (accepted.isEmpty()) "Couldn't attach that file. Pick a photo or an image file." else "Some files weren't images, so they weren't attached."
-            accepted.size < images.size -> "Up to $MAX_IMAGES images per message."
+            accepted.size < images.size || overflow > 0 -> "Up to $MAX_IMAGES images per message."
             else -> null
         }
     }
@@ -558,7 +558,12 @@ internal class ComposerModel(
         const val SLASH_WAIT_MS = 5_000L
         const val ASK_WAIT_MS = 15_000L
         const val OUTCOME_WAIT_MS = 30_000L
-        const val MAX_IMAGES = 4
+        /**
+         * Images per message: the host's own limit, MAX_ATTACHMENTS_PER_TURN = 16 in
+         * packages/headless/src/attachment_protocol.zig. Uploads stay bounded: at most
+         * [MAX_IMAGE_BYTES] each (16 × 700 KiB ≈ 11 MiB, well under the host's 256 MB pending per turn).
+         */
+        const val MAX_IMAGES = 16
         const val MAX_SENT_PREVIEWS = 8
         /**
          * Per image after re-encoding. Its base64 must fit one core event (1 MiB) with the draft

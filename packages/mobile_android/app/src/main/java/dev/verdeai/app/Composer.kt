@@ -26,6 +26,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.key
@@ -146,9 +148,11 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     }
 
     fun add(uris: List<Uri>, camera: Boolean = false) = scope.launch {
-        val prepared = ImageAttachments.prepare(context, uris)
+        // Never decode more than a message can carry (the file picker has no count limit).
+        val picked = uris.take(ComposerModel.MAX_IMAGES)
+        val prepared = ImageAttachments.prepare(context, picked)
         if (camera) ImageAttachments.clearCamera(context)
-        composer.attach(prepared.images, prepared.rejected)
+        composer.attach(prepared.images, prepared.rejected, overflow = uris.size - picked.size)
     }
     val photos = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(ComposerModel.MAX_IMAGES)) { if (it.isNotEmpty()) add(it) }
     val files = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { if (it.isNotEmpty()) add(it) }
@@ -544,32 +548,50 @@ private fun Suggestions(composer: ComposerModel, view: ChatComposerView?) {
 
 @Composable
 private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: ComposerModel) {
+    // Up to 16 images (the host's limit): one horizontally scrolling strip of thumbnails, each with
+    // its own remove button and upload progress, so the composer never grows a row per image.
+    val scroll = rememberScrollState()
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        for (a in items) {
-            val size = a.byte_size.toLongOrNull() ?: 0L
-            val uploaded = a.uploaded_bytes.toLongOrNull() ?: 0L
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                // A6-4: a draft image restored without its preview (the core still has its bytes)
-                // shows a photo glyph instead of a blank square.
-                val preview = composer.imagePreviews[a.local_id]
-                if (preview != null) DraftImagePreview(preview, attachmentDisplayName(a.name))
-                else Box(Modifier.padding(end = 8.dp).size(64.dp).background(VerdeColors.PanelAlt, RoundedCornerShape(8.dp)),
-                    contentAlignment = Alignment.Center) {
-                    Icon(painterResource(R.drawable.composer_attach), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(22.dp))
-                }
-                Column(Modifier.weight(1f)) {
-                    Text("${attachmentDisplayName(a.name)} · ${attachmentSize(size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+        Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).testTag(COMPOSER_ATTACHMENTS),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            for (a in items) key(a.local_id) {
+                val name = attachmentDisplayName(a.name)
+                val size = a.byte_size.toLongOrNull() ?: 0L
+                val uploaded = a.uploaded_bytes.toLongOrNull() ?: 0L
+                Column(Modifier.width(72.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Box(Modifier.size(72.dp)) {
+                        val tile = Modifier.align(Alignment.BottomStart).size(64.dp).clip(RoundedCornerShape(8.dp))
+                        // A6-4: a draft image restored without its preview (the core still has its
+                        // bytes) shows a photo glyph instead of a blank square.
+                        val preview = composer.imagePreviews[a.local_id]
+                        if (preview != null) DraftImagePreview(preview, "$name, ${attachmentSize(size)}", tile)
+                        else Box(tile.background(VerdeColors.PanelAlt).semantics { contentDescription = "$name, ${attachmentSize(size)}" },
+                            contentAlignment = Alignment.Center) {
+                            Icon(painterResource(R.drawable.composer_attach), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(22.dp))
+                        }
+                        if (!locked) Box(Modifier.align(Alignment.TopEnd).offset(x = 12.dp, y = (-12).dp).size(48.dp)
+                            .clickable(role = androidx.compose.ui.semantics.Role.Button) { composer.detach(a.local_id) }.nameOnly("Remove $name"),
+                            contentAlignment = Alignment.Center) {
+                            Box(Modifier.size(22.dp).background(VerdeColors.Panel, CircleShape).border(1.dp, VerdeColors.Border, CircleShape),
+                                contentAlignment = Alignment.Center) {
+                                Icon(Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Text, modifier = Modifier.size(14.dp))
+                            }
+                        }
+                    }
                     if (a.status == "uploading" || (locked && uploaded in 1 until size)) {
                         LinearProgressIndicator(progress = { if (size > 0) (uploaded.toFloat() / size).coerceIn(0f, 1f) else 0f },
-                            modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Uploading ${attachmentDisplayName(a.name)}" })
+                            modifier = Modifier.width(64.dp).semantics { contentDescription = "Uploading $name" })
                     }
-                    composerError(a.error)?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                 }
-                if (!locked) IconButton(onClick = { composer.detach(a.local_id) }, modifier = Modifier.named("Remove ${attachmentDisplayName(a.name)}")) { Icon(Icons.Filled.Close, contentDescription = null) }
             }
+        }
+        for (a in items) composerError(a.error)?.let {
+            Text("${attachmentDisplayName(a.name)}: $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
+
+internal const val COMPOSER_ATTACHMENTS = "composer-attachments"
 
 internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: id?.takeIf { it.isNotEmpty() }
 

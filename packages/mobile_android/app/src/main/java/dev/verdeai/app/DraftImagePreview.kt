@@ -16,14 +16,14 @@ import kotlinx.coroutines.withContext
 
 /** Already-bounded draft JPEG bytes only; no network, disk cache, or public URI. */
 @Composable
-internal fun DraftImagePreview(bytes: ByteArray, name: String) {
+internal fun DraftImagePreview(bytes: ByteArray, name: String, modifier: Modifier = Modifier.size(64.dp).padding(end = 8.dp)) {
     val bitmap by produceState<android.graphics.Bitmap?>(null, bytes) {
         value = withContext(Dispatchers.Default) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
     }
     val decoded = bitmap ?: return
     var expanded by remember { mutableStateOf(false) }
     Image(decoded.asImageBitmap(), "Preview $name", contentScale = ContentScale.Crop,
-        modifier = Modifier.size(64.dp).padding(end = 8.dp).clickable { expanded = true })
+        modifier = modifier.clickable { expanded = true })
     if (expanded) Dialog(onDismissRequest = { expanded = false }) {
         LiveOverModal()
         Surface(shape = MaterialTheme.shapes.large, color = VerdeColors.Panel) {
