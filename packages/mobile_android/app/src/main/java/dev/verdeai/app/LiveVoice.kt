@@ -207,6 +207,7 @@ internal class LiveVoice(
     fun start() {
         if (ui.value.active) return
         mutableUi.value = LiveUi(phase = LivePhase.Connecting)
+        connectingSince = System.currentTimeMillis()
         val name = companion.state.value.active?.name.orEmpty()
         val record = LiveTranscript(assistantAuthor = liveAssistantAuthor(name))
         transcript = record
@@ -319,7 +320,18 @@ internal class LiveVoice(
 
     fun dismissError() { if (ui.value.phase == LivePhase.Failed) mutableUi.value = LiveUi() }
 
-    private fun fail(code: String?) { mutableUi.update { it.copy(phase = LivePhase.Failed, error = liveError(code), errorCode = code) } }
+    /**
+     * A8-4: one state at a time. A start that fails at once (no key, offline) still shows
+     * "Connecting…" briefly on its own, then the failure replaces it; never both together.
+     */
+    private suspend fun fail(code: String?) {
+        if (ui.value.phase == LivePhase.Connecting) {
+            val shown = System.currentTimeMillis() - connectingSince
+            if (shown < MIN_CONNECTING_MS) delay(MIN_CONNECTING_MS - shown)
+        }
+        mutableUi.update { it.copy(phase = LivePhase.Failed, error = liveError(code), errorCode = code) }
+    }
+    private var connectingSince = 0L
 
     private suspend fun createSession(): VoiceSession? {
         val sent = dispatch { n, w, id -> EventVoiceSessionCreate(now_ms = n, wall_time_ms = w, intent_id = id,
@@ -530,6 +542,8 @@ internal class LiveVoice(
         private const val TAG = "VerdeLive"
         const val MAX_RECONNECTS = 3
         const val SESSION_WAIT_MS = 50_000L
+        /** A8-4: "Connecting…" stays up at least this long before a failure replaces it. */
+        const val MIN_CONNECTING_MS = 700L
         const val APPROVAL_WAIT_MS = 15_000L
         const val ASK_WAIT_MS = 30 * 60_000L
         const val SAVE_WAIT_MS = 60_000L

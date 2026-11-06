@@ -165,6 +165,8 @@ internal fun CompanionSheet(
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
     val liveUi = live?.ui?.collectAsState()?.value
+    // A8-4: one state at a time: starting Live (or its failure card) replaces a dictation notice.
+    LaunchedEffect(liveUi?.phase) { if (liveUi != null && liveUi.phase != LivePhase.Off) transcript?.composer?.clearNotice() }
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
@@ -531,7 +533,12 @@ private fun MicButton(voice: CompanionVoice, model: TranscriptModel, name: Strin
     val currentSpeaking by rememberUpdatedState(speaking)
     val listening = talk !is TalkState.Idle
     // Recognition problems surface where the user is looking: the composer's notice line.
-    LaunchedEffect(error) { error?.let { model.composer.showNotice(it); voice.clearError() } }
+    var voiceNotice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(error) { error?.let { model.composer.showNotice(it); voiceNotice = it; voice.clearError() } }
+    // A8-4: a recognition hiccup clears on the next press and when the sheet closes.
+    LaunchedEffect(talk) { if (talk !is TalkState.Idle) voiceNotice?.let { model.composer.clearNotice(it); voiceNotice = null } }
+    val noticeNow by rememberUpdatedState(voiceNotice)
+    DisposableEffect(model) { onDispose { noticeNow?.let { model.composer.clearNotice(it) } } }
     if (talk is TalkState.Listening) IconButton(onClick = voice::cancel, modifier = Modifier.named("Cancel recording")) {
         Icon(Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Muted)
     }

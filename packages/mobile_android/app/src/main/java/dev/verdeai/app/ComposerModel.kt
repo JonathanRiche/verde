@@ -534,6 +534,9 @@ internal class ComposerModel(
 
     fun showNotice(text: String) { notice = text }
 
+    /** A8-4: a transient notice (a voice hiccup) goes with the next action or when its sheet closes. */
+    fun clearNotice(text: String? = null) { if (text == null || notice == text) notice = null }
+
     fun retryFollowup(f: ChatFollowup) = action {
         fail(chat.dispatch { id, n, w -> EventFollowupRetry(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, followup_id=f.id) })
     }
