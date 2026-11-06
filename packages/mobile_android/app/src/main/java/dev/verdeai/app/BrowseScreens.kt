@@ -116,11 +116,40 @@ internal fun hiddenPane(pane: Pane, hidden: Set<String>) = pane.kind == "chat" &
 
 /** Use the live catalog: history belongs to the independently filtered, paged search screen. */
 internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8, hidden: Set<String> = emptySet()): List<ThreadSummary> =
-    workspaces?.items.orEmpty().flatMap { it.threads }
+    // S14: chats of closed workspaces aren't "recent".
+    workspaces?.items.orEmpty().filter { it.open }.flatMap { it.threads }
         .filter { !it.archived && listed(it) && it.thread_id !in hidden }
         .sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }
             .thenBy { it.workspace_id }.thenBy { it.thread_id })
         .take(limit)
+
+/**
+ * S14: workspace names as lists show them. A name several workspaces share gets the parent folder
+ * that tells them apart ("scripts · …/demo"); identical paths get a number.
+ */
+internal fun workspaceLabels(items: List<Workspace>): Map<String, String> {
+    val out = HashMap<String, String>()
+    items.groupBy { it.label }.forEach { (label, group) ->
+        if (group.size == 1) { out[group.single().workspace_id] = label; return@forEach }
+        val parents = group.map { it.path.trimEnd('/').substringBeforeLast('/', "") }
+        val tails = folderChipLabels(parents.distinct())
+        val seen = HashMap<String, Int>()
+        group.forEachIndexed { i, ws ->
+            val parent = parents[i]
+            val base = if (parent.isEmpty()) label else "$label · ${tails[parent] ?: parent}"
+            val n = (seen[base] ?: 0) + 1
+            seen[base] = n
+            out[ws.workspace_id] = if (n == 1) base else "$base ($n)"
+        }
+    }
+    return out
+}
+
+internal val LocalWorkspaceLabels = compositionLocalOf<Map<String, String>> { emptyMap() }
+
+/** The workspace's name as lists show it ([workspaceLabels]); its own label outside a list. */
+@Composable
+internal fun workspaceName(ws: Workspace): String = LocalWorkspaceLabels.current[ws.workspace_id] ?: ws.label
 
 internal fun workspaceThreads(workspace: Workspace): List<ThreadSummary> =
     workspace.threads.filter { !subagent(it) }.sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }.thenBy { it.thread_id })
@@ -433,7 +462,7 @@ internal fun HomeScreen(
                 items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
             if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
-            val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
+            val labels = workspaceLabels(state.workspaces?.items.orEmpty())
             // Beside the docked sidebar (foldable, tablet) the chats are already listed there: no second copy.
             val recent = if (docked) emptyList() else recentThreads(state.workspaces, hidden = hidden)
             if (docked && onHistory != null) item(key = "history") {
@@ -473,7 +502,7 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
         active.takeIf { it > 0 }?.let { "$it active" },
         "closed".takeIf { !workspace.open },
     ).joinToString(" · ")
-    MenuRow(workspace.label, listOf(summary, workspace.path).filter { it.isNotEmpty() }.joinToString("\n"), true,
+    MenuRow(workspaceName(workspace), listOf(summary, workspace.path).filter { it.isNotEmpty() }.joinToString("\n"), true,
         { onOpen(workspace.workspace_id) },
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
         badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} attention" })
@@ -530,7 +559,8 @@ internal fun WorkspaceScreen(
         if (panes.isEmpty()) note("nopanes", "No open panes.")
         items(panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
         if (onNewTerminal != null && canWrite(state.host) && workspace.path.isNotEmpty()) item(key = "new-terminal") {
-            TextButton(onClick = onNewTerminal, modifier = Modifier.padding(horizontal = 8.dp)) { Text("New terminal") }
+            ActionRow(androidx.compose.ui.res.painterResource(R.drawable.ic_tool_terminal), "New terminal",
+                tint = MaterialTheme.colorScheme.primary, chevron = false, onClick = onNewTerminal)
         }
         val threads = workspaceThreads(workspace).filter { listed(it) && it.thread_id !in hidden }
         val (archived, current) = threads.partition { it.archived }

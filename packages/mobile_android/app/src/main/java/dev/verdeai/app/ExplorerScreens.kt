@@ -2,6 +2,7 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -525,10 +526,17 @@ internal fun ExplorerLinks(onChanges: () -> Unit, onFiles: () -> Unit, workspace
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         // In All Workspaces scope the target is named ("in demo-app"), on screen and for TalkBack.
         val target = workspace?.let { " in $it" }.orEmpty()
-        AssistChip(onClick = onChanges, label = { Text("Changes") },
-            modifier = Modifier.testTag(EXPLORER_CHANGES_LINK).semantics { contentDescription = "Changes$target" })
-        AssistChip(onClick = onFiles, label = { Text("Files") },
-            modifier = Modifier.testTag(EXPLORER_FILES_LINK).semantics { contentDescription = "Files$target" })
+        // S16: tonal 48dp chips with an icon (iOS's Changes / Files).
+        FilledTonalButton(onClick = onChanges, shape = RoundedCornerShape(10.dp), contentPadding = PaddingValues(start = 12.dp, end = 14.dp),
+            modifier = Modifier.heightIn(min = 48.dp).testTag(EXPLORER_CHANGES_LINK).semantics { contentDescription = "Changes$target" }) {
+            Icon(painterResource(R.drawable.ic_changes), contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp)); Text("Changes")
+        }
+        FilledTonalButton(onClick = onFiles, shape = RoundedCornerShape(10.dp), contentPadding = PaddingValues(start = 12.dp, end = 14.dp),
+            modifier = Modifier.heightIn(min = 48.dp).testTag(EXPLORER_FILES_LINK).semantics { contentDescription = "Files$target" }) {
+            Icon(painterResource(R.drawable.ic_folder), contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp)); Text("Files")
+        }
         workspace?.let { Text("in $it", Modifier.weight(1f).clearAndSetSemantics {}, maxLines = 1, overflow = TextOverflow.Ellipsis,
             style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted) }
     }

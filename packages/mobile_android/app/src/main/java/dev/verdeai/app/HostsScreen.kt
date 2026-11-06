@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -93,15 +94,11 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                             }
                         }
                     }
-                    OutlinedButton(modifier=Modifier.fillMaxWidth(), shape=MaterialTheme.shapes.small,
-                        enabled=!state.busy, onClick={ adding=true }) {
-                        Icon(Icons.Filled.Add, contentDescription=null, modifier=Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Add host")
-                    }
+                    // S15: list rows, as on iOS.
+                    ActionRow(Icons.Filled.Add, "Add host", enabled=!state.busy, tint=MaterialTheme.colorScheme.primary, chevron=false, inset=0.dp) { adding=true }
                 }
             }
-            onSecurity?.let { open -> TextButton(modifier=Modifier.fillMaxWidth(), onClick=open) { Text("Settings") } }
+            onSecurity?.let { open -> ActionRow(Icons.Filled.Settings, "Settings", inset=0.dp, onClick=open) }
             // Clear of the companion bubble (S1).
             Spacer(Modifier.height(LocalBubbleReserve.current))
         }

@@ -527,13 +527,16 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
             safe.getBottom(density).toFloat(), reserveTop = with(density) { 56.dp.toPx() },
             reserveBottom = with(density) { 88.dp.toPx() }, margin = with(density) { 8.dp.toPx() })
         val currentArea by rememberUpdatedState(area)
-        val position = remember { Animatable(bubbleOffset(prefs.placement, area, size), Offset.VectorConverter) }
+        // S14: at rest the bubble stacks on the New chat button at the bottom of its side, where the
+        // lists keep space free; a drag picks the side, and it settles back to the bottom.
+        val resting = prefs.placement.copy(fraction = 1f)
+        val position = remember { Animatable(bubbleOffset(resting, area, size), Offset.VectorConverter) }
         var dragging by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
         // Settle on the saved side, and slide with the keyboard or rotation.
-        LaunchedEffect(area, prefs.placement, dragging) {
+        LaunchedEffect(area, resting, dragging) {
             if (dragging) return@LaunchedEffect
-            val target = bubbleOffset(prefs.placement, area, size)
+            val target = bubbleOffset(resting, area, size)
             if (reduced) position.snapTo(target) else position.animateTo(target, spring(dampingRatio = .75f, stiffness = Spring.StiffnessMediumLow))
         }
         val gap = with(density) { 8.dp.toPx() }

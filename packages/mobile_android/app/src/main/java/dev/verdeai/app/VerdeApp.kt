@@ -8,6 +8,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -206,6 +207,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // sheet, which opens to show them and clears them when it closes.
     val callUp = liveUi.active
     LaunchedEffect(liveUi.phase) {
+        // One message: a speech-recognition hiccup from the same attempt isn't shown beside it.
+        if (liveUi.phase == LivePhase.Failed) voice.clearError()
         if (liveUi.phase == LivePhase.Failed && !companionOpen) { companionSettings = false; companionOpen = true }
     }
     var liveSettings by remember { mutableStateOf(false) }
@@ -277,7 +280,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             placement = placement,
             onDismiss = { companionOpen = false; companionSettings = false; live.dismissError() })
     }
-    CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
+    val workspaceNames = remember(browseState.workspaces?.items) { workspaceLabels(browseState.workspaces?.items.orEmpty()) }
+    CompositionLocalProvider(LocalHiddenThreads provides companionThreads, LocalWorkspaceLabels provides workspaceNames) {
     // Moss on a docked window: in the sidebar, or its rail, rather than floating over the content.
     val companionUp = companionState.available && !bubblePrefs.hidden && !pairing
     // S1: the floating bubble only on the top-level lists, never over the keyboard or a dialog;
@@ -410,9 +414,11 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
             WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) },
                 actions = { workspace ->
                     val state by browse.state.collectAsState()
-                    ExplorerLinks(onChanges = { nav.navigate(Routes.changes(workspace.workspace_id)) }, onFiles = { nav.navigate(Routes.files(workspace.workspace_id)) },
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
-                    WorkspaceActions(state, manage, workspace) { nav.navigate(ManageRoutes.newChat(workspace.workspace_id)) }
+                    WorkspaceActions(state, manage, workspace, onNewChat = { nav.navigate(ManageRoutes.newChat(workspace.workspace_id)) },
+                        extraRows = {
+                            ActionRow(painterResource(R.drawable.ic_changes), "Changes") { nav.navigate(Routes.changes(workspace.workspace_id)) }
+                            ActionRow(painterResource(R.drawable.ic_folder), "Files") { nav.navigate(Routes.files(workspace.workspace_id)) }
+                        })
                 }) { nav.popBackStack() }
         }
         manageRoutes(nav, browse, manage, openThread, openWorkspace)

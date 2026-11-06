@@ -15,6 +15,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.foundation.text.BasicTextField
@@ -107,7 +113,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
     val state by browse.state.collectAsState()
     val history = state.workspaces?.history
     val workspaces = state.workspaces?.items.orEmpty()
-    val labels = workspaces.associate { it.workspace_id to it.label }
+    val labels = workspaceLabels(workspaces)
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf<String?>(null) }
     // What the core's history currently reflects; a leftover search from an earlier visit resets.
@@ -143,7 +149,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                 item { FilterChip(filter == null, { filter = null }, label = { Text("All") }) }
                 items(workspaces, key = { it.workspace_id }) { ws ->
                     FilterChip(filter == ws.workspace_id, { filter = if (filter == ws.workspace_id) null else ws.workspace_id },
-                        label = { Text(ws.label, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                        label = { Text(labels[ws.workspace_id] ?: ws.label, maxLines = 1, overflow = TextOverflow.Ellipsis) })
                 }
             }
         }
@@ -331,15 +337,16 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             line("browse-unsupported", "Update verde on the computer to browse folders. You can still type a path.")
             return@ManageFrame
         }
-        if (directory.suggestions.isNotEmpty()) item(key = "suggestions") {
-            LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val labels = folderChipLabels(directory.suggestions)
-                items(directory.suggestions, key = { it }) { root ->
-                    // A3-4: each chip names its folder by the shortest path tail no other chip shares;
-                    // the row scrolls, and TalkBack reads the full path.
-                    AssistChip(onClick = { manage.listDirectory(root) }, label = { Text(labels[root] ?: root, maxLines = 1) },
-                        modifier = Modifier.semantics { contentDescription = root })
-                }
+        if (directory.suggestions.isNotEmpty()) {
+            // S15: suggested folders as list rows: a name that tells them apart, the full path under it.
+            val labels = folderChipLabels(directory.suggestions)
+            items(directory.suggestions, key = { "suggestion:$it" }) { root ->
+                VerdeListRow(headlineContent = { Text(labels[root] ?: root, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    supportingContent = { Text(root, maxLines = 1, overflow = TextOverflow.MiddleEllipsis) },
+                    leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
+                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }
+                        .semantics(mergeDescendants = true) { contentDescription = "Browse $root" })
             }
         }
         if (directory.path.isNotEmpty()) item(key = "current") {
@@ -369,7 +376,9 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
 /** New chat, rename and close/reopen for one workspace, with the latest result under the buttons. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace: Workspace, onNewChat: () -> Unit) {
+internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace: Workspace, onNewChat: () -> Unit,
+    /** Rows that go after New chat (Changes, Files). */
+    extraRows: (@Composable () -> Unit)? = null) {
     val manageState by manage.state.collectAsState()
     var intent by rememberSaveable(workspace.workspace_id) { mutableStateOf<String?>(null) }
     var renaming by rememberSaveable(workspace.workspace_id) { mutableStateOf(false) }
@@ -378,16 +387,16 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
     val result = outcome(manageState, intent)
     val busy = result == JobOutcome.Pending
     val canManage = manageState.view?.can_manage_workspaces == true && !busy
-    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-        // S6: the screen's primary action is filled; the rest are secondary; closing is destructive.
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(horizontal = 8.dp)) {
-            if (workspace.open) Button(onClick = onNewChat, enabled = manageState.view?.can_create_threads == true, shape = MaterialTheme.shapes.small) { Text("New chat") }
-            OutlinedButton(onClick = { renaming = true }, enabled = canManage, shape = MaterialTheme.shapes.small) { Text("Rename") }
-            OutlinedButton(onClick = { styling = true }, enabled = canManage, shape = MaterialTheme.shapes.small) { Text("Icon and color") }
-            if (workspace.open) TextButton(onClick = { closing = true }, enabled = canManage,
-                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("Close workspace") }
-            else TextButton(onClick = { intent = manage.setArchived(workspace.workspace_id, false) }, enabled = canManage) { Text("Reopen") }
-        }
+    Column(Modifier.fillMaxWidth()) {
+        // S15: list rows, as on iOS: icon, title, chevron; New chat in the accent, Close in error.
+        if (workspace.open) ActionRow(Icons.Filled.Add, "New chat", enabled = manageState.view?.can_create_threads == true,
+            tint = MaterialTheme.colorScheme.primary, onClick = onNewChat)
+        extraRows?.invoke()
+        ActionRow(Icons.Filled.Edit, "Rename", enabled = canManage) { renaming = true }
+        ActionRow(painterResource(R.drawable.ic_palette), "Icon and color", enabled = canManage) { styling = true }
+        if (workspace.open) ActionRow(Icons.Filled.Close, "Close workspace", enabled = canManage, tint = MaterialTheme.colorScheme.error,
+            chevron = false) { closing = true }
+        else ActionRow(Icons.Filled.Refresh, "Reopen workspace", enabled = canManage, chevron = false) { intent = manage.setArchived(workspace.workspace_id, false) }
         if (renaming) {
             var label by rememberSaveable(workspace.workspace_id) { mutableStateOf(workspace.label) }
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -503,5 +512,26 @@ internal fun folderChipLabels(paths: List<String>): Map<String, String> {
         var k = 1
         while (k < segments.size && paths.any { o -> o != p && tail(o, k) == tail(p, k) }) k++
         if (k >= segments.size) p.trimEnd('/').ifEmpty { "/" } else (if (k > 1) "…/" else "") + tail(p, k)
+    }
+}
+
+/** A tappable list row: leading icon, title, optional trailing chevron (S15). */
+@Composable
+internal fun ActionRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, enabled: Boolean = true,
+    tint: Color = Color.Unspecified, chevron: Boolean = true, inset: androidx.compose.ui.unit.Dp = 16.dp, onClick: () -> Unit) =
+    ActionRow(androidx.compose.ui.graphics.vector.rememberVectorPainter(icon), title, enabled, tint, chevron, inset, onClick)
+
+@Composable
+internal fun ActionRow(icon: androidx.compose.ui.graphics.painter.Painter, title: String, enabled: Boolean = true,
+    tint: Color = Color.Unspecified, chevron: Boolean = true, inset: androidx.compose.ui.unit.Dp = 16.dp, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val ink = (if (tint == Color.Unspecified) colors.onSurface else tint).let { if (enabled) it else it.copy(alpha = .38f) }
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+        .padding(horizontal = inset, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        Icon(icon, contentDescription = null, tint = if (tint == Color.Unspecified) colors.onSurfaceVariant.let { if (enabled) it else it.copy(alpha = .38f) } else ink,
+            modifier = Modifier.size(22.dp))
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, color = ink)
+        if (chevron) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = colors.onSurfaceVariant)
     }
 }

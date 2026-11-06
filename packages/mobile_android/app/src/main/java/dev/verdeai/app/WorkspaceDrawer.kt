@@ -118,7 +118,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
             BackHandler(enabled = !persistent || searching) { if (searching) { searching = false; query = "" } else onClose() }
             VerdeTopBar(title = { VerdeWordmark() }, showWorkspaceMenu = false,
                 actions = {
-                    onSettings?.let { open -> IconButton(onClick = open) { Icon(Icons.Filled.Settings, "Settings") } }
+                    // Settings is a footer destination (iOS parity); the header only closes.
                     if (persistent) IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Collapse sidebar") }
                     else IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") }
                 })
@@ -179,22 +179,28 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                 }
                 dock?.invoke()
                 // Each tab takes the width of its label, so "Workspaces" never truncates in 300dp.
-                Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
-                    SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
-                    SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
-                }
-            } else Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                // Content-sized tabs: "Workspaces" never truncates (equal weights cut it to "Workspa…").
-                SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
-                SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
-                SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
-            }
+                DrawerFooter(currentTab, onTab, onSettings)
+            } else DrawerFooter(currentTab, onTab, onSettings)
         } else Spacer(Modifier.fillMaxHeight())
     }
 }
 
 internal const val SIDEBAR_NEW_CHAT = "sidebar-new-chat"
+
+/**
+ * The drawer's destinations, the same four on both platforms: Home, Workspaces, Hosts, Settings.
+ * Content-sized, so "Workspaces" never truncates; two per row when the drawer is narrow.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DrawerFooter(currentTab: String, onTab: (String) -> Unit, onSettings: (() -> Unit)?) {
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+        SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
+        SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
+        SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
+        onSettings?.let { open -> SidebarTab("Settings", false, open) }
+    }
+}
 
 @Composable
 private fun SidebarTab(label: String, active: Boolean, onClick: () -> Unit) {
@@ -241,7 +247,7 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
                 DropdownMenuItem(enabled = enabled,
                     modifier = Modifier.alpha(if (ws.open) 1f else .55f).semantics { selected = scoped?.workspace_id == ws.workspace_id },
                     leadingIcon = { WorkspaceChip(ws, 22.dp) },
-                    text = { Text(ws.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    text = { Text(workspaceName(ws), maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     trailingIcon = if (ws.open) ({ IconButton(onClick = { open = false; onSettings(ws.workspace_id) }) {
                         Icon(Icons.Filled.Settings, "Settings for ${ws.label}", Modifier.size(18.dp))
                     } }) else null,
