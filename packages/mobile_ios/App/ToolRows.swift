@@ -14,6 +14,9 @@ private let toolPreviewLines = 40
 struct ToolStatusIcon: View {
     let failed: Bool
     let running: Bool
+    /// I11-11: the glyphs grow with Dynamic Type like the text beside them.
+    @ScaledMetric(relativeTo: .footnote) private var glyph: CGFloat = 11
+    @ScaledMetric(relativeTo: .footnote) private var box: CGFloat = 16
 
     var body: some View {
         Group {
@@ -21,11 +24,11 @@ struct ToolStatusIcon: View {
                 ProgressView().controlSize(.mini)
             } else {
                 Image(systemName: failed ? "xmark" : "checkmark")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: glyph, weight: .bold))
                     .foregroundStyle(failed ? VerdeTheme.danger : VerdeTheme.accent)
             }
         }
-        .frame(width: 16, height: 16)
+        .frame(width: box, height: box)
         .accessibilityHidden(true)
     }
 }
@@ -33,12 +36,14 @@ struct ToolStatusIcon: View {
 /// The disclosure chevron: rotates when open, hidden from VoiceOver (the row says expanded).
 struct DisclosureChevron: View {
     let expanded: Bool
+    @ScaledMetric(relativeTo: .footnote) private var glyph: CGFloat = 12
+    @ScaledMetric(relativeTo: .footnote) private var box: CGFloat = 16
     var body: some View {
         Image(systemName: "chevron.right")
-            .font(.system(size: 12, weight: .semibold))
+            .font(.system(size: glyph, weight: .semibold))
             .foregroundStyle(VerdeTheme.muted)
             .rotationEffect(.degrees(expanded ? 90 : 0))
-            .frame(width: 16)
+            .frame(width: box)
             .accessibilityHidden(true)
     }
 }
@@ -47,10 +52,11 @@ struct DisclosureChevron: View {
 struct CopyIconButton: View {
     let label: String
     let text: () -> String
+    @ScaledMetric(relativeTo: .footnote) private var glyph: CGFloat = 14
 
     var body: some View {
         Button { UIPasteboard.general.string = text() } label: {
-            Image(systemName: "doc.on.doc").font(.system(size: 14)).foregroundStyle(VerdeTheme.muted).minTarget()
+            Image(systemName: "doc.on.doc").font(.system(size: glyph)).foregroundStyle(VerdeTheme.muted).minTarget()
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -102,6 +108,8 @@ private struct ToolHeader: View {
     let compact: Bool
     let toggle: () -> Void
     let copy: () -> String
+    @ScaledMetric(relativeTo: .footnote) private var kindGlyph: CGFloat = 14
+    @ScaledMetric(relativeTo: .footnote) private var kindBox: CGFloat = 20
 
     private var status: String { failed ? "Failed" : running ? "Running" : "Completed" }
 
@@ -125,9 +133,9 @@ private struct ToolHeader: View {
     private var label: some View {
         HStack(spacing: 10) {
             Image(systemName: toolSymbol(parts.kind))
-                .font(.system(size: 14))
+                .font(.system(size: kindGlyph))
                 .foregroundStyle(failed ? VerdeTheme.danger : VerdeTheme.muted)
-                .frame(width: 20)
+                .frame(width: kindBox)
             VStack(alignment: .leading, spacing: 1) {
                 Text(parts.title).font(VerdeTheme.ui(13, bold: true)).lineLimit(1)
                 if !parts.summary.isEmpty {
@@ -305,14 +313,16 @@ struct ToolGroupCard: View {
 /// Up to three distinct kind icons, overlapping slightly.
 private struct ToolIconStack: View {
     let kinds: [String]
+    @ScaledMetric(relativeTo: .footnote) private var glyph: CGFloat = 10
+    @ScaledMetric(relativeTo: .footnote) private var disc: CGFloat = 18
 
     var body: some View {
         let distinct = kinds.reduce(into: [String]()) { out, kind in if !out.contains(kind) { out.append(kind) } }
         HStack(spacing: -4) {
             ForEach(Array(distinct.prefix(3)), id: \.self) { kind in
-                Image(systemName: toolSymbol(kind)).font(.system(size: 10))
+                Image(systemName: toolSymbol(kind)).font(.system(size: glyph))
                     .foregroundStyle(VerdeTheme.muted)
-                    .frame(width: 18, height: 18)
+                    .frame(width: disc, height: disc)
                     .background(VerdeTheme.alternate, in: Circle())
                     .overlay(Circle().stroke(VerdeTheme.assistant, lineWidth: 1))
             }
