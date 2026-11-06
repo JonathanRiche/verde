@@ -96,3 +96,20 @@ final class SyntaxPaletteTests: XCTestCase {
         XCTAssertNil(tokenColor("unknown"))
     }
 }
+
+/// Pass 4: list hygiene.
+final class WorkspaceLabelTests: XCTestCase {
+    private func ws(_ id: String, _ label: String, _ path: String) -> Workspace {
+        Workspace(workspace_id: id, label: label, path: path, open: false, panes: [], threads: [])
+    }
+
+    func testSameNamedWorkspacesAreToldApart() {
+        let a = ws("a", "scripts", "/tmp/demo/scripts"), b = ws("b", "scripts", "/tmp/other/scripts"), c = ws("c", "infra", "/srv/infra")
+        let all = [a, b, c]
+        XCTAssertEqual(workspaceDisplayLabel(a, among: all), "scripts · demo")
+        XCTAssertEqual(workspaceDisplayLabel(b, among: all), "scripts · other")
+        XCTAssertEqual(workspaceDisplayLabel(c, among: all), "infra")
+        let same = ws("d", "scripts", "/tmp/demo/scripts")
+        XCTAssertTrue(workspaceDisplayLabel(same, among: [a, same]).hasPrefix("scripts · "))
+    }
+}

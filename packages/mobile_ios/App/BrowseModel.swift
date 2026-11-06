@@ -226,7 +226,8 @@ func listed(_ thread: ThreadSummary) -> Bool { !isSubagent(thread) && (thread.co
 
 /// History is independently filtered and paged; Home uses the live workspace catalog.
 func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8, hidden: Set<String> = []) -> [ThreadSummary] {
-    Array((workspaces?.items ?? []).flatMap(\.threads)
+    // Only open workspaces: a closed workspace's chats aren't "recent" (S14).
+    Array((workspaces?.items ?? []).filter(\.open).flatMap(\.threads)
         .filter { !$0.archived && listed($0) && !hidden.contains($0.thread_id) }
         .sorted {
             let a = $0.last_activity_at_ms ?? 0, b = $1.last_activity_at_ms ?? 0
@@ -311,4 +312,16 @@ func browseBanner(_ state: BrowseState, _ nowMs: Int64) -> Banner? {
     if state.savedAtMs != nil { return Banner(text: "Updating…\(saved)", busy: true) }
     if state.home?.incomplete_scopes.isEmpty == false { return Banner(text: "Some host data is still loading.") }
     return nil
+}
+
+/// A workspace's name, told apart from others with the same name by its parent folder
+/// ("scripts · demo"), so identical rows never appear (S14).
+func workspaceDisplayLabel(_ workspace: Workspace, among all: [Workspace]) -> String {
+    let twins = all.filter { $0.label == workspace.label && $0.workspace_id != workspace.workspace_id }
+    guard !twins.isEmpty else { return workspace.label }
+    let parent = basename((workspace.path as NSString).deletingLastPathComponent)
+    let distinct = !parent.isEmpty && parent != "/" && twins.allSatisfy { basename(($0.path as NSString).deletingLastPathComponent) != parent }
+    if distinct { return workspace.label + " · " + parent }
+    let shown = workspace.path.isEmpty ? workspace.workspace_id : workspace.path
+    return workspace.label + " · " + (shown.count > 28 ? "…" + shown.suffix(27) : shown)
 }

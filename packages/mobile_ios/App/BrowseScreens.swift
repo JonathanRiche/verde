@@ -191,9 +191,11 @@ private struct WorkspaceItem: View {
     let workspace: Workspace
     /// Companion chats, left out of the counts.
     var hidden: Set<String> = []
+    /// Every workspace, to tell same-named ones apart.
+    var all: [Workspace] = []
     var body: some View {
         let info = workspaceSummary(workspace, hidden: hidden)
-        MenuRow(content: RowContent(title: workspace.label,
+        MenuRow(content: RowContent(title: workspaceDisplayLabel(workspace, among: all),
                                     detail: [info.summary, workspace.path].filter { !$0.isEmpty }.joined(separator: "\n"),
                                     dot: Dot(color: info.active > 0 ? VerdeTheme.accent : VerdeTheme.subtle, label: info.active > 0 ? "Active" : "Idle"),
                                     badge: info.badge),
@@ -331,7 +333,7 @@ struct HomeScreen: View {
             }
             let open = workspaces.filter(\.open)
             if !open.isEmpty {
-                TitledSection("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
+                TitledSection("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden, all: workspaces) } }
             } else if state.workspaces != nil {
                 Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
             }
@@ -348,7 +350,7 @@ struct HomeScreen: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("home-new-chat")
-                .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 12)
+                .padding(.leading, 16).padding(.trailing, newChatTrailing).padding(.vertical, 16)
                 // The band is opaque so rows never sit under New chat or the bubble beside it.
                 .frame(maxWidth: .infinity, alignment: .trailing)
                 .background(VerdeTheme.background)
@@ -373,10 +375,10 @@ struct WorkspacesScreen: View {
                     NavigationLink(value: BrowseRoute.addWorkspace) { Label("Add workspace", systemImage: "folder.badge.plus") }
                 }
                 TitledSection("Open") {
-                    ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
+                    ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden, all: all) } }
                 let closed = all.filter { !$0.open }
                 if !closed.isEmpty {
-                    TitledSection("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
+                    TitledSection("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden, all: all) } }
                 }
             }
         }

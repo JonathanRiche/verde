@@ -255,7 +255,7 @@ struct WorkspaceDrawer: View {
                 scope = ws.workspace_id; switching = false
             }) {
                 WorkspaceChip(workspace: ws, size: 22)
-                Text(ws.label).lineLimit(1)
+                Text(workspaceDisplayLabel(ws, among: browse.state.workspaces?.items ?? [])).lineLimit(1)
             }.opacity(ws.open ? 1 : 0.55)
             if ws.open {
                 Button { switching = false; open(.workspace(ws.workspace_id)) } label: {

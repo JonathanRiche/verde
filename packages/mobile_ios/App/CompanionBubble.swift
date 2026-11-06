@@ -64,7 +64,7 @@ extension EnvironmentValues {
 }
 
 /// Bottom room a list keeps clear for the floating bubble (its diameter plus 16).
-let bubbleListReserve: CGFloat = BubbleLayout.diameter + 16 + 8
+let bubbleListReserve: CGFloat = BubbleLayout.diameter + 32
 
 /// Badge: approvals and blocked chats across workspaces (crew included) plus the companion's own
 /// pending approval.

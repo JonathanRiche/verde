@@ -47,7 +47,9 @@ struct HistoryScreen: View {
             ManageNotice(model: manage)
             Picker("Workspace", selection: $workspace) {
                 Text("All workspaces").tag("")
-                ForEach(browse.state.workspaces?.items ?? [], id: \.workspace_id) { Text($0.label).tag($0.workspace_id) }
+                ForEach(browse.state.workspaces?.items ?? [], id: \.workspace_id) { item in
+                    Text(workspaceDisplayLabel(item, among: browse.state.workspaces?.items ?? [])).tag(item.workspace_id)
+                }
             }
             let history = browse.state.workspaces?.history
             let sections = historySections(history?.items ?? [])
