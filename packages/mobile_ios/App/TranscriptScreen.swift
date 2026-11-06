@@ -46,7 +46,7 @@ struct TranscriptScreen: View {
             ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
             ToolbarItem(placement: .topBarTrailing) { CompanionHeaderButton(workspace: workspaceID, thread: threadID) }
             ToolbarItem(placement: .topBarTrailing) {
-                ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
+                ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage, git: git) }
             }
             if let summary = model?.thread?.thread {
                 ToolbarItem(placement: .principal) {
@@ -204,6 +204,25 @@ private struct PlaceholderView: View {
     }
 }
 
+/// Reading the newest output, with hysteresis: it starts within `bottomSlack` of the end and only
+/// stops past `bottomRelease`, so a bar appearing or a row re-measuring can't flip it each pass.
+func transcriptAtBottom(_ current: Bool, gap: CGFloat) -> Bool {
+    if gap <= bottomSlack { return true }
+    if gap > bottomRelease { return false }
+    return current
+}
+
+/// Past this distance from the end the reader has left the newest output.
+let bottomRelease: CGFloat = 120
+
+/// The newest rows include your own message that is still on its way (just sent).
+func ownSendAtTail(_ items: [TranscriptItem]) -> Bool {
+    items.suffix(3).contains { item in
+        if case .message(let row) = item { return row.role == "user" && row.delivery == "optimistic" }
+        return false
+    }
+}
+
 private struct BottomOffsetKey: PreferenceKey {
     static let defaultValue: CGFloat = .infinity
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
@@ -226,6 +245,9 @@ private struct TranscriptList: View {
     @State private var viewport: CGFloat = 0
     @State private var cardVisible = false
     @State private var settled = false
+    /// "Latest" is shown; follows `wantsLatest` after a short settle so a resize can't flip it
+    /// back and forth within one layout pass.
+    @State private var showLatest = false
     @Environment(\.compactChat) private var compact
     @Environment(\.adaptive) private var adaptive
 
@@ -237,20 +259,22 @@ private struct TranscriptList: View {
         return key
     }
 
+    private var wantsLatest: Bool { !atBottom && !follow && !model.items.isEmpty }
+
     var body: some View {
         ScrollViewReader { proxy in
-            VStack(spacing: 0) {
-                GeometryReader { outer in list(proxy: proxy, outer: outer) }
-                // Its own strip under the transcript, so it never covers text or code (I2-1).
-                if !atBottom && !follow && !model.items.isEmpty {
-                    LatestStrip { jumpToLatest(proxy) }
-                }
-            }
+            GeometryReader { outer in list(proxy: proxy, outer: outer) }
+        }
+        .task(id: wantsLatest) {
+            guard wantsLatest else { showLatest = false; return }
+            try? await Task.sleep(for: .milliseconds(250))
+            if !Task.isCancelled && wantsLatest { showLatest = true }
         }
     }
 
     private func jumpToLatest(_ proxy: ScrollViewProxy) {
         follow = true
+        showLatest = false
         withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
     }
 
@@ -282,6 +306,11 @@ private struct TranscriptList: View {
                         .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                     }
                     .coordinateSpace(name: "transcript")
+                    // A bar inset into the scroll view's bottom safe area (I2-1): it changes the
+                    // content inset, not the scroll view's frame, so rows don't re-lay out.
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        if showLatest { LatestStrip { jumpToLatest(proxy) } }
+                    }
                     // Scrolling or tapping the transcript puts the keyboard away (I-KB); the tap is
                     // simultaneous, so rows, links and buttons still get it.
                     .scrollDismissesKeyboard(.interactively)
@@ -306,15 +335,19 @@ private struct TranscriptList: View {
                         else if let position { proxy.scrollTo(position, anchor: .top) }
                     }
                     .onPreferenceChange(BottomOffsetKey.self) { maxY in
-                        let bottom = maxY - viewport <= bottomSlack
+                        // iOS 18 reads the scroll geometry instead (TailFollower).
+                        if #available(iOS 18.0, *) { return }
+                        let bottom = transcriptAtBottom(atBottom, gap: maxY - viewport)
                         if bottom != atBottom { atBottom = bottom }
-                        if #unavailable(iOS 18.0) { if bottom != follow { follow = bottom } }
+                        if bottom != follow { follow = bottom }
                     }
                     .onChange(of: tailKey(items)) {
+                        // Your own message always brings the transcript to the new turn (I3-6).
+                        if ownSendAtTail(items) && !follow { follow = true }
                         // `follow` still describes the layout before this change.
                         if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
                     }
-                    .modifier(TailFollower(follow: $follow, output: tailKey(items)) { proxy.scrollTo(bottomID, anchor: .bottom) })
+                    .modifier(TailFollower(follow: $follow, atBottom: $atBottom, output: tailKey(items)) { proxy.scrollTo(bottomID, anchor: .bottom) })
 
                     ApprovalBanner(approval: approval, cardVisible: cardVisible, controller: model.approvals) {
                         guard let approval else { return }
@@ -324,7 +357,14 @@ private struct TranscriptList: View {
 
                 }
             .onAppear { viewport = outer.size.height }
-            .onChange(of: outer.size.height) { _, height in viewport = height }
+            .onChange(of: outer.size.height) { old, height in
+                viewport = height
+                // The keyboard, the composer growing or an attachment strip: stay on what was
+                // being read (or the newest output) instead of drifting.
+                guard abs(height - old) > 60 else { return }
+                if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
+                else if let position { proxy.scrollTo(position, anchor: .top) }
+            }
     }
 }
 
@@ -360,12 +400,13 @@ private struct LatestStrip: View {
 /// composer was resized), so re-anchors wait for the geometry to settle and are capped per output.
 private struct TailFollower: ViewModifier {
     @Binding var follow: Bool
+    @Binding var atBottom: Bool
     /// Changes with new output; restores the re-anchor allowance.
     let output: String
     let anchor: () -> Void
 
     func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, output: output, anchor: anchor)) } else { content }
+        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, atBottom: $atBottom, output: output, anchor: anchor)) } else { content }
     }
 }
 
@@ -377,6 +418,7 @@ private let tailSettle: Duration = .milliseconds(150)
 @available(iOS 18.0, *)
 private struct TailFollowerGeometry: ViewModifier {
     @Binding var follow: Bool
+    @Binding var atBottom: Bool
     let output: String
     let anchor: () -> Void
     @State private var phase: ScrollPhase = .idle
@@ -388,7 +430,8 @@ private struct TailFollowerGeometry: ViewModifier {
         content
             .onScrollPhaseChange { _, next in
                 phase = next
-                if next == .interacting { follow = false; pending?.cancel() }
+                // Dragging the transcript puts the keyboard away (I3-5).
+                if next == .interacting { follow = false; pending?.cancel(); dismissKeyboard() }
                 if next == .idle, !follow, abs(gap) <= bottomSlack { follow = true }
             }
             // Points between the current offset and the last reachable one; negative is past the end.
@@ -397,6 +440,8 @@ private struct TailFollowerGeometry: ViewModifier {
                 return last - g.contentOffset.y
             } action: { _, next in
                 gap = next
+                let bottom = transcriptAtBottom(atBottom, gap: next)
+                if bottom != atBottom { atBottom = bottom }
                 schedule()
             }
             .onChange(of: follow) { _, following in

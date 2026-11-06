@@ -408,9 +408,16 @@ private struct MarkdownTableRow: View {
     }
 }
 
-private struct OverflowFrameKey: PreferenceKey {
-    static let defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+/// Which edges hide more content. Only these two flags are state: a fractional offset from a
+/// lazy re-layout can't change them, so scroll geometry never feeds back into layout.
+struct OverflowEdges: Equatable {
+    var leading = false
+    var trailing = false
+}
+
+func overflowEdges(offset: CGFloat, content: CGFloat, container: CGFloat) -> OverflowEdges {
+    guard container > 0 else { return OverflowEdges() }
+    return OverflowEdges(leading: offset > 2, trailing: content - offset - container > 2)
 }
 
 /// Sideways-scrolling content with a fade on each edge that hides more of it (S3).
@@ -418,32 +425,49 @@ struct OverflowScroll<Content: View>: View {
     /// Shown as a small chevron badge on the trailing edge while more is off screen (tables).
     var moreLabel: String? = nil
     @ViewBuilder let content: () -> Content
-    @State private var frame: CGRect = .zero
-    @State private var visible: CGFloat = 0
-
-    private var moreTrailing: Bool { overflowsTrailing(contentMaxX: frame.maxX, visible: visible) }
+    @State private var edges = OverflowEdges()
 
     var body: some View {
-        ScrollView(.horizontal) {
-            content()
-                .background(GeometryReader { g in
-                    Color.clear.preference(key: OverflowFrameKey.self, value: g.frame(in: .named("overflow-scroll")))
-                })
-        }
-        .coordinateSpace(name: "overflow-scroll")
-        .onPreferenceChange(OverflowFrameKey.self) { frame = $0 }
-        .background(GeometryReader { g in
-            Color.clear.onAppear { visible = g.size.width }.onChange(of: g.size.width) { _, width in visible = width }
-        })
-        .mask(OverflowFade(leading: frame.minX < -1, trailing: moreTrailing))
-        .overlay(alignment: .trailing) {
-            if let moreLabel, moreTrailing { MoreBadge(label: moreLabel) }
+        ScrollView(.horizontal) { content() }
+            .modifier(OverflowTracker(edges: $edges))
+            .mask(OverflowFade(leading: edges.leading, trailing: edges.trailing))
+            .overlay(alignment: .trailing) {
+                if let moreLabel, edges.trailing { MoreBadge(label: moreLabel) }
+            }
+    }
+}
+
+/// iOS 18 reads the horizontal scroll geometry; iOS 17 shows no fades.
+private struct OverflowTracker: ViewModifier {
+    @Binding var edges: OverflowEdges
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: OverflowEdges.self) { g in
+                overflowEdges(offset: g.contentOffset.x + g.contentInsets.leading, content: g.contentSize.width, container: g.containerSize.width)
+            } action: { _, next in
+                if next != edges { edges = next }
+            }
+        } else {
+            content
         }
     }
 }
 
-/// Content runs past the visible trailing edge.
-func overflowsTrailing(contentMaxX: CGFloat, visible: CGFloat) -> Bool { visible > 0 && contentMaxX > visible + 1 }
+private struct OverflowFade: View {
+    let leading: Bool
+    let trailing: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            LinearGradient(colors: [Color.black.opacity(leading ? 0 : 1), Color.black], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 24)
+            Rectangle().fill(Color.black)
+            LinearGradient(colors: [Color.black, Color.black.opacity(trailing ? 0 : 1)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 24)
+        }
+    }
+}
 
 /// "More columns": a chevron on the faded edge that says the content scrolls on.
 private struct MoreBadge: View {
@@ -462,20 +486,6 @@ private struct MoreBadge: View {
     }
 }
 
-private struct OverflowFade: View {
-    let leading: Bool
-    let trailing: Bool
-
-    var body: some View {
-        HStack(spacing: 0) {
-            LinearGradient(colors: [Color.black.opacity(leading ? 0 : 1), Color.black], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 24)
-            Rectangle().fill(Color.black)
-            LinearGradient(colors: [Color.black, Color.black.opacity(trailing ? 0 : 1)], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 24)
-        }
-    }
-}
 
 struct CodeBlock: View {
     let code: String

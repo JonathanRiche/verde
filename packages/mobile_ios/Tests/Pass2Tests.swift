@@ -26,9 +26,10 @@ final class Pass2Tests: XCTestCase {
     }
 
     func testMoreColumnsOnlyWhileContentRunsPastTheEdge() {
-        XCTAssertTrue(overflowsTrailing(contentMaxX: 500, visible: 300))
-        XCTAssertFalse(overflowsTrailing(contentMaxX: 300, visible: 300))
-        XCTAssertFalse(overflowsTrailing(contentMaxX: 500, visible: 0))
+        XCTAssertEqual(overflowEdges(offset: 0, content: 500, container: 300), OverflowEdges(leading: false, trailing: true))
+        XCTAssertEqual(overflowEdges(offset: 200, content: 500, container: 300), OverflowEdges(leading: true, trailing: false))
+        XCTAssertEqual(overflowEdges(offset: 0, content: 300, container: 300), OverflowEdges())
+        XCTAssertEqual(overflowEdges(offset: 0, content: 500, container: 0), OverflowEdges())
     }
 
     func testRelativeTimesRefreshEveryHalfMinute() {
@@ -43,5 +44,25 @@ final class Pass2Tests: XCTestCase {
         XCTAssertEqual(needsYouItems(home: home, workspaces: nil, crew: [], companion: nil).count, 1)
         home.items = [Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate", thread_id: "t", status: "idle")]
         XCTAssertEqual(needsYouItems(home: home, workspaces: nil, crew: [], companion: nil).count, 0)
+    }
+}
+
+/// Round-3 transcript rules: bottom hysteresis and following your own send.
+final class TranscriptFollowTests: XCTestCase {
+    func testAtBottomHasHysteresis() {
+        XCTAssertTrue(transcriptAtBottom(false, gap: 10))
+        XCTAssertTrue(transcriptAtBottom(false, gap: -30))
+        // In the band between the two thresholds the current state holds.
+        XCTAssertTrue(transcriptAtBottom(true, gap: 100))
+        XCTAssertFalse(transcriptAtBottom(false, gap: 100))
+        XCTAssertFalse(transcriptAtBottom(true, gap: 200))
+    }
+
+    func testOwnSendBringsTheTranscriptAlong() {
+        let sent = ChatRow(id: "u", role: "user", body: "please fail", delivery: "optimistic")
+        let reply = ChatRow(id: "a", role: "assistant", body: "ok")
+        XCTAssertTrue(ownSendAtTail([.message(reply), .message(sent)]))
+        XCTAssertFalse(ownSendAtTail([.message(reply)]))
+        XCTAssertFalse(ownSendAtTail([.message(ChatRow(id: "u2", role: "user", body: "old"))]))
     }
 }
