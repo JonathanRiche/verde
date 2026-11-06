@@ -120,7 +120,7 @@ class BrowseTest {
         }
         await { !hosts.state.value.loading && browse.state.value.home != null }
         compose.waitForIdle()
-        compose.onAllNodesWithText("Layout chat")[0].performClick()
+        compose.onAllNodes(hasText("Layout chat"), useUnmergedTree = true)[0].performClick()
         compose.waitForIdle()
         compose.onNodeWithTag(COMPOSER_FIELD).performTextInput("half a thought")
         compose.onNodeWithContentDescription("Back").assertExists()
@@ -131,7 +131,7 @@ class BrowseTest {
         compose.onNodeWithTag(SHELL_SIDEBAR).assertExists()
         compose.onNodeWithTag(COMPOSER_FIELD).assertTextEquals("half a thought")
         compose.onNodeWithContentDescription("Back").assertDoesNotExist()
-        assertTrue(compose.onAllNodesWithText("Layout chat").fetchSemanticsNodes().size >= 2) // sidebar row and chat header
+        assertTrue(compose.onAllNodes(hasText("Layout chat"), useUnmergedTree = true).fetchSemanticsNodes().size >= 2) // sidebar row and chat header
 
         // Fold again: the phone layout, still there.
         width = 400

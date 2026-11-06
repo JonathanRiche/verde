@@ -8,8 +8,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
@@ -100,6 +103,9 @@ internal fun paneLine(pane: Pane, nowMs: Long): String {
     return "$kind · ${paneLabel(pane)}$timer"
 }
 
+/** S26: a pane is "Running" while its turn or process is live (not merely open, done or unread). */
+internal fun homeRunning(pane: Pane): Boolean = activeStatus(pane.status) || (pane.kind == "terminal" && pane.status in setOf("working", "running"))
+
 internal fun subagent(thread: ThreadSummary) = thread.thread_id.startsWith("subagent:")
 
 /** Chat lists match the desktop sidebar: a draft that never sent a message stays hidden unless a turn is live. */
@@ -136,7 +142,9 @@ internal fun workspaceLabels(items: List<Workspace>): Map<String, String> {
         val seen = HashMap<String, Int>()
         group.forEachIndexed { i, ws ->
             val parent = parents[i]
-            val base = if (parent.isEmpty()) label else "$label · ${tails[parent] ?: parent}"
+            // "label · parent folder": the shortest distinguishing tail, never a raw "…/" path.
+            val tail = (tails[parent] ?: parent).removePrefix("…/").trimStart('/').ifEmpty { "/" }
+            val base = if (parent.isEmpty()) label else "$label · $tail"
             val n = (seen[base] ?: 0) + 1
             seen[base] = n
             out[ws.workspace_id] = if (n == 1) base else "$base ($n)"
@@ -237,13 +245,12 @@ private fun MenuRow(
             leadingContent = leading,
             trailingContent = badge?.let { { if (it == UNREAD) UnreadDot() else AttentionBadge(it) } },
             // S4: one TalkBack stop that reads "title, subtitle".
-            modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
-                contentDescription = listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '), badge).joinToString(", ")
-            }.combinedClickable(
+            modifier = Modifier.fillMaxWidth().combinedClickable(
                 enabled = enabled || menu.isNotEmpty(),
                 onClickLabel = "Open", onLongClickLabel = "More actions",
                 onClick = { if (enabled) onOpen() else if (menu.isNotEmpty()) expanded = true },
-                onLongClick = { if (menu.isNotEmpty()) expanded = true }),
+                onLongClick = { if (menu.isNotEmpty()) expanded = true })
+                .nameOnly(listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '), badge).joinToString(", ")),
         )
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             LiveOverMenu()
@@ -259,7 +266,7 @@ internal const val UNREAD = "Unread"
 /** S21: an unread finished chat is just a dot (TalkBack: "Unread"), never an amber "needs you". */
 @Composable
 private fun UnreadDot() {
-    Box(Modifier.size(10.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+    Box(Modifier.size(8.dp).background(VerdeColors.Muted, CircleShape))
 }
 
 @Composable
@@ -332,7 +339,7 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
 }
 
 @Composable
-private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?, onOpen: (ThreadSummary) -> Unit) {
+private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?, onOpen: (ThreadSummary) -> Unit, unread: Boolean = false) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val kind = rowState(thread.status, false)
     val state = statusLabel(thread.status).takeIf { thread.status !in setOf("idle", "completed") }
@@ -340,6 +347,7 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
     MenuRow(thread.title, parts.filterNotNull().joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
         styledSupporting = stateLine(parts, state, kind).takeIf { it.isNotEmpty() },
+        badge = UNREAD.takeIf { unread },
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProviderGlyph(thread.provider, Modifier.size(20.dp))
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
@@ -372,7 +380,7 @@ private fun BrowseFrame(
     Column(Modifier.fillMaxSize()) {
         if (onBack != null) {
             VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+                navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
         }
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
             // Top-level lists keep their last rows clear of the New chat button and the companion bubble (S1).
@@ -460,28 +468,30 @@ internal fun HomeScreen(
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
+            // S26: three sections from the core's state. "Needs you" is its needs_you; "Running" is a
+            // live turn or process; finished chats sit in "Recent", an unread one with a neutral dot.
             val attention = panes.filter { it.needs_you }
-            val running = panes.filterNot { it.needs_you || hiddenPane(it, hidden) }
+            val running = panes.filter { !it.needs_you && !hiddenPane(it, hidden) && homeRunning(it) }
             if (attention.isNotEmpty()) {
-                header("Needs attention")
+                header("Needs you")
                 items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
             if (running.isNotEmpty()) {
                 header("Running")
                 items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
-            if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
+            if (attention.isEmpty() && running.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             val labels = workspaceLabels(state.workspaces?.items.orEmpty())
-            // Beside the docked sidebar (foldable, tablet) the chats are already listed there: no second copy.
-            val recent = if (docked) emptyList() else recentThreads(state.workspaces, hidden = hidden)
-            if (docked && onHistory != null) item(key = "history") {
-                TextButton(onClick = onHistory, modifier = Modifier.padding(horizontal = 8.dp)) { Text("All chats") }
-            }
+            val unread = panes.filter { it.attention_kind == "unread" && it.thread_id != null }.map { it.workspace_id to it.thread_id!! }.toSet()
+            // Beside the docked sidebar (foldable, tablet) Home keeps a short Recent (S26).
+            val recent = recentThreads(state.workspaces, limit = if (docked) 5 else 8, hidden = hidden)
             if (recent.isNotEmpty()) {
-                header("Recent chats")
-                items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) { ThreadItem(it, now, labels[it.workspace_id], onOpenThread) }
+                header("Recent")
+                items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) {
+                    ThreadItem(it, now, labels[it.workspace_id], onOpenThread, unread = (it.workspace_id to it.thread_id) in unread)
+                }
                 if (onHistory != null) item(key = "history") {
-                    TextButton(onClick = onHistory, modifier = Modifier.padding(horizontal = 8.dp)) { Text("All chats") }
+                    NamedButton("All chats", onHistory, Modifier.padding(horizontal = 8.dp))
                 }
             }
             val open = state.workspaces?.items.orEmpty().filter { it.open }
@@ -491,9 +501,10 @@ internal fun HomeScreen(
             } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces menu.")
         }
         if (onNewChat != null && hasContent(state) && !needsPairing(state) && state.workspaces?.items.orEmpty().any { it.open }) {
-            ExtendedFloatingActionButton(onClick = onNewChat, modifier = Modifier.align(androidx.compose.ui.Alignment.BottomEnd).padding(16.dp)) {
-                Text("New chat")
-            }
+            // S29: the FAB's own node is named "New chat" (a Material FAB names only its child text).
+            NamedButton("New chat", onNewChat, Modifier.align(androidx.compose.ui.Alignment.BottomEnd).padding(16.dp).heightIn(min = 56.dp),
+                container = MaterialTheme.colorScheme.primaryContainer, content = MaterialTheme.colorScheme.onPrimaryContainer,
+                shape = RoundedCornerShape(16.dp), padding = PaddingValues(horizontal = 20.dp), shadow = 6.dp)
         }
     }
 }
@@ -515,25 +526,34 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
     MenuRow(workspaceName(workspace), listOf(summary, workspace.path.takeIf { workspace.open }.orEmpty()).filter { it.isNotEmpty() }.joinToString("\n"), true,
         { onOpen(workspace.workspace_id) },
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
+        // S27: list rows like iOS and Hosts: the workspace's own icon leads.
+        leading = { WorkspaceChip(workspace, 28.dp) },
         badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} attention" })
 }
 
 @Composable
 internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> Unit, onHosts: () -> Unit, onPair: () -> Unit,
-    onAddWorkspace: (() -> Unit)? = null) {
+    onNewChat: (() -> Unit)? = null, onHistory: (() -> Unit)? = null, onAddWorkspace: (() -> Unit)? = null) {
     val state by model.state.collectAsState()
     val now = rememberNow(false)
     BrowseFrame("Workspaces", state, now, model::refresh, onHosts) {
         if (!gate(state, onPair)) return@BrowseFrame
         val all = state.workspaces?.items.orEmpty()
-        if (onAddWorkspace != null) item(key = "add-workspace") {
-            TextButton(onClick = onAddWorkspace, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Add workspace") }
-        }
         if (all.isEmpty()) {
             note("empty", if (onAddWorkspace != null) "No workspaces on this host yet." else "No workspaces on this host yet. Add one from verde on your computer.")
+            if (onAddWorkspace != null) item(key = "add-workspace") {
+                ActionRow(painterResource(R.drawable.ic_folder), "Add workspace", tint = MaterialTheme.colorScheme.primary, onClick = onAddWorkspace)
+            }
             return@BrowseFrame
         }
-        items(all.filter { it.open }, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
+        // S27: the same icon rows as iOS (New chat, History, Add workspace), then Open / Closed.
+        if (onNewChat != null) item(key = "new-chat") { ActionRow(Icons.Filled.Edit, "New chat", onClick = onNewChat) }
+        if (onHistory != null) item(key = "history") { ActionRow(painterResource(R.drawable.ic_schedule), "History", onClick = onHistory) }
+        if (onAddWorkspace != null) item(key = "add-workspace") { ActionRow(painterResource(R.drawable.ic_folder), "Add workspace", onClick = onAddWorkspace) }
+        header("Open")
+        val open = all.filter { it.open }
+        if (open.isEmpty()) note("noopen", "No open workspaces.")
+        items(open, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
         val closed = all.filterNot { it.open }
         if (closed.isNotEmpty()) {
             header("Closed")

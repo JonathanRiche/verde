@@ -131,7 +131,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHos
     val lockOn = settings.enabled
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(title = { Text("Settings") },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
         // S8: Appearance, Notifications, Security, Companion, Hosts, About (iOS has the same order).
         CompositionLocalProvider(LocalSectionInset provides 0.dp) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 24.dp),
@@ -160,7 +160,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHos
             Column(Modifier.selectableGroup()) {
                 RelockAfter.entries.forEach { option ->
                     Row(Modifier.fillMaxWidth().selectable(selected = settings.relock_after == option, enabled = lockOn,
-                        role = Role.RadioButton) { model.setRelockAfter(option) }.padding(vertical = 12.dp),
+                        role = Role.RadioButton) { model.setRelockAfter(option) }.nameOnly(option.label).heightIn(min = 48.dp).padding(vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = settings.relock_after == option, onClick = null, enabled = lockOn)
                         Text(option.label, Modifier.padding(start = 16.dp),
@@ -205,7 +205,7 @@ internal fun appVersionLabel(name: String = BuildConfig.VERSION_NAME, code: Int 
 
 @Composable
 private fun SettingLink(title: String, detail: String, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick).padding(vertical = 12.dp),
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick).nameOnly("$title, $detail").padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
@@ -229,7 +229,7 @@ private fun SettingValue(title: String, value: String) {
 @Composable
 private fun SettingSwitch(title: String, detail: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth().toggleable(checked, enabled = enabled, role = Role.Switch, onValueChange = onChange)
-        .padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        .nameOnly("$title, $detail").padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
             Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -250,11 +250,35 @@ internal val BUNDLED_LICENCES = listOf(
     BundledLicence("Material Icons", "Apache License 2.0", null, "https://www.apache.org/licenses/LICENSE-2.0"),
 )
 
-/** Licence text reflowed for a phone: hard-wrapped lines join; blank lines stay paragraph breaks. */
-internal fun reflowLicence(text: String): String =
-    text.replace("\r\n", "\n").split(Regex("\n\\s*\n")).joinToString("\n\n") { para ->
-        para.lines().map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ")
-    }.trim()
+/**
+ * One blank-line block as paragraphs (the iOS renderer): rulers ("-----") are dropped, and an
+ * all-caps heading line ("PREAMBLE") stands as its own paragraph instead of running into the text.
+ */
+internal fun licenceBlockParagraphs(block: String): List<String> {
+    val out = mutableListOf<String>()
+    val current = mutableListOf<String>()
+    fun flush() { if (current.isNotEmpty()) { out += current.joinToString(" "); current.clear() } }
+    for (raw in block.split('\n')) {
+        val line = raw.trim()
+        if (line.isEmpty()) continue
+        if (line.all { it == '-' || it == '=' || it == '_' }) { flush(); continue }
+        val letters = line.filter { it.isLetter() }
+        // A heading opens its block, is short, all caps and has no closing full stop.
+        if (current.isEmpty() && letters.isNotEmpty() && letters == letters.uppercase() && line.length <= 40 && !line.endsWith(".")) {
+            out += line; continue
+        }
+        current += line
+    }
+    flush()
+    return out
+}
+
+/** Hard-wrapped licence text as paragraphs: blank lines separate them, the lines within one join. */
+internal fun licenceParagraphs(text: String): List<String> =
+    text.replace("\r\n", "\n").split(Regex("\n\\s*\n")).flatMap(::licenceBlockParagraphs).filter { it.isNotEmpty() }
+
+/** Licence text reflowed for a phone, one paragraph per blank-line-separated block. */
+internal fun reflowLicence(text: String): String = licenceParagraphs(text).joinToString("\n\n")
 
 /** S15: every bundled font's licence in full (no template placeholders), selectable. */
 @Composable
@@ -268,18 +292,20 @@ private fun LicencesScreen(onClose: () -> Unit) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().safeDrawingPadding()) {
                 VerdeTopBar(title = { Text("Open-source licences") }, showWorkspaceMenu = false, companion = false,
-                    navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+                    navigationIcon = { IconButton(onClick = onClose, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
                 androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
                     BUNDLED_LICENCES.forEach { item ->
                         item(key = item.name) {
                             Column(Modifier.padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text(item.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
                                 Text(item.licence, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                val text = remember(item.raw) {
-                                    item.raw?.let { id -> context.resources.openRawResource(id).bufferedReader().use { r -> reflowLicence(r.readText()) } }
+                                val paragraphs = remember(item.raw) {
+                                    item.raw?.let { id -> context.resources.openRawResource(id).bufferedReader().use { r -> licenceParagraphs(r.readText()) } }
                                 }
-                                if (text != null) androidx.compose.foundation.text.selection.SelectionContainer {
-                                    Text(text, style = MaterialTheme.typography.bodySmall)
+                                if (paragraphs != null) androidx.compose.foundation.text.selection.SelectionContainer {
+                                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        paragraphs.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                                    }
                                 }
                                 item.url?.let { url -> TextButton(onClick = { uri.openUri(url) }, contentPadding = PaddingValues(horizontal = 0.dp)) { Text(url) } }
                             }

@@ -64,6 +64,9 @@ class ScreenSpecTest {
 
     @Test fun licencesReflowAndHaveNoPlaceholders() {
         assertEquals("one two\n\nthree", reflowLicence("one\ntwo\n\n three \n"))
+        // Headings stand alone; rulers never land inside a paragraph.
+        assertEquals(listOf("SIL OPEN FONT LICENSE Version 1.1", "PREAMBLE", "The goals of the OFL are good."),
+            licenceParagraphs("-----\nSIL OPEN FONT LICENSE Version 1.1\n-----\n\nPREAMBLE\nThe goals of the\nOFL are good.\n"))
     }
 
     @Test fun addWorkspaceDropsClosedWorkspaceFolders() {

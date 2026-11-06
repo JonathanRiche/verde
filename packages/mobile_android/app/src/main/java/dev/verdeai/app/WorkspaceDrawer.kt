@@ -124,8 +124,8 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
             VerdeTopBar(title = { VerdeWordmark() }, showWorkspaceMenu = false,
                 actions = {
                     // Settings is a footer destination (iOS parity); the header only closes.
-                    if (persistent) IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Collapse sidebar") }
-                    else IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") }
+                    if (persistent) IconButton(onClick = onClose, modifier = Modifier.named("Collapse sidebar")) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, null) }
+                    else IconButton(onClick = onClose, modifier = Modifier.named("Close workspace drawer")) { Icon(Icons.Filled.Close, null) }
                 })
             val ready = hasContent(state) && !needsPairing(state)
             if (ready) WorkspaceSwitcher(all, scoped, onScope, onWorkspaceSettings, onAddWorkspace, canManageWorkspaces, onReopen)
@@ -133,18 +133,18 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                 if (searching) OutlinedTextField(query, { query = it }, singleLine = true,
                     placeholder = { Text("Search chats") },
                     leadingIcon = { Icon(Icons.Filled.Search, null) },
-                    trailingIcon = { IconButton(onClick = { query = ""; searching = false }) { Icon(Icons.Filled.Close, "Close search") } },
+                    trailingIcon = { IconButton(onClick = { query = ""; searching = false }, modifier = Modifier.named("Close search")) { Icon(Icons.Filled.Close, null) } },
                     modifier = Modifier.weight(1f).testTag("drawer-search"))
                 else Row(Modifier.weight(1f).heightIn(min = 40.dp).background(VerdeColors.PanelAlt, RoundedCornerShape(20.dp))
-                    .clickable { searching = true }.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically,
+                    .clickable(role = Role.Button) { searching = true }.nameOnly("Search chats").padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(Icons.Filled.Search, null, Modifier.size(18.dp), tint = VerdeColors.Subtle)
                     Text("Search", color = VerdeColors.Subtle)
                 }
                 if (ready) {
-                    if (!persistent) IconButton(onClick = { onNewChat(target?.workspace_id) }) { Icon(Icons.Filled.Add, "New chat") }
-                    if (target != null) IconButton(onClick = { onNewTerminal(target.workspace_id) }) {
-                        Icon(workspaceIcon(9), "New terminal", Modifier.size(20.dp))
+                    if (!persistent) IconButton(onClick = { onNewChat(target?.workspace_id) }, modifier = Modifier.named("New chat")) { Icon(Icons.Filled.Add, null) }
+                    if (target != null) IconButton(onClick = { onNewTerminal(target.workspace_id) }, modifier = Modifier.named("New terminal")) {
+                        Icon(workspaceIcon(9), null, Modifier.size(20.dp))
                     }
                 }
             }
@@ -215,7 +215,7 @@ private fun FooterTab(label: String, icon: androidx.compose.ui.graphics.painter.
     val tint = if (active) VerdeColors.AccentHi else VerdeColors.Muted
     Column(modifier.heightIn(min = 56.dp).clip(RoundedCornerShape(10.dp))
         .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
-        .semantics(mergeDescendants = true) { selected = active }.clickable(role = Role.Tab, onClick = onClick)
+        .clickable(role = Role.Tab, onClick = onClick).nameOnly(label, selected = active)
         .padding(vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
         Text(label, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
@@ -227,7 +227,7 @@ private fun FooterTab(label: String, icon: androidx.compose.ui.graphics.painter.
 private fun SidebarTab(label: String, active: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
     Text(label, modifier.padding(vertical = 2.dp).clip(RoundedCornerShape(7.dp))
         .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
-        .semantics { selected = active }.clickable(role = Role.Tab, onClick = onClick)
+        .clickable(role = Role.Tab, onClick = onClick).nameOnly(label, selected = active)
         .heightIn(min = 48.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 6.dp),
         color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.bodyMedium, maxLines = 1, softWrap = false,
         textAlign = androidx.compose.ui.text.style.TextAlign.Center, overflow = TextOverflow.Ellipsis)
@@ -243,8 +243,8 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
     var closedExpanded by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).clip(RoundedCornerShape(7.dp)).clickable { query = ""; closedExpanded = false; open = true }
-            .padding(horizontal = 8.dp).testTag("workspace-switcher")
-            .semantics { contentDescription = "Workspace scope: ${scoped?.label ?: "All Workspaces"}" },
+            .nameOnly("Workspace scope: ${scoped?.label ?: "All Workspaces"}")
+            .padding(horizontal = 8.dp).testTag("workspace-switcher"),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (scoped != null) WorkspaceChip(scoped, 22.dp)
             else Icon(Icons.Filled.Menu, null, Modifier.size(22.dp), tint = VerdeColors.Muted)
@@ -270,8 +270,8 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
                     modifier = Modifier.alpha(if (ws.open) 1f else .55f).semantics { selected = scoped?.workspace_id == ws.workspace_id },
                     leadingIcon = { WorkspaceChip(ws, 22.dp) },
                     text = { Text(workspaceName(ws), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    trailingIcon = if (ws.open) ({ IconButton(onClick = { open = false; onSettings(ws.workspace_id) }) {
-                        Icon(Icons.Filled.Settings, "Settings for ${ws.label}", Modifier.size(18.dp))
+                    trailingIcon = if (ws.open) ({ IconButton(onClick = { open = false; onSettings(ws.workspace_id) }, modifier = Modifier.named("Settings for ${ws.label}")) {
+                        Icon(Icons.Filled.Settings, null, Modifier.size(18.dp))
                     } }) else null,
                     onClick = {
                         open = false
@@ -321,7 +321,6 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
         } },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
-            .semantics { selected = active }
             .pointerInput(thread.workspace_id, thread.thread_id) {
                 awaitPointerEventScope {
                     while (true) {
@@ -333,7 +332,9 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
                     }
                 }
             }
-            .combinedClickable(onClick = onClick, onLongClickLabel = "Chat actions", onLongClick = { menu = true }))
+            .combinedClickable(onClick = onClick, onLongClickLabel = "Chat actions", onLongClick = { menu = true })
+            .nameOnly(listOfNotNull(chip?.label, thread.title, statusLabel(thread.status).takeIf { rowState(thread.status, false) != RowState.Quiet })
+                .joinToString(", "), selected = active))
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             LiveOverMenu()
             DropdownMenuItem(text = { Text("Open chat") }, onClick = { menu = false; onClick() })
@@ -356,14 +357,14 @@ private fun DrawerTerminal(pane: Pane, active: Boolean, chip: Workspace?, onClic
         leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             chip?.let { WorkspaceChip(it, 16.dp) }
             if (pane.provider != null) ProviderGlyph(pane.provider)
-            else Text(">_", style = MaterialTheme.typography.labelMedium, color = VerdeColors.Subtle)
+            else Icon(painterResource(R.drawable.ic_tool_terminal), contentDescription = null, tint = VerdeColors.Subtle, modifier = Modifier.size(18.dp))
         } },
         trailingContent = if (activeStatus(pane.status)) ({
             StatusPip(statusColor(pane.status, pane.status == "waiting"), paneLabel(pane), active = pane.status == "working")
         }) else null,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
-            .semantics { selected = active }.clickable(onClick = onClick))
+            .clickable(onClick = onClick).nameOnly(listOfNotNull(chip?.label, pane.title, paneLabel(pane).takeIf { activeStatus(pane.status) }).joinToString(", "), selected = active))
 }
 
 @Composable
@@ -372,5 +373,5 @@ private fun DrawerRow(label: String, active: Boolean, modifier: Modifier = Modif
         leadingContent = chip?.let { { WorkspaceChip(it, 16.dp) } },
         modifier = modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
-            .semantics { selected = active }.clickable(onClick = onClick))
+            .clickable(onClick = onClick).nameOnly(listOfNotNull(chip?.label, label).joinToString(", "), selected = active))
 }
