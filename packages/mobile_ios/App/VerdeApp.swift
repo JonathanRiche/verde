@@ -187,9 +187,9 @@ struct RootView: View {
     }
 
     /// Pushed screens dock the companion in their top bar (wide windows dock it in the sidebar).
-    private func companionEntry(docked: Bool) -> CompanionEntry? {
+    private func companionEntry(docked: Bool) -> CompanionHeaderEntry? {
         guard companion.available, !docked else { return nil }
-        return CompanionEntry(model: companion, voice: companionVoice, live: live,
+        return CompanionHeaderEntry(model: companion, voice: companionVoice, live: live,
                               open: { companionSheet = true }, settings: { companionSettings = true })
     }
 

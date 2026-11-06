@@ -10,7 +10,7 @@ import UIKit
 
 /// What the header avatar needs from the root view. Nil while the bubble is off (hidden, a
 /// docked companion pane on wide windows, or no companion on this host).
-struct CompanionEntry {
+struct CompanionHeaderEntry {
     let model: CompanionModel
     let voice: CompanionVoice
     let live: LiveVoice
@@ -18,10 +18,10 @@ struct CompanionEntry {
     let settings: () -> Void
 }
 
-private struct CompanionEntryKey: EnvironmentKey { static let defaultValue: CompanionEntry? = nil }
+private struct CompanionEntryKey: EnvironmentKey { static let defaultValue: CompanionHeaderEntry? = nil }
 
 extension EnvironmentValues {
-    var companionEntry: CompanionEntry? {
+    var companionEntry: CompanionHeaderEntry? {
         get { self[CompanionEntryKey.self] }
         set { self[CompanionEntryKey.self] = newValue }
     }
@@ -58,7 +58,7 @@ struct CompanionHeaderButton: View {
 }
 
 private struct CompanionHeaderFace: View {
-    let entry: CompanionEntry
+    let entry: CompanionHeaderEntry
     let active: RosterEntry
     @State private var press: PressIntent?
     @State private var pressStart = Date()
