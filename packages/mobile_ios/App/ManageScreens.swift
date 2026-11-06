@@ -52,9 +52,10 @@ struct HistoryScreen: View {
                 }
             }
             let history = browse.state.workspaces?.history
-            let sections = historySections(history?.items ?? [])
-            let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             let live = liveActivity(browse.state.workspaces)
+            // I10-5: ordered by the activity the rows show (live activity included).
+            let sections = historySections((history?.items ?? []).map { withLiveActivity($0, live) })
+            let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             ForEach(sections.indices, id: \.self) { index in
                 Section {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
