@@ -624,7 +624,7 @@ struct TerminalScreen: View {
             Spacer()
             if let offset = model.snapshot?.scroll_offset, offset > 0 {
                 Button { model.scroll(-Int(offset)) } label: { Label("Latest", systemImage: "arrow.down") }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(PrimaryButtonStyle(fullWidth: false))
                     .padding(.bottom, 12)
             }
         }
