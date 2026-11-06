@@ -360,6 +360,8 @@ private struct TranscriptList: View {
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                         }
                     }
+                    // On the list alone, so the bars over it keep their own identifiers.
+                    .accessibilityIdentifier("transcript-list")
                     .coordinateSpace(name: "transcript")
                     // A bar over the bottom edge (I2-1), drawn as an overlay so it never changes the
                     // scroll view's size or insets: resizing the lazy transcript while scrolled up
@@ -393,7 +395,6 @@ private struct TranscriptList: View {
                         }
                         settled = true
                     }
-                    .accessibilityIdentifier("transcript-list")
                     // A resize reflows every row; keep the reader on the row they were reading.
                     .onChange(of: outer.size.width) {
                         if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
