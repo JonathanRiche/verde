@@ -36,6 +36,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
@@ -109,7 +111,8 @@ internal fun transcriptBanner(state: TranscriptState, nowMs: Long): Banner? {
     if (needsPairing(browse)) return Banner("This phone isn't paired with ${browse.row?.saved?.label ?: "this host"}.", BannerAction.Hosts, error=true)
     browseBanner(browse.copy(home=null, workspaces=null, savedAtMs=null), nowMs)?.let { return it }
     // A failed approval decision also lands in the thread error; the approval card reports it.
-    val error = state.thread?.error?.takeIf { state.thread?.page?.loading != true && it != state.thread?.approval?.error }
+    // S19: a failed send is reported on its message row, not as a chat that couldn't load.
+    val error = state.thread?.error?.takeIf { state.thread?.page?.loading != true && it != state.thread?.approval?.error && !state.sendFailed }
     if (error != null) return Banner("Couldn't load this chat. ${error.message}".trim(), BannerAction.Retry, error=true)
     return null
 }
@@ -179,7 +182,9 @@ internal fun TranscriptScreen(
         model.setVisible(true)
         onDispose { model.setVisible(false) }
     }
-    val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
+    val items = remember(state.thread, state.removed) {
+        state.thread?.let(::transcriptItems).orEmpty().filterNot { it is TranscriptItem.Message && it.row.id in state.removed }
+    }
     val now = rememberNow(state.turn?.started_at_ms != null)
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread, gitChanges)
     val openDrawer = LocalWorkspaceMenu.current
@@ -268,8 +273,8 @@ private fun BannerCard(banner: Banner, onRetry: () -> Unit, onHosts: () -> Unit)
             Text(banner.text)
             if (banner.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             when (banner.action) {
-                BannerAction.Retry -> TextButton(onClick = onRetry) { Text("Retry") }
-                BannerAction.Hosts -> TextButton(onClick = onHosts) { Text("Open hosts") }
+                BannerAction.Retry -> TextButton(onClick = onRetry, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") }
+                BannerAction.Hosts -> TextButton(onClick = onHosts, modifier = Modifier.heightIn(min = 48.dp)) { Text("Open hosts") }
                 null -> Unit
             }
         }
@@ -329,7 +334,16 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     Column(Modifier.fillMaxSize()) {
     Box(Modifier.weight(1f).fillMaxWidth()) {
         CompositionLocalProvider(LocalDisclosureAnchor provides anchor, LocalDisclosureStore provides disclosures) {
-        LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
+        // S20: when the viewport changes height (keyboard, attachment strip, composer growth) the
+        // reading position holds: at the bottom it stays at the bottom (the reversed list anchors
+        // there); scrolled up, the top row stays put instead of sliding under the header.
+        var viewport by remember { mutableIntStateOf(-1) }
+        LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST)
+            .onSizeChanged { size ->
+                val before = viewport
+                viewport = size.height
+                if (before > 0 && before != size.height && !atBottom) list.dispatchRawDelta((before - size.height).toFloat())
+            }, state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->
                 CompositionLocalProvider(LocalTranscriptIndex provides index) { TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
@@ -398,6 +412,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
                 }
             }
             if (row.attachments.isNotEmpty()) AttachmentStrip(row, ctx)
+            if (mine && row.delivery == "failed") FailedSend(row, ctx.model)
             if (body.isNotEmpty()) {
                 // A2-11: prompts and replies share the core's markdown AST (desktop
                 // transcriptBodyUsesMarkdown), so `code` and **bold** in a prompt render. It is safe
@@ -607,4 +622,19 @@ private fun SelectTextDialog(content: @Composable () -> Unit, onDismiss: () -> U
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } })
+}
+
+/** S19: a message that didn't send says why and offers Retry and Remove (48dp each) on its own row. */
+@Composable
+private fun FailedSend(row: ChatRow, model: TranscriptModel) {
+    val state by model.state.collectAsState()
+    val reason = composerError(state.thread?.error) ?: "This message wasn't sent."
+    Column(Modifier.fillMaxWidth().padding(top = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite })
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            TextButton(onClick = { model.composer.resend(row.body) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Retry") }
+            TextButton(onClick = { model.removeFailed(row.id) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Remove") }
+        }
+    }
 }

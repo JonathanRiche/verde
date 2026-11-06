@@ -345,6 +345,12 @@ internal class ComposerModel(
     /** Send, steer/interrupt/queue, `!` shell confirmation or `/command`, depending on the draft and turn. */
     fun submit() = submitDraft(voice = false)
 
+    /** S19: sends a message that failed again: back into the prompt, then sent. */
+    fun resend(text: String) {
+        edit(TextFieldValue(text, TextRange(text.length)))
+        submitDraft(voice = false)
+    }
+
     /** One send with a chosen follow-up kind (long-press Send while a turn runs). */
     fun submitAs(kind: EventFollowupSubmitKind) {
         followupOverride = kind

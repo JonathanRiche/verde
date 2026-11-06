@@ -46,7 +46,11 @@ internal data class TranscriptState(
     val focusError: String? = null,
     val stopSending: Boolean = false,
     val fatal: Boolean = false,
+    /** Failed (never delivered) messages the user removed from view (S19). */
+    val removed: Set<String> = emptySet(),
 ) {
+    /** A send failed: its message row shows the error, Retry and Remove (S19), not the chat banner. */
+    val sendFailed get() = thread?.rows?.any { it.role == "user" && it.delivery == "failed" && it.id !in removed } == true
     val turn get() = thread?.turn?.takeIf { activeTurn(it.status) }
     val canStop get() = composer?.can_stop == true && turn?.stop_pending == false && !stopSending
     val stopping get() = turn?.stop_pending == true || stopSending
@@ -204,6 +208,9 @@ internal class TranscriptModel(
     }
 
     /** Explicit user retry: re-focus reloads the newest page and restarts the live tail. */
+    /** S19: hides a message that failed to send (it never reached the host). */
+    fun removeFailed(rowId: String) { mutableState.update { it.copy(removed = it.removed + rowId) } }
+
     fun retry() {
         val host = core ?: return
         requestedCursor = null
