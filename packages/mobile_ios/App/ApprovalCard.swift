@@ -63,7 +63,7 @@ struct ApprovalCard: View {
                 let sending: ApprovalDecision? = { if case .sending(let d) = phase { return d }; return nil }()
                 HStack(spacing: 8) {
                     Button { decide(.deny) } label: { Text(sending == .deny ? "Denying…" : "Deny") }
-                        .buttonStyle(TonalButtonStyle())
+                        .buttonStyle(TonalButtonStyle(tall: true))
                         .accessibilityLabel("Deny: \(title)")
                     Button { decide(.approve) } label: { Text(sending == .approve ? "Approving…" : "Approve") }
                         .buttonStyle(PrimaryButtonStyle())

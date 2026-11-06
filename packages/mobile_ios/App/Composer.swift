@@ -114,8 +114,8 @@ struct ChipFlow: Layout {
         for row in rows {
             var x = bounds.minX
             for index in row.items {
-                let size = subviews[index].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
-                subviews[index].place(at: CGPoint(x: x, y: bounds.minY + row.y), proposal: ProposedViewSize(width: min(size.width, bounds.width), height: size.height))
+                let size = chipSize(subviews[index], width: bounds.width)
+                subviews[index].place(at: CGPoint(x: x, y: bounds.minY + row.y), proposal: ProposedViewSize(width: size.width, height: size.height))
                 x += size.width + spacing
             }
         }
@@ -123,11 +123,18 @@ struct ChipFlow: Layout {
 
     private struct Row { var items: [Int] = []; var y: CGFloat = 0; var width: CGFloat = 0; var height: CGFloat = 0 }
 
+    /// A chip's ideal size (so flexible frames don't stretch it), never wider than the row.
+    private func chipSize(_ subview: LayoutSubview, width: CGFloat) -> CGSize {
+        let ideal = subview.sizeThatFits(.unspecified)
+        guard ideal.width > width else { return ideal }
+        return subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
+    }
+
     private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
         var rows: [Row] = []
         var current = Row()
         for index in subviews.indices {
-            let size = subviews[index].sizeThatFits(ProposedViewSize(width: width, height: nil))
+            let size = chipSize(subviews[index], width: width)
             let next = current.items.isEmpty ? size.width : current.width + spacing + size.width
             if !current.items.isEmpty && next > width {
                 rows.append(current)
