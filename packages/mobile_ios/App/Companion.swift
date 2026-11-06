@@ -546,32 +546,36 @@ struct NeedsYouItem: Equatable, Identifiable {
     var id: String { workspaceID + "/" + threadID }
 }
 
-/// Approvals and blocked chats across every workspace, from the existing Home projection
-/// (panes with K-17 attention) and thread statuses, plus crew rows that need the user.
-/// The companion's own thread is excluded; its approval shows inline in the conversation.
-func needsYouItems(home: HomeView?, workspaces: WorkspacesView?, crew: [CrewLink], companion: (workspace: String, thread: String)?) -> [NeedsYouItem] {
+/// The core's one "needs you" set (C8 `attention.needs`) as rows: approvals, input waits and
+/// unseen failures across open workspaces, the crew's included. Without it (only the warm-start
+/// cache so far) the Home panes' own `needs_you` flags stand in. Unread is never "needs you".
+func needsYouItems(attention: AttentionView?, home: HomeView?, workspaces: WorkspacesView?) -> [NeedsYouItem] {
     let labels = Dictionary((workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
-    var seen = Set<String>()
-    var items: [NeedsYouItem] = []
-    func add(_ workspace: String, _ thread: String, _ title: String, _ reason: String) {
-        let key = workspace + "/" + thread
-        if let companion, companion.workspace == workspace, companion.thread == thread { return }
-        guard !thread.isEmpty, seen.insert(key).inserted else { return }
-        items.append(NeedsYouItem(workspaceID: workspace, threadID: thread, title: title.isEmpty ? "Untitled chat" : title,
-                                  workspaceLabel: labels[workspace], reason: reason))
+    func item(_ workspace: String, _ thread: String, _ title: String, _ reason: String) -> NeedsYouItem {
+        NeedsYouItem(workspaceID: workspace, threadID: thread, title: title.isEmpty ? "Untitled chat" : title,
+                     workspaceLabel: labels[workspace], reason: reason)
     }
-    for pane in home?.items ?? [] where pane.kind == "chat" {
-        guard let thread = pane.thread_id else { continue }
-        if pane.attention_kind == "needs_approval" || pane.status == "waiting_approval" { add(pane.workspace_id, thread, pane.title, "Needs approval") }
-        else if pane.attention_kind == "blocked" { add(pane.workspace_id, thread, pane.title, "Needs input") }
+    if let attention {
+        return attention.needs.map { item($0.workspace_id, $0.thread_id, $0.title, needReason($0.kind)) }
     }
-    for workspace in workspaces?.items ?? [] {
-        for thread in workspace.threads where thread.status == "waiting_approval" && !thread.archived && !isSubagent(thread) {
-            add(thread.workspace_id, thread.thread_id, thread.title, "Needs approval")
-        }
+    return (home?.items ?? []).compactMap { pane in
+        guard pane.needs_you, let thread = pane.thread_id else { return nil }
+        return item(pane.workspace_id, thread, pane.title, pane.attention_kind == "blocked" ? "Needs input" : pane.attention_kind == "failed" ? "Failed" : "Needs approval")
     }
-    for link in crew where link.attention.needsYou { add(link.workspace_id, link.local_thread_id, link.displayTitle, link.attention.label) }
-    return items
+}
+
+/// The badge count: the core's `needs_you`, else the stand-in rows.
+func needsYouBadge(attention: AttentionView?, items: [NeedsYouItem]) -> Int {
+    attention.map { Int($0.needs_you) } ?? items.count
+}
+
+func needReason(_ kind: AttentionKind) -> String {
+    switch kind {
+    case .needs_approval: return "Needs approval"
+    case .blocked: return "Needs input"
+    case .failed: return "Failed"
+    case .unread: return "Unread"
+    }
 }
 
 /// One row of the sheet's activity panel: a crew chat or another chat running on the machine.
@@ -602,7 +606,7 @@ func activityItems(crew: [CrewLink], home: HomeView?, workspaces: WorkspacesView
                                   attention: attention, crew: crew))
     }
     for link in crew { add(link.workspace_id, link.local_thread_id, link.displayTitle, link.attention, crew: true) }
-    for pane in home?.items ?? [] where pane.kind == "chat" && pane.attention_kind == nil && pane.status != "waiting_approval" {
+    for pane in home?.items ?? [] where pane.kind == "chat" && !pane.needs_you && pane.attention_kind == nil {
         guard let thread = pane.thread_id, pane.can_stop || activeTurn(pane.status) else { continue }
         add(pane.workspace_id, thread, pane.title, .running, crew: false)
     }

@@ -164,17 +164,15 @@ private struct CompanionHeader: View {
         let presence = model.presence
         // Counts match the strip's capsules (needs list, machine-wide activity), so every count
         // in the header has a panel to open.
-        let needs = model.needsYou.count
+        // One "needs you" count everywhere (C8), the same as the bubble's badge.
+        let needs = model.badgeCount
         let running = model.runningCount
         let working = presence.pose == .working && running == 0
         let connected = presence.pose != .paused
-        // The companion's own approval shows inline in the conversation below, so it gets no count.
-        let ownApproval = connected && needs == 0 && model.badgeCount > 0
-        let suffix = ownApproval ? (text: "waiting on you", tone: SummaryTone.attention)
-            : companionStatusSuffix(needsYou: needs, crewRunning: running, working: working,
-                                    failed: presence.failure, connected: connected)
-        let target: CompanionPanel? = ownApproval ? nil : companionHeaderPanel(needsYou: needs, running: running, working: working,
-                                                                               failed: presence.failure, connected: connected)
+        let suffix = companionStatusSuffix(needsYou: needs, crewRunning: running, working: working,
+                                           failed: presence.failure, connected: connected)
+        let target = companionHeaderPanel(needsYou: needs, running: running, working: working,
+                                          failed: presence.failure, connected: connected)
         let companions = model.roster?.companions ?? []
         HStack(spacing: 8) {
             CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
@@ -272,7 +270,7 @@ private struct CompanionSummary: View {
     var body: some View {
         let needs = model.needsYou
         let activity = model.activity
-        let needsText = needsSummary(needs.count)
+        let needsText = needsSummary(model.badgeCount)
         let activityText = activitySummary(activity)
         Group {
             if needsText != nil || activityText != nil {

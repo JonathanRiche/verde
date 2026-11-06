@@ -77,7 +77,8 @@ final class CompanionModel {
     var crew: [CrewLink] { crewRows(crewLinks, home: active?.home_workspace_id ?? "") }
 
     var needsYou: [NeedsYouItem] {
-        needsYouItems(home: browse.state.home, workspaces: browse.state.workspaces, crew: crew, companion: conversation)
+        let state = browse.state
+        return needsYouItems(attention: state.attention, home: state.home, workspaces: state.workspaces)
     }
 
     /// The sheet's activity panel: crew plus every other chat running on the machine.
@@ -101,7 +102,8 @@ final class CompanionModel {
     var conversationBusy: Bool { threadStatus.map(activeTurn) ?? false }
 
     /// The bubble badge: everything in "Needs you" plus the companion's own pending approval.
-    var badgeCount: Int { companionBadgeCount(needsYou: needsYou.count, ownApproval: threadStatus == "waiting_approval") }
+    /// Every badge (bubble, header avatar, docked row, sheet) is the core's one "needs you" count (C8).
+    var badgeCount: Int { needsYouBadge(attention: browse.state.attention, items: needsYou) }
 
     /// Changes when the companion finishes a turn (its chat went quiet with newer activity); the
     /// bubble pops "<Name> replied" for a change it hasn't seen.

@@ -159,10 +159,10 @@ private struct PaneItem: View {
     let now: Int64
     var body: some View {
         MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
-                                    dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.attention), label: paneLabel(pane)),
+                                    dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.needs_you), label: paneLabel(pane)),
                                     provider: pane.kind == "terminal" ? pane.provider : nil,
                                     badge: attentionLabel(pane.attention_kind),
-                                    state: RowState(status: pane.status, attention: pane.attention), stateText: paneLabel(pane)),
+                                    state: RowState(status: pane.status, attention: pane.needs_you), stateText: paneLabel(pane)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
             .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }
     }
@@ -314,10 +314,11 @@ struct HomeScreen: View {
         let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
         BrowseFrame(title: "Home", model: model, actions: actions,
                     ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }, reservesBubble: !showsNewChat) { state, now in
-            let attention = panes.filter(\.attention)
-            let running = panes.filter { !$0.attention }
+            // "Needs you" is the core's set (C8); unread completions stay with the rest.
+            let attention = panes.filter(\.needs_you)
+            let running = panes.filter { !$0.needs_you }
             if !attention.isEmpty {
-                TitledSection("Needs attention") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
+                TitledSection("Needs you") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if !running.isEmpty {
                 TitledSection("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }

@@ -36,14 +36,31 @@ final class Pass2Tests: XCTestCase {
         XCTAssertEqual(relativeTimeRefresh, 30)
     }
 
-    /// The badge is derived from the Home projection, so the core's re-announced Home clears it.
-    func testNeedsYouFollowsTheAnnouncedHome() {
+    /// One "needs you" set (C8): the core's `attention.needs` drives every badge and list.
+    func testNeedsYouIsTheCoreSet() {
+        let needs = [AttentionNeed(workspace_id: "w", thread_id: "t", kind: .needs_approval, title: "Rotate", deep_link: "verde://t"),
+                     AttentionNeed(workspace_id: "w", thread_id: "u", kind: .failed, title: "", deep_link: "verde://u")]
+        let attention = AttentionView(items: [], count: 3, loading: false, needs: needs, needs_you: 2, unread: 1)
+        // An unread pane flagged `attention` is not "needs you".
+        let unread = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Done", thread_id: "x", attention: true, attention_kind: "unread")
+        let home = HomeView(items: [unread], loading: false, stale: false, incomplete_scopes: [], error: nil)
+        let items = needsYouItems(attention: attention, home: home, workspaces: nil)
+        XCTAssertEqual(items.map(\.reason), ["Needs approval", "Failed"])
+        XCTAssertEqual(items[1].title, "Untitled chat")
+        XCTAssertEqual(needsYouBadge(attention: attention, items: items), 2)
+        let resolved = AttentionView(items: [], count: 1, loading: false, needs: [], needs_you: 0, unread: 1)
+        XCTAssertEqual(needsYouBadge(attention: resolved, items: needsYouItems(attention: resolved, home: home, workspaces: nil)), 0)
+    }
+
+    /// Before the core's view arrives (warm-start cache), panes' own `needs_you` flags stand in.
+    func testNeedsYouFallsBackToPaneFlags() {
         let waiting = Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate", thread_id: "t",
-                           status: "waiting_approval", attention: true, attention_kind: "needs_approval")
-        var home = HomeView(items: [waiting], loading: false, stale: false, incomplete_scopes: [], error: nil)
-        XCTAssertEqual(needsYouItems(home: home, workspaces: nil, crew: [], companion: nil).count, 1)
-        home.items = [Pane(id: "p", workspace_id: "w", kind: "chat", title: "Rotate", thread_id: "t", status: "idle")]
-        XCTAssertEqual(needsYouItems(home: home, workspaces: nil, crew: [], companion: nil).count, 0)
+                           status: "waiting_approval", attention: true, attention_kind: "needs_approval", needs_you: true)
+        let unread = Pane(id: "q", workspace_id: "w", kind: "chat", title: "Done", thread_id: "u", attention: true, attention_kind: "unread")
+        let home = HomeView(items: [waiting, unread], loading: false, stale: false, incomplete_scopes: [], error: nil)
+        let items = needsYouItems(attention: nil, home: home, workspaces: nil)
+        XCTAssertEqual(items.map(\.threadID), ["t"])
+        XCTAssertEqual(needsYouBadge(attention: nil, items: items), 1)
     }
 }
 

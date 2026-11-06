@@ -66,9 +66,6 @@ extension EnvironmentValues {
 /// Bottom room a list keeps clear for the floating bubble (its diameter plus 16).
 let bubbleListReserve: CGFloat = BubbleLayout.diameter + 32
 
-/// Badge: approvals and blocked chats across workspaces (crew included) plus the companion's own
-/// pending approval.
-func companionBadgeCount(needsYou: Int, ownApproval: Bool) -> Int { needsYou + (ownApproval ? 1 : 0) }
 
 func needsYouPhrase(_ count: Int) -> String { count == 1 ? "1 thing needs you" : "\(count) things need you" }
 

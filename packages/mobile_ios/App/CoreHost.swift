@@ -57,6 +57,8 @@ final class CoreViewStore {
     private(set) var operations: OperationsQuery?
     private(set) var home: HomeQuery?
     private(set) var workspaces: WorkspacesQuery?
+    /// The core's one "needs you" set and unread count (C8), announced with Home.
+    private(set) var attention: AttentionQuery?
     // Future selectors remain lossless until their typed models are registered.
     private(set) var snapshots: [String: Data] = [:]
     private(set) var notifications: [EffectNotify] = []
@@ -75,6 +77,7 @@ final class CoreViewStore {
                 case "operations": operations = try JSONDecoder().decode(OperationsQuery.self, from: data)
                 case "home": home = try JSONDecoder().decode(HomeQuery.self, from: data)
                 case "workspaces": workspaces = try JSONDecoder().decode(WorkspacesQuery.self, from: data)
+                case "attention": attention = try JSONDecoder().decode(AttentionQuery.self, from: data)
                 default: break
                 }
                 snapshots[selector] = data
@@ -84,6 +87,7 @@ final class CoreViewStore {
                     // A core-driven wipe also retires every projection held by the platform.
                     home = nil
                     workspaces = nil
+                    attention = nil
                     synced = false
                     snapshots = snapshots.filter { $0.key == "hosts" || $0.key == "operations" }
                 } else if row.sync_state == "ready" { synced = true }

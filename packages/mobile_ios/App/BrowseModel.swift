@@ -6,6 +6,8 @@ struct BrowseState {
     var row: HostRow?
     var home: HomeView?
     var workspaces: WorkspacesView?
+    /// The core's "needs you" set; nil while only the warm-start cache is shown.
+    var attention: AttentionView?
     /// Non-nil while the warm-start cache is shown instead of this session's live projection.
     var savedAtMs: Int64?
     var refreshing = false
@@ -72,6 +74,7 @@ final class BrowseModel {
         } else {
             state.home = store.home?.data
             state.workspaces = store.workspaces?.data
+            state.attention = store.attention?.data
         }
         return state
     }
@@ -264,12 +267,13 @@ func workspaceSummary(_ workspace: Workspace, hidden: Set<String> = []) -> (summ
     let panes = visiblePanes(workspace.panes, hidden: hidden)
     let terminals = panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.count
     let active = panes.filter { $0.attention || $0.can_stop || $0.status == "working" }.count
-    let flagged = panes.filter { $0.attention_kind != nil }.count
+    // The core's "needs you" flag (C8); unread completions don't count.
+    let flagged = panes.filter(\.needs_you).count
     var parts = ["\(chats) chat\(chats == 1 ? "" : "s")"]
     if terminals > 0 { parts.append("\(terminals) terminal\(terminals == 1 ? "" : "s")") }
     if active > 0 { parts.append("\(active) active") }
     if !workspace.open { parts.append("closed") }
-    let badge = flagged > 0 ? "\(flagged) need\(flagged == 1 ? "s" : "") attention" : nil
+    let badge = flagged > 0 ? needsYouCount(flagged) : nil
     return (parts.joined(separator: " · "), active, badge)
 }
 
