@@ -48,6 +48,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -170,7 +171,10 @@ internal fun CompanionSheet(
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
     val liveUi = live?.ui?.collectAsState()?.value
     // A8-4: one state at a time: starting Live (or its failure card) replaces a dictation notice.
-    LaunchedEffect(liveUi?.phase) { if (liveUi != null && liveUi.phase != LivePhase.Off) transcript?.composer?.clearNotice() }
+    // O: also a hiccup that lands after Live started (the recognizer stopping for the call).
+    val liveOn = liveUi != null && liveUi.phase != LivePhase.Off
+    val composerNotice = transcript?.composer?.notice
+    LaunchedEffect(liveOn, composerNotice) { if (liveOn && composerNotice != null) { voice?.clearError(); transcript?.composer?.clearNotice() } }
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
@@ -250,13 +254,15 @@ internal fun CompanionSheet(
         var tall by rememberSaveable { mutableStateOf(false) }
         val height by androidx.compose.animation.core.animateFloatAsState(if (tall) .92f else .6f, label = "Companion sheet height")
         ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET),
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            modifier = Modifier.testTag(COMPANION_SHEET),
             dragHandle = { CompanionSheetHandle(tall) { tall = it } }) {
             LiveOverModal()
             // A share of the screen, not of the sheet's window: Live's bar joining the window (and
             // padding it) during "Connecting…" no longer drops the sheet to a lower height.
             val screen = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
-            Column(Modifier.fillMaxWidth().height(screen * height), content = panel)
+            // X: at full height the handle stays below the status bar and camera cutout.
+            Column(Modifier.fillMaxWidth().height(minOf(screen * height, sheetMaxContentHeight())), content = panel)
         }
     }
     if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript,
@@ -350,7 +356,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = if (onChats != null) 0.dp else 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (onChats != null) 4.dp else 8.dp)) {
         onChats?.let { ChatsButton(it) }
-        CompanionAvatar(character, pose, size = 28.dp, description = "$name, ${character.label}")
+        CompanionAvatar(character, pose, size = 28.dp, description = if (name == character.label) name else "$name, ${character.label}")
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
             // S28: the name keeps its width ("Sprout", never "S…"); the status after it gives way.
             Text(name, Modifier.widthIn(max = 160.dp), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -702,9 +708,11 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     var confirmRemove by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { companion.clearSaveError() }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SETTINGS)) {
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        modifier = Modifier.testTag(COMPANION_SETTINGS)) {
         LiveOverModal()
-        Column(Modifier.fillMaxWidth().verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
+        // X: never so tall that its handle sits under the status bar or camera cutout.
+        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight()).verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
             VerdeSection("Companions")
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -750,8 +758,8 @@ private fun CharacterPicker(selected: CompanionCharacter, enabled: Boolean, onPi
             val on = character == selected
             Column(Modifier.weight(1f).background(if (on) VerdeColors.AccentWash else VerdeColors.PanelAlt, RoundedCornerShape(10.dp))
                 .border(1.dp, if (on) VerdeColors.Accent else VerdeColors.Border, RoundedCornerShape(10.dp))
-                .clickable(enabled = enabled, role = Role.RadioButton) { onPick(character) }
-                .semantics { this.selected = on }
+                .selectable(selected = on, enabled = enabled, role = Role.RadioButton) { onPick(character) }
+                .nameOnly(character.label, selected = on)
                 .padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 CompanionAvatar(character, CompanionPose.Idle, size = 56.dp)
                 Text(character.label, style = MaterialTheme.typography.labelLarge)
@@ -862,6 +870,20 @@ private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, cur
 }
 
 internal const val COMPANION_CONVERSATIONS = "companion-conversations"
+
+/** X: a sheet tall enough to reach the top keeps its handle clear of the status bar and cutout. */
+internal val SheetTopInsets: WindowInsets
+    @Composable get() = WindowInsets.statusBars.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top)
+
+/** X: the tallest a sheet's content may be so the whole sheet (handle and nav bar inset included) clears the top inset. */
+@Composable
+internal fun sheetMaxContentHeight(): androidx.compose.ui.unit.Dp {
+    val density = LocalDensity.current
+    val screen = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
+    val top = with(density) { SheetTopInsets.getTop(this).toDp() }
+    val bottom = with(density) { WindowInsets.navigationBars.getBottom(this).toDp() }
+    return screen - top - bottom - 56.dp
+}
 
 /**
  * S27: the companion's brain as one label everywhere (composer chip, settings, Conversations):

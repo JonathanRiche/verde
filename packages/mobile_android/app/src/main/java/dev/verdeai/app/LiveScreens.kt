@@ -514,16 +514,21 @@ private fun ProviderRow(live: LiveVoice, provider: VoiceProvider, isDefault: Boo
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
         .background(VerdeColors.PanelAlt, RoundedCornerShape(10.dp)).border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))) {
-        Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        val title = provider.label.ifBlank { providerLabel(provider.id) } + if (isDefault) " · default" else ""
+        val keyLine = when (provider.key_source) {
+            "verde" -> "API key saved on your desktop"
+            "environment" -> "API key from the desktop's environment"
+            else -> "No API key"
+        }
+        // W: no state-less dot; the key line says the state, a chevron says it opens.
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = androidx.compose.ui.semantics.Role.Button) { expanded = !expanded }
+            .nameOnly("$title, $keyLine", state = if (expanded) "Expanded" else "Collapsed").padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(provider.label.ifBlank { providerLabel(provider.id) } + if (isDefault) " · default" else "", style = MaterialTheme.typography.titleSmall)
-                Text(when (provider.key_source) {
-                    "verde" -> "API key saved on your desktop"
-                    "environment" -> "API key from the desktop's environment"
-                    else -> "No API key"
-                }, style = MaterialTheme.typography.bodySmall, color = if (provider.configured) VerdeColors.Accent else VerdeColors.Muted)
+                Text(title, style = MaterialTheme.typography.titleSmall)
+                Text(keyLine, style = MaterialTheme.typography.bodySmall, color = if (provider.configured) VerdeColors.Accent else VerdeColors.Muted)
             }
-            Box(Modifier.size(10.dp).background(if (provider.configured) VerdeColors.Accent else VerdeColors.Subtle, CircleShape))
+            Chevron(expanded)
         }
         if (expanded) Column(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(key, { key = it.trim() }, Modifier.fillMaxWidth(), enabled = !busy, singleLine = true,

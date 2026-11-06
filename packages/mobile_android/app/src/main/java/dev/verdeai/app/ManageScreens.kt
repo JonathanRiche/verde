@@ -191,7 +191,8 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                 VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     leadingContent = { ProviderGlyph(thread.provider) },
                     supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(it.joinToString(" · "), maxLines = 1) } },
-                    modifier = Modifier.fillMaxWidth().clickable(onClickLabel = "Open") { onOpenThread(thread) })
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open") { onOpenThread(thread) }
+                        .nameOnly(listOf(thread.title).plus(parts).joinToString(", ")))
             }
         }
         history.error?.let { line("history-error", "Couldn't load chats. ${it.message}".trim(), error = true) }
@@ -385,7 +386,9 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             val labels = folderChipLabels(suggestions)
             items(suggestions, key = { "suggestion:$it" }) { root ->
                 VerdeListRow(headlineContent = { Text(labels[root] ?: root, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    supportingContent = { Text(root, maxLines = 1, overflow = TextOverflow.MiddleEllipsis) },
+                    // U: the folder it sits in, not the raw path (the full path is in the field once chosen).
+                    supportingContent = basename(root.trimEnd('/').substringBeforeLast('/', "")).takeIf { it.isNotEmpty() }?.let { p ->
+                        { Text("in $p", maxLines = 1, overflow = TextOverflow.Ellipsis) } },
                     leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
                     trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
                     modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }.nameOnly("Browse $root"))
@@ -510,7 +513,9 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
                     Text("Color", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
                     FilterChip(selected = color == null, onClick = { color = null }, label = { Text("Automatic") })
                 }
-                // Two rows of four: every swatch keeps a 48dp target, and each has a colour name.
+                // Two rows of four: every swatch keeps a 48dp target, and each has its own name (V: iOS's
+                // hue names, a repeat numbered: "Green", "Green 2").
+                val names = workspaceColorNames(VerdeColors.Accent)
                 for (row in 0 until 2) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     for (col in 0 until 4) {
                         val k = row * 4 + col
@@ -518,7 +523,7 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
                         val swatch = workspaceColor(k, VerdeColors.Accent, VerdeColors.dark)
                         Box(Modifier.weight(1f).heightIn(min = 48.dp).testTag(IDENTITY_COLOR + k)
                             .selectable(selected = selected, role = Role.RadioButton) { color = k }
-                            .semantics { contentDescription = colorName(swatch) }, contentAlignment = Alignment.Center) {
+                            .semantics { contentDescription = names[k] }, contentAlignment = Alignment.Center) {
                             Box(Modifier.size(40.dp)
                                 .then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
                                 .padding(4.dp).background(swatch, CircleShape))
@@ -529,6 +534,33 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
         },
         confirmButton = { TextButton(onClick = { onSave(icon, color) }, enabled = changed) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
+}
+
+/** A hue's everyday name (iOS colorHueName), for TalkBack. */
+internal fun colorHueName(hue: Float): String = when {
+    hue < 15f -> "Red"; hue < 40f -> "Orange"; hue < 65f -> "Yellow"; hue < 95f -> "Lime"; hue < 150f -> "Green"
+    hue < 185f -> "Teal"; hue < 205f -> "Cyan"; hue < 250f -> "Blue"; hue < 275f -> "Indigo"; hue < 300f -> "Purple"
+    hue < 330f -> "Magenta"; hue < 345f -> "Pink"; else -> "Red"
+}
+
+/** The eight identity colours' names for [accent], a repeat numbered ("Green 2"), as on iOS. */
+internal fun workspaceColorNames(accent: Color): List<String> {
+    val seen = HashMap<String, Int>()
+    return (0 until 8).map { slot ->
+        val c = workspaceColor(slot, accent, dark = false)
+        val max = maxOf(c.red, c.green, c.blue); val min = minOf(c.red, c.green, c.blue); val d = max - min
+        var h = when {
+            d <= 0f -> 0f
+            max == c.red -> 60f * (((c.green - c.blue) / d) % 6f)
+            max == c.green -> 60f * ((c.blue - c.red) / d + 2f)
+            else -> 60f * ((c.red - c.green) / d + 4f)
+        }
+        if (h < 0f) h += 360f
+        val name = colorHueName(h)
+        val n = (seen[name] ?: 0) + 1
+        seen[name] = n
+        if (n > 1) "$name $n" else name
+    }
 }
 
 /** A spoken name for a workspace colour swatch ("Teal"), from its hue. */

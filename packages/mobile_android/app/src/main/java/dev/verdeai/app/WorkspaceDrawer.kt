@@ -313,7 +313,10 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
             // A8-5: one dot rule in every scope (Home's): amber when it needs you, pulsing green while
             // running, red when failed; done and idle chats carry none.
-            drawerDot(thread, pane)?.let { (color, label, live) -> StatusPip(color, label, active = live) }
+            drawerDot(thread, pane)?.let { (color, label, live) ->
+                if (label == "Failed") Icon(Icons.Filled.Close, contentDescription = null, tint = color, modifier = Modifier.size(14.dp))
+                else StatusPip(color, label, active = live)
+            }
         } },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
@@ -348,9 +351,12 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
 /** A8-5: a drawer chat's dot (colour, label, pulsing), the same in every scope and matching Home. */
 @Composable
 private fun drawerDot(thread: ThreadSummary, pane: Pane?): Triple<androidx.compose.ui.graphics.Color, String, Boolean>? = when {
+    // P: failed is red "Failed" everywhere (as on Home), even when it also needs you; amber only
+    // for an approval or input.
+    thread.status == "failed" || pane?.status == "failed" || pane?.attention_kind == "failed" ->
+        Triple(MaterialTheme.colorScheme.error, "Failed", false)
     pane?.needs_you == true -> Triple(VerdeColors.Warning, "Needs you", false)
     pane != null && homeRunning(pane) || activeStatus(thread.status) -> Triple(MaterialTheme.colorScheme.primary, statusLabel(thread.status), true)
-    thread.status == "failed" -> Triple(MaterialTheme.colorScheme.error, statusLabel(thread.status), false)
     else -> null
 }
 

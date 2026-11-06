@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -260,7 +261,9 @@ private fun MenuRow(
                 onClickLabel = "Open", onLongClickLabel = "More actions",
                 onClick = { if (enabled) onOpen() else if (menu.isNotEmpty()) expanded = true },
                 onLongClick = { if (menu.isNotEmpty()) expanded = true })
-                .nameOnly(listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '), badge).joinToString(", ")),
+                // V: the badge isn't repeated when the subtitle already says it ("Failed").
+                .nameOnly(listOfNotNull(headline, (styledSupporting?.text ?: supporting)?.replace('\n', ' '),
+                    badge?.takeIf { b -> (styledSupporting?.text ?: supporting)?.contains(b, ignoreCase = true) != true }).joinToString(", ")),
         )
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             LiveOverMenu()
@@ -281,7 +284,11 @@ private fun UnreadDot() {
 
 @Composable
 private fun AttentionBadge(text: String) {
-    Badge(containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer) {
+    // S: failed is the error container; approval / needs-you the amber one.
+    val failed = text.contains("fail", ignoreCase = true)
+    val colors = MaterialTheme.colorScheme
+    Badge(containerColor = if (failed) colors.errorContainer else colors.tertiaryContainer,
+        contentColor = if (failed) colors.onErrorContainer else colors.onTertiaryContainer) {
         Text(text, Modifier.padding(horizontal = 4.dp))
     }
 }
@@ -437,6 +444,28 @@ private fun BrowseFrame(
     }
 }
 
+@Composable
+private fun WorkspaceFolderRow(workspace: Workspace, parent: String?) {
+    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
+    var menu by remember { mutableStateOf(false) }
+    val short = listOfNotNull(parent?.takeIf { it.isNotEmpty() }, basename(workspace.path)).joinToString(" \u00b7 ")
+    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(short, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Muted,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Box {
+            IconButton(onClick = { menu = true }, modifier = Modifier.named("Folder details")) {
+                Icon(Icons.Filled.MoreVert, contentDescription = null, tint = VerdeColors.Muted)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
+                Text(workspace.path, Modifier.padding(horizontal = 16.dp, vertical = 8.dp).widthIn(max = 320.dp),
+                    style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+                DropdownMenuItem(text = { Text("Copy path") }, onClick = { menu = false; clipboard.setText(AnnotatedString(workspace.path)) })
+            }
+        }
+    }
+}
+
 /** r5 (iOS parity): the bottom band's height: the 56dp New chat button / bubble with 16dp around them. */
 internal val BOTTOM_BAND = 88.dp
 
@@ -562,7 +591,7 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit, parent
         listOf("Open" to { onOpen(workspace.workspace_id) }, "Copy path" to { clipboard.setText(AnnotatedString(workspace.path)) }),
         // S27: list rows like iOS and Hosts: the workspace's own icon leads.
         leading = { WorkspaceChip(workspace, 28.dp) },
-        badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} attention" })
+        badge = flagged.takeIf { it > 0 }?.let { "$it need${if (it == 1) "s" else ""} you" })
 }
 
 @Composable
@@ -617,7 +646,10 @@ internal fun WorkspaceScreen(
     BrowseFrame(workspace?.label ?: "Workspace", state, now, model::refresh, onHosts, onBack) {
         if (!gate(state, onPair)) return@BrowseFrame
         if (workspace == null) { note("missing", "This workspace is no longer on the host."); return@BrowseFrame }
-        if (workspace.path.isNotEmpty()) note("path", workspace.path)
+        // U: the distinguishing parent and the folder ("demo · project"); the full path only in its menu.
+        if (workspace.path.isNotEmpty()) item(key = "path") {
+            WorkspaceFolderRow(workspace, workspaceParents(state.workspaces?.items.orEmpty())[workspace.workspace_id])
+        }
         if (actions != null) item(key = "actions") { actions(workspace) }
         header("Panes")
         val panes = workspace.panes.filterNot { hiddenPane(it, hidden) }
