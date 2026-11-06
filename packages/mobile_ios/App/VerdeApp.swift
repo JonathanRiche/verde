@@ -232,8 +232,8 @@ struct RootView: View {
 
     private var companionDock: some View {
         CompanionDock(model: companion, voice: companionVoice, live: live, open: companionSheet, toggle: {
-            // Its own pane is beside the list, so the row closes it too.
-            if companionSheet && AdaptiveTier(width: windowWidth) == .triple { companionSheet = false }
+            // Moss never covers the list now (its own pane or a trailing inspector), so the row closes it too.
+            if companionSheet && AdaptiveTier(width: windowWidth).docked { companionSheet = false }
             else { companionSheet = true; chatsPeek = false }
         }, reveal: {
             companionSheet = true
