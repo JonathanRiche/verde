@@ -6,10 +6,24 @@ struct GitChatControls: View {
     let thread: String
     let model: GitChangesModel?
     @Environment(\.adaptive) private var adaptive
+    /// Phones keep the header for the companion and the menu: the git actions move into the
+    /// chat's "⋯" menu (`GitMenuItems`) and only the sheets and dialogs stay mounted here.
+    private var inline: Bool { adaptive.tier.wide }
+    private func hasActions(_ model: GitChangesModel) -> Bool {
+        (model.change?.files ?? 0) > 0 || model.ahead > 0 || model.notice != nil
+    }
     private var controls: some View {
         Group {
             if let model {
-                if (model.change?.files ?? 0) > 0 || model.ahead > 0 || model.notice != nil {
+                if inline && hasActions(model) {
+                    button(model).modifier(GitPresentations(model: model))
+                } else {
+                    Color.clear.frame(width: 0, height: 0).modifier(GitPresentations(model: model))
+                }
+            }
+        }
+    }
+    private func button(_ model: GitChangesModel) -> some View {
                     HStack(spacing: 0) {
                         Button {
                             Task {
@@ -20,8 +34,7 @@ struct GitChatControls: View {
                             HStack(spacing: 4) {
                                 Text(model.canCommit ? model.label : "Changes").lineLimit(1)
                                 if model.change != nil { Text("\(model.mineCount)").monospacedDigit() }
-                                // Wide windows have room for the diff stat in the header.
-                                if adaptive.tier.wide, let change = model.change, change.additions + change.deletions > 0 {
+                                if let change = model.change, change.additions + change.deletions > 0 {
                                     Text("+\(change.additions)").monospacedDigit().foregroundStyle(VerdeTheme.accent)
                                     Text("−\(change.deletions)").monospacedDigit().foregroundStyle(VerdeTheme.danger)
                                 }
@@ -29,34 +42,12 @@ struct GitChatControls: View {
                         }.disabled(model.busy)
                         if model.canCommit {
                             Divider().frame(height: 18)
-                            Menu {
-                                Button("Commit…") { Task { await model.begin(push: false) } }
-                                Button("Commit & push") { Task { await model.begin(push: true, quick: true) } }
-                                if model.ahead > 0 { Button("Push") { Task { await model.push() } } }
-                                ForEach(model.rejectedRoots, id: \.self) { root in
-                                    Button("Pull & push · \(URL(fileURLWithPath: root).lastPathComponent)") { Task { await model.pullPush(root) } }
-                                }
-                            } label: { Image(systemName: "chevron.down").padding(8).accessibilityLabel("Git actions") }
+                            Menu { GitMenuItems(model: model) } label: { Image(systemName: "chevron.down").padding(8).accessibilityLabel("Git actions") }
                             .disabled(model.busy)
                         }
                     }.font(VerdeTheme.ui(11, bold: true))
                         .foregroundStyle((model.change?.attention ?? 0) > 0 ? VerdeTheme.warning : VerdeTheme.text)
                         .modifier(ToolbarChrome())
-                        .sheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
-                        .confirmationDialog("Push repository", isPresented: Binding(get: { model.choosePush }, set: { model.choosePush = $0 })) {
-                            ForEach(model.repos.filter { $0.has_remote && $0.ahead > 0 }, id: \.root) { repo in
-                                Button("\(repo.name) · ↑\(repo.ahead)") { Task { await model.push(root: repo.root) } }
-                            }
-                        }
-                        .alert("Commit & push to \(model.mainBranch ?? "main")?", isPresented: Binding(get: { model.confirmMain }, set: { model.confirmMain = $0 })) {
-                            Button("Abort", role: .cancel) {}
-                            Button("Commit & push to \(model.mainBranch ?? "main")") { Task { await model.commit(push: true) } }
-                            Button("Create branch & continue") { Task { await model.commit(push: true, newBranch: true) } }
-                        } message: { Text("\(model.count) files · \(model.finalMessage.components(separatedBy: .newlines).first ?? "")") }
-
-                }
-            }
-        }
     }
     var body: some View {
         controls
@@ -75,6 +66,43 @@ struct GitChatControls: View {
         await model?.catalog(available: available, connected: browse.session?.row?.phase == "ready" && browse.session?.store.synced == true)
     }
 
+}
+
+/// The commit sheet, push picker and main-branch confirmation, wherever the controls render.
+private struct GitPresentations: ViewModifier {
+    let model: GitChangesModel
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
+            .confirmationDialog("Push repository", isPresented: Binding(get: { model.choosePush }, set: { model.choosePush = $0 })) {
+                ForEach(model.repos.filter { $0.has_remote && $0.ahead > 0 }, id: \.root) { repo in
+                    Button("\(repo.name) · ↑\(repo.ahead)") { Task { await model.push(root: repo.root) } }
+                }
+            }
+            .alert("Commit & push to \(model.mainBranch ?? "main")?", isPresented: Binding(get: { model.confirmMain }, set: { model.confirmMain = $0 })) {
+                Button("Abort", role: .cancel) {}
+                Button("Commit & push to \(model.mainBranch ?? "main")") { Task { await model.commit(push: true) } }
+                Button("Create branch & continue") { Task { await model.commit(push: true, newBranch: true) } }
+            } message: { Text("\(model.count) files · \(model.finalMessage.components(separatedBy: .newlines).first ?? "")") }
+    }
+}
+
+/// Commit, push and pull-and-push: the split button's menu, and a section of the chat's "⋯" menu
+/// on phones.
+struct GitMenuItems: View {
+    let model: GitChangesModel
+    var body: some View {
+        if model.canCommit {
+            Button("Commit… (\(model.mineCount))") { Task { await model.begin(push: false) } }
+            Button("Commit & push") { Task { await model.begin(push: true, quick: true) } }
+        } else if (model.change?.files ?? 0) > 0 {
+            Button("Changes (\(model.mineCount))") { Task { await model.begin(push: model.defaultPush, quick: false) } }
+        }
+        if model.ahead > 0 { Button("Push") { Task { await model.push() } } }
+        ForEach(model.rejectedRoots, id: \.self) { root in
+            Button("Pull & push · \(URL(fileURLWithPath: root).lastPathComponent)") { Task { await model.pullPush(root) } }
+        }
+    }
 }
 
 struct GitCommitSheet: View {

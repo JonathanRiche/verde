@@ -324,12 +324,16 @@ struct ThreadActions: View {
     let thread: String
     let title: String
     let manage: ManageModel
+    /// The chat's git actions; on phones they live here instead of in the header (S1).
+    var git: GitChangesModel? = nil
     @State private var rename = false
     @State private var close = false
     @State private var name = ""
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.adaptive) private var adaptive
     var body: some View {
         Menu {
+            if let git, !adaptive.tier.wide { Section { GitMenuItems(model: git) }.disabled(git.busy) }
             Button("Rename chat") { name = title; rename = true }
             Button("Sync chat") { Task { await manage.thread("sync", workspace: workspace, thread: thread) } }
             Button("Close chat", role: .destructive) { close = true }
