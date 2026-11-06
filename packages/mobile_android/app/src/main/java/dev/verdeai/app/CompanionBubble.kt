@@ -113,7 +113,7 @@ internal fun snapBubble(at: Offset, area: BubbleArea, size: Float): BubblePlacem
 
 // ---- Badge and pop-ups (pure, unit tested) ----
 
-private fun chatKey(workspaceId: String, threadId: String) = "chat:$workspaceId\u001f$threadId"
+internal fun chatKey(workspaceId: String, threadId: String) = "chat:$workspaceId\u001f$threadId"
 
 /**
  * Everything that needs the user, deduplicated by chat: Home panes flagged across workspaces,
@@ -254,15 +254,19 @@ internal class BubbleChip(val text: String?, val clear: () -> Unit)
  */
 @Composable
 internal fun rememberBubbleChip(shown: Boolean, hostId: String?, name: String, needKeys: Set<String>, replyAt: Long?,
-    replyText: () -> String?, talk: BubbleTalk?): BubbleChip {
+    replyText: () -> String?, talk: BubbleTalk?,
+    /** A3-2: needs the screen already shows (the open chat's approval pill) are counted but not announced. */
+    quietKeys: Set<String> = emptySet()): BubbleChip {
     var seen by remember(hostId) { mutableStateOf(BubbleSeen()) }
     var popup by remember(hostId) { mutableStateOf<Pair<Int, String>?>(null) }
     var serial by remember { mutableIntStateOf(0) }
+    val quiet by rememberUpdatedState(quietKeys)
     LaunchedEffect(needKeys, replyAt, shown) {
+        val fresh = needKeys - seen.needs
         val step = bubbleStep(seen, needKeys, replyAt, collapsed = shown)
         seen = step.seen
         when (val kind = step.popup) {
-            is BubblePopup.NeedsYou -> popup = ++serial to "$name: ${companionStatusLine(CompanionPulse(kind.count, 0))}"
+            is BubblePopup.NeedsYou -> if (!quiet.containsAll(fresh)) popup = ++serial to "$name: ${companionStatusLine(CompanionPulse(kind.count, 0))}"
             BubblePopup.Reply -> popup = ++serial to "$name: ${replyText()?.takeIf { it.isNotBlank() } ?: "replied"}"
             null -> Unit
         }

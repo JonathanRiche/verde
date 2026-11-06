@@ -286,6 +286,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val imeUp = WindowInsets.isImeVisible
     val bubbleShown = companionUp && !tier.docked && topLevel && !companionOpen && !onCompanionThread && !drawerOpen &&
         !hostsState.loading && !imeUp && threadAction == null
+    // The open chat shows its own approval pill, so its need isn't announced again over it.
+    val openChatKey = if (route == Routes.THREAD) entry?.arguments?.let { a ->
+        val ws = a.getString("ws"); val th = a.getString("thread")
+        if (ws != null && th != null) chatKey(ws, th) else null } else null
     val headerShown = companionUp && !tier.docked && !topLevel && route != null && !onCompanionThread && !hostsState.loading
     val dockShown = companionUp && tier.docked && panes.moss != MossPlacement.SidebarSlot
     val companionCharacter = CompanionCharacter.of(companionActive?.character)
@@ -306,7 +310,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         stopSpeaking = voice::stopSpeaking, clearError = voice::clearError)
     val bubbleChip = rememberBubbleChip(bubbleShown || ((headerShown || dockShown) && !companionOpen), browseState.hostId, companionName, companionNow.needKeys,
         companionNow.companionThread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
-        { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk)
+        { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk,
+        quietKeys = openChatKey?.let(::setOf).orEmpty())
     val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
