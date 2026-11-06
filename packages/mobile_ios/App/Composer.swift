@@ -441,8 +441,9 @@ struct ChatComposer: View {
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
                 // Up to 16 images: one row that scrolls sideways, never taller than one thumbnail.
+                // A plain stack: 16 small items are cheap, and every Remove stays reachable.
                 ScrollView(.horizontal) {
-                    LazyHStack {
+                    HStack {
                         ForEach(attachments, id: \.local_id) { item in
                             HStack {
                                 if let data = model.previews[item.local_id], let image = UIImage(data: data) {
