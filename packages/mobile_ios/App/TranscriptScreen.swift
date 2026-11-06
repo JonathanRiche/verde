@@ -645,8 +645,8 @@ private struct MessageRow: View {
                         Text(mine ? "You" : (row.author.isEmpty ? "Assistant" : row.author)).font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                     }
-                    if let label = deliveryLabel(row.delivery) {
-                        Text(label) .font(VerdeTheme.ui(10)).foregroundStyle(row.delivery == "failed" ? Color.red : Color.secondary)
+                    if let label = deliveryLabel(row.delivery), !(mine && row.delivery == "failed") {
+                        Text(label) .font(VerdeTheme.ui(10)).foregroundStyle(row.delivery == "failed" ? VerdeTheme.danger : Color.secondary)
                     }
                 }
                 if !row.attachments.isEmpty {
@@ -656,6 +656,7 @@ private struct MessageRow: View {
                     // Prompts and replies both go through the core's markdown AST (desktop parity).
                     MarkdownText(text: mine ? shown : streamTail(row), model: model)
                 }
+                if mine && row.delivery == "failed" { FailedSendBar(row: row, model: model) }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -668,6 +669,28 @@ private struct MessageRow: View {
         }
         .accessibilityIdentifier("message-row")
         .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
+    }
+}
+
+/// A message that didn't send (S19): why, then Retry (sends the kept draft again) and Remove.
+private struct FailedSendBar: View {
+    let row: ChatRow
+    let model: TranscriptModel
+
+    var body: some View {
+        let reason = model.input.notice ?? model.input.view?.error?.message ?? model.thread?.error?.message
+        VStack(alignment: .leading, spacing: 4) {
+            Label(reason.map { "Not sent. \($0)" } ?? "Not sent.", systemImage: "exclamationmark.circle")
+                .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.danger)
+            HStack(spacing: 8) {
+                Button("Retry") { model.input.submit() }
+                    .buttonStyle(TonalButtonStyle(fullWidth: false)).disabled(!model.input.canSubmit)
+                Button("Remove", role: .destructive) { model.removeFailed(row.id); model.input.discardDraft() }
+                    .buttonStyle(TonalButtonStyle(destructive: true, fullWidth: false))
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("failed-send")
     }
 }
 

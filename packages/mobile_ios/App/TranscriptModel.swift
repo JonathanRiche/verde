@@ -143,6 +143,15 @@ final class TranscriptModel: DiffRenderSource {
     private(set) var composer: ChatComposerView?
     /// Renderable items, rebuilt once per thread projection (never per frame).
     private(set) var items: [TranscriptItem] = []
+    /// Failed messages the user removed (S19); the core drops them on its next read or send.
+    private(set) var removedFailures: Set<String> = []
+    func removeFailed(_ rowID: String) {
+        removedFailures.insert(rowID)
+        items = items.filter { item in
+            if case .message(let row) = item { return !removedFailures.contains(row.id) }
+            return true
+        }
+    }
     private(set) var focusError: String?
     private(set) var stopSending = false
     private(set) var fatal = false
@@ -349,7 +358,11 @@ final class TranscriptModel: DiffRenderSource {
                 guard !self.closed else { break }
                 if bytes != self.threadData || identity != self.boundSession { continue }
                 self.thread = decoded.0
-                self.items = decoded.1
+                let removed = self.removedFailures
+                self.items = removed.isEmpty ? decoded.1 : decoded.1.filter { item in
+                    if case .message(let row) = item { return !(row.delivery == "failed" && removed.contains(row.id)) }
+                    return true
+                }
                 self.approvals.update(thread: self.thread)
                 break
             }

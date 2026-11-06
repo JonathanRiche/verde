@@ -365,6 +365,17 @@ final class ComposerModel {
         }
     }
 
+    /// Remove on a failed message (S19): drops the kept draft (text and images) and its notice.
+    func discardDraft() {
+        action { [self] in
+            text = ""
+            selection = NSRange(location: 0, length: 0)
+            generation += 1
+            if await setDraft("", []) { savedGeneration = generation }
+            notice = nil
+        }
+    }
+
     func detach(_ id: String) { action { [self] in if await flush() { _ = await setDraft(text, references().filter { $0.local_id != id }) } } }
 
     func followup(_ verb: String, _ followup: ChatFollowup) {
