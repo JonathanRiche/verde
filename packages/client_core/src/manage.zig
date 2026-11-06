@@ -19,7 +19,8 @@ const add = c.append;
 
 pub const Busy = rpc.Busy;
 /// One management intent. `kind` is the intent tag; `thread_id` is set up front
-/// for `thread_create` so the platform can navigate once `state` succeeds.
+/// for `thread_create` so the platform can navigate once `state` succeeds;
+/// `workspace_create` sets `workspace_id` to the host's id when it succeeds.
 pub const Job = struct {
     intent_id: []const u8,
     kind: []const u8,
@@ -58,7 +59,7 @@ pub const View = struct {
     can_create_threads: bool,
 };
 
-const Step = enum { register, snapshot, workspace_upsert, thread_upsert, thread_get, thread_mutate, close, done };
+const Step = enum { register, snapshot, workspace_create, workspace_upsert, thread_upsert, thread_get, thread_mutate, close, done };
 const Task = struct {
     job: Job,
     step: Step = .register,
@@ -164,13 +165,19 @@ fn workspace(state: *const h.State, id: []const u8) V {
     for (p.rows(p.get(p.get(state.sync.snapshot, "snapshot"), "workspaces"))) |w| if (eq(p.s(w, "workspace_id"), id)) return w;
     return .null;
 }
+/// The listed workspace for `path` (as stored, or under the path's hashed id).
+fn workspaceAt(state: *const h.State, path: []const u8) V {
+    var buffer: [16]u8 = undefined;
+    const hashed = std.fmt.bufPrint(&buffer, "{x}", .{std.hash.Wyhash.hash(0, path)}) catch unreachable;
+    for (p.rows(p.get(p.get(state.sync.snapshot, "snapshot"), "workspaces"))) |w| {
+        if (p.s(w, "workspace_id").len == 0) continue;
+        if (eq(cleanPath(p.s(w, "path")) orelse "", path) or eq(p.s(w, "workspace_id"), hashed)) return w;
+    }
+    return .null;
+}
 fn known(provider: []const u8) bool {
     for (providers) |item| if (eq(item[0], provider)) return true;
     return false;
-}
-/// Same identity as the web fallback (`linuxWorkspaceId`): wyhash seed 0, lowercase hex.
-pub fn workspaceId(a: A, path: []const u8) E![]const u8 {
-    return std.fmt.allocPrint(a, "{x}", .{std.hash.Wyhash.hash(0, path)});
 }
 /// Absolute, no parent traversal or control bytes; trailing slashes dropped.
 fn cleanPath(raw: []const u8) ?[]const u8 {
@@ -296,8 +303,10 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
             try fail(tx, job, "invalid_label", "Use a shorter workspace name.");
             return true;
         } else null;
-        job.workspace_id = try workspaceId(tx.allocator(), path);
-        const existing = workspace(&tx.state, job.workspace_id.?);
+        // The host resolves, validates and dedupes the folder (`workspace.create`) and names the
+        // workspace; only a folder it already lists is handled here.
+        const existing = workspaceAt(&tx.state, path);
+        if (existing != .null) job.workspace_id = p.s(existing, "workspace_id");
         const i = try begin(tx, job);
         const t = &tx.state.manage.tasks[i];
         t.path = path;
@@ -519,7 +528,7 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
     switch (t.step) {
         .register => t.rpc_id = try rpc.request(tx, "daemon.client.register", .{ .persistent = false }, .{ .intent_id = "@manage" }),
         .snapshot => t.rpc_id = try rpc.request(tx, "core.snapshot", .{ .workspace_id = t.job.workspace_id.?, .scopes = [_][]const u8{"workspaces"} }, .{ .mutation = false, .legacy_snapshot = true, .intent_id = "@manage" }),
-        .workspace_upsert => t.rpc_id = try rpc.request(tx, "workspace.upsert", .{ .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.? }, .workspace = .{ .workspace_id = t.job.workspace_id.?, .label = t.label orelse std.fs.path.basenamePosix(t.path), .path = t.path } }, .{ .intent_id = "@manage" }),
+        .workspace_create => t.rpc_id = try rpc.request(tx, "workspace.create", .{ .path = t.path, .label = t.label orelse "", .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.? } }, .{ .intent_id = "@manage" }),
         // Only the thread's metadata is needed; a long transcript could also exceed the response cap.
         .thread_get => t.rpc_id = try rpc.request(tx, "chat.thread.get", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.?, .message_limit = @as(u32, 0) }, .{ .mutation = false, .intent_id = "@manage" }),
         .thread_mutate => {
@@ -540,7 +549,8 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
         },
         .thread_upsert => t.rpc_id = try rpc.request(tx, "chat.thread.upsert", .{ .workspace_id = t.job.workspace_id.?, .thread = t.thread.?, .mutation = .{ .client_id = tx.state.chat.client_id.?, .request_key = try requestKey(tx, t) } }, .{ .intent_id = "@manage" }),
         .close => t.rpc_id = try rpc.request(tx, "workspace.close", .{ .workspace_id = t.job.workspace_id.? }, .{ .intent_id = "@manage" }),
-        .done => {},
+        // `.snapshot` sends the rewritten metadata itself.
+        .workspace_upsert, .done => {},
     }
 }
 fn firstStep(t: *const Task) Step {
@@ -548,7 +558,7 @@ fn firstStep(t: *const Task) Step {
     if (std.mem.startsWith(u8, t.job.kind, "thread_")) return .thread_get;
     // Rename, identity, archive and reopen rewrite the full metadata read at a revision.
     if (t.archived != null or eq(t.job.kind, "workspace_rename") or eq(t.job.kind, "workspace_identity")) return .snapshot;
-    return .workspace_upsert;
+    return .workspace_create;
 }
 
 /// Drain owned RPC outcomes; results tagged `@manage` but superseded are dropped.
@@ -687,6 +697,13 @@ fn step(tx: *h.Transaction, i: usize, result: rpc.Result) E!void {
             if (t.label) |title| t.thread.?.title = title;
             t.step = .thread_mutate;
             try advance(tx, i);
+        },
+        .workspace_create => {
+            const id = p.s(v, "workspace_id");
+            if (id.len == 0) return finish(tx, i, failure("invalid_workspace", "The host did not add this folder."));
+            t.job.workspace_id = id;
+            finish(tx, i, null);
+            try sync.refresh(tx);
         },
         .thread_mutate, .workspace_upsert, .close => {
             finish(tx, i, null);

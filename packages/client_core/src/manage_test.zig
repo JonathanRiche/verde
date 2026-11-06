@@ -228,22 +228,46 @@ test "new_chat_select pre-fills the desktop's new-chat defaults and keeps explic
     try eql("low", p.s(selection, "effort"));
 }
 
-test "workspace_create hashes the path like the web, trims it and derives the label" {
+test "workspace_create asks the host to resolve the folder and adopts the id it returns" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();
     const id = try f.intent("workspace_create", .{ .path = " /home/u/src/two/ ", .label = null });
     try f.reply("daemon.client.register", .{ .client_id = "client-1" });
-    const params = try f.params("workspace.upsert");
-    const ws = p.get(params, "workspace");
-    const expected = try std.fmt.allocPrint(f.a(), "{x}", .{std.hash.Wyhash.hash(0, "/home/u/src/two")});
-    try eql(expected, p.s(ws, "workspace_id"));
-    try eql("/home/u/src/two", p.s(ws, "path"));
-    try eql("two", p.s(ws, "label"));
-    try expect(p.get(p.get(params, "mutation"), "expected_store_revision") == .null);
-    try eql(expected, p.s(try f.job(id), "workspace_id"));
-    try f.reply("workspace.upsert", .{ .store_revision = 6, .applied = true });
-    try eql("succeeded", p.s(try f.job(id), "state"));
+    try expect(f.pending("workspace.upsert") == 0);
+    const params = try f.params("workspace.create");
+    try eql("/home/u/src/two", p.s(params, "path"));
+    try eql("", p.s(params, "label"));
+    try eql("client-1", p.s(p.get(params, "mutation"), "client_id"));
+    try expect(p.s(p.get(params, "mutation"), "request_key").len > 0);
+    try expect(p.get(try f.job(id), "workspace_id") == .null);
+    // The host canonicalizes (symlinks, duplicate spellings) and names the workspace.
+    try f.reply("workspace.create", .{ .workspace_id = "host-ws-2", .path = "/data/src/two", .label = "two", .store_revision = 6 });
+    const done = try f.job(id);
+    try eql("succeeded", p.s(done, "state"));
+    try eql("host-ws-2", p.s(done, "workspace_id"));
     try expect(f.pending("core.snapshot") == 1);
+
+    // A label is forwarded; host errors (a missing folder) fail the operation.
+    const missing = try f.intent("workspace_create", .{ .path = "/home/u/typo", .label = "  Mine  " });
+    try eql("Mine", p.s(try f.params("workspace.create"), "label"));
+    try f.reject("workspace.create", "not_found", null);
+    try f.expectFailed(missing, "not_found");
+    try expect(p.get(try f.job(missing), "workspace_id") == .null);
+    const blank = try f.intent("workspace_create", .{ .path = "/home/u/three" });
+    try f.reply("workspace.create", .{ .store_revision = 7 });
+    try f.expectFailed(blank, "invalid_workspace");
+
+    // A folder the host already lists is not created again; a closed one reopens.
+    const listed = try f.intent("workspace_create", .{ .path = "/home/u/src/one/" });
+    try eql("succeeded", p.s(try f.job(listed), "state"));
+    try eql("ws-1", p.s(try f.job(listed), "workspace_id"));
+    try expect(f.pending("workspace.create") == 0);
+    const closed = try f.intent("workspace_create", .{ .path = "/srv/old" });
+    try eql("ws-closed", p.s(try f.params("core.snapshot"), "workspace_id"));
+    try f.replyJson("core.snapshot", snapshot);
+    try expect(p.get(p.get(try f.params("workspace.upsert"), "workspace"), "archived").bool == false);
+    try f.reply("workspace.upsert", .{ .store_revision = 8, .applied = true });
+    try eql("succeeded", p.s(try f.job(closed), "state"));
 
     try f.expectFailed(try f.intent("workspace_create", .{ .path = "relative/dir" }), "invalid_path");
     try f.expectFailed(try f.intent("workspace_create", .{ .path = "/home/u/../etc" }), "invalid_path");
