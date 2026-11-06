@@ -222,18 +222,55 @@ struct AppSettings: View {
     }
 }
 
+/// One row per bundled font, each opening its licence (I3-12).
 private struct LicencesPage: View {
     var body: some View {
         List {
-            ForEach(bundledLicences, id: \.1) { licence in
-                if let url = Bundle.main.url(forResource: licence.1, withExtension: "txt"), let text = try? String(contentsOf: url, encoding: .utf8) {
-                    Section {
-                        Text(text).font(VerdeTheme.mono(11)).textSelection(.enabled)
-                    } header: { SectionTitle(licence.0) }
+            TitledSection("Fonts and symbols") {
+                ForEach(bundledLicences, id: \.1) { licence in
+                    NavigationLink { LicenceText(title: licence.0, resource: licence.1) } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(licence.0)
+                            Text(licence.1.contains("OFL") ? "SIL Open Font License 1.1" : "MIT License")
+                                .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                        }
+                    }
                 }
             }
         }
         .scrollContentBackground(.hidden).background(VerdeTheme.background)
         .navigationTitle("Licences").navigationBarTitleDisplayMode(.inline)
     }
+}
+
+/// A licence's text, reflowed into paragraphs (the files hard-wrap at 70 columns), selectable.
+private struct LicenceText: View {
+    let title: String
+    let resource: String
+
+    var body: some View {
+        let text = Bundle.main.url(forResource: resource, withExtension: "txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(licenceParagraphs(text ?? "This licence text is missing from the app.").enumerated()), id: \.offset) { _, paragraph in
+                    Text(paragraph).font(VerdeTheme.ui(14)).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .textSelection(.enabled)
+            .padding(16)
+        }
+        .background(VerdeTheme.background)
+        .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// Hard-wrapped licence text as paragraphs: blank lines separate them, the lines within one join.
+func licenceParagraphs(_ text: String) -> [String] {
+    text.replacingOccurrences(of: "\r\n", with: "\n")
+        .components(separatedBy: "\n\n")
+        .map { (block: String) -> String in
+            let lines: [String] = block.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            return lines.filter { !$0.isEmpty }.joined(separator: " ")
+        }
+        .filter { !$0.isEmpty }
 }

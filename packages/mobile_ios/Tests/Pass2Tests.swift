@@ -66,3 +66,10 @@ final class TranscriptFollowTests: XCTestCase {
         XCTAssertFalse(ownSendAtTail([.message(ChatRow(id: "u2", role: "user", body: "old"))]))
     }
 }
+
+final class LicenceTextTests: XCTestCase {
+    func testHardWrappedLinesJoinIntoParagraphs() {
+        XCTAssertEqual(licenceParagraphs("Copyright 2022 A\n\nThis Font Software is\nlicensed under\r\nthe OFL.\n\n\n"),
+                       ["Copyright 2022 A", "This Font Software is licensed under the OFL."])
+    }
+}
