@@ -42,33 +42,69 @@ struct ComposerChipWidth: Equatable {
     let kind: ComposerPicker
     let full: CGFloat
     let iconOnly: CGFloat?
+    /// With the short label (Auto, Std, Ask…); `full` when the chip has none.
+    var short: CGFloat? = nil
+    /// The narrowest a model chip may truncate to.
+    var minimum: CGFloat? = nil
 }
 
-/// Which chips go where and which show only their icon.
+/// Which chips go where, which use their short label, which only their icon, and how far the
+/// model chip may be truncated.
 struct ComposerChipPlan: Equatable {
     var first: [ComposerPicker]
     var second: [ComposerPicker] = []
     var icons: Set<ComposerPicker> = []
+    var short: Set<ComposerPicker> = []
+    var modelCap: CGFloat? = nil
     var twoRows: Bool { !second.isEmpty }
 }
 
-/// The chip row's layout for `available` points (the paperclip included): one row with full
-/// labels, then Access and Speed as icons, then Effort too; otherwise the model (and provider)
-/// beside the paperclip and the rest on a second row, iconified the same way if needed.
+/// The chip row's layout for `available` points (the paperclip included), S25: full labels;
+/// then short labels (Auto, Std, Full); then the model truncated before any label goes; icons
+/// only when even short labels can't fit; otherwise the model on its own row.
 func composerChipPlan(widths: [ComposerChipWidth], available: CGFloat) -> ComposerChipPlan {
     let spacing: CGFloat = 4, attach: CGFloat = 44
-    let steps: [Set<ComposerPicker>] = [[], [.access, .speed], [.access, .speed, .effort]]
-    func width(_ items: [ComposerChipWidth], icons: Set<ComposerPicker>) -> CGFloat {
-        items.reduce(0) { $0 + spacing + (icons.contains($1.kind) ? ($1.iconOnly ?? $1.full) : $1.full) }
+    let labelled: Set<ComposerPicker> = [.effort, .speed, .access]
+    let shortKinds = Set(widths.filter { $0.short != nil && labelled.contains($0.kind) }.map(\.kind))
+    let iconKinds = Set(widths.filter { $0.iconOnly != nil && labelled.contains($0.kind) }.map(\.kind))
+    func w(_ c: ComposerChipWidth, short: Set<ComposerPicker>, icons: Set<ComposerPicker>) -> CGFloat {
+        if icons.contains(c.kind), let icon = c.iconOnly { return icon }
+        if short.contains(c.kind), let s = c.short { return s }
+        return c.full
     }
-    for icons in steps where attach + width(widths, icons: icons) <= available {
-        return ComposerChipPlan(first: widths.map(\.kind), icons: icons.filter { kind in widths.contains { $0.kind == kind && $0.iconOnly != nil } })
+    func total(_ items: [ComposerChipWidth], short: Set<ComposerPicker>, icons: Set<ComposerPicker>) -> CGFloat {
+        items.reduce(0) { $0 + spacing + w($1, short: short, icons: icons) }
     }
+    let kinds = widths.map(\.kind)
+    // 1. Full labels, 2. short labels.
+    for short in [Set<ComposerPicker>(), shortKinds] where attach + total(widths, short: short, icons: []) <= available {
+        return ComposerChipPlan(first: kinds, short: short)
+    }
+    // 3. Short labels with the model truncated, down to its minimum.
+    if let model = widths.first(where: { $0.kind == .model }), let minimum = model.minimum {
+        let others = attach + total(widths.filter { $0.kind != .model }, short: shortKinds, icons: []) + spacing
+        let cap = available - others
+        if cap >= minimum { return ComposerChipPlan(first: kinds, short: shortKinds, modelCap: cap) }
+    }
+    // 4. Icons only, the model truncated if need be.
+    if attach + total(widths, short: [], icons: iconKinds) <= available {
+        return ComposerChipPlan(first: kinds, icons: iconKinds)
+    }
+    if let model = widths.first(where: { $0.kind == .model }), let minimum = model.minimum {
+        let cap = available - attach - total(widths.filter { $0.kind != .model }, short: [], icons: iconKinds) - spacing
+        if cap >= minimum { return ComposerChipPlan(first: kinds, icons: iconKinds, modelCap: cap) }
+    }
+    // 5. Large text: the model (and provider) beside the paperclip, the rest below.
     let lead = widths.filter { $0.kind == .model || $0.kind == .provider }
     let rest = widths.filter { $0.kind != .model && $0.kind != .provider }
-    let icons = steps.first { width(rest, icons: $0) - spacing <= available + attach } ?? steps[steps.count - 1]
-    return ComposerChipPlan(first: lead.map(\.kind), second: rest.map(\.kind),
-                            icons: icons.filter { kind in rest.contains { $0.kind == kind && $0.iconOnly != nil } })
+    let room = available + attach
+    if total(rest, short: [], icons: []) - spacing <= room {
+        return ComposerChipPlan(first: lead.map(\.kind), second: rest.map(\.kind))
+    }
+    if total(rest, short: shortKinds, icons: []) - spacing <= room {
+        return ComposerChipPlan(first: lead.map(\.kind), second: rest.map(\.kind), short: shortKinds)
+    }
+    return ComposerChipPlan(first: lead.map(\.kind), second: rest.map(\.kind), icons: iconKinds)
 }
 
 /// The model chip: the chosen model, else the one an unset choice runs (the catalog's first);
@@ -89,13 +125,40 @@ func composerResolvedModel(_ models: [ChatChoice], value: String?, defaultLabel:
 /// The effort a chip names: the chosen one, else the default's resolved effort ("High"), else "Default".
 func composerResolvedEffort(_ efforts: [ChatChoice], value: String?, defaultLabel: String?) -> String {
     let label = composerEffortLabel(efforts, value: value, defaultLabel: defaultLabel)
-    return label.hasPrefix("Default · ") ? String(label.dropFirst("Default · ".count)) : label
+    return label.hasPrefix("Auto · ") ? String(label.dropFirst("Auto · ".count)) : label
 }
 
-/// The effort chip: the chosen effort, else "Default · <effort>" when the core names it.
+/// The effort a picker or New chat row names (S25): the chosen effort, else "Auto" (the
+/// provider's default), "Auto · High" when the core names it. Never a bare "Default".
 func composerEffortLabel(_ efforts: [ChatChoice], value: String?, defaultLabel: String? = nil) -> String {
-    guard let value, !isDefaultChoice(value) else { return composerDefaultLabel(defaultLabel) }
+    guard let value, !isDefaultChoice(value) else {
+        guard let defaultLabel, !defaultLabel.isEmpty else { return "Auto" }
+        return "Auto · " + defaultLabel
+    }
     return composerChoiceLabel(efforts, value: value)
+}
+
+/// The short chip labels, the same table as Android (S25): effort Low/Med/High/Auto, speed
+/// Std/Fast, access Ask (supervised) / Full.
+func composerShortLabel(_ kind: ComposerPicker, id: String?, label: String) -> String {
+    let value = (id ?? "").lowercased()
+    switch kind {
+    case .effort:
+        switch value {
+        case "", "default": return "Auto"
+        case "low": return "Low"
+        case "medium": return "Med"
+        case "high": return "High"
+        case "xhigh", "extra-high": return "XHigh"
+        case "max": return "Max"
+        case "minimal": return "Min"
+        case "none": return "None"
+        default: return String(label.prefix(4))
+        }
+    case .speed: return value == "on" ? "Fast" : "Std"
+    case .access: return value == "supervised" ? "Ask" : "Full"
+    default: return label
+    }
 }
 
 /// The access mode in effect, without the "Default ·" prefix.
@@ -269,7 +332,7 @@ struct ChatComposer: View {
                 let current = composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind))
                 List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: {
-                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: choice, selected: choice.id == current,
+                        PickerRow(glyph: AnyView(pickerGlyph(kind, value: choice.id)), choice: pickerChoice(kind, choice), selected: choice.id == current,
                                   subtitle: isDefaultChoice(choice.id) ? defaultSubtitle(kind) : nil)
                     }.disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
@@ -380,23 +443,12 @@ struct ChatComposer: View {
             // S11: one row, paperclip first, chips with their resolved values, then Stop / Send.
             // The chips wrap onto another line only when they don't fit (large text).
             HStack(alignment: .bottom, spacing: 4) {
-                if adaptive.tier.wide {
-                    attachMenu
-                    // Full labels when they fit; a tight pane drops effort to its icon first, and
-                    // only with no room left does the model name truncate.
-                    ViewThatFits(in: .horizontal) {
-                        inlineSettings(effortIcon: false)
-                        inlineSettings(effortIcon: true)
-                    }
-                    .layoutPriority(1)
-                } else {
-                    // S18: one row at the default text size: full labels when they fit, then Access
-                    // and Speed as icons, then Effort too; large text puts the model on its own row.
-                    // The choice is computed from the conversation's width and the text size, never
-                    // from measuring the chips, so no layout pass can change it (I7-1: measured
-                    // fallbacks looped at 100% CPU).
-                    chipRows(composerChipPlan(widths: chipWidths(), available: chipRowWidth))
-                }
+                // S18/S25: one row at the default text size, labels shortening before they go. The
+                // choice is computed from the conversation's width and the text size, never from
+                // measuring the chips, so no layout pass can change it (I7-1: measured layouts
+                // looped at 100% CPU). Wide windows and iPad use the same plan in the 720-point
+                // column (S28).
+                chipRows(composerChipPlan(widths: chipWidths(), available: chipRowWidth))
                 Spacer(minLength: 4)
                 // One 44-point action slot (I8-1, I8-3): Send, or Stop while a reply runs. With text
                 // typed during a reply, Stop stacks above Send instead of widening the row, so the
@@ -421,7 +473,8 @@ struct ChatComposer: View {
     /// Width left for the paperclip and chips: the composer card minus its margins and padding,
     /// the action slot and its spacing, and a margin for estimate error (I8-2).
     private var chipRowWidth: CGFloat {
-        max(0, availableWidth - 16 - 24 - (44 + 12) - 12)
+        let column = adaptive.tier.wide && compact == nil ? min(availableWidth, transcriptTextWidth + 16) : availableWidth
+        return max(0, column - 16 - 24 - (44 + 12) - 12)
     }
 
     private var running: Bool { model.chat.state.turn != nil }
@@ -453,12 +506,14 @@ struct ChatComposer: View {
         let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(dynamicTypeSize))
         let size = UIFontMetrics(forTextStyle: .body).scaledValue(for: 12, compatibleWith: traits)
         let font = UIFont(name: "NotoSans-Regular", size: size) ?? .systemFont(ofSize: size)
+        func measure(_ text: String) -> CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
         return visiblePickers.map { kind in
-            let label = chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)
-            let text = ceil((label as NSString).size(withAttributes: [.font: font]).width)
             let glyph: CGFloat = kind == .model || kind == .provider ? 24 : 0
-            let icon: CGFloat = settingIcon(kind) != nil ? 22 : 0
-            return ComposerChipWidth(kind: kind, full: glyph + icon + text + 20, iconOnly: settingIcon(kind) != nil ? 44 : nil)
+            let icon: CGFloat = hasChipIcon(kind) ? 22 : 0
+            let full = glyph + icon + measure(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)) + 20
+            let short = [.effort, .speed, .access].contains(kind) ? glyph + icon + measure(shortChipText(kind)) + 20 : nil
+            let minimum: CGFloat? = kind == .model ? glyph + measure("GPT-6…") + 20 : nil
+            return ComposerChipWidth(kind: kind, full: full, iconOnly: hasChipIcon(kind) ? 44 : nil, short: short, minimum: minimum)
         }
     }
 
@@ -467,19 +522,30 @@ struct ChatComposer: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
                     attachMenu
-                    ForEach(plan.first, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
+                    ForEach(plan.first, id: \.self) { kind in planChip(kind, plan) }
                 }
                 HStack(spacing: 4) {
-                    ForEach(plan.second, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
+                    ForEach(plan.second, id: \.self) { kind in planChip(kind, plan) }
                 }
             }
         } else {
             HStack(spacing: 4) {
                 attachMenu
-                ForEach(plan.first, id: \.self) { kind in settingButton(kind, compact: plan.icons.contains(kind), stretch: false) }
+                ForEach(plan.first, id: \.self) { kind in planChip(kind, plan) }
             }
         }
     }
+
+    @ViewBuilder private func planChip(_ kind: ComposerPicker, _ plan: ComposerChipPlan) -> some View {
+        let chip = settingButton(kind, compact: plan.icons.contains(kind), stretch: false, short: plan.short.contains(kind))
+        if kind == .model, let cap = plan.modelCap { chip.frame(maxWidth: cap, alignment: .leading) } else { chip }
+    }
+
+    private func shortChipText(_ kind: ComposerPicker) -> String {
+        composerShortLabel(kind, id: kind == .speed ? (selectedID(kind) ?? "off") : composerCurrentChoice(kind, value: selectedID(kind), choices: choices(kind)), label: chipText(kind))
+    }
+
+    private func hasChipIcon(_ kind: ComposerPicker) -> Bool { kind == .speed || settingIcon(kind) != nil }
 
     private var attachMenu: some View {
         Menu {
@@ -488,15 +554,6 @@ struct ChatComposer: View {
             Button("Files", systemImage: "folder") { files = true }
         } label: { Image(systemName: "paperclip").frame(width: 44, height: 44).accessibilityLabel("Attach image") }
             .accessibilityLabel("Attach image").disabled(model.busy || model.pending)
-    }
-
-    /// Each chip at its natural width: the model neither stretches nor truncates when there is room.
-    private func inlineSettings(effortIcon: Bool) -> some View {
-        HStack(spacing: 4) {
-            ForEach(visiblePickers) { kind in
-                settingButton(kind, compact: kind == .effort && effortIcon, stretch: false)
-            }
-        }
     }
 
     /// The input on its own full-width row, then one compact row: "+", the brain chip, the mic,
@@ -674,11 +731,15 @@ struct ChatComposer: View {
         return composerPromptHeight(resizedHeight ?? natural, available: availableHeight, minimum: basePrompt)
     }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
-    private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true) -> some View {
+    private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true, short: Bool = false) -> some View {
         Button { picker = kind } label: {
             HStack(spacing: 6) {
                 if kind == .model { ProviderGlyph(provider: model.displayedSelection?.provider) }
-                if let icon = settingIcon(kind) {
+                // S25: a bolt for Fast and a gauge for Standard, not a bare ring.
+                if kind == .speed {
+                    Image(systemName: selectedID(kind) == "on" ? "bolt.fill" : "gauge.with.dots.needle.33percent")
+                        .font(.system(size: 13, weight: .semibold)).frame(width: 16, height: 16).accessibilityHidden(true)
+                } else if let icon = settingIcon(kind) {
                     ComposerGlyph(name: icon).opacity(0.32)
                         .overlay(alignment: .bottom) {
                             ComposerGlyph(name: icon).mask(alignment: .bottom) {
@@ -686,7 +747,10 @@ struct ChatComposer: View {
                             }
                         }.frame(width: 16, height: 16).accessibilityHidden(true)
                 }
-                if !compact { Text(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)).lineLimit(1).truncationMode(.tail) }
+                if !compact {
+                    Text(short ? shortChipText(kind) : chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28))
+                        .lineLimit(1).truncationMode(kind == .model ? .middle : .tail)
+                }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
                 .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
@@ -737,13 +801,21 @@ struct ChatComposer: View {
         default: return composerChoiceLabel(list, value: selectedID(kind))
         }
     }
-    /// What the picker's Default row runs, under its label ("Opus 5.5").
+    /// What the picker's Default row runs, under its label ("Opus 5.5"; effort: "provider default").
     private func defaultSubtitle(_ kind: ComposerPicker) -> String? {
         switch kind {
         case .model: return model.view?.catalogs.default_model_label
-        case .effort: return model.view?.catalogs.default_effort_label
+        case .effort: return model.view?.catalogs.default_effort_label ?? "provider default"
         default: return nil
         }
+    }
+
+    /// The effort picker's default row reads "Auto", never "Default" (S25).
+    private func pickerChoice(_ kind: ComposerPicker, _ choice: ChatChoice) -> ChatChoice {
+        guard kind == .effort, isDefaultChoice(choice.id) else { return choice }
+        var renamed = choice
+        renamed.label = "Auto"
+        return renamed
     }
     /// The chip's own text: the resolved value alone ("Full access"); labels and menus keep
     /// "Default · …" so the inheritance is still announced.

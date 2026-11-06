@@ -48,8 +48,8 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerModelLabel(withDefault, value: "default", defaultLabel: nil), "Default")
         XCTAssertEqual(composerModelLabel(withDefault, value: "opus", defaultLabel: "Opus 5.5"), "Opus 5.5")
         let efforts = [ChatChoice(id: "", label: "Default"), ChatChoice(id: "high", label: "High")]
-        XCTAssertEqual(composerEffortLabel(efforts, value: nil, defaultLabel: nil), "Default")
-        XCTAssertEqual(composerEffortLabel(efforts, value: "", defaultLabel: "Medium"), "Default · Medium")
+        XCTAssertEqual(composerEffortLabel(efforts, value: nil, defaultLabel: nil), "Auto")
+        XCTAssertEqual(composerEffortLabel(efforts, value: "", defaultLabel: "Medium"), "Auto · Medium")
         XCTAssertEqual(composerEffortLabel(efforts, value: "high"), "High")
         XCTAssertEqual(composerResolvedAccess(access, value: nil), "Full access")
         XCTAssertEqual(composerResolvedAccess(access, value: "supervised"), "Supervised")
@@ -76,26 +76,43 @@ final class ComposerChipsTests: XCTestCase {
     }
 }
 
-/// I7-1: the chip layout is a pure function of the widths.
+/// I7-1 / S25: the chip layout is a pure function of the widths.
 final class ComposerChipPlanTests: XCTestCase {
-    private let chips = [ComposerChipWidth(kind: .model, full: 110, iconOnly: nil),
-                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44),
-                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44),
-                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44)]
+    private let chips = [ComposerChipWidth(kind: .model, full: 110, iconOnly: nil, minimum: 70),
+                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44, short: 70),
+                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44, short: 66),
+                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44, short: 66)]
 
-    func testOneRowWhileItFits() {
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 500), ComposerChipPlan(first: [.model, .effort, .speed, .access]))
-        let tight = composerChipPlan(widths: chips, available: 350)
-        XCTAssertFalse(tight.twoRows)
-        XCTAssertEqual(tight.icons, [.access, .speed])
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 305).icons, [.access, .speed, .effort])
+    func testLabelsShortenBeforeTheyDisappear() {
+        // 44 + 114 + 94 + 94 + 114 = 460
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 460), ComposerChipPlan(first: [.model, .effort, .speed, .access]))
+        // Short labels: 44 + 114 + 74 + 70 + 70 = 372
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 372).short, [.effort, .speed, .access])
+        // Then the model truncates (minimum 70) before any label goes.
+        let truncated = composerChipPlan(widths: chips, available: 340)
+        XCTAssertEqual(truncated.short, [.effort, .speed, .access])
+        XCTAssertEqual(truncated.modelCap, 340 - (44 + 74 + 70 + 70) - 4)
+        XCTAssertTrue(truncated.icons.isEmpty)
+        // Only below that do the icons alone remain.
+        let icons = composerChipPlan(widths: chips, available: 300)
+        XCTAssertEqual(icons.icons, [.effort, .speed, .access])
+        XCTAssertFalse(icons.twoRows)
     }
 
     func testLargeTextPutsTheModelOnItsOwnRow() {
-        let plan = composerChipPlan(widths: chips, available: 200)
+        let plan = composerChipPlan(widths: chips, available: 180)
         XCTAssertTrue(plan.twoRows)
         XCTAssertEqual(plan.first, [.model])
         XCTAssertEqual(plan.second, [.effort, .speed, .access])
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 200), plan, "same input, same layout")
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 180), plan, "same input, same layout")
+    }
+
+    func testShortLabelTable() {
+        XCTAssertEqual(composerShortLabel(.effort, id: "", label: "Default"), "Auto")
+        XCTAssertEqual(composerShortLabel(.effort, id: "medium", label: "Medium"), "Med")
+        XCTAssertEqual(composerShortLabel(.speed, id: "off", label: "Normal"), "Std")
+        XCTAssertEqual(composerShortLabel(.speed, id: "on", label: "Fast"), "Fast")
+        XCTAssertEqual(composerShortLabel(.access, id: "supervised", label: "Supervised"), "Ask")
+        XCTAssertEqual(composerShortLabel(.access, id: "full_access", label: "Full access"), "Full")
     }
 }

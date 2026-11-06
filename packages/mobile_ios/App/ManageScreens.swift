@@ -156,9 +156,10 @@ struct NewChatScreen: View {
             Menu {
                 ForEach(choices, id: \.id) { item in
                     let current = item.id == (value ?? newChatDefault(label))
+                    // S25: the default effort reads "Auto · provider default", never "Default".
+                    let title = (label == "Effort" && isDefaultChoice(item.id) ? "Auto · provider default" : item.label) + (item.favorite ? " ★" : "")
                     Button { Task { await manage.select(workspace, update(item.id)) } } label: {
-                        if current { Label(item.label + (item.favorite ? " ★" : ""), systemImage: "checkmark") }
-                        else { Text(item.label + (item.favorite ? " ★" : "")) }
+                        if current { Label(title, systemImage: "checkmark") } else { Text(title) }
                     }.disabled(!item.enabled)
                 }
             } label: {
