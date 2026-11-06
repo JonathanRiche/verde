@@ -134,7 +134,7 @@ struct TranscriptBody: View {
             let state = model.state
             VStack(spacing: 0) {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
-                    if let banner = transcriptBanner(state, nowMs(context.date)) {
+                    if let banner = transcriptBanner(state, nowMs(context.date), sendError: model.input.view?.error, sendNotice: model.input.notice) {
                         BannerCard(banner: banner, retry: {
                             if state.thread?.error != nil { model.retry() } else { Task { await browse.refresh() } }
                         }, hosts: onHosts)
@@ -175,8 +175,8 @@ private struct BannerCard: View {
             Text(banner.text) .font(VerdeTheme.ui(14)).accessibilityIdentifier("transcriptBanner")
             if banner.busy { ProgressView().progressViewStyle(.linear) }
             switch banner.action {
-            case .some(.retry): Button("Retry", action: retry)
-            case .some(.hosts): Button("Open hosts", action: hosts)
+            case .some(.retry): Button(action: retry) { Text("Retry").font(VerdeTheme.ui(14, bold: true)).minTarget() }
+            case .some(.hosts): Button(action: hosts) { Text("Open hosts").font(VerdeTheme.ui(14, bold: true)).minTarget() }
             case nil: EmptyView()
             }
         }
@@ -286,32 +286,45 @@ private struct TranscriptList: View {
         withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
     }
 
+    @ViewBuilder private func rows(_ items: [TranscriptItem], lazy: Bool) -> some View {
+        PageHeader(page: page, loadOlder: { model.loadOlder(force: true) }).id(headerID)
+        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+            TranscriptRow(item: item, model: model, turnStartedAt: turn?.started_at_ms)
+                .frame(maxWidth: (compact ? nil : transcriptRowCap(item, tier: adaptive.tier)) ?? .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .id(item.id)
+                .onAppear {
+                    // An eager stack shows every row at once; it pages from the scroll position instead.
+                    if lazy && index < prefetchItems { model.loadOlder() }
+                    if case .approval = item { cardVisible = true }
+                }
+                .onDisappear { if case .approval = item { cardVisible = false } }
+        }
+        Color.clear.frame(height: 1).id(bottomID)
+            .background(GeometryReader { g in
+                Color.clear.preference(key: BottomOffsetKey.self, value: g.frame(in: .named("transcript")).maxY)
+            })
+    }
+
     private func list(proxy: ScrollViewProxy, outer: GeometryProxy) -> some View {
                 // Observe rows inside the deferred content instead of capturing
                 // a snapshot that can stay on the optimistic Sending row.
                 let items = model.items
                 return ZStack(alignment: .top) {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) {
-                            PageHeader(page: page, loadOlder: { model.loadOlder(force: true) }).id(headerID)
-                            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                                TranscriptRow(item: item, model: model, turnStartedAt: turn?.started_at_ms)
-                                    .frame(maxWidth: (compact ? nil : transcriptRowCap(item, tier: adaptive.tier)) ?? .infinity, alignment: .leading)
-                                    .frame(maxWidth: .infinity)
-                                    .id(item.id)
-                                    .onAppear {
-                                        if index < prefetchItems { model.loadOlder() }
-                                        if case .approval = item { cardVisible = true }
-                                    }
-                                    .onDisappear { if case .approval = item { cardVisible = false } }
-                            }
-                            Color.clear.frame(height: 1).id(bottomID)
-                                .background(GeometryReader { g in
-                                    Color.clear.preference(key: BottomOffsetKey.self, value: g.frame(in: .named("transcript")).maxY)
-                                })
+                        // I6-1: a lazy stack re-estimates rows it hasn't measured whenever content
+                        // above the viewport changes height (a tool group collapsing, the composer
+                        // resizing) and could loop for minutes placing them. Ordinary chats are laid
+                        // out eagerly, so every height is known; only very long ones stay lazy.
+                        if items.count <= eagerTranscriptLimit {
+                            VStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: false) }
+                                .scrollTargetLayout()
+                                .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: true) }
+                                .scrollTargetLayout()
+                                .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                         }
-                        .scrollTargetLayout()
-                        .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                     }
                     .coordinateSpace(name: "transcript")
                     // A bar over the bottom edge (I2-1), drawn as an overlay so it never changes the
@@ -356,7 +369,8 @@ private struct TranscriptList: View {
                         // `follow` still describes the layout before this change.
                         if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
                     }
-                    .modifier(TailFollower(follow: $follow, atBottom: $atBottom, output: tailKey(items)) { proxy.scrollTo(bottomID, anchor: .bottom) })
+                    .modifier(TailFollower(follow: $follow, atBottom: $atBottom, output: tailKey(items),
+                                           nearTop: { model.loadOlder() }) { proxy.scrollTo(bottomID, anchor: .bottom) })
 
                     ApprovalBanner(approval: approval, cardVisible: cardVisible, controller: model.approvals) {
                         guard let approval else { return }
@@ -368,11 +382,10 @@ private struct TranscriptList: View {
             .onAppear { viewport = outer.size.height }
             .onChange(of: outer.size.height) { old, height in
                 viewport = height
-                // The keyboard, the composer growing or an attachment strip: stay on what was
-                // being read (or the newest output) instead of drifting.
-                guard abs(height - old) > 60 else { return }
-                if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
-                else if let position { proxy.scrollTo(position, anchor: .top) }
+                // The keyboard, the composer growing or an attachment strip: a reader at the
+                // newest output stays there (I6-2). A reader scrolled up keeps their offset; a
+                // programmatic jump there moved the transcript and fed the layout loop.
+                if follow && abs(height - old) > 1 { proxy.scrollTo(bottomID, anchor: .bottom) }
             }
     }
 }
@@ -412,10 +425,14 @@ private struct TailFollower: ViewModifier {
     @Binding var atBottom: Bool
     /// Changes with new output; restores the re-anchor allowance.
     let output: String
+    /// The reader reached the oldest loaded rows (pages the eager stack).
+    var nearTop: () -> Void = {}
     let anchor: () -> Void
 
     func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, atBottom: $atBottom, output: output, anchor: anchor)) } else { content }
+        if #available(iOS 18.0, *) {
+            content.modifier(TailFollowerGeometry(follow: $follow, atBottom: $atBottom, output: output, nearTop: nearTop, anchor: anchor))
+        } else { content }
     }
 }
 
@@ -423,52 +440,79 @@ private struct TailFollower: ViewModifier {
 private let tailReanchors = 3
 /// Quiet time before a settled geometry is re-anchored.
 private let tailSettle: Duration = .milliseconds(150)
+/// Chats up to this many rows are laid out eagerly (I6-1).
+let eagerTranscriptLimit = 160
+
+/// The scroll geometry the follower reacts to, coarse enough that sub-point re-layouts don't
+/// count as changes.
+struct TailGeometry: Equatable {
+    var gap: CGFloat
+    var container: CGFloat
+    var nearTop: Bool
+
+    init(offset: CGFloat, insetTop: CGFloat, insetBottom: CGFloat, content: CGFloat, container: CGFloat) {
+        let last = max(-insetTop, content + insetBottom - container)
+        gap = ((last - offset) / 4).rounded() * 4
+        self.container = container.rounded()
+        nearTop = offset + insetTop < 400
+    }
+}
+
+/// Bookkeeping that must not re-render the transcript: writing it on every scroll frame (as
+/// `@State`) re-evaluated the scroll view inside its own layout pass.
+private final class TailState {
+    var phase: ScrollPhase = .idle
+    var geometry: TailGeometry?
+    var allowance = tailReanchors
+    var pending: Task<Void, Never>?
+}
 
 @available(iOS 18.0, *)
 private struct TailFollowerGeometry: ViewModifier {
     @Binding var follow: Bool
     @Binding var atBottom: Bool
     let output: String
+    let nearTop: () -> Void
     let anchor: () -> Void
-    @State private var phase: ScrollPhase = .idle
-    @State private var gap: CGFloat = 0
-    @State private var allowance = tailReanchors
-    @State private var pending: Task<Void, Never>?
+    @State private var tail = TailState()
 
     func body(content: Content) -> some View {
         content
             .onScrollPhaseChange { _, next in
-                phase = next
+                tail.phase = next
                 // Dragging the transcript puts the keyboard away (I3-5).
-                if next == .interacting { follow = false; pending?.cancel(); dismissKeyboard() }
-                if next == .idle, !follow, abs(gap) <= bottomSlack { follow = true }
+                if next == .interacting { if follow { follow = false }; tail.pending?.cancel(); dismissKeyboard() }
+                if next == .idle, !follow, abs(tail.geometry?.gap ?? 0) <= bottomSlack { follow = true }
             }
-            // Points between the current offset and the last reachable one; negative is past the end.
-            .onScrollGeometryChange(for: CGFloat.self) { g in
-                let last = max(-g.contentInsets.top, g.contentSize.height + g.contentInsets.bottom - g.containerSize.height)
-                return last - g.contentOffset.y
-            } action: { _, next in
-                gap = next
-                let bottom = transcriptAtBottom(atBottom, gap: next)
+            .onScrollGeometryChange(for: TailGeometry.self) { g in
+                TailGeometry(offset: g.contentOffset.y, insetTop: g.contentInsets.top, insetBottom: g.contentInsets.bottom,
+                             content: g.contentSize.height, container: g.containerSize.height)
+            } action: { previous, next in
+                tail.geometry = next
+                // A resized container (keyboard, composer) is new geometry to follow, not a retry.
+                if previous.container != next.container { tail.allowance = tailReanchors }
+                if next.nearTop && !previous.nearTop && !follow { nearTop() }
+                let bottom = transcriptAtBottom(atBottom, gap: next.gap)
                 if bottom != atBottom { atBottom = bottom }
                 schedule()
             }
             .onChange(of: follow) { _, following in
-                if following { allowance = tailReanchors } else { pending?.cancel() }
+                if following { tail.allowance = tailReanchors } else { tail.pending?.cancel() }
             }
-            .onChange(of: output) { allowance = tailReanchors }
-            .onDisappear { pending?.cancel() }
+            .onChange(of: output) { tail.allowance = tailReanchors }
+            .onDisappear { tail.pending?.cancel() }
     }
 
     /// Restarts the settle timer on each change, so a burst of layout passes anchors once. When the
     /// allowance is spent the transcript stops following and shows Jump to latest instead.
     private func schedule() {
-        pending?.cancel()
-        guard follow, phase == .idle, abs(gap) > bottomSlack else { return }
-        pending = Task { @MainActor in
+        tail.pending?.cancel()
+        guard follow, tail.phase == .idle, abs(tail.geometry?.gap ?? 0) > bottomSlack else { return }
+        let tail = tail
+        tail.pending = Task { @MainActor in
             try? await Task.sleep(for: tailSettle)
-            guard !Task.isCancelled, follow, phase == .idle, abs(gap) > bottomSlack else { return }
-            if allowance > 0 { allowance -= 1; anchor() } else { follow = false }
+            guard !Task.isCancelled, follow, tail.phase == .idle, abs(tail.geometry?.gap ?? 0) > bottomSlack else { return }
+            if tail.allowance > 0 { tail.allowance -= 1; anchor() } else { follow = false }
         }
     }
 }
