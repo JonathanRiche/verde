@@ -10,7 +10,7 @@ struct GitChatControls: View {
     /// chat's "⋯" menu (`GitMenuItems`) and only the sheets and dialogs stay mounted here.
     private var inline: Bool { adaptive.tier.wide }
     private func hasActions(_ model: GitChangesModel) -> Bool {
-        (model.change?.files ?? 0) > 0 || model.ahead > 0 || model.notice != nil
+        model.commitCount > 0 || model.ahead > 0 || model.notice != nil
     }
     private var controls: some View {
         Group {
@@ -27,13 +27,13 @@ struct GitChatControls: View {
                     HStack(spacing: 0) {
                         Button {
                             Task {
-                                if (model.change?.files ?? 0) == 0 && model.ahead > 0 { await model.push() }
+                                if model.commitCount == 0 && model.ahead > 0 { await model.push() }
                                 else { await model.begin(push: model.defaultPush, quick: model.canCommit) }
                             }
                         } label: {
                             HStack(spacing: 4) {
                                 Text(model.canCommit ? model.label : "Changes").lineLimit(1)
-                                if model.change != nil { Text("\(model.mineCount)").monospacedDigit() }
+                                if model.change != nil || model.workspaceFiles != nil { Text("\(model.commitCount)").monospacedDigit() }
                                 if let change = model.change, change.additions + change.deletions > 0 {
                                     Text("+\(change.additions)").monospacedDigit().foregroundStyle(VerdeTheme.accent)
                                     Text("−\(change.deletions)").monospacedDigit().foregroundStyle(VerdeTheme.danger)
@@ -59,6 +59,7 @@ struct GitChatControls: View {
         .onChange(of: browse.session?.store.snapshots["git_review"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_status"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_summary:" + workspace]) { _, _ in Task { await model?.refresh() } }
+        .onChange(of: browse.session?.store.snapshots["workspace_changes:" + workspace]) { _, _ in Task { await model?.refresh() } }
     }
     private func catalogChanged() async {
         let workspaceValue = browse.session?.store.workspaces?.data?.items.first { $0.workspace_id == workspace }
@@ -93,10 +94,10 @@ struct GitMenuItems: View {
     let model: GitChangesModel
     var body: some View {
         if model.canCommit {
-            Button("Commit… (\(model.mineCount))") { Task { await model.begin(push: false) } }
+            Button(model.commitCount > 0 ? "Commit… (\(model.commitCount))" : "Commit…") { Task { await model.begin(push: false) } }
             Button("Commit & push") { Task { await model.begin(push: true, quick: true) } }
-        } else if (model.change?.files ?? 0) > 0 {
-            Button("Changes (\(model.mineCount))") { Task { await model.begin(push: model.defaultPush, quick: false) } }
+        } else if model.commitCount > 0 {
+            Button("Changes (\(model.commitCount))") { Task { await model.begin(push: model.defaultPush, quick: false) } }
         }
         if model.ahead > 0 { Button("Push") { Task { await model.push() } } }
         ForEach(model.rejectedRoots, id: \.self) { root in
@@ -252,7 +253,7 @@ struct CommitSettingsSection: View {
     var body: some View {
         TitledSection("Commit messages") {
             LabeledContent("Provider", value: ["auto": "Auto", "codex": "Codex", "claude": "Claude", "cursor": "Cursor", "opencode": "OpenCode"][config?.commit_message_provider ?? "auto"] ?? "Auto")
-            LabeledContent("Model", value: config?.commit_message_model ?? "Default (provider’s fast model)")
+            LabeledContent("Model", value: config?.commit_message_model ?? "Auto (provider’s fast model)")
             LabeledContent("Default action", value: config?.commit_default_action == "commit_and_push" ? "Commit & push" : "Commit")
             Text("Change on your computer").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
         }.task {

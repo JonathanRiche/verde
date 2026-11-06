@@ -71,6 +71,11 @@ final class GitChangesModel {
     }
     var change: GitThreadSummary? { summary?.threads.first { $0.local_thread_id == thread } }
     var mineCount: UInt32 { guard let change else { return 0 }; return change.files > change.attention ? change.files - change.attention : 0 }
+    /// Changed files in the chat's workspace repositories (the Changes screen's "All" count), once read.
+    private(set) var workspaceFiles: Int?
+    /// The menu's count (I10-7): what Commit… reviews, the workspace's changed files, rather than
+    /// only the files this chat claimed (0 when every change is unassigned).
+    var commitCount: Int { workspaceFiles ?? Int(mineCount) }
     var review: GitReviewResult? {
         guard view?.review?.workspace_id == workspace, view?.review?.local_thread_id == thread else { return nil }
         return view?.review
@@ -163,12 +168,16 @@ final class GitChangesModel {
     }
     var defaultPush: Bool { (view?.config?.commit_default_action ?? "commit") == "commit_and_push" }
     var label: String {
-        if (change?.files ?? 0) == 0 && ahead > 0 { return "↑\(ahead) Push" }
+        if commitCount == 0 && ahead > 0 { return "↑\(ahead) Push" }
         return defaultPush ? "Commit & push" : "Commit"
     }
     func start() async {
         await dispatch(.git_summary_refresh(EventGitSummaryRefresh(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace)))
         await dispatch(.git_status_refresh(EventGitStatusRefresh(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, thread_id: thread)))
+        // One read of the workspace's changes for the count: open asks for it, close stops the
+        // core's refresh-on-turn watch (the reply still lands). The Changes screen keeps its own.
+        await dispatch(.workspace_changes_open(EventWorkspaceChangesOpen(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace)))
+        await dispatch(.workspace_changes_close(EventWorkspaceChangesClose(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace)))
         await refresh()
     }
     func refresh() async {
@@ -176,6 +185,10 @@ final class GitChangesModel {
             let next = try JSONDecoder().decode(GitReviewQuery.self, from: await query("git_review")).data
             status = try JSONDecoder().decode(GitStatusQuery.self, from: await query("git_status")).data
             summary = try JSONDecoder().decode(GitSummaryQuery.self, from: await query("git_summary:" + workspace)).data
+            if let changes = try? JSONDecoder().decode(ExplorerChangesQuery.self, from: await query("workspace_changes:" + workspace)).data,
+               changes.workspace_id == workspace, changes.loaded {
+                workspaceFiles = changes.repos.reduce(0) { $0 + $1.files.count }
+            }
             await receive(next)
             await receipts()
             await advanceQuickAction()
