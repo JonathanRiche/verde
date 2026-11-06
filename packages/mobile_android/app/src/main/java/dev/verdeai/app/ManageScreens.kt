@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.*
@@ -132,15 +133,19 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
     ManageFrame("History", onBack) {
         if (!ready(state)) return@ManageFrame
         item(key = "search") {
-            BasicTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp).testTag(HISTORY_SEARCH),
+            // A5-7: a search pill (like the drawer's) whose text has its inner padding, so neither the
+            // text nor a keyboard focus ring sits against the edge.
+            BasicTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag(HISTORY_SEARCH),
                 singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = VerdeColors.Text),
                 cursorBrush = SolidColor(VerdeColors.Accent), decorationBox = { field ->
-                    Column {
-                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(vertical = 12.dp)) {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).background(VerdeColors.PanelAlt, RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Icon(Icons.Filled.Search, contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp))
+                        Box(Modifier.weight(1f)) {
                             if (query.isEmpty()) Text("Search chats", color = VerdeColors.Subtle)
                             field()
                         }
-                        HorizontalDivider(color = VerdeColors.Border)
                     }
                 })
         }
@@ -337,10 +342,12 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             line("browse-unsupported", "Update verde on the computer to browse folders. You can still type a path.")
             return@ManageFrame
         }
-        if (directory.suggestions.isNotEmpty()) {
+        // A5-8: no stale suggestions from closed workspaces (their folders may be gone).
+        val suggestions = freshFolderSuggestions(directory.suggestions, state.workspaces?.items.orEmpty())
+        if (suggestions.isNotEmpty()) {
             // S15: suggested folders as list rows: a name that tells them apart, the full path under it.
-            val labels = folderChipLabels(directory.suggestions)
-            items(directory.suggestions, key = { "suggestion:$it" }) { root ->
+            val labels = folderChipLabels(suggestions)
+            items(suggestions, key = { "suggestion:$it" }) { root ->
                 VerdeListRow(headlineContent = { Text(labels[root] ?: root, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     supportingContent = { Text(root, maxLines = 1, overflow = TextOverflow.MiddleEllipsis) },
                     leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
@@ -534,4 +541,17 @@ internal fun ActionRow(icon: androidx.compose.ui.graphics.painter.Painter, title
         Text(title, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, color = ink)
         if (chevron) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = colors.onSurfaceVariant)
     }
+}
+
+/**
+ * Add-workspace suggestions worth offering: folders tied to an open workspace (the folder, one of
+ * its parents or one inside it) always stay; folders known only from closed workspaces go, since
+ * the host can't vouch they still exist.
+ */
+internal fun freshFolderSuggestions(suggestions: List<String>, workspaces: List<Workspace>): List<String> {
+    fun norm(p: String) = p.trimEnd('/')
+    fun related(a: String, b: String) = norm(a) == norm(b) || norm(a).startsWith(norm(b) + "/") || norm(b).startsWith(norm(a) + "/")
+    val open = workspaces.filter { it.open && it.path.isNotEmpty() }.map { it.path }
+    val closed = workspaces.filter { !it.open && it.path.isNotEmpty() }.map { it.path }
+    return suggestions.filter { s -> open.any { related(s, it) } || closed.none { related(s, it) } }.distinctBy(::norm)
 }

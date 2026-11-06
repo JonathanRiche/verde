@@ -2,6 +2,7 @@ package dev.verdeai.app
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /** S4/S7/S8 presentation rules shared with iOS. */
@@ -63,5 +64,19 @@ class ScreenSpecTest {
 
     @Test fun licencesReflowAndHaveNoPlaceholders() {
         assertEquals("one two\n\nthree", reflowLicence("one\ntwo\n\n three \n"))
+    }
+
+    @Test fun addWorkspaceDropsClosedWorkspaceFolders() {
+        fun ws(id: String, path: String, open: Boolean) = dev.verdeai.core.Workspace(id, id, path, open = open, panes = emptyList(), threads = emptyList())
+        val workspaces = listOf(ws("demo", "/r/demo/project", true), ws("s1", "/r/x/demo/scripts/demo", false), ws("s2", "/r/nope/scripts/demo", false))
+        val suggestions = listOf("/r/demo", "/r/demo/project", "/r/x/demo/scripts/demo", "/r/nope/scripts/demo", "/home/me")
+        assertEquals(listOf("/r/demo", "/r/demo/project", "/home/me"), freshFolderSuggestions(suggestions, workspaces))
+    }
+
+    @Test fun imagePickerTypesAreJudgedByContent() {
+        assertTrue(ImageAttachments.plausibleImageType(null))
+        assertTrue(ImageAttachments.plausibleImageType("image/png"))
+        assertTrue(ImageAttachments.plausibleImageType("application/octet-stream"))
+        assertFalse(ImageAttachments.plausibleImageType("video/mp4"))
     }
 }
