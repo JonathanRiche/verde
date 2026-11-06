@@ -41,8 +41,12 @@ struct DrawerItem: Identifiable {
 /// screen is under Workspaces; Home, Hosts and Settings only when they are on screen. The back
 /// button is the chevron alone, so it never names a different section.
 func drawerFooterDestination(tab: RootTab, route: BrowseRoute?) -> RootTab {
-    guard tab.showsBrowse, route != nil else { return tab }
-    return .workspaces
+    // One rule on both platforms, by the current screen's type.
+    guard tab.showsBrowse, let route else { return tab }
+    switch route {
+    case .history, .newChat: return .home
+    case .thread, .terminal, .newTerminal, .changes, .files, .patch, .workspaceFile, .workspace, .addWorkspace: return .workspaces
+    }
 }
 
 /// Active = running or needs_you, the same rule as Home's "Needs you" and "Running" sections.

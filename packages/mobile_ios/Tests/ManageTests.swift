@@ -107,6 +107,22 @@ final class ManageTests: XCTestCase {
         XCTAssertEqual(drawerFooterDestination(tab: .settings, route: .changes("w")), .settings)
     }
 
+    /// The footer marks the current screen's type, the same rule as Android.
+    func testFooterHighlightFollowsTheScreenType() {
+        let workspaces: [BrowseRoute] = [.thread(workspace: "w", thread: "t"), .files("w"), .changes("w"),
+                                         .patch(workspace: "w", root: "r", path: "p"),
+                                         .workspaceFile(workspace: "w", root: "r", path: "p", absolute: ""),
+                                         .terminal(workspace: "w", terminal: "t"), .workspace("w")]
+        for tab in [RootTab.home, .workspaces] {
+            for route in workspaces { XCTAssertEqual(drawerFooterDestination(tab: tab, route: route), .workspaces, "\(route)") }
+            XCTAssertEqual(drawerFooterDestination(tab: tab, route: .history), .home)
+            XCTAssertEqual(drawerFooterDestination(tab: tab, route: .newChat("w")), .home)
+            XCTAssertEqual(drawerFooterDestination(tab: tab, route: nil), tab)
+        }
+        XCTAssertEqual(drawerFooterDestination(tab: .settings, route: nil), .settings)
+        XCTAssertEqual(drawerFooterDestination(tab: .hosts, route: .history), .hosts)
+    }
+
     func testNewChatRowsNameTheResolvedDefault() {
         let access = [ChatChoice(id: "supervised", label: "Supervised"), ChatChoice(id: "full_access", label: "Full access")]
         XCTAssertEqual(newChatChoiceLabel("Access", value: nil, choices: access), "Full access")
