@@ -332,7 +332,7 @@ private struct MdBlockView: View {
         case .paragraph(let text):
             Text(themedInline(text, background: VerdeTheme.alternate)) .font(VerdeTheme.ui(compact ? 14 : 15)).frame(maxWidth: .infinity, alignment: .leading)
         case .heading(let level, let text):
-            Text(themedInline(text, background: VerdeTheme.alternate)).font(VerdeTheme.ui(compact ? (level == 1 ? 18 : level == 2 ? 16 : 15) : (level == 1 ? 24 : level == 2 ? 20 : 17), bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
+            Text(themedInline(text, background: VerdeTheme.alternate)).font(VerdeTheme.ui(compact ? (level == 1 ? 18 : level == 2 ? 16 : 15) : (level == 1 ? 24 : level == 2 ? 20 : 17), bold: true)).foregroundStyle(VerdeTheme.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
         case .bullets(let ordered, let items):
@@ -355,20 +355,97 @@ private struct MdBlockView: View {
         case .rule:
             Divider()
         case .table(let rows):
-            ScrollView(.horizontal) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                        HStack(alignment: .top, spacing: 0) {
-                            ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
-                                Text(themedInline(cell, background: VerdeTheme.alternate)).font(index == 0 ? .subheadline.weight(.semibold) : .footnote)
-                                    .frame(width: 140, alignment: .leading).padding(6)
-                            }
-                        }
-                        if index < rows.count - 1 { Divider() }
-                    }
+            MarkdownTable(rows: rows)
+        }
+    }
+}
+
+/// Columns sized to their longest cell (capped, then wrapping), scrolling sideways in a rounded
+/// well with an edge fade, so no cell is cut off.
+private struct MarkdownTable: View {
+    let rows: [[AttributedString]]
+    /// Roughly one footnote character, scaled with Dynamic Type.
+    @ScaledMetric(relativeTo: .footnote) private var charWidth: CGFloat = 7.4
+    @ScaledMetric(relativeTo: .footnote) private var maxColumn: CGFloat = 240
+
+    private func width(_ column: Int) -> CGFloat {
+        let longest = rows.map { $0.indices.contains(column) ? $0[column].characters.count : 0 }.max() ?? 0
+        return min(maxColumn, max(48, CGFloat(longest) * charWidth)) + 20
+    }
+
+    var body: some View {
+        let columns = rows.map(\.count).max() ?? 0
+        let widths = (0..<columns).map(width)
+        OverflowScroll {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    MarkdownTableRow(cells: row, widths: widths, header: index == 0)
+                    if index < rows.count - 1 { Divider().overlay(VerdeTheme.border) }
                 }
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(VerdeTheme.border))
             }
+        }
+        .background(VerdeTheme.alternate.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(VerdeTheme.border))
+        .accessibilityIdentifier("markdown-table")
+    }
+}
+
+private struct MarkdownTableRow: View {
+    let cells: [AttributedString]
+    let widths: [CGFloat]
+    let header: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { column, cell in
+                Text(themedInline(cell, background: VerdeTheme.alternate))
+                    .font(header ? .footnote.weight(.semibold) : .footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .frame(width: column < widths.count ? widths[column] : 120, alignment: .leading)
+            }
+        }
+    }
+}
+
+private struct OverflowFrameKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+}
+
+/// Sideways-scrolling content with a fade on each edge that hides more of it (S3).
+struct OverflowScroll<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    @State private var frame: CGRect = .zero
+    @State private var visible: CGFloat = 0
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            content()
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: OverflowFrameKey.self, value: g.frame(in: .named("overflow-scroll")))
+                })
+        }
+        .coordinateSpace(name: "overflow-scroll")
+        .onPreferenceChange(OverflowFrameKey.self) { frame = $0 }
+        .background(GeometryReader { g in
+            Color.clear.onAppear { visible = g.size.width }.onChange(of: g.size.width) { _, width in visible = width }
+        })
+        .mask(OverflowFade(leading: frame.minX < -1, trailing: frame.maxX > visible + 1))
+    }
+}
+
+private struct OverflowFade: View {
+    let leading: Bool
+    let trailing: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            LinearGradient(colors: [Color.black.opacity(leading ? 0 : 1), Color.black], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 24)
+            Rectangle().fill(Color.black)
+            LinearGradient(colors: [Color.black, Color.black.opacity(trailing ? 0 : 1)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 24)
         }
     }
 }
@@ -388,20 +465,21 @@ struct CodeBlock: View {
         if code.hasSuffix("\n"), let last = text.characters.indices.last { text.removeSubrange(last...) }
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(language ?? "code") .font(VerdeTheme.ui(10)).foregroundStyle(.secondary)
+                Text(language ?? "code") .font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.muted)
                 Spacer()
-                Button("Copy code") { UIPasteboard.general.string = code.hasSuffix("\n") ? String(code.dropLast()) : code }
-                     .font(VerdeTheme.ui(12))
+                CopyIconButton(label: "Copy code") { code.hasSuffix("\n") ? String(code.dropLast()) : code }
             }
-            .padding(.horizontal, 10).padding(.vertical, 4)
-            ScrollView(.horizontal, showsIndicators: false) {
+            .padding(.leading, 10)
+            OverflowScroll {
                 Text(text).font(VerdeTheme.mono()).fixedSize()
                     .padding(.horizontal, 10).padding(.bottom, 10)
                     .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 8))
+        .background(VerdeTheme.alternate.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(VerdeTheme.border))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
         .accessibilityIdentifier("code-block")
         .task(id: key) {
             guard let language else { return }
