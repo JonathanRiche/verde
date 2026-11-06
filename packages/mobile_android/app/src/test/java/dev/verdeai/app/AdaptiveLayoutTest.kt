@@ -115,7 +115,7 @@ class AdaptiveLayoutTest {
         open = true
         compose.waitForIdle()
         compose.onNodeWithText("Chats").assertDoesNotExist()
-        compose.onNodeWithTag(SHELL_MOSS).assertWidthIsEqualTo(SIDEBAR_WIDTH)
+        compose.onNodeWithTag(SHELL_MOSS).assertWidthIsEqualTo(MOSS_SLOT_WIDTH)
         open = false
         compose.waitForIdle()
         compose.onNodeWithText("Chats").assertExists()

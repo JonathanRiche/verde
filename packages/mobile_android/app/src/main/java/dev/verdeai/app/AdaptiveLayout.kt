@@ -29,6 +29,7 @@ internal const val THREE_PANE_WINDOW_DP = 1000f
 internal val SIDEBAR_WIDTH = 300.dp
 internal val SIDEBAR_RAIL_WIDTH = 56.dp
 internal val MOSS_PANE_WIDTH = 320.dp
+internal val MOSS_SLOT_WIDTH = 340.dp
 internal val TRANSCRIPT_TEXT_MAX_WIDTH = 720.dp
 
 internal const val SHELL_SIDEBAR = "shell-sidebar"
@@ -114,7 +115,9 @@ internal fun AdaptiveShellFrame(panes: ShellPanes, sidebar: @Composable () -> Un
             SidebarMode.Hidden -> Unit
         }
         if (panes.moss == MossPlacement.SidebarSlot) {
-            MossPane(SIDEBAR_WIDTH, WindowInsetsSides.Start, moss)
+            // r5: a little wider than the sidebar, so the companion's composer shows its brain in full
+            // ("Codex · GPT-6.1 Sol") beside the attach, mic and send controls.
+            MossPane(MOSS_SLOT_WIDTH, WindowInsetsSides.Start, moss)
             PaneDivider()
         }
         Box(Modifier.weight(1f).fillMaxHeight().testTag(SHELL_CONTENT)) { content() }

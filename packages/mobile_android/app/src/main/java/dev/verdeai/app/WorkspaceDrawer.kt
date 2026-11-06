@@ -141,7 +141,9 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                     Text("Search", color = VerdeColors.Subtle)
                 }
                 if (ready) {
-                    if (!persistent) IconButton(onClick = { onNewChat(target?.workspace_id) }, modifier = Modifier.named("New chat")) { Icon(Icons.Filled.Add, null) }
+                    // r5: the sidebar too starts a chat from here, so its chat list keeps the height a
+                    // separate New chat button took.
+                    IconButton(onClick = { onNewChat(target?.workspace_id) }, modifier = Modifier.named("New chat").testTag(SIDEBAR_NEW_CHAT)) { Icon(Icons.Filled.Add, null) }
                     if (target != null) IconButton(onClick = { onNewTerminal(target.workspace_id) }, modifier = Modifier.named("New terminal")) {
                         Icon(workspaceIcon(9), null, Modifier.size(20.dp))
                     }
@@ -175,11 +177,6 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
             }
             HorizontalDivider(color = VerdeColors.Border)
             if (persistent) {
-                if (ready) FilledTonalButton(onClick = { onNewChat(target?.workspace_id) }, shape = RoundedCornerShape(7.dp),
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).testTag(SIDEBAR_NEW_CHAT)) {
-                    Icon(Icons.Filled.Add, null, Modifier.size(18.dp))
-                    Text("New chat", Modifier.padding(start = 6.dp))
-                }
                 dock?.invoke()
                 // Each tab takes the width of its label, so "Workspaces" never truncates in 300dp.
                 DrawerFooter(currentTab, onTab, onSettings)

@@ -539,7 +539,8 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
         val area = bubbleArea(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat(), size,
             safe.getLeft(density, direction).toFloat(), safe.getTop(density).toFloat(), safe.getRight(density, direction).toFloat(),
             safe.getBottom(density).toFloat(), reserveTop = with(density) { 56.dp.toPx() },
-            reserveBottom = with(density) { 88.dp.toPx() }, margin = with(density) { 8.dp.toPx() })
+            // r5: at rest it sits in the bottom band beside the New chat button (16dp off the bottom), not above it.
+            reserveBottom = with(density) { 8.dp.toPx() }, margin = with(density) { 8.dp.toPx() })
         val currentArea by rememberUpdatedState(area)
         // S14: at rest the bubble stacks on the New chat button at the bottom of its side, where the
         // lists keep space free; a drag picks the side, and it settles back to the bottom.

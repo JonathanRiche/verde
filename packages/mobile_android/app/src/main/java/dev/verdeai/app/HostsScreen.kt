@@ -46,11 +46,8 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
             }
         } else Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement=Arrangement.spacedBy(16.dp)) {
-            Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
-                Text("Hosts", style=MaterialTheme.typography.titleLarge)
-                Text("Your machines, wherever you work.", style=MaterialTheme.typography.bodyMedium,
-                    color=VerdeColors.Muted)
-            }
+            // Android-only (r5): no tagline, like iOS.
+            Text("Hosts", style=MaterialTheme.typography.titleLarge)
             if (state.busy && !state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.error?.let { Text(it, color=MaterialTheme.colorScheme.error) }
             when {
@@ -103,13 +100,22 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                             HorizontalDivider(color=VerdeColors.Border)
                         }
                     }
-                    // S15: list rows, as on iOS.
-                    ActionRow(Icons.Filled.Add, "Add host", enabled=!state.busy, tint=MaterialTheme.colorScheme.primary, chevron=false, inset=0.dp) { adding=true }
+                    // r5: the same full-width tonal "Add host" as iOS.
+                    val colors = MaterialTheme.colorScheme
+                    NamedButton("Add host", { adding=true }, Modifier.fillMaxWidth().heightIn(min=48.dp), enabled=!state.busy,
+                        container=colors.secondaryContainer, content=colors.onSecondaryContainer, shape=MaterialTheme.shapes.small) {
+                        Icon(Icons.Filled.Add, contentDescription=null, modifier=Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Add host")
+                    }
                 }
             }
-            onSecurity?.let { open -> ActionRow(Icons.Filled.Settings, "Settings", inset=0.dp, onClick=open) }
-            // Clear of the companion bubble (S1).
-            Spacer(Modifier.height(LocalBubbleReserve.current))
+            // Settings is a drawer tab; Hosts doesn't repeat it (iOS parity).
+            // Clear of the bottom band that holds the resting companion bubble (r5).
+            if (LocalBubbleReserve.current > 0.dp) Spacer(Modifier.height(BOTTOM_BAND))
+        }
+        if (pair == null && LocalBubbleReserve.current > 0.dp) Box(Modifier.fillMaxSize().safeDrawingPadding(), contentAlignment = Alignment.BottomCenter) {
+            BottomBand()
         }
     }
     if (adding) AddHostDialog(onAdd={ model.add(it) }, onDismiss={ adding=false })
