@@ -13,6 +13,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -267,7 +272,7 @@ private fun MarkdownTable(rows: List<List<AnnotatedString>>) {
     val shape = RoundedCornerShape(8.dp)
     val container = VerdeColors.Assistant
     Box(Modifier.fillMaxWidth().clip(shape).border(1.dp, colors.outlineVariant, shape).testTag(MARKDOWN_TABLE_TAG)) {
-        Column(Modifier.horizontalEdgeFade(scroll, container).horizontalScroll(scroll)) {
+        Column(Modifier.horizontalEdgeFade(scroll, container, 48.dp).horizontalScroll(scroll)) {
             rows.forEachIndexed { index, row ->
                 Row(if (index == 0) Modifier.background(colors.surfaceVariant) else Modifier) {
                     widths.forEachIndexed { c, width ->
@@ -277,6 +282,27 @@ private fun MarkdownTable(rows: List<List<AnnotatedString>>) {
                 }
                 if (index < rows.size - 1) HorizontalDivider(Modifier.width(widths.fold(0.dp) { a, w -> a + w }), color = colors.outlineVariant)
             }
+        }
+        ScrollMoreHint(scroll, Modifier.align(Alignment.CenterEnd))
+    }
+}
+
+internal const val SCROLL_MORE_TAG = "scroll-more"
+
+/** A2-3: while more content sits off the trailing edge, a small arrow says so (and scrolls on tap). */
+@Composable
+internal fun ScrollMoreHint(scroll: androidx.compose.foundation.ScrollState, modifier: Modifier = Modifier) {
+    if (!scroll.canScrollForward) return
+    val scope = rememberCoroutineScope()
+    val colors = MaterialTheme.colorScheme
+    Box(modifier.padding(end = 2.dp).size(48.dp).testTag(SCROLL_MORE_TAG)
+        .clickable(role = androidx.compose.ui.semantics.Role.Button, onClickLabel = "Scroll right") {
+            scope.launch { scroll.animateScrollBy(scroll.viewportSize * .8f) }
+        }, contentAlignment = Alignment.Center) {
+        Box(Modifier.size(28.dp).background(colors.surfaceVariant, androidx.compose.foundation.shape.CircleShape)
+            .border(1.dp, colors.outlineVariant, androidx.compose.foundation.shape.CircleShape), contentAlignment = Alignment.Center) {
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "More columns",
+                tint = colors.onSurfaceVariant, modifier = Modifier.size(20.dp))
         }
     }
 }
