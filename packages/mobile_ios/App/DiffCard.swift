@@ -312,6 +312,14 @@ func diffRowText(_ row: DiffRow, width: Int, pad: Int = 0) -> AttributedString {
     return styledText(text, ranges)
 }
 
+/// `diffRowText` split into its gutter (numbers and sign) and its text, styles kept.
+func diffRowParts(_ row: DiffRow, width: Int) -> (gutter: AttributedString, text: AttributedString) {
+    let full = diffRowText(row, width: width)
+    let count = min(diffGutter(row, width: width).count, full.characters.count)
+    let split = full.index(full.startIndex, offsetByCharacters: count)
+    return (AttributedString(full[..<split]), AttributedString(full[split...]))
+}
+
 /// Chunked rows of one hunk: scrolled horizontally together (one Text per 80 rows, padded so line
 /// backgrounds span the row), or wrapped one row per line under the gutter.
 private struct DiffLines: View {

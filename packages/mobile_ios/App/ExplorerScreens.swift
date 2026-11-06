@@ -562,6 +562,9 @@ private struct PatchScreen: View {
                     Text(signed(UInt64(result.additions), UInt64(result.deletions)) + (result.truncated ? " · truncated" : ""))
                         .font(VerdeTheme.mono(11)).foregroundStyle(VerdeTheme.muted)
                     Spacer()
+                    // In the content, not the top bar, so the file name keeps the header's room.
+                    Toggle("Full file", isOn: $full).toggleStyle(.button).font(VerdeTheme.ui(13)).minTarget()
+                        .accessibilityIdentifier("patch-full")
                     Button(wrap ? "No wrap" : "Wrap") { wrap.toggle() }.font(VerdeTheme.ui(13)).minTarget()
                 }
                 .padding(.horizontal, 16).padding(.vertical, 4)
@@ -602,7 +605,6 @@ private struct PatchScreen: View {
         .toolbar {
             ExplorerTitle(title: basename(path), subtitle: (path as NSString).deletingLastPathComponent)
             ToolbarItemGroup(placement: .primaryAction) {
-                Toggle("Full file", isOn: $full).toggleStyle(.button).accessibilityIdentifier("patch-full")
                 Button("Open") {
                     var line: UInt64?
                     if case .parsed(let parsed) = render { line = firstNewLine(parsed) }
@@ -672,8 +674,7 @@ private struct PatchLines: View {
                             .background(hunkBackground)
                     case .line(let h, let r, let at):
                         let row = model.hunks[h].rows[r]
-                        Text(diffRowText(row, width: model.numberWidth)).font(selectableLineFont)
-                            .fixedSize(horizontal: !wrap, vertical: true)
+                        PatchLineText(row: row, width: model.numberWidth, wrap: wrap)
                             .padding(.horizontal, 8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(selection?.contains(at) == true ? selectedLineColor : Color.clear)
@@ -708,6 +709,27 @@ private struct TopLeadingScroll<Content: View>: View {
                     .frame(minWidth: axes.contains(.horizontal) ? geometry.size.width : nil,
                            minHeight: geometry.size.height, alignment: .topLeading)
             }
+        }
+    }
+}
+
+/// One patch line. Wrapped, the gutter (line numbers and sign) is its own column, so continuation
+/// lines start after it rather than under the numbers (I3-13).
+private struct PatchLineText: View {
+    let row: DiffRow
+    let width: Int
+    let wrap: Bool
+
+    var body: some View {
+        let parts = diffRowParts(row, width: width)
+        if wrap {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text(parts.gutter).font(selectableLineFont).fixedSize()
+                Text(parts.text).font(selectableLineFont).fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            Text(parts.gutter + parts.text).font(selectableLineFont).fixedSize()
         }
     }
 }
@@ -752,6 +774,8 @@ struct ExplorerLinks: View {
     let onChanges: () -> Void
     let onFiles: () -> Void
     var workspace: String? = nil
+    /// Named only to VoiceOver ("Changes in infra"); nothing is drawn.
+    var spoken: String? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -776,7 +800,7 @@ struct ExplorerLinks: View {
                 .frame(minHeight: 44).contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
-        .accessibilityLabel(workspace.map { "\(title) in \($0)" } ?? title)
+        .accessibilityLabel((workspace ?? spoken).map { "\(title) in \($0)" } ?? title)
         .foregroundStyle(VerdeTheme.text)
         .accessibilityIdentifier(id)
     }
