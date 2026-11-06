@@ -184,8 +184,7 @@ struct ScheduledScreen: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!view.can_edit)
                 .accessibilityIdentifier("schedule-empty-new")
-                Button("Use this example") { form = .example }
-                    .frame(minHeight: 44)
+                Button { form = .example } label: { Text("Use this example").frame(minHeight: 44).contentShape(Rectangle()) }
                     .disabled(!view.can_edit)
                 if !view.can_edit { readOnlyNote }
                 if let notice = model.notice ?? view.error?.message {

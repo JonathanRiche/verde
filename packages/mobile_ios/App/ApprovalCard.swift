@@ -187,8 +187,8 @@ private struct ApprovalDetails: View {
                     .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Approval details")
                     HStack(spacing: 16) {
-                        Button("Copy request") { UIPasteboard.general.string = approval.body }.frame(minHeight: 44)
-                        if truncated { Button("Show all \(countLines(approval.body)) lines") { disclosure.setFlag(key + ":all", true) }.frame(minHeight: 44) }
+                        Button { UIPasteboard.general.string = approval.body } label: { TargetText("Copy request") }
+                        if truncated { Button { disclosure.setFlag(key + ":all", true) } label: { TargetText("Show all \(countLines(approval.body)) lines") } }
                     }
                     .font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
                 }
@@ -233,4 +233,11 @@ struct ApprovalBanner: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
+}
+
+/// A text button label whose hit area is at least 44 points tall (a plain button only hits its text).
+private struct TargetText: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View { Text(text).frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
 }

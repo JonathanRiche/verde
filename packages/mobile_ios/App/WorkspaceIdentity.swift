@@ -114,6 +114,7 @@ struct WorkspaceIdentitySheet: View {
                                     .frame(maxWidth: .infinity, minHeight: 48)
                                     .background(shown ? tint.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
                                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(icon == k ? tint : Color.clear, lineWidth: 2))
+                                    .contentShape(RoundedRectangle(cornerRadius: 10))
                             }.buttonStyle(.plain)
                                 .accessibilityLabel(workspaceIconNames[k]).accessibilityAddTraits(icon == k ? .isSelected : [])
                                 .accessibilityIdentifier("identity-icon-\(k)")
@@ -122,12 +123,14 @@ struct WorkspaceIdentitySheet: View {
                 }
                 TitledSection("Color") {
                     automatic(color == nil) { color = nil }
-                    HStack(spacing: 6) {
+                    // Four per row so each swatch keeps a 48-point target (I3-8).
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
                         ForEach(0..<8, id: \.self) { k in
                             Button { color = k } label: {
-                                Circle().fill(workspaceColor(k)).padding(4)
-                                    .overlay(Circle().stroke(color == k ? VerdeTheme.text : Color.clear, lineWidth: 2))
-                                    .frame(maxWidth: .infinity).aspectRatio(1, contentMode: .fit)
+                                Circle().fill(workspaceColor(k)).frame(width: 32, height: 32)
+                                    .overlay(Circle().stroke(color == k ? VerdeTheme.text : Color.clear, lineWidth: 2).padding(-4))
+                                    .frame(maxWidth: .infinity, minHeight: 48)
+                                    .contentShape(Rectangle())
                             }.buttonStyle(.plain)
                                 .accessibilityLabel("Color \(k + 1)").accessibilityAddTraits(color == k ? .isSelected : [])
                                 .accessibilityIdentifier("identity-color-\(k)")
