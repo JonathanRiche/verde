@@ -306,9 +306,10 @@ private struct TranscriptList: View {
                         .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                     }
                     .coordinateSpace(name: "transcript")
-                    // A bar inset into the scroll view's bottom safe area (I2-1): it changes the
-                    // content inset, not the scroll view's frame, so rows don't re-lay out.
-                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                    // A bar over the bottom edge (I2-1), drawn as an overlay so it never changes the
+                    // scroll view's size or insets: resizing the lazy transcript while scrolled up
+                    // made its layout loop (I3-1). It only shows away from the newest output.
+                    .overlay(alignment: .bottom) {
                         if showLatest { LatestStrip { jumpToLatest(proxy) } }
                     }
                     // Scrolling or tapping the transcript puts the keyboard away (I-KB); the tap is
