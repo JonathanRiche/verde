@@ -225,9 +225,33 @@ internal class Disclosure(private val state: MutableState<Boolean>, private val 
     val track: Modifier get() = Modifier.onGloballyPositioned { header = it }
 }
 
+/**
+ * Expanded / collapsed choices for one transcript, kept outside its rows. A lazy row that shrinks
+ * past the list's anchor is disposed and recreated, and its own saved state could come back at
+ * the default (A5-1: a failed group sprang open again on every collapse).
+ */
+internal class DisclosureStore(initial: Map<String, Boolean> = emptyMap()) {
+    val choices = androidx.compose.runtime.snapshots.SnapshotStateMap<String, Boolean>().apply { putAll(initial) }
+    fun state(key: String, initial: Boolean): MutableState<Boolean> = object : MutableState<Boolean> {
+        override var value: Boolean
+            get() = choices[key] ?: initial
+            set(v) { choices[key] = v }
+        override fun component1() = value
+        override fun component2(): (Boolean) -> Unit = { value = it }
+    }
+
+    companion object {
+        val Saver = androidx.compose.runtime.saveable.Saver<DisclosureStore, HashMap<String, Boolean>>(
+            save = { HashMap(it.choices) }, restore = { DisclosureStore(it) })
+    }
+}
+
+internal val LocalDisclosureStore = staticCompositionLocalOf<DisclosureStore?> { null }
+
 @Composable
 internal fun rememberDisclosure(key: String, initial: Boolean): Disclosure {
-    val state = rememberSaveable(key) { mutableStateOf(initial) }
+    val store = LocalDisclosureStore.current
+    val state = if (store != null) remember(store, key) { store.state(key, initial) } else rememberSaveable(key) { mutableStateOf(initial) }
     val anchor = LocalDisclosureAnchor.current
     val index = LocalTranscriptIndex.current
     return remember(state, anchor) { Disclosure(state, anchor) }.also { it.index = index }

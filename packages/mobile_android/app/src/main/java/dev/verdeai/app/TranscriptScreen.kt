@@ -309,10 +309,11 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
             .collect { top -> if (top >= list.layoutInfo.totalItemsCount - PREFETCH_ITEMS) ctx.model.loadOlder() }
     }
     val anchor = remember(list, scope) { DisclosureAnchor(list, scope) }
+    val disclosures = rememberSaveable(saver = DisclosureStore.Saver) { DisclosureStore() }
     // A2-6: "Jump to latest" takes its own strip under the transcript instead of floating over text.
     Column(Modifier.fillMaxSize()) {
     Box(Modifier.weight(1f).fillMaxWidth()) {
-        CompositionLocalProvider(LocalDisclosureAnchor provides anchor) {
+        CompositionLocalProvider(LocalDisclosureAnchor provides anchor, LocalDisclosureStore provides disclosures) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             itemsIndexed(reversed, key = { _, it -> it.key }, contentType = { _, it -> it::class }) { index, item ->
