@@ -18,6 +18,15 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerCurrentChoice(.effort, value: nil, choices: [ChatChoice(id: "", label: "Default"), ChatChoice(id: "low", label: "Low")]), "")
     }
 
+    func testChipsShowResolvedValues() {
+        let models = [ChatChoice(id: "opus", label: "Opus 5.5"), ChatChoice(id: "haiku", label: "Haiku 5.5")]
+        XCTAssertEqual(composerModelLabel(models, value: nil), "Opus 5.5")
+        XCTAssertEqual(composerModelLabel(models, value: "haiku"), "Haiku 5.5")
+        XCTAssertEqual(composerModelLabel([], value: nil), "Default")
+        XCTAssertEqual(composerResolvedAccess(access, value: nil), "Full access")
+        XCTAssertEqual(composerResolvedAccess(access, value: "supervised"), "Supervised")
+    }
+
     func testSlashSuggestionsAreOneDeduplicatedList() {
         let slash = [ChatChoice(id: "usage", label: "/usage"), ChatChoice(id: "code-review", label: "/code-review"),
                      ChatChoice(id: "code-review", label: "/code-review"), ChatChoice(id: "code-review-2", label: "/code-review")]

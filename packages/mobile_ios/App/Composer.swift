@@ -23,6 +23,18 @@ func composerHintLine(_ kind: FollowupKind?, text: String, followupShown: Bool) 
     return kind.hint + ". Long-press Send for other options."
 }
 
+/// The model chip: the chosen model, else the one an unset choice runs (the catalog's first).
+func composerModelLabel(_ models: [ChatChoice], value: String?) -> String {
+    if let value, !value.isEmpty { return composerChoiceLabel(models, value: value) }
+    return models.first?.label ?? "Default"
+}
+
+/// The access mode in effect, without the "Default ·" prefix.
+func composerResolvedAccess(_ choices: [ChatChoice], value: String?) -> String {
+    let id = (value?.isEmpty == false ? value : nil) ?? defaultAccessID
+    return composerChoiceLabel(choices, value: id)
+}
+
 /// The access chip's resolved value: "Supervised", "Full access", or "Default · Full access".
 func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
     if let value, !value.isEmpty { return composerChoiceLabel(choices, value: value) }
@@ -318,23 +330,11 @@ struct ChatComposer: View {
                     }
                 }
                 .accessibilityIdentifier("composer-field")
-            if !adaptive.tier.wide {
-                if visiblePickers.contains(.provider) { settingButton(.provider, compact: false) }
-                // Natural widths; a full row (or large text) wraps onto the next line.
-                ChipFlow(spacing: 4) {
-                    ForEach(visiblePickers.filter { $0 != .provider }) { kind in
-                        settingButton(kind, compact: kind == .speed, stretch: false)
-                    }
-                }
-            }
-            HStack {
-                Menu {
-                    Button("Photos", systemImage: "photo") { photos = true }
-                    Button("Camera", systemImage: "camera") { openCamera() }
-                    Button("Files", systemImage: "folder") { files = true }
-                } label: { Image(systemName: "paperclip").frame(width: 44, height: 44).accessibilityLabel("Attach image") }
-                    .accessibilityLabel("Attach image").disabled(model.busy || model.pending)
+            // S11: one row, paperclip first, chips with their resolved values, then Stop / Send.
+            // The chips wrap onto another line only when they don't fit (large text).
+            HStack(alignment: .bottom, spacing: 4) {
                 if adaptive.tier.wide {
+                    attachMenu
                     // Full labels when they fit; a tight pane drops effort to its icon first, and
                     // only with no room left does the model name truncate.
                     ViewThatFits(in: .horizontal) {
@@ -342,21 +342,30 @@ struct ChatComposer: View {
                         inlineSettings(effortIcon: true)
                     }
                     .layoutPriority(1)
+                } else {
+                    ChipFlow(spacing: 4) {
+                        attachMenu
+                        ForEach(visiblePickers) { kind in settingButton(kind, compact: false, stretch: false) }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Spacer(minLength: 4)
                 if model.chat.state.turn != nil {
                     Button(action: model.chat.stopTurn) { Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle()).modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4)) }
                         .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
                 }
-                Button(action: model.submit) {
-                    Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold))
-                        .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
-                        .frame(width: 44, height: 44)
-                        .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
-                }.buttonStyle(.plain)
-                    .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
-                    .accessibilityIdentifier("composer-send")
-                    .contextMenu { sendAlternatives }
+                // While a reply runs with nothing typed, Stop is the one action (desktop parity).
+                if model.chat.state.turn == nil || model.canSubmit {
+                    Button(action: model.submit) {
+                        Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
+                            .frame(width: 44, height: 44)
+                            .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
+                    }.buttonStyle(.plain)
+                        .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
+                        .accessibilityIdentifier("composer-send")
+                        .contextMenu { sendAlternatives }
+                }
             }
             if let line = composerHintLine(followupKind, text: model.text, followupShown: model.view?.followup.map(visibleFollowup) ?? false) {
                 Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).accessibilityIdentifier("composer-action-hint")
@@ -368,11 +377,20 @@ struct ChatComposer: View {
         .padding(8)
     }
 
+    private var attachMenu: some View {
+        Menu {
+            Button("Photos", systemImage: "photo") { photos = true }
+            Button("Camera", systemImage: "camera") { openCamera() }
+            Button("Files", systemImage: "folder") { files = true }
+        } label: { Image(systemName: "paperclip").frame(width: 44, height: 44).accessibilityLabel("Attach image") }
+            .accessibilityLabel("Attach image").disabled(model.busy || model.pending)
+    }
+
     /// Each chip at its natural width: the model neither stretches nor truncates when there is room.
     private func inlineSettings(effortIcon: Bool) -> some View {
         HStack(spacing: 4) {
             ForEach(visiblePickers) { kind in
-                settingButton(kind, compact: kind == .speed || (kind == .effort && effortIcon), stretch: false)
+                settingButton(kind, compact: kind == .effort && effortIcon, stretch: false)
             }
         }
     }
@@ -561,7 +579,7 @@ struct ChatComposer: View {
                             }
                         }.frame(width: 16, height: 16).accessibilityHidden(true)
                 }
-                if !compact { Text(selectionLabel(kind)).lineLimit(1).truncationMode(.tail) }
+                if !compact { Text(chipText(kind)).lineLimit(1).truncationMode(.tail).frame(maxWidth: kind == .model ? 150 : nil) }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
                 .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
@@ -604,8 +622,17 @@ struct ChatComposer: View {
     }
     private func selectionLabel(_ kind: ComposerPicker) -> String {
         let list = choices(kind)
-        if kind == .access { return composerAccessLabel(list, value: selectedID(kind)) }
-        return composerChoiceLabel(list, value: selectedID(kind))
+        switch kind {
+        case .access: return composerAccessLabel(list, value: selectedID(kind))
+        case .model: return composerModelLabel(list, value: selectedID(kind))
+        case .speed: return composerChoiceLabel(list, value: selectedID(kind) ?? "off")
+        default: return composerChoiceLabel(list, value: selectedID(kind))
+        }
+    }
+    /// The chip's own text: the resolved value alone ("Full access"); labels and menus keep
+    /// "Default · …" so the inheritance is still announced.
+    private func chipText(_ kind: ComposerPicker) -> String {
+        kind == .access ? composerResolvedAccess(choices(kind), value: selectedID(kind)) : selectionLabel(kind)
     }
     private func settingIcon(_ kind: ComposerPicker, value: String? = nil) -> String? {
         switch kind {
