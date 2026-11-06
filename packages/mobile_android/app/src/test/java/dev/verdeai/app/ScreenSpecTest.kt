@@ -133,4 +133,15 @@ class ScreenSpecTest {
         assertEquals(Routes.HOSTS, footerTab(Routes.HOSTS))
         assertEquals("", footerTab(null))
     }
+
+    /** A11-3: History reads the live last activity, so a filtered list keeps All's ages and order. */
+    @Test fun historyUsesLiveLastActivity() {
+        fun t(id: String, at: Long) = dev.verdeai.core.ThreadSummary("ws", id, id, "codex", null, null, open = true, archived = false,
+            last_activity_at_ms = at, status = "idle", history_bucket = "Today")
+        val stale = listOf(t("a", 300), t("b", 200))
+        val live = mapOf(("ws" to "b") to t("b", 900))
+        val rows = historySections(stale, live).single().second
+        assertEquals(listOf("b", "a"), rows.map { it.thread_id })
+        assertEquals(900L, rows.first().last_activity_at_ms)
+    }
 }

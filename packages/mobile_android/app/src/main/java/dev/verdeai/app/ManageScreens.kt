@@ -57,12 +57,18 @@ internal const val IDENTITY_COLOR = "identity-color-"
 internal const val SEARCH_DEBOUNCE_MS = 300L
 
 /** History rows in core order with a header whenever the core's bucket changes. */
-internal fun historySections(items: List<ThreadSummary>): List<Pair<String, List<ThreadSummary>>> {
+internal fun historySections(items: List<ThreadSummary>, live: Map<Pair<String, String>, ThreadSummary> = emptyMap()):
+    List<Pair<String, List<ThreadSummary>>> {
     val out = mutableListOf<Pair<String, MutableList<ThreadSummary>>>()
-    for (item in items.filterNot(::subagent)) {
+    for (raw in items.filterNot(::subagent)) {
+        // A11-3: the same live last activity Home and the drawer show, so a workspace filter can't
+        // show older ages or another order than All.
+        val item = live[raw.workspace_id to raw.thread_id]?.last_activity_at_ms
+            ?.takeIf { it > (raw.last_activity_at_ms ?: 0L) }?.let { raw.copy(last_activity_at_ms = it) } ?: raw
         if (out.lastOrNull()?.first != item.history_bucket) out += item.history_bucket to mutableListOf()
         out.last().second += item
     }
+    out.forEach { (_, rows) -> rows.sortWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: Long.MIN_VALUE }) }
     return out
 }
 
@@ -181,7 +187,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
             }
         }
         if (history == null) return@ManageFrame
-        val sections = historySections(history.items)
+        val sections = historySections(history.items, workspaces.flatMap { it.threads }.associateBy { it.workspace_id to it.thread_id })
         for ((bucket, threads) in sections) {
             section(bucket)
             items(threads, key = { "history:${it.workspace_id}:${it.thread_id}" }) { thread ->

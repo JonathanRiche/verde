@@ -554,8 +554,10 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).testTag(COMPOSER_ATTACHMENTS),
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            for (a in items) key(a.local_id) {
-                val name = attachmentDisplayName(a.name)
+            // A11-3: names that tell the images apart; generic ones become "Photo 1…16".
+            val names = draftImageNames(items.map { it.name })
+            for ((index, a) in items.withIndex()) key(a.local_id) {
+                val name = names[index]
                 val size = a.byte_size.toLongOrNull() ?: 0L
                 val uploaded = a.uploaded_bytes.toLongOrNull() ?: 0L
                 Column(Modifier.width(72.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -592,6 +594,12 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
 }
 
 internal const val COMPOSER_ATTACHMENTS = "composer-attachments"
+
+/** Draft image names TalkBack can tell apart: the display name when it's unique, else "Photo <n>". */
+internal fun draftImageNames(raw: List<String>): List<String> {
+    val shown = raw.map(::attachmentDisplayName)
+    return shown.mapIndexed { i, name -> if (shown.count { it == name } > 1) "Photo ${i + 1}" else name }
+}
 
 internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: id?.takeIf { it.isNotEmpty() }
 

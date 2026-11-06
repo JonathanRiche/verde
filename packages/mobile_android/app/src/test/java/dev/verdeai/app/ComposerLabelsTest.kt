@@ -81,4 +81,10 @@ class ComposerLabelsTest {
         assertEquals(16, ComposerModel.MAX_IMAGES)
         assertTrue(ComposerModel.MAX_IMAGES.toLong() * ComposerModel.MAX_IMAGE_BYTES < 256L * 1024 * 1024)
     }
+
+    /** A11-3: sixteen "photo.jpg" drafts read "Photo 1…16"; a unique name stays. */
+    @Test fun draftImagesHaveDistinctNames() {
+        assertEquals(listOf("Photo 1", "Photo 2", "diagram.png"), draftImageNames(listOf("1000001.jpg", "1000002.jpg", "diagram.png")))
+        assertEquals((1..16).map { "Photo $it" }, draftImageNames(List(16) { "photo.jpg" }).let { names -> names.map { it } })
+    }
 }

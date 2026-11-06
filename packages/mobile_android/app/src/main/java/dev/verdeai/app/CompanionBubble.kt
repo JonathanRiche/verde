@@ -131,6 +131,14 @@ internal fun bubbleNeedKeys(needs: List<Pane>, crew: List<CompanionLink>, compan
     return keys
 }
 
+/** The avatar ring: amber for an approval or input, red when only failures need the user. */
+@Composable
+internal fun needsRing(pose: CompanionPose, count: Int): androidx.compose.ui.graphics.Color = when {
+    count == 0 -> VerdeColors.Border
+    pose == CompanionPose.Approval -> VerdeColors.Warning
+    else -> VerdeColors.Danger
+}
+
 /** "1" … "99", then "99+". */
 internal fun badgeLabel(count: Int): String = if (count > 99) "99+" else count.toString()
 
@@ -493,7 +501,7 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
         Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
             if (state.live?.active == true) LiveRing(state.live.level()) else if (state.running || talking) RunningRing(reduced)
             Box(Modifier.size(36.dp).background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
-                .border(1.dp, if (talking) VerdeColors.Accent else if (state.count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
+                .border(1.dp, if (talking) VerdeColors.Accent else needsRing(state.pose, state.count), CircleShape),
                 contentAlignment = Alignment.Center) {
                 CompanionAvatar(state.character, if (talking) CompanionPose.Working else state.pose, size = 30.dp)
             }
@@ -648,7 +656,8 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                 if (liveOn) LiveRing(live?.level?.invoke() ?: 0f) else if (running || talking) RunningRing(reduced)
                 Box(Modifier.align(Alignment.Center).size(50.dp)
                     .background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
-                    .border(1.dp, if (talking) VerdeColors.Accent else if (count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
+                    // A11-3: amber only while something asks for approval or input; failures alone are red.
+                    .border(1.dp, if (talking) VerdeColors.Accent else needsRing(pose, count), CircleShape),
                     contentAlignment = Alignment.Center) {
                     CompanionAvatar(character, if (talking) CompanionPose.Working else pose, size = 42.dp)
                 }

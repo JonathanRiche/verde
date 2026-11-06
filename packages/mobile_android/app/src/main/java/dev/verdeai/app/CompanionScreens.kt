@@ -95,6 +95,8 @@ internal data class CompanionSnapshot(
     val companionThread: ThreadSummary?,
     /** The activity panel: crew plus other chats running machine-wide (see [companionActivity]). */
     val activity: List<CompanionActivity> = emptyList(),
+    /** A11-3: something asks for an approval or input (amber); false when the only needs are failures (red). */
+    val asking: Boolean = needKeys.isNotEmpty(),
 )
 
 internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
@@ -111,9 +113,12 @@ internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): Co
     val keys = attention?.needs?.map { chatKey(it.workspace_id, it.thread_id) }?.toCollection(LinkedHashSet())
         ?: bubbleNeedKeys(needs, crew, thread)
     val pulse = companionPulse(panes, crew, hidden).let { p -> if (attention != null) p.copy(needsYou = attention.needs_you.toInt()) else p }
+    val asking = attention?.needs?.any { it.kind != dev.verdeai.core.AttentionKind.failed }
+        ?: (needs.any { it.status != "failed" && it.attention_kind != "failed" } ||
+            crew.any { crewStatus(it).needsYou && crewStatus(it) != ChildStatus.Failed } || thread?.status == "waiting_approval")
     return CompanionSnapshot(active, needs, crew, pulse,
         keys, crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
-        companionActivity(panes, crew, hidden))
+        companionActivity(panes, crew, hidden), asking = asking)
 }
 
 /**
@@ -178,7 +183,7 @@ internal fun CompanionSheet(
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
-    val pose = companionPose(online, snapshot.needKeys.isNotEmpty() || transcriptState?.thread?.approval != null, working)
+    val pose = companionPose(online, snapshot.asking || transcriptState?.thread?.approval != null, working)
 
     val inPane = placement != MossPlacement.Sheet
     // In the sidebar's slot the way back to the chat list is one tap: closing Moss restores it.
@@ -201,7 +206,9 @@ internal fun CompanionSheet(
                 suffixExpanded = shownStrip != null,
                 onNewConversation = { confirmNew = true }, onConversations = { conversations = true },
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
-                liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null,
+                liveActive = liveUi?.active == true,
+                // A11-3: a voice notice goes in the same frame Live starts, before "Connecting…" shows.
+                onLive = if (live != null && liveSupported) ({ voice?.clearError(); transcript?.composer?.clearNotice(); onLive() }) else null,
                 onChats = onChats, onClose = onClose, scheduledButton = !inPane,
                 // Hosts without scheduled tasks hide the entry; the count appears once the list loads.
                 onScheduled = if (schedules.view?.supported != false) ({ scheduled = true }) else null,
