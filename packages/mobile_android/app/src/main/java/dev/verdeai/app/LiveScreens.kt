@@ -565,14 +565,19 @@ internal const val LIVE_FAILURE = "live-failure"
  */
 @Composable
 internal fun LiveFailureCard(ui: LiveUi, onSettings: () -> Unit, onRetry: () -> Unit, onClose: () -> Unit) {
+    // S13: a missing or rejected key "needs setup" (amber); only a real failure is error red.
+    val setup = ui.needsSettings
+    val container = if (setup) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.errorContainer
+    val edge = if (setup) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error
+    val ink = if (setup) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onErrorContainer
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
-        .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp))
-        .border(1.dp, MaterialTheme.colorScheme.error, RoundedCornerShape(12.dp))
+        .background(container, RoundedCornerShape(12.dp))
+        .border(1.dp, edge, RoundedCornerShape(12.dp))
         .padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 4.dp).testTag(LIVE_FAILURE),
         verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text("Live voice stopped", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onErrorContainer)
+        Text(if (setup) "Live voice needs setup" else "Live voice stopped", style = MaterialTheme.typography.titleSmall, color = ink)
         Text(ui.error ?: liveError(ui.errorCode), Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+            style = MaterialTheme.typography.bodyMedium, color = ink)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onClose) { Text("Close") }
             if (ui.needsSettings) Button(onClick = onSettings, shape = MaterialTheme.shapes.small) { Text("Open Companion settings") }

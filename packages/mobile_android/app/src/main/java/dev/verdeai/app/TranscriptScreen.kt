@@ -184,11 +184,16 @@ internal fun TranscriptScreen(
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(
             title = {
+                // S10: [back] [drawer] title over the provider's name … [companion] [⋯], the same on every launch.
+                val provider = state.thread?.thread?.provider
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ProviderGlyph(state.thread?.thread?.provider)
-                    Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = 1,
-                        overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-
+                    ProviderGlyph(provider)
+                    Column {
+                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                        provider?.let { id -> Text(PROVIDERS.find { it.first == id }?.second ?: id.replaceFirstChar { it.uppercase() }, maxLines = 1,
+                            style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted) }
+                    }
                 }
             },
             showWorkspaceMenu = false,
@@ -202,7 +207,7 @@ internal fun TranscriptScreen(
                 }
             },
             actions = {
-                if (tier.wide) gitChanges?.let { GitChangesInlineActions(it) }
+                // Git actions never sit between the companion and ⋯: they get the row under the header.
                 if (onThreadAction != null) Box {
                     val thread = state.thread?.thread
                     IconButton(onClick = { chatMenu = true }, enabled = thread != null) {
@@ -219,7 +224,7 @@ internal fun TranscriptScreen(
                     }
                 }
             })
-        gitChanges?.let { if (tier.wide) GitChangesInlineNotes(it) else GitChangesHeader(it) }
+        gitChanges?.let { GitChangesHeader(it) }
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
@@ -551,8 +556,10 @@ internal fun WorkingRow(item: TranscriptItem.Working, ctx: TranscriptContext) {
     val elapsed = item.turn.started_at_ms?.let { elapsedLabel(it, ctx.now) }
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        StatusPip(active = true, size = 8.dp, command = true)
-        Text(workingLabel(item, elapsed), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+        // S13: waiting on the user is amber (dot and text); working is the accent.
+        val tint = if (item.waitingApproval && !item.turn.stop_pending) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
+        StatusPip(tint, active = true, size = 8.dp, command = true)
+        Text(workingLabel(item, elapsed), style = MaterialTheme.typography.labelMedium, color = tint)
     }
 }
 

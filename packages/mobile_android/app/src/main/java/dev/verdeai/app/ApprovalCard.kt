@@ -77,18 +77,16 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // S12: one title, then the body, then Deny / Approve; Copy request is the header's icon button.
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(Modifier.size(9.dp).background(colors.tertiary, CircleShape))
-            Column(Modifier.weight(1f)) {
-                // Announced once when the card appears (TalkBack reads polite live regions on change).
-                Text("Approval required", style = MaterialTheme.typography.labelMedium, color = colors.tertiary,
-                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite; contentDescription = "Approval required: $title" })
-                Text(title, style = MaterialTheme.typography.titleSmall, maxLines = 3, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.semantics { heading() })
-            }
+            // Announced once when the card appears (TalkBack reads polite live regions on change).
+            Text(title, Modifier.weight(1f).semantics { heading(); liveRegion = LiveRegionMode.Polite; contentDescription = "Approval needed: $title" },
+                style = MaterialTheme.typography.titleSmall, color = colors.onSurface, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            if (approval.body.isNotBlank()) CopyIconButton("Copy request") { approval.body }
         }
         ApprovalSummary(preview)
-        ApprovalDetails(approval, preview, onCopy = { clipboard.setText(AnnotatedString(approval.body)) })
+        ApprovalDetails(approval, preview)
         phaseText(phase)?.let { text ->
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (phase is ApprovalPhase.Sending) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
@@ -100,18 +98,18 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
         if (phase !is ApprovalPhase.Stale && phase !is ApprovalPhase.Sent) {
             val enabled = phase.canDecide()
             val sending = (phase as? ApprovalPhase.Sending)?.decision
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
-                OutlinedButton(shape = MaterialTheme.shapes.small,
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilledTonalButton(shape = MaterialTheme.shapes.small,
                     onClick = {
                         if (controller.decide(approval, ApprovalDecision.Deny)) haptics.performHapticFeedback(HapticFeedbackType.Reject)
                     },
-                    enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Deny: $title" },
+                    enabled = enabled, modifier = Modifier.weight(1f).heightIn(min = 48.dp).semantics { contentDescription = "Deny: $title" },
                 ) { Text(if (sending == ApprovalDecision.Deny) "Denying…" else DENY_LABEL) }
                 Button(shape = MaterialTheme.shapes.small,
                     onClick = {
                         if (controller.decide(approval, ApprovalDecision.Approve)) haptics.performHapticFeedback(HapticFeedbackType.Confirm)
                     },
-                    enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Approve: $title" },
+                    enabled = enabled, modifier = Modifier.weight(1f).heightIn(min = 48.dp).semantics { contentDescription = "Approve: $title" },
                 ) { Text(if (sending == ApprovalDecision.Approve) "Approving…" else APPROVE_LABEL) }
             }
         }
@@ -169,7 +167,7 @@ private fun ChangePreview(preview: ApprovalPreview) {
 private const val DETAIL_LINES = 40
 
 @Composable
-private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview, onCopy: () -> Unit) {
+private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview) {
     if (approval.body.isBlank()) return
     // Without a structured summary the raw request *is* the summary, so it starts open.
     val structured = preview.command != null || preview.changes.isNotEmpty() || preview.tool != null
@@ -177,9 +175,11 @@ private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview, on
     var all by rememberSaveable(approval.key + ":all") { mutableStateOf(false) }
     val colors = MaterialTheme.colorScheme
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        if (structured) Text(if (expanded) "▾ Hide full request" else "▸ Show full request",
-            Modifier.clickable(onClickLabel = if (expanded) "Hide full request" else "Show full request") { expanded = !expanded }
-                .padding(vertical = 6.dp), style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)
+        if (structured) Row(Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (expanded) "Hide full request" else "Show full request") { expanded = !expanded },
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Chevron(expanded)
+            Text(if (expanded) "Hide full request" else "Show full request", style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)
+        }
         if (expanded) {
             val total = remember(approval.body) { countLines(approval.body) }
             val (shown, truncated) = remember(approval.body, all) { if (all) approval.body.trim() to false else leadingLines(approval.body, DETAIL_LINES) }
@@ -187,10 +187,7 @@ private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview, on
                 .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp)
                 .semantics { contentDescription = "Approval details" },
                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
-            Row {
-                TextButton(onClick = onCopy) { Text("Copy request") }
-                if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }
-            }
+            if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }
         }
     }
 }
