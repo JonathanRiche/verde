@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -85,6 +86,26 @@ internal fun imageStatus(item: AttachmentItem?): ImageStatus = when (item?.statu
     else -> ImageStatus.Loading
 }
 
+/** Why a transcript image has no preview, which decides what the chip says and offers. */
+internal enum class ImageProblem { HostTooOld, Gone, Transient }
+
+/** RPC codes from a host whose gateway refuses `chat.attachment.read` to a paired phone (an older verde). */
+private val HOST_REFUSED_CODES = setOf("forbidden", "insufficient_scope", "method_not_found", "unknown_method", "not_allowed", "unauthorized")
+
+/** The core's settled `error_code` (attachments.zig) and status → what went wrong. */
+internal fun imageProblem(status: ImageStatus, code: String?): ImageProblem = when {
+    code in HOST_REFUSED_CODES -> ImageProblem.HostTooOld
+    code == "not_found" || code == "unavailable" || (code == null && status == ImageStatus.Unavailable) -> ImageProblem.Gone
+    else -> ImageProblem.Transient
+}
+
+/** The same strings as iOS. Transient failures add a Retry next to theirs. */
+internal fun imageProblemText(problem: ImageProblem): String = when (problem) {
+    ImageProblem.HostTooOld -> "Update verde on this host to see images"
+    ImageProblem.Gone -> "Preview unavailable"
+    ImageProblem.Transient -> "Couldn't load image"
+}
+
 /** Power-of-two downsampling so the decoded image is at most about [maxPx] on its longer side. */
 internal fun sampleSize(width: Int, height: Int, maxPx: Int): Int {
     var sample = 1
@@ -111,6 +132,8 @@ internal class AttachmentImages(
 ) {
     val status = mutableStateMapOf<String, ImageStatus>()
     val files = mutableStateMapOf<String, File>()
+    /** The core's error code for a failed or unavailable item; absent for local failures (timeouts, no host). */
+    val errors = mutableStateMapOf<String, String>()
 
     private fun decode(value: JsonElement?): AttachmentsView? = value?.let {
         try { CoreJson.decodeFromJsonElement<AttachmentsQuery>(it).data } catch (_: Exception) { null }
@@ -122,6 +145,7 @@ internal class AttachmentImages(
         if (status[key] == ImageStatus.Loading || status[key] == ImageStatus.Ready) return
         val file = File(File(cacheRoot, ATTACHMENT_CACHE_DIR), attachmentCacheName(hostId().orEmpty(), key))
         status[key] = ImageStatus.Loading
+        errors.remove(key)
         scope.launch {
             if (withContext(Dispatchers.IO) { file.isFile && file.length() > 0 }) {
                 files[key] = file
@@ -141,6 +165,7 @@ internal class AttachmentImages(
             }
             val outcome = imageStatus(item)
             if (outcome != ImageStatus.Ready) {
+                item?.error_code?.let { errors[key] = it }
                 status[key] = if (outcome == ImageStatus.Loading) ImageStatus.Failed else outcome
                 return@launch
             }
@@ -209,11 +234,21 @@ private fun AttachmentChip(row: ChatRow, a: ChatAttachment, ctx: TranscriptConte
                     } ?: ImagePlaceholder()
                 }
                 status == ImageStatus.Loading -> ImagePlaceholder()
+                image -> ImageMissing()
                 else -> Unit
             }
             Text(label, style = MaterialTheme.typography.labelMedium)
-            if (status == ImageStatus.Unavailable || status == ImageStatus.Failed)
-                Text("Preview unavailable", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
+            if (status == ImageStatus.Unavailable || status == ImageStatus.Failed) {
+                // Why there's no preview: an older host refusing the read, an image that's gone, or a
+                // hiccup worth retrying.
+                val problem = imageProblem(status, target?.let { images.errors[it.key] })
+                val retry = target?.takeIf { problem == ImageProblem.Transient }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(imageProblemText(problem), Modifier.widthIn(max = 160.dp), style = MaterialTheme.typography.labelSmall,
+                        color = VerdeColors.Subtle)
+                    if (retry != null) NamedButton("Retry", { images.request(retry, context.cacheDir) }, padding = PaddingValues(horizontal = 8.dp))
+                }
+            }
         }
     }
     if (viewing) ImageViewer(file, local, a.mime, label) { viewing = false }
@@ -221,6 +256,15 @@ private fun AttachmentChip(row: ChatRow, a: ChatAttachment, ctx: TranscriptConte
 
 private const val THUMBNAIL_PX = 480
 private const val VIEWER_PX = 2048
+
+/** The placeholder for an image without a preview: the same box with an image glyph, no shimmer. */
+@Composable
+private fun ImageMissing() {
+    Box(Modifier.size(width = 128.dp, height = 96.dp).clip(RoundedCornerShape(8.dp)).background(VerdeColors.PanelMuted),
+        contentAlignment = Alignment.Center) {
+        Icon(painterResource(R.drawable.composer_attach), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(24.dp))
+    }
+}
 
 /** A soft shimmer while the image loads (static when the UI clock doesn't tick, e.g. in tests). */
 @Composable
