@@ -28,6 +28,10 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -184,7 +188,9 @@ internal fun CompanionSheet(
             }
             val handoff = handoffStatus(state.view?.brain_switch)
             val shownStrip = shownPanel(strip, snapshot)
-            CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running),
+            // S32: the pills under the header carry the counts; the header doesn't repeat them.
+            val pillsShown = snapshot.needKeys.isNotEmpty() || activitySummary(snapshot.activity.map { it.status }) != null
+            CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running).takeIf { !pillsShown },
                 enabled = state.view?.can_edit == true && !state.saving,
                 // The status count toggles the panel it summarizes.
                 onSuffix = if (handoff == null) headerPanel(snapshot)?.let { panel -> { strip = if (shownStrip != null) null else panel } } else null,
@@ -417,7 +423,7 @@ private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace
     fun label(ws: String) = workspaces.find { it.workspace_id == ws }?.label
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically) {
-        if (needsCount > 0) StripPill(needsLabel(needsCount), VerdeColors.Warning, open == StripPanel.Needs) {
+        if (needsCount > 0) StripPill(needsLabel(needsCount), VerdeColors.Warning, open == StripPanel.Needs, warning = true) {
             onToggle(if (open == StripPanel.Needs) null else StripPanel.Needs)
         }
         if (crewLabel != null) StripPill(crewLabel, if (snapshot.activity.any { it.status.running }) VerdeColors.Accent else VerdeColors.Subtle,
@@ -454,18 +460,19 @@ private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun StripPill(text: String, dot: androidx.compose.ui.graphics.Color, selected: Boolean, onClick: () -> Unit) {
-    // S29: the pill's clickable node carries its name and selection (no unnamed wrapper).
-    val shape = RoundedCornerShape(12.dp)
-    Box(Modifier.minimumInteractiveComponentSize().clip(shape).background(if (selected) VerdeColors.PanelAlt else VerdeColors.Panel, shape)
-        .border(1.dp, if (selected) dot else VerdeColors.Border, shape)
+private fun StripPill(text: String, color: androidx.compose.ui.graphics.Color, selected: Boolean, warning: Boolean = false, onClick: () -> Unit) {
+    // S32: the iOS capsule: a tinted fill, a warning sign (needs you) or a dot (activity), bold text
+    // and a chevron; the clickable node carries its name and selection.
+    Box(Modifier.minimumInteractiveComponentSize().clip(CircleShape).background(color.copy(alpha = .14f), CircleShape)
         .clickable(role = Role.Button, onClick = onClick).nameOnly("$text. ${if (selected) "Collapse" else "Show"} list", selected = selected)) {
-        Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Box(Modifier.size(7.dp).background(dot, CircleShape))
-            Text(text, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            if (warning) Icon(Icons.Filled.Warning, contentDescription = null, tint = color, modifier = Modifier.size(12.dp))
+            else Box(Modifier.size(7.dp).background(color, CircleShape))
+            Text(text, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), maxLines = 1)
+            Icon(if (selected) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown, contentDescription = null,
+                tint = VerdeColors.Subtle, modifier = Modifier.size(14.dp))
         }
     }
 }

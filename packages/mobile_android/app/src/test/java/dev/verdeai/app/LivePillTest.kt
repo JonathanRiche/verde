@@ -55,6 +55,11 @@ class LivePillTest {
         compose.onNodeWithContentDescription("Listening", substring = false, useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithContentDescription("Muted", useUnmergedTree = true).performClick()
         assertEquals(listOf("mute", "captions", "settings", "end", "expand"), taps)
+        // S33: while connecting the pill offers only Cancel.
+        ui = LiveUi(phase = LivePhase.Connecting)
+        compose.onNodeWithContentDescription("Voice settings").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Mute microphone").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Cancel live voice").assertExists()
     }
 
     @Test fun callBarShowsThePillOrAFailedCallsReason() {

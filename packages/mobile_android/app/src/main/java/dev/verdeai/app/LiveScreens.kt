@@ -30,6 +30,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
@@ -298,6 +301,7 @@ internal fun LivePill(ui: LiveUi, input: Float, output: Float, character: Compan
     onExpand: () -> Unit, onSettings: () -> Unit, onCaptions: () -> Unit, onMute: () -> Unit, onEnd: () -> Unit,
     modifier: Modifier = Modifier, compactCaptions: Boolean = false) {
     val speaking = ui.phase == LivePhase.Live && output > .04f
+    val live = ui.phase == LivePhase.Live
     Column(modifier.widthIn(max = 420.dp).padding(horizontal = 12.dp), horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(Modifier.fillMaxWidth().shadow(8.dp, RoundedCornerShape(50)).background(VerdeColors.PanelAlt, RoundedCornerShape(50))
@@ -319,14 +323,17 @@ internal fun LivePill(ui: LiveUi, input: Float, output: Float, character: Compan
                 else LiveDots(ui, if (speaking) output else if (ui.muted) 0f else input, speaking, Modifier.weight(1f).height(40.dp)
                     .semantics { liveRegion = LiveRegionMode.Polite; contentDescription = liveStatusLabel(ui, speaking, name) })
             }
-            PillButton(R.drawable.ic_settings, "Voice settings", PillTone.Plain, onSettings)
-            PillButton(R.drawable.ic_closed_caption, if (captionsShown) "Hide captions" else "Show captions",
-                if (captionsShown) PillTone.Selected else PillTone.Plain, onCaptions)
-            PillButton(if (ui.muted) R.drawable.ic_mic_off else R.drawable.ic_mic, if (ui.muted) "Unmute microphone" else "Mute microphone",
-                if (ui.muted) PillTone.Warning else PillTone.Plain, onMute, enabled = ui.phase == LivePhase.Live)
-            PillButton(R.drawable.ic_close, "End live voice", PillTone.Danger, onEnd)
+            // S33: one connecting surface: until the call is live only Close is offered.
+            if (live) {
+                PillButton(R.drawable.ic_settings, "Voice settings", PillTone.Plain, onSettings)
+                PillButton(R.drawable.ic_closed_caption, if (captionsShown) "Hide captions" else "Show captions",
+                    if (captionsShown) PillTone.Selected else PillTone.Plain, onCaptions)
+                PillButton(if (ui.muted) R.drawable.ic_mic_off else R.drawable.ic_mic, if (ui.muted) "Unmute microphone" else "Mute microphone",
+                    if (ui.muted) PillTone.Warning else PillTone.Plain, onMute)
+            }
+            PillButton(R.drawable.ic_close, if (live) "End live voice" else "Cancel live voice", PillTone.Danger, onEnd)
         }
-        if (captionsShown) LiveCaptionsCard(ui, name, compactCaptions,
+        if (captionsShown && live) LiveCaptionsCard(ui, name, compactCaptions,
             Modifier.fillMaxWidth().clickable(onClickLabel = "Open the full Live view", onClick = onExpand))
     }
 }
@@ -558,23 +565,28 @@ internal const val LIVE_FAILURE = "live-failure"
  */
 @Composable
 internal fun LiveFailureCard(ui: LiveUi, onSettings: () -> Unit, onRetry: () -> Unit, onClose: () -> Unit) {
-    // S13: a missing or rejected key "needs setup" (amber); only a real failure is error red.
+    // S33: one card on both platforms: amber for a key to add or replace ("needs setup"), red only
+    // for a real failure; the title, the shared copy, then [Not now] [Open Companion settings | Try again].
     val setup = ui.needsSettings
-    val container = if (setup) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.errorContainer
-    val edge = if (setup) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error
-    val ink = if (setup) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onErrorContainer
+    val edge = if (setup) VerdeColors.Warning else VerdeColors.Danger
+    val shape = RoundedCornerShape(12.dp)
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
-        .background(container, RoundedCornerShape(12.dp))
-        .border(1.dp, edge, RoundedCornerShape(12.dp))
-        .padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 4.dp).testTag(LIVE_FAILURE),
-        verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text(if (setup) "Live voice needs setup" else "Live voice stopped", style = MaterialTheme.typography.titleSmall, color = ink)
+        .background(VerdeColors.PanelAlt, shape).border(1.dp, edge.copy(alpha = .6f), shape)
+        .padding(start = 12.dp, end = 8.dp, top = 10.dp, bottom = 6.dp).testTag(LIVE_FAILURE),
+        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(Icons.Filled.Warning, contentDescription = null, tint = edge, modifier = Modifier.size(18.dp))
+            Text(if (setup) "Live voice needs setup" else "Live voice stopped", style = MaterialTheme.typography.titleSmall,
+                color = VerdeColors.Text, modifier = Modifier.semantics { heading() })
+        }
         Text(ui.error ?: liveError(ui.errorCode), Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-            style = MaterialTheme.typography.bodyMedium, color = ink)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onClose) { Text("Close") }
-            if (ui.needsSettings) Button(onClick = onSettings, shape = MaterialTheme.shapes.small) { Text("Open Companion settings") }
-            else Button(onClick = onRetry, shape = MaterialTheme.shapes.small) { Text("Try again") }
+            style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Text)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
+            NamedButton("Not now", onClose)
+            val colors = MaterialTheme.colorScheme
+            NamedButton(if (setup) "Open Companion settings" else "Try again", if (setup) onSettings else onRetry,
+                container = VerdeColors.AccentWash, content = colors.primary, shape = MaterialTheme.shapes.small,
+                padding = PaddingValues(horizontal = 16.dp))
         }
     }
 }

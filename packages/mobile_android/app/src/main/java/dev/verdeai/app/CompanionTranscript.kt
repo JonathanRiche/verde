@@ -133,9 +133,11 @@ private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
         }
         return
     }
-    Box(Modifier.fillMaxWidth()) {
-        Column(Modifier.fillMaxWidth().longPressMenu("Copy message") { menu = true }
-            .padding(horizontal = 2.dp, vertical = 2.dp)) {
+    // S32: replies sit in their own bubble, inset like yours (iOS: assistant fill, 12dp corners).
+    Box(Modifier.fillMaxWidth().padding(end = 32.dp)) {
+        Column(Modifier.background(VerdeColors.Assistant, RoundedCornerShape(12.dp))
+            .longPressMenu("Copy message") { menu = true }
+            .padding(horizontal = 10.dp, vertical = 8.dp)) {
             if (row.body.isNotEmpty()) MarkdownText(streamTail(row), ctx.model, ctx.onCitation)
             delivery?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) }
         }

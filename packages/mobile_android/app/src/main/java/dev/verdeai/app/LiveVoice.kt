@@ -77,12 +77,13 @@ internal fun liveCaptions(captions: List<LiveCaption>, event: LiveEvent): List<L
 }
 
 internal fun liveError(code: String?): String = when (code) {
-    "voice_not_configured" -> "Live voice needs an API key for a voice provider. Add one in Companion settings."
-    "voice_key_rejected" -> "The voice provider rejected its API key. Replace it in Companion settings."
-    "voice_provider_unavailable" -> "Couldn't reach the voice provider. Try again."
-    "unsupported", "unknown_method" -> "Update verde on the computer to use live voice."
+    // S33: the same copy as iOS (liveVoiceMessage) for the codes both platforms share.
+    "voice_not_configured" -> "Add an API key for a live voice provider in Companion settings."
+    "voice_key_rejected" -> "The provider rejected the API key saved on your desktop. Replace it in Companion settings."
+    "voice_provider_unavailable" -> "The live voice provider is unavailable right now. Try again shortly."
+    "unsupported", "unknown_method", "rejected", "method_not_found" -> "Update verde on the computer to use live voice."
     "offline", "unavailable" -> "Connect to the host first."
-    "insufficient_scope" -> "This phone isn't allowed to use live voice. Pair again with chat access."
+    "insufficient_scope", "scope_denied" -> "This phone isn't allowed to start live voice on this host."
     "microphone" -> "Couldn't open the microphone."
     "protocol" -> "This voice provider isn't supported yet."
     "dropped" -> "The live connection dropped."
