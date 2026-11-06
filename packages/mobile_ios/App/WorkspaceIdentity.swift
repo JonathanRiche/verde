@@ -58,6 +58,50 @@ func workspaceColor(_ slot: Int) -> Color {
     })
 }
 
+/// A hue's everyday name, for VoiceOver (S38: swatches say what they are, not "Color 3").
+func colorHueName(_ hue: Double) -> String {
+    switch hue {
+    case ..<15: return "Red"
+    case ..<40: return "Orange"
+    case ..<65: return "Yellow"
+    case ..<95: return "Lime"
+    case ..<150: return "Green"
+    case ..<185: return "Teal"
+    case ..<205: return "Cyan"
+    case ..<250: return "Blue"
+    case ..<275: return "Indigo"
+    case ..<300: return "Purple"
+    case ..<330: return "Magenta"
+    case ..<345: return "Pink"
+    default: return "Red"
+    }
+}
+
+/// The eight identity colours' names for the current accent, repeats numbered ("Green 2").
+func workspaceColorNames(accent: (r: Double, g: Double, b: Double)? = nil) -> [String] {
+    var base = accent ?? (0, 0, 0)
+    if accent == nil {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(VerdeTheme.accent).resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)).getRed(&r, green: &g, blue: &b, alpha: &a)
+        base = (Double(r), Double(g), Double(b))
+    }
+    var seen: [String: Int] = [:]
+    return (0..<8).map { slot in
+        let c = workspaceRGB(slot: slot, accent: base, dark: false)
+        let maxV = max(c.r, c.g, c.b), minV = min(c.r, c.g, c.b), d = maxV - minV
+        var h = 0.0
+        if d > 0 {
+            if maxV == c.r { h = 60 * ((c.g - c.b) / d).truncatingRemainder(dividingBy: 6) }
+            else if maxV == c.g { h = 60 * ((c.b - c.r) / d + 2) }
+            else { h = 60 * ((c.r - c.g) / d + 4) }
+        }
+        if h < 0 { h += 360 }
+        let name = colorHueName(h)
+        seen[name, default: 0] += 1
+        return seen[name]! > 1 ? "\(name) \(seen[name]!)" : name
+    }
+}
+
 /// Identity icon on a square chip tinted with the slot color at 18% alpha.
 struct WorkspaceChip: View {
     let workspace: Workspace
@@ -132,7 +176,7 @@ struct WorkspaceIdentitySheet: View {
                                     .frame(maxWidth: .infinity, minHeight: 48)
                                     .contentShape(Rectangle())
                             }.buttonStyle(.plain)
-                                .accessibilityLabel("Color \(k + 1)").accessibilityAddTraits(color == k ? .isSelected : [])
+                                .accessibilityLabel(workspaceColorNames()[k]).accessibilityAddTraits(color == k ? .isSelected : [])
                                 .accessibilityIdentifier("identity-color-\(k)")
                         }
                     }.padding(.vertical, 6)

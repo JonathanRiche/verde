@@ -50,7 +50,7 @@ final class ComposerChipsTests: XCTestCase {
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "off", label: "Normal")), "Standard (default)")
         XCTAssertEqual(composerPickerLabel(.speed, ChatChoice(id: "on", label: "Fast")), "Fast")
         XCTAssertEqual(composerPickerLabel(.access, access[1]), "Full access (default)")
-        XCTAssertEqual(composerPickerLabel(.effort, ChatChoice(id: "", label: "Default")), "Auto")
+        XCTAssertEqual(composerPickerLabel(.effort, ChatChoice(id: "", label: "Default")), "Auto (default)")
         XCTAssertEqual(composerSpeedLabel(nil), "Standard")
         XCTAssertEqual(composerModelLabel(withDefault, value: "opus", defaultLabel: "Opus 5.5"), "Opus 5.5")
         let efforts = [ChatChoice(id: "", label: "Default"), ChatChoice(id: "high", label: "High")]
@@ -82,42 +82,74 @@ final class ComposerChipsTests: XCTestCase {
     }
 }
 
-/// I7-1 / S25: the chip layout is a pure function of the widths.
+/// I7-1 / S25 / S31: the chip layout is a pure function of the widths; every chip keeps its
+/// glyph and a label, and the row wraps rather than dropping either.
 final class ComposerChipPlanTests: XCTestCase {
-    private let chips = [ComposerChipWidth(kind: .model, full: 110, iconOnly: nil, minimum: 70),
-                         ComposerChipWidth(kind: .effort, full: 90, iconOnly: 44, short: 70, bare: 48),
-                         ComposerChipWidth(kind: .speed, full: 90, iconOnly: 44, short: 66, bare: 44),
-                         ComposerChipWidth(kind: .access, full: 110, iconOnly: 44, short: 66, bare: 44)]
+    private let chips = [ComposerChipWidth(kind: .model, full: 110, minimum: 70),
+                         ComposerChipWidth(kind: .effort, full: 90, short: 70),
+                         ComposerChipWidth(kind: .speed, full: 90, short: 66),
+                         ComposerChipWidth(kind: .access, full: 110, short: 66)]
 
-    func testLabelsShortenBeforeTheyDisappear() {
+    func testLabelsShortenThenTheModelTruncatesThenTheRowWraps() {
         // 44 + 114 + 94 + 94 + 114 = 460
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 460), ComposerChipPlan(first: [.model, .effort, .speed, .access]))
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 460), ComposerChipPlan(rows: [[.model, .effort, .speed, .access]]))
         // Short labels: 44 + 114 + 74 + 70 + 70 = 372
         XCTAssertEqual(composerChipPlan(widths: chips, available: 372).short, [.effort, .speed, .access])
-        // Then the model truncates (minimum 70) before any label goes.
         let truncated = composerChipPlan(widths: chips, available: 340)
-        XCTAssertEqual(truncated.short, [.effort, .speed, .access])
+        XCTAssertEqual(truncated.rows, [[.model, .effort, .speed, .access]])
         XCTAssertEqual(truncated.modelCap, 340 - (44 + 74 + 70 + 70) - 4)
-        XCTAssertTrue(truncated.icons.isEmpty)
-        // Then the effort and access glyphs go (the labels stay), then the speed glyph.
-        let bare = composerChipPlan(widths: chips, available: 300)
-        XCTAssertEqual(bare.short, [.effort, .speed, .access])
-        XCTAssertEqual(bare.bare, [.effort, .access])
-        XCTAssertTrue(bare.icons.isEmpty)
-        // 44 + 4 + 70 (minimum) + 52 + 48 + 48 = 266
-        XCTAssertEqual(composerChipPlan(widths: chips, available: 266).bare, [.effort, .speed, .access])
-        // Only below that do the icons alone remain.
-        let icons = composerChipPlan(widths: chips, available: 264)
-        XCTAssertEqual(icons.icons, [.effort, .speed, .access])
-        XCTAssertFalse(icons.twoRows)
+        // Below that the chips wrap in order; nothing becomes icon-only.
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 300).rows, [[.model, .effort], [.speed, .access]])
     }
 
-    func testLargeTextPutsTheModelOnItsOwnRow() {
+    func testLargeTextWrapsOntoMoreRows() {
         let plan = composerChipPlan(widths: chips, available: 180)
-        XCTAssertTrue(plan.twoRows)
-        XCTAssertEqual(plan.first, [.model])
-        XCTAssertEqual(plan.second, [.effort, .speed, .access])
+        XCTAssertEqual(plan.rows, [[.model], [.effort, .speed], [.access]])
         XCTAssertEqual(composerChipPlan(widths: chips, available: 180), plan, "same input, same layout")
+        // A model wider than the room beside the paperclip truncates on the first row.
+        XCTAssertEqual(composerChipPlan(widths: chips, available: 120).modelCap, 72)
+    }
+
+    /// S31: Claude and Codex at large, XXL and AX-L on a 402-point phone. The width doesn't depend
+    /// on the turn, so idle and Steer get the same plan.
+    func testRealChipsKeepEveryLabelAtEverySize() {
+        let claude = [ComposerChipText(kind: .model, full: "Opus 5.5"),
+                      ComposerChipText(kind: .effort, full: "Auto", short: "Auto"),
+                      ComposerChipText(kind: .access, full: "Full access", short: "Full")]
+        let codex = [ComposerChipText(kind: .model, full: "GPT-6.1 Sol"),
+                     ComposerChipText(kind: .effort, full: "Auto", short: "Auto"),
+                     ComposerChipText(kind: .speed, full: "Standard", short: "Std"),
+                     ComposerChipText(kind: .access, full: "Full access", short: "Full")]
+        let available = composerChipRowWidth(402)
+        for size in [DynamicTypeSize.large, .xxLarge, .accessibility3] {
+            for chips in [claude, codex] {
+                let widths = composerChipWidths(chips, size: size)
+                let idle = composerChipPlan(widths: widths, available: available)
+                let steer = composerChipPlan(widths: widths, available: composerChipRowWidth(402))
+                XCTAssertEqual(idle, steer)
+                XCTAssertEqual(idle.all, chips.map(\.kind), "every chip once, in order, at \(size)")
+                for (index, row) in idle.rows.enumerated() {
+                    let used = row.reduce(index == 0 ? composerAttachWidth : -composerChipSpacing) { sum, kind in
+                        let chip = widths.first { $0.kind == kind }!
+                        let width = kind == .model ? min(chip.full, idle.modelCap ?? chip.full) : (idle.short.contains(kind) ? chip.short ?? chip.full : chip.full)
+                        return sum + composerChipSpacing + width
+                    }
+                    XCTAssertLessThanOrEqual(used, available + 0.5, "row \(index) fits at \(size)")
+                }
+            }
+            if size == .large {
+                XCTAssertFalse(composerChipPlan(widths: composerChipWidths(claude, size: size), available: available).twoRows, "Claude is one row at 1.0x")
+                XCTAssertFalse(composerChipPlan(widths: composerChipWidths(codex, size: size), available: available).twoRows, "Codex is one row at 1.0x")
+            }
+        }
+    }
+
+    func testSwatchesHaveNames() {
+        let names = workspaceColorNames(accent: (0.11, 0.49, 0.29))
+        XCTAssertEqual(names.count, 8)
+        XCTAssertEqual(Set(names).count, 8, "\(names)")
+        XCTAssertFalse(names.contains { $0.hasPrefix("Color") })
+        XCTAssertEqual(newChatMenuLabel("Effort", ChatChoice(id: "", label: "Default")), "Auto (default)")
     }
 
     func testShortLabelTable() {

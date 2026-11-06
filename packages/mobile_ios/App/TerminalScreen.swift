@@ -686,5 +686,7 @@ struct TerminalScreen: View {
         }
         .labelStyle(.titleOnly)
         .buttonBorderShape(.roundedRectangle)
+        // S38: a 44-point target like the keys beside it.
+        .controlSize(.large)
     }
 }

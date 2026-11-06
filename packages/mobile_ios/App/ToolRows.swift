@@ -266,7 +266,10 @@ struct ToolGroupCard: View {
         VStack(alignment: .leading, spacing: 0) {
             Button { disclosure.toggle(id, counts.failed > 0) } label: { header(counts, expanded: expanded) }
                 .buttonStyle(.plain)
-                .accessibilityElement(children: .combine)
+                // S35/S38: one element; the ✓ and kind icons are artwork, never "Selected".
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(toolGroupSummary(rows, subagent: subagent, elapsed: nil) + ", " + (counts.running > 0 ? "Running" : counts.failed > 0 ? "Failed" : "Completed"))
+                .accessibilityAddTraits(.isButton)
                 .accessibilityValue(expanded ? "Expanded" : "Collapsed")
                 .accessibilityHint(expanded ? "Collapse" : "Expand")
             if expanded { children }

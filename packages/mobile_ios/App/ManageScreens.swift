@@ -187,7 +187,7 @@ struct NewChatScreen: View {
             Menu {
                 ForEach(choices, id: \.id) { item in
                     let current = newChatIsCurrent(label, item: item, value: value, choices: choices)
-                    // S25 / I10-1: "Auto · provider default" for effort, the host default "(default)".
+                    // S35: the default row reads "<value> (default)" in every menu and picker.
                     let title = newChatMenuLabel(label, item, defaultModel: catalogs?.default_model_label) + (item.favorite ? " ★" : "")
                     Button { Task { await manage.select(workspace, update(item.id)) } } label: {
                         if current { Label(title, systemImage: "checkmark") } else { Text(title) }
@@ -244,7 +244,7 @@ func newChatIsCurrent(_ setting: String, item: ChatChoice, value: String?, choic
 /// A New chat menu row, in the composer pickers' words.
 func newChatMenuLabel(_ setting: String, _ item: ChatChoice, defaultModel: String? = nil) -> String {
     switch setting {
-    case "Effort": return isDefaultChoice(item.id) ? "Auto · provider default" : item.label
+    case "Effort": return composerPickerLabel(.effort, item)
     case "Model": return composerPickerLabel(.model, item, defaultModel: defaultModel)
     case "Speed": return composerPickerLabel(.speed, item)
     case "Access": return composerPickerLabel(.access, item)
@@ -284,14 +284,23 @@ struct AddWorkspaceScreen: View {
                 .accessibilityLabel("Add workspace")
                 .accessibilityIdentifier("add-workspace")
             }
+            // S34: recent folders are their own section, apart from the browsed folder's contents.
+            if let directory = manage.view?.directory, directory.supported {
+                let recent = freshFolderSuggestions(directory.suggestions, workspaces: manage.browse.state.workspaces?.items ?? [])
+                if !recent.isEmpty {
+                    Section {
+                        // Host lists can repeat a folder; a repeated row id can break the list's updates.
+                        ForEach(recent, id: \.self) { root in
+                            folderRow(root, systemImage: "clock.arrow.circlepath") { Task { await manage.directory(root) } }
+                        }
+                    } header: { SectionTitle("Recent folders") }
+                    .disabled(manage.busy)
+                }
+            }
             Section {
                 if let directory = manage.view?.directory {
                     if !directory.supported { Text("Folder browsing needs a newer host. You can still enter a path.") }
                     else {
-                        // Host lists can repeat a folder; a repeated row id can break the list's updates.
-                        ForEach(freshFolderSuggestions(directory.suggestions, workspaces: manage.browse.state.workspaces?.items ?? []), id: \.self) { root in
-                            folderRow(root, systemImage: "folder") { Task { await manage.directory(root) } }
-                        }
                         if !directory.path.isEmpty {
                             HStack(spacing: 8) {
                                 Image(systemName: "folder.fill").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true)
