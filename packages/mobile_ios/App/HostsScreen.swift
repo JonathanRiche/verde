@@ -29,7 +29,10 @@ struct HostsScreen: View {
                         Section { HostCard(model: model, row: row, onUse: onUse) { confirmation = $0 } }
                     }
                     Section {
-                        Button("Add host") { adding = true }.accessibilityIdentifier("addHost")
+                        Button { adding = true } label: { Label("Add host", systemImage: "plus") }
+                            .buttonStyle(TonalButtonStyle())
+                            .listRowSeparator(.hidden)
+                            .accessibilityIdentifier("addHost")
                     }
                 }
             }
@@ -110,6 +113,7 @@ struct HostMenu: View {
             }
             .padding(.horizontal, 8).frame(height: 32)
             .modifier(ToolbarChrome())
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .disabled(model.loading)
@@ -133,8 +137,14 @@ private struct HostCard: View {
         let failure = row.operation?.error ?? row.view?.error
         let status = hostStatus(row)
         HStack(spacing: 8) {
-            Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityLabel(status)
-            Text(row.saved.label) .font(VerdeTheme.ui(15, bold: true))
+            Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityHidden(true)
+            // The status is part of the row's text, never the dot's colour alone.
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.saved.label) .font(VerdeTheme.ui(15, bold: true))
+                Text(model.active == id ? "\(status) · Selected" : status).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                    .accessibilityIdentifier("hostStatus")
+            }
+            .accessibilityElement(children: .combine)
             Spacer()
             Menu {
                 Button("Rename machine") { nickname = row.saved.label; renaming = true }
@@ -150,9 +160,7 @@ private struct HostCard: View {
                 Button("Save") { model.rename(id, label: nickname) }
                     .disabled(nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || nickname.count > 128)
             } message: { Text("This nickname is saved on this phone.") }
-            if model.active == id { Text("Selected") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
         }
-        Text(status).accessibilityIdentifier("hostStatus")
         if failure?.code == "sign_out_unconfirmed" {
             Text("Sign out could not be confirmed. Your local pairing is still saved.")
             Text("If you remove it anyway, this device may remain listed on the desktop. Revoke it there when you can.")
@@ -169,9 +177,11 @@ private struct HostCard: View {
             Button("Pair again") { model.showPairing(id) }
         } else {
             if row.view?.auth_state == "paired" && row.view?.trust_proposal == nil {
-                Button("Use \(row.saved.label)") { if model.select(id) { onUse() } }.disabled(pending || row.fatal)
+                Button("Use \(row.saved.label)") { if model.select(id) { onUse() } }
+                    .modifier(PrimaryRow()).disabled(pending || row.fatal)
             } else if row.view?.auth_state != "signing_out" {
-                Button("Pair / review host") { model.showPairing(id) }.disabled(pending || row.fatal)
+                Button("Pair / review host") { model.showPairing(id) }
+                    .modifier(PrimaryRow()).disabled(pending || row.fatal)
             }
             if failure?.retryable == true { Button("Retry connection") { model.retry(id) }.disabled(pending) }
         }

@@ -17,31 +17,35 @@ struct PairingView: View {
         NavigationStack {
             Form {
                 if let proposal = model.row?.trust_proposal {
-                    Section("Confirm host") {
+                    TitledSection("Confirm host") {
                         Text("Only trust a host you recognize. A changed identity or key requires your approval again.")
                         Text(proposal.origin) .font(VerdeTheme.ui(15, bold: true))
                         if let runtime = proposal.runtime_id { LabeledContent("Runtime", value: runtime) }
                         Text("SHA-256 key fingerprint") .font(VerdeTheme.ui(12))
                         Text(proposal.spki_sha256).font(.system(.caption, design: .monospaced))
                         Button("Trust and pair") { Task { await model.trust(proposal, accept: true) } }
+                            .modifier(PrimaryRow())
                             .disabled(model.submitting).accessibilityIdentifier("trustHost")
                         Button("Don't trust", role: .cancel) { Task { await model.trust(proposal, accept: false) } }
+                            .buttonStyle(TonalButtonStyle(destructive: true))
+                            .listRowBackground(Color.clear)
                             .disabled(model.submitting)
                     }
                 } else if model.paired {
-                    Section("Paired") {
+                    TitledSection("Paired") {
                         Label("Host saved securely", systemImage: "checkmark.shield")
                         Text(model.row?.phase == "ready" ? "Connected to your verde host." : "Pairing is saved. Connecting to your host…")
                         if let origin = model.row?.https_url { Text(origin) }
                         if let scopes = model.row?.scopes, !scopes.isEmpty {
                             Text("Permissions: " + scopes.joined(separator: ", ")) .font(VerdeTheme.ui(12))
                         }
+                        if let onClose { Button("Done", action: onClose).modifier(PrimaryRow()).accessibilityIdentifier("pairingDone") }
                     }
                 } else {
                     Section {
                         Text("Run Tailscale on this phone and your host. Create a pairing grant in verde on your computer, then scan or paste it here.")
                     }
-                    Section("Pair a host") {
+                    TitledSection("Pair a host") {
                         TextField("Device name", text: $model.deviceLabel)
                             .accessibilityIdentifier("deviceLabel")
                         Button { Task { await scan() } } label: { Label("Scan QR code", systemImage: "qrcode.viewfinder") }
@@ -59,9 +63,10 @@ struct PairingView: View {
                             let input = link
                             clearSecrets()
                             Task { await model.receive(input) }
-                        }.disabled(link.isEmpty || model.busy).accessibilityIdentifier("submitPairingLink")
+                        }.modifier(PrimaryRow())
+                        .disabled(link.isEmpty || model.busy).accessibilityIdentifier("submitPairingLink")
                     }.disabled(model.fatal)
-                    Section("Enter details manually") {
+                    TitledSection("Enter details manually") {
                         TextField("HTTPS host address", text: $manualHost).keyboardType(.URL)
                         SecureField("Grant ID", text: $grant).privacySensitive()
                         SecureField("Pair code", text: $code).privacySensitive()
@@ -69,7 +74,8 @@ struct PairingView: View {
                             let input = PairingInput.manual(host: manualHost, grant: grant, code: code)
                             clearSecrets()
                             Task { await model.receive(input) }
-                        }.disabled(manualHost.isEmpty || grant.isEmpty || code.isEmpty || model.busy)
+                        }.buttonStyle(TonalButtonStyle()).listRowBackground(Color.clear)
+                        .disabled(manualHost.isEmpty || grant.isEmpty || code.isEmpty || model.busy)
                     }.textInputAutocapitalization(.never).autocorrectionDisabled()
                         .disabled(model.fatal)
                     if model.busy && model.errorText == nil {
@@ -77,7 +83,7 @@ struct PairingView: View {
                     }
                 }
                 if let error = model.errorText {
-                    Section("Connection needs attention") {
+                    TitledSection("Connection needs attention") {
                         Text(error).accessibilityIdentifier("pairingError")
                         if model.error?.retryable == true {
                             Button("Retry") { Task { await model.retry() } }.disabled(model.submitting)
@@ -86,7 +92,7 @@ struct PairingView: View {
                 }
                 if model.row?.update_required == true { Text("Update verde on your phone or host to continue.") }
                 if let cameraError {
-                    Section("Camera unavailable") {
+                    TitledSection("Camera unavailable") {
                         Text(cameraError)
                         Button("Open Settings") {
                             if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
