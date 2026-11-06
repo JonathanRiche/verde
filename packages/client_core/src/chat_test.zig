@@ -234,8 +234,14 @@ test "chat approvals reconcile from tail and reject stale or duplicate decisions
     _ = try f.intent("approval_decide", .{ .turn_id = "fixture-turn", .call_id = "call", .decision = "approve" });
     try eql("pending", f.host.state.chat.threads[0].approval.?.resolution);
     try f.reply("chat.turn.approve", .{ .approved = true });
-    try f.tail(.{ .status = "running", .events = .{}, .pending_approval = @as(?u8, null) });
+    const resolved = try f.response("chat.turn.tail", try f.value(.{ .status = "running", .events = .{}, .pending_approval = @as(?u8, null) }), null);
     try expect(f.host.state.chat.threads[0].approval == null);
+    // Home's "needs you" overlay reads this chat's approval, so Home is re-announced.
+    var announced = false;
+    for (p.rows(p.get(resolved, "effects"))) |effect| if (h.eq(p.s(effect, "type"), "state_changed")) {
+        for (p.rows(p.get(effect, "scopes"))) |scope| announced = announced or (scope == .string and h.eq(scope.string, "home"));
+    };
+    try expect(announced);
 }
 
 test "chat follow-up requires durable receipt and uncertain steer is never automatically queued" {

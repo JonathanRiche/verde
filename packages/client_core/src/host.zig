@@ -777,6 +777,15 @@ fn sharedViewsChanged(before: *const State, after: *const State, host_changed: b
     for (before.chat.threads) |t| if (t.focused and !focused) return true;
     if (before.terminal.rows.len != after.terminal.rows.len) return true;
     for (before.terminal.rows, after.terminal.rows) |old, new| if (old.view.attached != new.view.attached) return true;
+    // Home and Workspaces overlay a focused chat's live turn (attention.zig), so a
+    // change in that turn's status or pending approval must re-announce them.
+    if (before.chat.threads.len != after.chat.threads.len) return true;
+    for (before.chat.threads, after.chat.threads) |old, new| {
+        if (!new.focused) continue;
+        const old_status = if (old.turn) |turn| turn.status else "";
+        const new_status = if (new.turn) |turn| turn.status else "";
+        if (!eq(old_status, new_status) or (old.approval == null) != (new.approval == null)) return true;
+    }
     return false;
 }
 fn otherViewsChanged(before: *const State, after: *const State, host_changed: bool) bool {
