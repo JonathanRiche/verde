@@ -131,57 +131,6 @@ func rankedMentions(_ mentions: [ChatMention], query: String) -> [ChatMention] {
     return direct + mentions.filter { !contains($0) && fuzzy($0) }
 }
 
-/// Chips at their natural width, wrapping onto further lines when a row is full (large text).
-struct ChipFlow: Layout {
-    var spacing: CGFloat = 6
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
-        let height = rows.last.map { $0.y + $0.height } ?? 0
-        let widest = rows.map(\.width).max() ?? 0
-        return CGSize(width: proposal.width ?? widest, height: height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let rows = arrange(width: bounds.width, subviews: subviews)
-        for row in rows {
-            var x = bounds.minX
-            for index in row.items {
-                let size = chipSize(subviews[index], width: bounds.width)
-                subviews[index].place(at: CGPoint(x: x, y: bounds.minY + row.y), proposal: ProposedViewSize(width: size.width, height: size.height))
-                x += size.width + spacing
-            }
-        }
-    }
-
-    private struct Row { var items: [Int] = []; var y: CGFloat = 0; var width: CGFloat = 0; var height: CGFloat = 0 }
-
-    /// A chip's ideal size (so flexible frames don't stretch it), never wider than the row.
-    private func chipSize(_ subview: LayoutSubview, width: CGFloat) -> CGSize {
-        let ideal = subview.sizeThatFits(.unspecified)
-        guard ideal.width > width else { return ideal }
-        return subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
-    }
-
-    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
-        var rows: [Row] = []
-        var current = Row()
-        for index in subviews.indices {
-            let size = chipSize(subviews[index], width: width)
-            let next = current.items.isEmpty ? size.width : current.width + spacing + size.width
-            if !current.items.isEmpty && next > width {
-                rows.append(current)
-                current = Row(items: [], y: current.y + current.height + spacing)
-            }
-            current.width = current.items.isEmpty ? size.width : current.width + spacing + size.width
-            current.height = max(current.height, size.height)
-            current.items.append(index)
-        }
-        if !current.items.isEmpty { rows.append(current) }
-        return rows
-    }
-}
-
 /// The "/" commands or "@" files as one vertical list of 44-point rows (S5).
 private struct ComposerSuggestionList: View {
     let items: [ComposerSuggestion]
@@ -410,11 +359,20 @@ struct ChatComposer: View {
                         phoneChipRow(icons: [])
                         phoneChipRow(icons: [.access, .speed])
                         phoneChipRow(icons: [.access, .speed, .effort])
-                        ChipFlow(spacing: 4) {
-                            attachMenu
-                            ForEach(visiblePickers) { kind in settingButton(kind, compact: false, stretch: false) }
+                        // Large text: two plain rows, the model beside the paperclip and the rest
+                        // below. Every candidate is a fixed-size stack, so the choice is made from
+                        // the proposed width alone (a measured flow layout here looped, I7-1).
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                attachMenu
+                                if visiblePickers.contains(.model) { settingButton(.model, compact: false, stretch: false) }
+                            }
+                            ViewThatFits(in: .horizontal) {
+                                secondChipRow(icons: [])
+                                secondChipRow(icons: [.access, .speed])
+                                secondChipRow(icons: [.access, .speed, .effort])
+                            }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 Spacer(minLength: 4)
@@ -454,6 +412,16 @@ struct ChatComposer: View {
         .fixedSize(horizontal: true, vertical: false)
     }
 
+    /// Every chip but the model (large-text layout).
+    private func secondChipRow(icons: Set<ComposerPicker>) -> some View {
+        HStack(spacing: 4) {
+            ForEach(visiblePickers.filter { $0 != .model }) { kind in
+                settingButton(kind, compact: icons.contains(kind) && settingIcon(kind) != nil, stretch: false)
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
     private var attachMenu: some View {
         Menu {
             Button("Photos", systemImage: "photo") { photos = true }
@@ -484,10 +452,12 @@ struct ChatComposer: View {
             HStack(alignment: .center, spacing: 2) {
                 plusMenu(brainLocked: compact.openBrain != nil)
                 if model.view != nil {
+                    // The brain's name may take two lines at large text instead of being cut (I7-4).
                     Group {
                         if let openBrain = compact.openBrain { brainLabelChip(openBrain, name: compact.brainName) } else { settingsChip }
                     }
-                    .frame(maxWidth: 160, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(1)
                 }
                 Spacer(minLength: 4)
                 if let trailing = compact.trailing { trailing }
@@ -573,7 +543,8 @@ struct ChatComposer: View {
         return Button(action: open) {
             HStack(spacing: 5) {
                 ProviderGlyph(provider: model.displayedSelection?.provider).scaleEffect(0.8)
-                Text(label).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).truncationMode(.tail)
+                Text(label).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 10).padding(.vertical, 5)
             .frame(minHeight: 44, alignment: .leading)
