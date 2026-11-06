@@ -169,47 +169,65 @@ private fun copySensitive(context: android.content.Context, text: String) {
 @Composable
 private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermInput) -> Unit,
     onCtrl: () -> Unit, onAlt: () -> Unit, onPaste: () -> Unit) {
-    // One keycap style for every key (Ctrl/Alt fill with the accent while latched), in a row that
-    // scrolls sideways with an edge fade, so no key is ever squeezed or cut off.
+    // One keycap style for every key (Ctrl/Alt fill with the accent while latched). S49: the row shows
+    // a whole number of equal keys and snaps to key boundaries, so no key is ever cut off at an edge
+    // and every key keeps a full 48dp+ target.
     @Composable fun keycap(label: String, description: String, latched: Boolean? = null, onClick: () -> Unit) {
         val fill = if (latched == true) VerdeColors.Accent else VerdeColors.PanelAlt
         val ink = if (latched == true) MaterialTheme.colorScheme.onPrimary else VerdeColors.Text
-        Box(Modifier.padding(horizontal = 2.dp).sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+        Box(Modifier.fillMaxWidth().padding(horizontal = 2.dp).sizeIn(minWidth = 48.dp, minHeight = 48.dp)
             .clip(RoundedCornerShape(8.dp))
             .then(if (latched != null) Modifier.toggleable(latched, enabled = enabled, role = Role.Switch) { onClick() }
                 else Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick))
             .nameOnly(description), contentAlignment = Alignment.Center) {
-            Box(Modifier.sizeIn(minWidth = 44.dp).height(36.dp).background(fill, RoundedCornerShape(8.dp))
-                .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)).padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
+            Box(Modifier.fillMaxWidth().height(36.dp).background(fill, RoundedCornerShape(8.dp))
+                .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
                 Text(label, style = MaterialTheme.typography.labelLarge.copy(fontFamily = VerdeMono),
                     color = if (enabled) ink else ink.copy(alpha = .38f), maxLines = 1)
             }
         }
     }
-    @Composable fun keyButton(label: String, description: String = label, input: TermInput) = keycap(label, description) { send(input) }
-    @Composable fun toggle(label: String, on: Boolean, action: () -> Unit) = keycap(label, label, latched = on, onClick = action)
-    val scroll = rememberScrollState()
-    Row(Modifier.fillMaxSize().testTag("terminal-keys").horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).padding(start = 4.dp, end = 16.dp),
-        verticalAlignment = Alignment.CenterVertically) {
-        keyButton("Esc", "Escape", TermInput.Key("Escape"))
-        keyButton("Tab", input = TermInput.Key("Tab"))
-        toggle("Ctrl", state.ctrl, onCtrl)
-        toggle("Alt", state.alt, onAlt)
-        keyButton("←", "Left", TermInput.Key("ArrowLeft"))
-        keyButton("↓", "Down", TermInput.Key("ArrowDown"))
-        keyButton("↑", "Up", TermInput.Key("ArrowUp"))
-        keyButton("→", "Right", TermInput.Key("ArrowRight"))
-        keyButton("|", "Pipe", TermInput.Text("|"))
-        keyButton("~", "Tilde", TermInput.Text("~"))
-        keyButton("/", "Slash", TermInput.Text("/"))
-        keyButton("-", "Dash", TermInput.Text("-"))
-        keyButton("Home", input = TermInput.Key("Home"))
-        keyButton("End", input = TermInput.Key("End"))
-        keyButton("PgUp", "Page up", TermInput.Key("PageUp"))
-        keyButton("PgDn", "Page down", TermInput.Key("PageDown"))
-        keycap("Paste", "Paste", onClick = onPaste)
+    val keys: List<@Composable () -> Unit> = listOf(
+        { keycap("Esc", "Escape") { send(TermInput.Key("Escape")) } },
+        { keycap("Tab", "Tab") { send(TermInput.Key("Tab")) } },
+        { keycap("Ctrl", "Ctrl", latched = state.ctrl, onClick = onCtrl) },
+        { keycap("Alt", "Alt", latched = state.alt, onClick = onAlt) },
+        { keycap("\u2190", "Left") { send(TermInput.Key("ArrowLeft")) } },
+        { keycap("\u2193", "Down") { send(TermInput.Key("ArrowDown")) } },
+        { keycap("\u2191", "Up") { send(TermInput.Key("ArrowUp")) } },
+        { keycap("\u2192", "Right") { send(TermInput.Key("ArrowRight")) } },
+        { keycap("|", "Pipe") { send(TermInput.Text("|")) } },
+        { keycap("~", "Tilde") { send(TermInput.Text("~")) } },
+        { keycap("/", "Slash") { send(TermInput.Text("/")) } },
+        { keycap("-", "Dash") { send(TermInput.Text("-")) } },
+        { keycap("Home", "Home") { send(TermInput.Key("Home")) } },
+        { keycap("End", "End") { send(TermInput.Key("End")) } },
+        { keycap("PgUp", "Page up") { send(TermInput.Key("PageUp")) } },
+        { keycap("PgDn", "Page down") { send(TermInput.Key("PageDown")) } },
+        { keycap("Paste", "Paste", onClick = onPaste) },
+    )
+    BoxWithConstraints(Modifier.fillMaxSize().testTag("terminal-keys")) {
+        val perView = maxOf(1, (maxWidth / TERMINAL_KEY_MIN_WIDTH).toInt())
+        val keyWidth = maxWidth / perView
+        val list = androidx.compose.foundation.lazy.rememberLazyListState()
+        val keyPx = with(LocalDensity.current) { keyWidth.toPx() }
+        // A slow drag ends without a fling, so settle on the nearest key boundary when scrolling stops.
+        LaunchedEffect(list, keyPx) {
+            snapshotFlow { list.isScrollInProgress }.collect { moving ->
+                val offset = list.firstVisibleItemScrollOffset
+                if (!moving && offset != 0) list.animateScrollToItem(list.firstVisibleItemIndex + if (offset > keyPx / 2) 1 else 0)
+            }
+        }
+        androidx.compose.foundation.lazy.LazyRow(Modifier.fillMaxSize(), state = list,
+            flingBehavior = androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior(list),
+            verticalAlignment = Alignment.CenterVertically) {
+            items(keys.size) { i -> Box(Modifier.width(keyWidth)) { keys[i]() } }
+        }
     }
 }
+
+/** The narrowest a key may be: the longest label ("Paste", "PgUp") with room, and well over 48dp. */
+private val TERMINAL_KEY_MIN_WIDTH = 64.dp
 
 private enum class Gesture { Tap, Scroll, Pinch, Select }
 
