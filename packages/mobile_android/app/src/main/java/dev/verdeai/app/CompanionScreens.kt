@@ -41,6 +41,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -229,10 +230,17 @@ internal fun CompanionSheet(
                 escape
             }
             .focusRequester(focus).focusable().focusGroup(), content = panel)
-    } else ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET)) {
-        LiveOverModal()
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.92f), content = panel)
+    } else {
+        // Opens at about 60% (iOS medium detent) with the conversation anchored to the bottom; drag
+        // the handle up for the full height, down to come back (or further to dismiss).
+        var tall by rememberSaveable { mutableStateOf(false) }
+        val height by androidx.compose.animation.core.animateFloatAsState(if (tall) .92f else .6f, label = "Companion sheet height")
+        ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET),
+            dragHandle = { CompanionSheetHandle(tall) { tall = it } }) {
+            LiveOverModal()
+            Column(Modifier.fillMaxWidth().fillMaxHeight(height), content = panel)
+        }
     }
     if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript,
         focusLive = settingsForLive) { settings = false; settingsForLive = false }
@@ -255,6 +263,24 @@ internal fun CompanionSheet(
             if (ws != active.home_workspace_id || chat != active.thread_id) onOpenChat(ws, chat)
         }, onDismiss = { scheduled = false })
     if (brainOnly && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript, startOnBrain = true) { brainOnly = false }
+}
+
+/** The sheet's grabber: drag (or tap, or the TalkBack actions) to switch between half and full height. */
+@Composable
+private fun CompanionSheetHandle(tall: Boolean, onTall: (Boolean) -> Unit) {
+    var drag by remember { mutableFloatStateOf(0f) }
+    Box(Modifier.fillMaxWidth().height(28.dp)
+        .pointerInput(tall) {
+            detectVerticalDragGestures(
+                onDragStart = { drag = 0f },
+                onDragEnd = { if (drag < -24f) onTall(true) else if (drag > 24f && tall) onTall(false) },
+            ) { change, amount -> drag += amount; if (tall || amount < 0f) change.consume() }
+        }
+        .clickable(onClickLabel = if (tall) "Make the companion smaller" else "Show the companion full height") { onTall(!tall) }
+        .semantics { contentDescription = if (tall) "Companion, full height" else "Companion, half height" },
+        contentAlignment = Alignment.Center) {
+        Box(Modifier.size(width = 36.dp, height = 4.dp).background(VerdeColors.Border, RoundedCornerShape(2.dp)))
+    }
 }
 
 @Composable
