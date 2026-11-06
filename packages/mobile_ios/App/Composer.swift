@@ -11,6 +11,18 @@ func composerChoiceLabel(_ choices: [ChatChoice], value: String?) -> String {
 /// A new thread runs with full access unless the user picks otherwise (host default).
 let defaultAccessID = "full_access"
 
+/// The empty field's placeholder: while a reply runs it says what Send does instead.
+func composerPlaceholder(_ kind: FollowupKind?) -> String {
+    kind.map { $0.hint + "…" } ?? "Ask anything, or use / for commands and @ to search files."
+}
+
+/// The line under the controls while a reply runs. The empty field's placeholder already says
+/// it, and a follow-up card speaks for itself, so the hint shows once (I2-5).
+func composerHintLine(_ kind: FollowupKind?, text: String, followupShown: Bool) -> String? {
+    guard let kind, !followupShown, !text.isEmpty else { return nil }
+    return kind.hint + ". Long-press Send for other options."
+}
+
 /// The access chip's resolved value: "Supervised", "Full access", or "Default · Full access".
 func composerAccessLabel(_ choices: [ChatChoice], value: String?) -> String {
     if let value, !value.isEmpty { return composerChoiceLabel(choices, value: value) }
@@ -297,7 +309,7 @@ struct ChatComposer: View {
                 .frame(height: promptHeight)
                 .overlay(alignment: .topLeading) {
                     if model.text.isEmpty {
-                        Text("Ask anything, or use / for commands and @ to search files.")
+                        Text(composerPlaceholder(followupKind))
                             .font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.subtle).allowsHitTesting(false).accessibilityHidden(true)
                     }
                 }
@@ -342,7 +354,9 @@ struct ChatComposer: View {
                     .accessibilityIdentifier("composer-send")
                     .contextMenu { sendAlternatives }
             }
-            if let kind = followupKind { Text(kind.hint + ". Long-press Send for other options.") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
+            if let line = composerHintLine(followupKind, text: model.text, followupShown: model.view?.followup.map(visibleFollowup) ?? false) {
+                Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).accessibilityIdentifier("composer-action-hint")
+            }
         }
         .padding(12)
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
