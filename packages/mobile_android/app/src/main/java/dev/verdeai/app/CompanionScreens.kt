@@ -247,7 +247,10 @@ internal fun CompanionSheet(
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET),
             dragHandle = { CompanionSheetHandle(tall) { tall = it } }) {
             LiveOverModal()
-            Column(Modifier.fillMaxWidth().fillMaxHeight(height), content = panel)
+            // A share of the screen, not of the sheet's window: Live's bar joining the window (and
+            // padding it) during "Connecting…" no longer drops the sheet to a lower height.
+            val screen = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
+            Column(Modifier.fillMaxWidth().height(screen * height), content = panel)
         }
     }
     if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript,
@@ -348,7 +351,8 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
             if (suffix != null) Text("  \u00b7 $suffix",
                 Modifier.weight(1f, fill = false).then(if (onSuffix != null) Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity",
                     role = Role.Button, onClick = onSuffix).wrapContentHeight(Alignment.CenterVertically).padding(end = 8.dp) else Modifier)
-                    .semantics { if (onSuffix != null) this.selected = suffixExpanded },
+                    // The clickable node itself is named ("1 needs you"), not an unnamed wrapper.
+                    .then(if (onSuffix != null) Modifier.nameOnly(suffix, selected = suffixExpanded) else Modifier),
                 style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         // Tight in a pane; the menu below always has it.

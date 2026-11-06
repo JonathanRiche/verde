@@ -330,7 +330,7 @@ internal fun CodeBlock(code: String, language: String?, model: HighlightSource) 
         .border(1.dp, VerdeColors.Border, RoundedCornerShape(8.dp)).testTag(CODE_BLOCK_TAG)) {
         Row(Modifier.fillMaxWidth().background(VerdeColors.PanelAlt).padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(language ?: "code", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { clipboard.setText(AnnotatedString(code.removeSuffix("\n"))) }) { Text("Copy code") }
+            NamedButton("Copy code", { clipboard.setText(AnnotatedString(code.removeSuffix("\n"))) }, padding = PaddingValues(horizontal = 12.dp))
         }
         val scroll = rememberScrollState()
         Text(text, Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Background).horizontalScroll(scroll)

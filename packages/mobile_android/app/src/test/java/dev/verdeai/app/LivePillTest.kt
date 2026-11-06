@@ -77,12 +77,11 @@ class LivePillTest {
         assertEquals(oneLine, compose.onNodeWithTag(LIVE_CALL_BAR).fetchSemanticsNode().size.height)
         compose.onNodeWithContentDescription("End live voice").performClick()
 
+        // A failed call is explained by the companion sheet's card, not a red banner in the bar.
         ui = LiveUi(phase = LivePhase.Failed, error = "The voice provider is unavailable.")
         compose.onNodeWithTag(LIVE_PILL).assertDoesNotExist()
-        compose.onNodeWithText("The voice provider is unavailable.").assertExists()
-        compose.onNodeWithText("Try again").performClick()
-        compose.onNodeWithText("Close").performClick()
-        assertEquals(listOf("end", "retry", "close"), taps)
+        compose.onNodeWithText("The voice provider is unavailable.").assertDoesNotExist()
+        assertEquals(listOf("end"), taps)
     }
 
     private fun barHost(taps: MutableList<String>) = LiveBarHost(mutableStateOf<@Composable (Dp) -> Unit>({ top ->

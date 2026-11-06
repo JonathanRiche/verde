@@ -347,16 +347,9 @@ internal fun LiveCallBar(ui: LiveUi, input: () -> Float, output: () -> Float, ch
         else Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
     Column(modifier.fillMaxWidth().then(top).testTag(LIVE_CALL_BAR)) {
         Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
-            if (ui.phase == LivePhase.Failed) {
-                Row(Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(horizontal = 12.dp)
-                    .background(VerdeColors.DangerPanel, RoundedCornerShape(14.dp)).border(1.dp, VerdeColors.Danger, RoundedCornerShape(14.dp))
-                    .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(ui.error ?: liveStatusLabel(ui, false, name), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite },
-                        style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    TextButton(onClick = onRetry) { Text("Try again") }
-                    TextButton(onClick = onClose) { Text("Close") }
-                }
-            } else LivePill(ui, input(), output(), character, name, captionsShown, onExpand, onSettings, onCaptions, onMute, onEnd,
+            // A failed call explains itself in the companion sheet's card (S9), never in a second,
+            // red banner over it (r5: it flashed above the needs-setup card for a frame).
+            if (ui.active) LivePill(ui, input(), output(), character, name, captionsShown, onExpand, onSettings, onCaptions, onMute, onEnd,
                 compactCaptions = true)
         }
     }
