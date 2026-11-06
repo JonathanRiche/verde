@@ -17,13 +17,14 @@ struct BackgroundStatusIcon: View {
         Group {
             switch status ?? "" {
             case "running": ProgressView().controlSize(.mini)
-            case "failed": Image(systemName: "xmark").font(.system(size: glyph, weight: .bold))
-            case "stopped": Image(systemName: "stop.fill").font(.system(size: glyph * 0.9, weight: .bold))
-            default: Image(systemName: "checkmark").font(.system(size: glyph, weight: .bold))
+            case "failed": Image(systemName: "xmark").font(.system(size: glyph, weight: .bold)).accessibilityHidden(true)
+            case "stopped": Image(systemName: "stop.fill").font(.system(size: glyph * 0.9, weight: .bold)).accessibilityHidden(true)
+            default: Image(systemName: "checkmark").font(.system(size: glyph, weight: .bold)).accessibilityRemoveTraits(.isSelected).accessibilityHidden(true)
             }
         }
         .foregroundStyle(backgroundStatusColor(status))
         .frame(width: box, height: box)
+        .accessibilityRemoveTraits(.isSelected)
         .accessibilityHidden(true)
     }
 }
@@ -55,10 +56,14 @@ private struct BackgroundCommand: View {
     }
 }
 
+/// The flag that flashes a task's row after the bar scrolls to it (I14-2).
+func backgroundHighlightKey(_ rowID: String) -> String { rowID + ":highlight" }
+
 /// One task, or a run of finished ones, in the transcript.
 struct BackgroundTaskCard: View {
     let rows: [ChatRow]
     let disclosure: DisclosureStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
@@ -70,13 +75,28 @@ struct BackgroundTaskCard: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
+            .background(highlighted ? VerdeTheme.accent.opacity(0.14) : VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(highlighted ? VerdeTheme.accent : VerdeTheme.border, lineWidth: highlighted ? 2 : 1))
+            .animation(.easeOut(duration: 0.25), value: highlighted)
         }
         .accessibilityIdentifier("background-task")
     }
 
     private func key(_ row: ChatRow) -> String { row.id + ":background" }
+    private var highlighted: Bool { rows.contains { disclosure.flag(backgroundHighlightKey($0.id)) } }
+
+    /// The status and age, never broken mid-word (I14-1): one line each, shrinking a little.
+    private func statusLine(_ row: ChatRow, now: Int64) -> some View {
+        let status = row.background?.status
+        return HStack(spacing: 6) {
+            BackgroundStatusIcon(status: status)
+            Text(backgroundStatusText(status)).font(VerdeTheme.ui(12, bold: true)).foregroundStyle(backgroundStatusColor(status))
+                .lineLimit(1).minimumScaleFactor(0.8).fixedSize(horizontal: true, vertical: false)
+            if let age = backgroundAge(row, now: now) {
+                Text(age).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).minimumScaleFactor(0.8)
+            }
+        }
+    }
 
     /// "▸ pytest -q    ◌ Running · 3 min ago".
     private func single(_ row: ChatRow, now: Int64) -> some View {
@@ -86,16 +106,22 @@ struct BackgroundTaskCard: View {
             Button { disclosure.toggle(key(row)) } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "terminal").foregroundStyle(VerdeTheme.muted).accessibilityHidden(true)
-                    // S36: up to two lines before the middle ellipsis.
-                    Text(backgroundLabel(row)).font(VerdeTheme.mono(12)).lineLimit(2).truncationMode(.middle)
-                    Spacer(minLength: 8)
-                    BackgroundStatusIcon(status: status)
-                    Text(backgroundStatusText(status)).font(VerdeTheme.ui(12, bold: true)).foregroundStyle(backgroundStatusColor(status))
-                    if let age = backgroundAge(row, now: now) {
-                        Text(age).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+                    if dynamicTypeSize.isAccessibilitySize {
+                        // Large text: the label on top, the status under it, so neither is cut.
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(backgroundLabel(row)).font(VerdeTheme.mono(12)).lineLimit(2).truncationMode(.middle)
+                            statusLine(row, now: now)
+                        }
+                        Spacer(minLength: 4)
+                    } else {
+                        // S36: up to two lines before the middle ellipsis.
+                        Text(backgroundLabel(row)).font(VerdeTheme.mono(12)).lineLimit(2).truncationMode(.middle)
+                        Spacer(minLength: 8)
+                        statusLine(row, now: now)
                     }
                     DisclosureChevron(expanded: expanded)
                 }
+                .padding(.vertical, 4)
                 .frame(minHeight: 44).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -146,13 +172,14 @@ struct BackgroundTasksBar: View {
             Button { show(first) } label: {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini)
-                    Text(backgroundBarText(tasks.count)).font(VerdeTheme.ui(13, bold: true)).lineLimit(1)
+                    // I14-1: wraps at large text rather than being cut off.
+                    Text(backgroundBarText(tasks.count)).font(VerdeTheme.ui(13, bold: true)).lineLimit(2).minimumScaleFactor(0.85)
                     Spacer(minLength: 4)
                     Image(systemName: "chevron.up").font(.caption.weight(.semibold)).foregroundStyle(VerdeTheme.muted)
                 }
-                .padding(.horizontal, 14).frame(minHeight: 44).contentShape(Rectangle())
-                .background(VerdeTheme.panel, in: Capsule())
-                .overlay(Capsule().stroke(VerdeTheme.border))
+                .padding(.horizontal, 14).padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
+                .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 22))
+                .overlay(RoundedRectangle(cornerRadius: 22).stroke(VerdeTheme.border))
             }
             .buttonStyle(.plain)
             .foregroundStyle(VerdeTheme.text)

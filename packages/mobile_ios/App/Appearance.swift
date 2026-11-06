@@ -187,6 +187,8 @@ struct AppSettings: View {
                 hostsSection
                 aboutSection
             }
+            // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+            .headerProminence(.increased)
             // Section headers keep the case they're written in (S7), including the shared sections.
             .textCase(nil)
             .scrollContentBackground(.hidden).background(VerdeTheme.background)

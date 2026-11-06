@@ -140,7 +140,8 @@ struct WorkspaceDrawer: View {
                 // S27 (Android parity): under All Workspaces the chips say which workspace they open,
                 // the open chat's (S21) or the most recent one.
                 ExplorerLinks(onChanges: { open(.changes(target.workspace_id)) }, onFiles: { open(.files(target.workspace_id)) },
-                              workspace: scoped == nil ? target.label : nil)
+                              workspace: scoped == nil ? target.label : nil,
+                              onCaption: { workspaceQuery = ""; closedExpanded = false; switching = true })
                     .padding(.horizontal, 12).padding(.bottom, 8)
             }
             Rectangle().fill(VerdeTheme.border).frame(height: 1)

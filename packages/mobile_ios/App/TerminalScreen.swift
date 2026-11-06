@@ -554,7 +554,7 @@ struct TerminalScreen: View {
     @State private var model: TerminalModel?
     @State private var hostID: String?
     @State private var created: String?
-    @Environment(\.openRoute) private var relaunch
+    @Environment(\.replaceRoute) private var relaunch
     @State private var selection: GridSelection?
     @State private var handle = TerminalHandle()
     @AppStorage("terminal.fontSize") private var fontSize: Double = 14

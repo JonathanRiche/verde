@@ -389,6 +389,8 @@ struct ScheduleForm: View {
                     }
                 }
             }
+            // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+            .headerProminence(.increased)
             .scrollContentBackground(.hidden)
             .background(VerdeTheme.background)
             .navigationTitle(editing == nil ? "New scheduled task" : "Edit scheduled task")
@@ -460,11 +462,9 @@ struct ScheduleForm: View {
 
     private var repeatSection: some View {
         Section {
-            Picker("Repeat", selection: $draft.repeatKind) {
-                ForEach(ScheduleRepeatKind.allCases) { kind in Text(kind.label).tag(kind) }
-            }
-            .pickerStyle(.segmented)
-            .accessibilityIdentifier("schedule-repeat")
+            // I14-7: 44-point segments (the system segmented control is 32 points tall).
+            SegmentedChoice(title: "Repeat", options: ScheduleRepeatKind.allCases.map { ($0, $0.label) }, selection: $draft.repeatKind)
+                .accessibilityIdentifier("schedule-repeat")
             switch draft.repeatKind {
             case .once:
                 DatePicker("Run at", selection: $draft.at, displayedComponents: [.date, .hourAndMinute])
@@ -472,10 +472,7 @@ struct ScheduleForm: View {
                 Stepper(value: $draft.every, in: draft.unit.range, step: draft.unit.step) {
                     Text("Every \(draft.every) \(draft.unit.noun(draft.every))")
                 }
-                Picker("Unit", selection: $draft.unit) {
-                    ForEach(ScheduleIntervalUnit.allCases) { unit in Text(unit.title).tag(unit) }
-                }
-                .pickerStyle(.segmented)
+                SegmentedChoice(title: "Unit", options: ScheduleIntervalUnit.allCases.map { ($0, $0.title) }, selection: $draft.unit)
             case .daily:
                 DatePicker("At", selection: timeBinding, displayedComponents: .hourAndMinute)
                 WeekdayChips(selection: $draft.weekdays)
@@ -633,5 +630,36 @@ private struct WeekdayChips: View {
             next.remove(day)
         }
         selection = next
+    }
+}
+
+
+/// A segmented choice with 44-point segments: the current one filled, each a button that says
+/// whether it is selected.
+struct SegmentedChoice<Value: Hashable>: View {
+    let title: String
+    let options: [(Value, String)]
+    @Binding var selection: Value
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(options, id: \.0) { value, label in
+                let selected = value == selection
+                Button { selection = value } label: {
+                    Text(label).font(VerdeTheme.ui(14, bold: selected)).lineLimit(1).minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .foregroundStyle(selected ? VerdeTheme.onAccent : VerdeTheme.text)
+                        .background(selected ? VerdeTheme.accent : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(label)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
     }
 }

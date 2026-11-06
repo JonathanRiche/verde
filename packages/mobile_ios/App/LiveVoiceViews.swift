@@ -337,6 +337,8 @@ private struct LiveProviderEditor: View {
             } label: { if saving { ProgressView() } else { Text("Save on desktop") } }
             .disabled(saving)
         }
+        // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+        .headerProminence(.increased)
         .scrollContentBackground(.hidden)
         .background(VerdeTheme.background)
         .navigationTitle(provider.label)

@@ -128,6 +128,8 @@ struct CompanionBrainScreen: View {
             if let message { Text(message).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.warning) }
             if let notice = manage?.notice { Text(notice).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.warning) }
         }
+        // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+        .headerProminence(.increased)
         .scrollContentBackground(.hidden)
         .background(VerdeTheme.background)
         .alert(brainSwitchTitle(name: active?.name ?? "Companion", provider: providerDisplayName(provider, choices: providers)),

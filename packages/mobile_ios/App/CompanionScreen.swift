@@ -644,6 +644,8 @@ private struct CompanionConversations: View {
                     Text("Removing only takes a conversation off this list; the chat stays in your history.")
                 }
             }
+            // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+            .headerProminence(.increased)
             .scrollContentBackground(.hidden)
             .background(VerdeTheme.background)
             .navigationTitle("Conversations")
@@ -758,6 +760,8 @@ struct CompanionSettings: View {
                     Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))
                 } footer: { Text("Long-press the bubble to hide it; turn it back on here or in Settings.") }
         }
+        // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+        .headerProminence(.increased)
     }
 
     /// Scrolls to Live voice and flashes it once when opened for a Live error's repair (I2-7).

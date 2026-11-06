@@ -40,12 +40,21 @@ func route(_ pane: Pane) -> BrowseRoute? {
 private struct OpenRouteKey: EnvironmentKey {
     static let defaultValue: (BrowseRoute) -> Void = { _ in }
 }
+private struct ReplaceRouteKey: EnvironmentKey {
+    static let defaultValue: (BrowseRoute) -> Void = { _ in }
+}
 
 extension EnvironmentValues {
     /// Pushes onto the enclosing browse stack (context-menu "Open").
     var openRoute: (BrowseRoute) -> Void {
         get { self[OpenRouteKey.self] }
         set { self[OpenRouteKey.self] = newValue }
+    }
+    /// Replaces the current screen in the browse stack (an ended terminal's Relaunch, I14-3), so
+    /// Back skips the screen it replaced.
+    var replaceRoute: (BrowseRoute) -> Void {
+        get { self[ReplaceRouteKey.self] }
+        set { self[ReplaceRouteKey.self] = newValue }
     }
 }
 
@@ -525,5 +534,13 @@ struct BrowseStack<Root: View>: View {
             }
         }
         .environment(\.openRoute, { route in path.append(route) })
+        .environment(\.replaceRoute, { route in
+            var next = path
+            if !next.isEmpty { next.removeLast() }
+            next.append(route)
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { path = next }
+        })
     }
 }

@@ -22,7 +22,7 @@ final class Pass2Tests: XCTestCase {
         XCTAssertNil(composerHintLine(.steer, text: "", followupShown: false))
         XCTAssertNil(composerHintLine(.steer, text: "go", followupShown: true))
         XCTAssertNil(composerHintLine(nil, text: "go", followupShown: false))
-        XCTAssertEqual(composerHintLine(.steer, text: "go", followupShown: false), "Steer the current reply. Long-press Send for other options.")
+        XCTAssertEqual(composerHintLine(.steer, text: "go", followupShown: false), "Steer the current reply. Hold Send for more.")
     }
 
     func testMoreColumnsOnlyWhileContentRunsPastTheEdge() {

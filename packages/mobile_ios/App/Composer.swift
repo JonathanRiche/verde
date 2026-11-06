@@ -27,7 +27,8 @@ func composerPlaceholder(_ kind: FollowupKind?) -> String {
 /// it, and a follow-up card speaks for itself, so the hint shows once (I2-5).
 func composerHintLine(_ kind: FollowupKind?, text: String, followupShown: Bool) -> String? {
     guard let kind, !followupShown, !text.isEmpty else { return nil }
-    return kind.hint + ". Long-press Send for other options."
+    // I14-5: short enough not to be cut at large text; it wraps if it must.
+    return kind.hint + ". Hold Send for more."
 }
 
 /// A chip label cut to `limit` characters with "…" (a capped frame would stretch every chip to it).
@@ -507,7 +508,7 @@ struct ChatComposer: View {
                 }
             }
             if let line = composerHintLine(followupKind, text: model.text, followupShown: model.view?.followup.map(visibleFollowup) ?? false) {
-                Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).accessibilityIdentifier("composer-action-hint")
+                Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("composer-action-hint")
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 12)

@@ -36,6 +36,8 @@ struct HostsScreen: View {
                     }
                 }
             }
+            // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+            .headerProminence(.increased)
             .modifier(ReadableListWidth())
             .navigationTitle("Hosts").modifier(VerdeNavigation()).modifier(RootCompanionToolbar())
             .listStyle(.plain).scrollContentBackground(.hidden).background(VerdeTheme.background)

@@ -182,6 +182,8 @@ struct WorkspaceIdentitySheet: View {
                     }.padding(.vertical, 6)
                 }
             }
+            // S32 / I14-6: sentence-case headers in sheets too (the root setting stops at a sheet).
+            .headerProminence(.increased)
             .navigationTitle("Icon and color").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { BarButton("Cancel") { dismiss() } }

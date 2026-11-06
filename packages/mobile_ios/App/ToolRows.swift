@@ -26,6 +26,8 @@ struct ToolStatusIcon: View {
                 Image(systemName: failed ? "xmark" : "checkmark")
                     .font(.system(size: glyph, weight: .bold))
                     .foregroundStyle(failed ? VerdeTheme.danger : VerdeTheme.accent)
+                    // I14-8: a status glyph, never "Selected" (the symbol's default trait).
+                    .accessibilityRemoveTraits(.isSelected).accessibilityHidden(true)
             }
         }
         .frame(width: box, height: box)

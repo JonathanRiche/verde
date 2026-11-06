@@ -196,11 +196,11 @@ private struct ApprovalDetails: View {
                 if expanded {
                     let (shown, truncated) = all ? (approval.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
                         : leadingLines(approval.body, detailLines)
-                    ScrollView(.horizontal) {
-                        Text(shown).font(VerdeTheme.mono()).fixedSize().textSelection(.enabled)
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // I14-4: the request wraps at every size; it never hides behind a sideways scroll.
+                    Text(shown).font(VerdeTheme.mono()).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 8)
                     .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Approval details")
                     HStack(spacing: 16) {

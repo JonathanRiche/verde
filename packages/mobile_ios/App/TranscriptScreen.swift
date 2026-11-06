@@ -294,12 +294,21 @@ private struct TranscriptList: View {
         }
     }
 
-    /// Room under the last row for the background bar, which overlays the list's bottom edge.
-    @ScaledMetric(relativeTo: .body) private var backgroundBarReserve: CGFloat = 52
+    /// The background bar's measured height: the room kept under the last row so the bar, which
+    /// overlays the list's bottom edge, never covers a row (I14-1). Only the content's padding
+    /// depends on it, never the bar itself, so it can't feed back into its own layout.
+    @State private var backgroundBarHeight: CGFloat = 52
 
+    /// I14-2: scrolls the task's row into view and flashes it.
     private func showBackground(_ task: ChatBackgroundTask, _ proxy: ScrollViewProxy) {
         follow = false
         withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("b:" + task.row_id, anchor: .center) }
+        let key = backgroundHighlightKey(task.row_id)
+        model.disclosure.setFlag(key, true)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1600))
+            model.disclosure.setFlag(key, false)
+        }
     }
 
     private func jumpToLatest(_ proxy: ScrollViewProxy) {
@@ -342,12 +351,12 @@ private struct TranscriptList: View {
                             VStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: false) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
-                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarReserve)
+                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarHeight + 8)
                         } else {
                             LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) { rows(items, lazy: true) }
                                 .scrollTargetLayout()
                                 .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
-                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarReserve)
+                                .padding(.bottom, background.isEmpty ? 0 : backgroundBarHeight + 8)
                         }
                     }
                     .coordinateSpace(name: "transcript")
@@ -359,6 +368,9 @@ private struct TranscriptList: View {
                             if showLatest { LatestStrip { jumpToLatest(proxy) } }
                             // U1: running tasks above the composer; a tap shows the task's row.
                             BackgroundTasksBar(tasks: background) { task in showBackground(task, proxy) }
+                                .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { height in
+                                    if height > 0 && abs(height - backgroundBarHeight) > 1 { backgroundBarHeight = height }
+                                }
                         }
                     }
                     // Scrolling or tapping the transcript puts the keyboard away (I-KB); the tap is

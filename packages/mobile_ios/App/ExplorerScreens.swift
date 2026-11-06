@@ -788,6 +788,8 @@ struct ExplorerLinks: View {
     var workspace: String? = nil
     /// Named only to VoiceOver ("Changes in infra"); nothing is drawn.
     var spoken: String? = nil
+    /// I14-9: the caption opens the scope picker.
+    var onCaption: (() -> Void)? = nil
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -814,9 +816,22 @@ struct ExplorerLinks: View {
     }
 
     /// Says which workspace the chips open when the drawer lists all of them.
-    private func caption(_ workspace: String) -> some View {
-        Text("in \(workspace)").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
-            .frame(maxWidth: .infinity, alignment: .leading)
+    @ViewBuilder private func caption(_ workspace: String) -> some View {
+        let text = HStack(spacing: 3) {
+            Text("in \(workspace)").lineLimit(1)
+            if onCaption != nil { Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).accessibilityHidden(true) }
+        }
+        .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+        if let onCaption {
+            Button(action: onCaption) { text.frame(minHeight: 44).contentShape(Rectangle()) }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Workspace: \(workspace)")
+                .accessibilityHint("Chooses the workspace scope.")
+                .accessibilityIdentifier("explorer-scope")
+        } else {
+            text.frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private func link(_ title: String, icon: String, id: String, action: @escaping () -> Void) -> some View {
