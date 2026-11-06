@@ -18659,9 +18659,12 @@ pub const AppState = struct {
             return true;
         }
         if (task.pid != null or task.pid_path != null) {
+            // A restored PID may have been reused by an unrelated process, so
+            // never signal it; just end the tracked row so the card does not
+            // keep a Stop button that can never succeed.
             if (!task.pid_verified) {
-                self.setSidebarNotice("Cannot safely stop this restored PID; wait for a new live task event.");
-                return false;
+                runtime_log.diagnostic("bg-stop restored pid unverified; collapsing row without signalling thread={s}", .{thread.local_thread_id});
+                return self.endTrackedBackgroundTaskRow(thread, task);
             }
             const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
             // No PID to signal (never written, or the pid file is gone):
