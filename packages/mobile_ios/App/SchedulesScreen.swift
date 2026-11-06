@@ -67,7 +67,7 @@ struct ScheduledScreen: View {
                     Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { form = .new } label: { Image(systemName: "plus") }
+                    Button { form = .new } label: { Image(systemName: "plus").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()) }
                         .disabled(!canEdit)
                         .keyboardShortcut("n", modifiers: .command)
                         .accessibilityLabel("New scheduled task")
@@ -601,7 +601,8 @@ private struct WeekdayChips: View {
     @Binding var selection: Set<Int>
 
     var body: some View {
-        HStack(spacing: 4) {
+        // Seven across with 2-point gaps keeps each toggle at least 44 points wide on a phone.
+        HStack(spacing: 2) {
             ForEach(scheduleWeekOrder, id: \.self) { day in
                 let on = selection.contains(day)
                 Button { flip(day) } label: {
