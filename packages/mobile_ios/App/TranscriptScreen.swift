@@ -821,8 +821,8 @@ private struct CompactMessageRow: View {
             }
             .frame(maxWidth: mine ? nil : .infinity, alignment: mine ? .trailing : .leading)
             .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
-            if !mine { Spacer(minLength: 32) }
             .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
+            if !mine { Spacer(minLength: 32) }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
