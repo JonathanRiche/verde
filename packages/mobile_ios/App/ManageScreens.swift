@@ -16,6 +16,17 @@ struct ManageContainer<Content: View>: View {
     }
 }
 
+/// A list section header (S7): sentence case, 13 pt semibold, the muted text colour. Lists
+/// uppercase headers by default; this keeps the title as written.
+struct SectionTitle: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+    var body: some View {
+        Text(title).font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.muted).textCase(nil)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
 struct ManageNotice: View {
     let model: ManageModel
     var body: some View {
@@ -38,17 +49,26 @@ struct HistoryScreen: View {
             }
             let history = browse.state.workspaces?.history
             let sections = historySections(history?.items ?? [])
+            let labels = Dictionary((browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
             ForEach(sections.indices, id: \.self) { index in
-                Section(sections[index].0) {
+                Section {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
+                        let subtitle = historySubtitle(thread, workspace: labels[thread.workspace_id], now: now)
                         NavigationLink(value: BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack { Text(thread.title).lineLimit(2); Spacer(); GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id) }
-                                Text([thread.provider, thread.archived ? "Archived" : nil, thread.cwd].compactMap { $0 }.joined(separator: " · ")) .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
+                            HStack(alignment: .top, spacing: 12) {
+                                ProviderGlyph(provider: thread.provider).padding(.top, 2)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(thread.title.isEmpty ? "Untitled chat" : thread.title).font(VerdeTheme.ui(16)).lineLimit(2)
+                                    if !subtitle.isEmpty { Text(subtitle).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).lineLimit(2) }
+                                }
+                                Spacer(minLength: 4)
+                                GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                             }
+                            .accessibilityElement(children: .combine)
                         }
                     }
-                }
+                } header: { SectionTitle(sections[index].0) }
             }
             if history?.loading == true { ProgressView("Loading chats…") }
             else if history?.next_cursor != nil { Button("Load more") { Task { await manage.moreHistory() } } }
@@ -98,28 +118,63 @@ struct NewChatScreen: View {
                         .accessibilityIdentifier("new-chat-model-notice")
                 }
             }
-            Button("Start chat") {
-                Task {
-                    if let job = await manage.createThread(workspace), let thread = job.thread_id {
-                        openRoute(.thread(workspace: job.workspace_id ?? workspace, thread: thread))
+            Section {
+                Button {
+                    Task {
+                        if let job = await manage.createThread(workspace), let thread = job.thread_id {
+                            openRoute(.thread(workspace: job.workspace_id ?? workspace, thread: thread))
+                        }
                     }
+                } label: {
+                    if manage.busy { ProgressView().tint(VerdeTheme.onAccent) } else { Text("Start chat") }
                 }
-            }.disabled(manage.busy || chat?.workspace_id != workspace || chat?.can_create != true)
+                .modifier(PrimaryRow())
+                .disabled(manage.busy || chat?.workspace_id != workspace || chat?.can_create != true)
+                .accessibilityLabel("Start chat")
                 .accessibilityIdentifier("create-chat")
+            }
         }.navigationTitle("New chat").navigationBarTitleDisplayMode(.inline)
         .onAppear { workspace = initialWorkspace ?? mostRecentOpenWorkspace(workspaces)?.workspace_id ?? "" }
         .task(id: workspace) { if !workspace.isEmpty { await manage.select(workspace) } }
     }
+    /// The whole row opens the menu (not only its value), and the menu marks the current choice.
     @ViewBuilder private func choice(_ label: String, value: String?, choices: [ChatChoice], update: @escaping (String) -> ChatSelection) -> some View {
         if !choices.isEmpty {
+            let shown = newChatChoiceLabel(label, value: value, choices: choices)
             Menu {
                 ForEach(choices, id: \.id) { item in
-                    Button(item.label + (item.favorite ? " ★" : "")) { Task { await manage.select(workspace, update(item.id)) } }.disabled(!item.enabled)
+                    let current = item.id == (value ?? newChatDefault(label))
+                    Button { Task { await manage.select(workspace, update(item.id)) } } label: {
+                        if current { Label(item.label + (item.favorite ? " ★" : ""), systemImage: "checkmark") }
+                        else { Text(item.label + (item.favorite ? " ★" : "")) }
+                    }.disabled(!item.enabled)
                 }
-            } label: { LabeledContent(label, value: choices.first { $0.id == value }?.label ?? value ?? "Default") }
-                .disabled(manage.busy)
+            } label: {
+                HStack(spacing: 8) {
+                    Text(label).foregroundStyle(VerdeTheme.text)
+                    Spacer(minLength: 8)
+                    Text(shown).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 12, weight: .semibold)).foregroundStyle(VerdeTheme.subtle)
+                }
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .disabled(manage.busy)
+            .accessibilityLabel(label)
+            .accessibilityValue(shown)
+            .accessibilityHint("Opens the \(label.lowercased()) choices.")
         }
     }
+}
+
+/// The host's default when a new chat leaves a setting unset (client_core manage.zig).
+func newChatDefault(_ setting: String) -> String? { setting == "Access" ? "full_access" : nil }
+
+/// A New chat row's value: the chosen label, or "Default" with what that resolves to when known.
+func newChatChoiceLabel(_ setting: String, value: String?, choices: [ChatChoice]) -> String {
+    if let value, !value.isEmpty { return choices.first { $0.id == value }?.label ?? value }
+    if let id = newChatDefault(setting), let resolved = choices.first(where: { $0.id == id }) { return "Default · " + resolved.label }
+    return "Default"
 }
 
 struct AddWorkspaceScreen: View {
@@ -128,34 +183,79 @@ struct AddWorkspaceScreen: View {
     @State private var label = ""
     @Environment(\.openRoute) private var openRoute
     var body: some View {
+        let problem = workspacePathProblem(path)
         Form {
             ManageNotice(model: manage)
-            Section("Workspace") {
-                TextField("Folder on the computer", text: $path).textInputAutocapitalization(.never).autocorrectionDisabled()
+            Section {
+                TextField("Folder on the computer, e.g. /Users/you/project", text: $path)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL).submitLabel(.done)
+                    .accessibilityLabel("Folder on the computer")
                     .accessibilityIdentifier("workspace-path")
-                TextField("Name (optional)", text: $label)
-                Button("Add workspace") {
-                    Task { if let job = await manage.createWorkspace(path: path, label: label), let id = job.workspace_id { openRoute(.workspace(id)) } }
-                }.disabled(path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || manage.busy || manage.view?.can_manage_workspaces != true)
+                if let problem {
+                    Text(problem).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.danger).accessibilityIdentifier("workspace-path-problem")
+                }
+                TextField("Name (optional)", text: $label).accessibilityLabel("Workspace name, optional")
+            } header: { SectionTitle("Workspace") }
+            Section {
+                Button {
+                    Task {
+                        if let job = await manage.createWorkspace(path: path, label: label), let id = job.workspace_id { openRoute(.workspace(id)) }
+                    }
+                } label: {
+                    if manage.busy { ProgressView().tint(VerdeTheme.onAccent) } else { Text("Add workspace") }
+                }
+                .modifier(PrimaryRow())
+                .disabled(normalizedWorkspacePath(path).isEmpty || problem != nil || manage.busy || manage.view?.can_manage_workspaces != true)
+                .accessibilityLabel("Add workspace")
+                .accessibilityIdentifier("add-workspace")
             }
-            Section("Browse folders") {
+            Section {
                 if let directory = manage.view?.directory {
                     if !directory.supported { Text("Folder browsing needs a newer host. You can still enter a path.") }
                     else {
-                        ForEach(directory.suggestions, id: \.self) { root in Button(root) { Task { await manage.directory(root) } } }
-                        if !directory.path.isEmpty {
-                            Text(directory.path) .font(VerdeTheme.ui(12))
-                            Button("Use this folder") { path = directory.path }.disabled(directory.loading || directory.error != nil)
+                        // Host lists can repeat a folder; a repeated row id can break the list's updates.
+                        ForEach(uniqued(directory.suggestions), id: \.self) { root in
+                            folderRow(root, systemImage: "folder") { Task { await manage.directory(root) } }
                         }
-                        if let parent = directory.parent { Button("Up one folder") { Task { await manage.directory(parent) } } }
-                        ForEach(directory.entries, id: \.path) { entry in Button(entry.name) { Task { await manage.directory(entry.path) } } }
+                        if !directory.path.isEmpty {
+                            HStack(spacing: 8) {
+                                Image(systemName: "folder.fill").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true)
+                                Text(directory.path).font(VerdeTheme.mono(12)).foregroundStyle(VerdeTheme.text).lineLimit(3).textSelection(.enabled)
+                            }
+                            .accessibilityElement(children: .combine).accessibilityLabel("Current folder, \(directory.path)")
+                            Button("Use this folder") { path = directory.path; manage.notice = nil }
+                                .buttonStyle(TonalButtonStyle())
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                                .disabled(directory.loading || directory.error != nil)
+                        }
+                        if let parent = directory.parent { folderRow("Up one folder", systemImage: "arrow.turn.left.up") { Task { await manage.directory(parent) } } }
+                        ForEach(uniqued(directory.entries, by: \.path), id: \.path) { entry in
+                            folderRow(entry.name, systemImage: "folder") { Task { await manage.directory(entry.path) } }
+                        }
                         if directory.loading { ProgressView() }
-                        if let error = directory.error { Text(error.message).foregroundStyle(.red) }
+                        if let error = directory.error { Text(workspaceFolderMessage(error)).foregroundStyle(VerdeTheme.danger) }
                     }
                 }
-            }.disabled(manage.busy)
+            } header: { SectionTitle("Browse folders") }
+            .disabled(manage.busy)
         }.navigationTitle("Add workspace").navigationBarTitleDisplayMode(.inline)
         .task { await manage.directory() }
+    }
+
+    /// A folder to browse into: icon, name and a chevron, the whole row tappable.
+    private func folderRow(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage).foregroundStyle(VerdeTheme.muted).frame(width: 20).accessibilityHidden(true)
+                Text(title).foregroundStyle(VerdeTheme.text).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "chevron.forward").font(.system(size: 12, weight: .semibold)).foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
+            }
+            .frame(minHeight: 44).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityHint("Shows this folder's subfolders.")
     }
 }
 
@@ -167,30 +267,48 @@ struct WorkspaceActions: View {
     @State private var styling = false
     @State private var label = ""
     var body: some View {
-        Section("Workspace actions") {
+        // Each presenter sits on its own row: modifiers on a List section apply to every row in
+        // it, and several rows presenting one sheet at once present nothing.
+        Section {
             ManageNotice(model: manage)
             NavigationLink("New chat", value: BrowseRoute.newChat(workspace.workspace_id)).disabled(manage.view?.can_create_threads != true)
             NavigationLink("History", value: BrowseRoute.history)
             Button("Rename workspace") { label = workspace.label; rename = true }.disabled(manage.view?.can_manage_workspaces != true)
+                .alert("Rename workspace", isPresented: $rename) {
+                    TextField("Name", text: $label)
+                    Button("Cancel", role: .cancel) {}
+                    Button("Rename") { Task { await manage.workspace("rename", id: workspace.workspace_id, value: label) } }.disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
             Button { styling = true } label: {
-                HStack { Text("Icon and color"); Spacer(); WorkspaceChip(workspace: workspace, size: 22) }
-            }.disabled(manage.view?.can_manage_workspaces != true).accessibilityIdentifier("workspace-identity")
-            if workspace.open { Button("Close workspace", role: .destructive) { close = true }.disabled(manage.view?.can_manage_workspaces != true) }
+                HStack {
+                    Text("Icon and color").foregroundStyle(VerdeTheme.text)
+                    Spacer()
+                    WorkspaceChip(workspace: workspace, size: 28)
+                    Image(systemName: "chevron.forward").font(.system(size: 12, weight: .semibold)).foregroundStyle(VerdeTheme.subtle)
+                }
+                .frame(minHeight: 44).contentShape(Rectangle())
+            }
+            .disabled(manage.view?.can_manage_workspaces != true)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Icon and color")
+            .accessibilityValue(workspaceIconNames[((Int(workspace.icon_index) % 16) + 16) % 16])
+            .accessibilityAddTraits(.isButton)
+            .accessibilityIdentifier("workspace-identity")
+            .sheet(isPresented: $styling) {
+                WorkspaceIdentitySheet(workspace: workspace) { icon, color in
+                    Task { await manage.identity(workspace.workspace_id, icon: icon, color: color) }
+                }.presentationDetents([.medium, .large])
+            }
+            if workspace.open {
+                Button("Close workspace", role: .destructive) { close = true }.disabled(manage.view?.can_manage_workspaces != true)
+                    .foregroundStyle(VerdeTheme.danger)
+                    .confirmationDialog("Close this workspace and its sessions?", isPresented: $close, titleVisibility: .visible) {
+                        Button("Close workspace", role: .destructive) { Task { await manage.workspace("close", id: workspace.workspace_id) } }
+                    } message: { Text("The host will refuse to close a workspace while requests or background tasks are running.") }
+            }
             else { Button("Reopen workspace") { Task { await manage.workspace("reopen", id: workspace.workspace_id) } }.disabled(manage.view?.can_manage_workspaces != true) }
-        }.disabled(manage.busy)
-        .alert("Rename workspace", isPresented: $rename) {
-            TextField("Name", text: $label)
-            Button("Cancel", role: .cancel) {}
-            Button("Rename") { Task { await manage.workspace("rename", id: workspace.workspace_id, value: label) } }.disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        }
-        .sheet(isPresented: $styling) {
-            WorkspaceIdentitySheet(workspace: workspace) { icon, color in
-                Task { await manage.identity(workspace.workspace_id, icon: icon, color: color) }
-            }.presentationDetents([.medium, .large])
-        }
-        .confirmationDialog("Close this workspace and its sessions?", isPresented: $close, titleVisibility: .visible) {
-            Button("Close workspace", role: .destructive) { Task { await manage.workspace("close", id: workspace.workspace_id) } }
-        } message: { Text("The host will refuse to close a workspace while requests or background tasks are running.") }
+        } header: { SectionTitle("Workspace actions") }
+        .disabled(manage.busy)
     }
 }
 
