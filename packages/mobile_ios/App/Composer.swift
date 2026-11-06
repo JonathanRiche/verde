@@ -398,21 +398,12 @@ struct ChatComposer: View {
                     chipRows(composerChipPlan(widths: chipWidths(), available: chipRowWidth))
                 }
                 Spacer(minLength: 4)
-                if model.chat.state.turn != nil {
-                    Button(action: model.chat.stopTurn) { Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle()).modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4)) }
-                        .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
-                }
-                // While a reply runs with nothing typed, Stop is the one action (desktop parity).
-                if model.chat.state.turn == nil || model.canSubmit {
-                    Button(action: model.submit) {
-                        Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
-                            .frame(width: 44, height: 44)
-                            .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
-                    }.buttonStyle(.plain)
-                        .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
-                        .accessibilityIdentifier("composer-send")
-                        .contextMenu { sendAlternatives }
+                // One 44-point action slot (I8-1, I8-3): Send, or Stop while a reply runs. With text
+                // typed during a reply, Stop stacks above Send instead of widening the row, so the
+                // chip layout never changes because a turn started or ended.
+                VStack(spacing: 4) {
+                    if running && model.canSubmit { stopButton }
+                    if running && !model.canSubmit { stopButton } else { sendButton }
                 }
             }
             if let line = composerHintLine(followupKind, text: model.text, followupShown: model.view?.followup.map(visibleFollowup) ?? false) {
@@ -423,13 +414,38 @@ struct ChatComposer: View {
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
+        // Never wider than the conversation (I8-2): an over-wide row would widen the whole screen.
+        .frame(maxWidth: availableWidth > 0 ? availableWidth : nil)
     }
 
-    /// Width left for the paperclip and chips: the composer card minus its margins, padding,
-    /// and Stop / Send at the end of the row.
+    /// Width left for the paperclip and chips: the composer card minus its margins and padding,
+    /// the action slot and its spacing, and a margin for estimate error (I8-2).
     private var chipRowWidth: CGFloat {
-        let actions: CGFloat = model.chat.state.turn != nil ? 92 : 48
-        return max(0, availableWidth - 16 - 24 - actions)
+        max(0, availableWidth - 16 - 24 - (44 + 12) - 12)
+    }
+
+    private var running: Bool { model.chat.state.turn != nil }
+
+    private var stopButton: some View {
+        Button(action: model.chat.stopTurn) {
+            Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background)
+                .frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle())
+                .modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4))
+        }
+        .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
+    }
+
+    private var sendButton: some View {
+        Button(action: model.submit) {
+            Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold))
+                .foregroundStyle(model.canSubmit ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
+                .frame(width: 44, height: 44)
+                .background(model.canSubmit ? VerdeTheme.accent : VerdeTheme.disabledFill, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
+        .accessibilityIdentifier("composer-send")
+        .contextMenu { sendAlternatives }
     }
 
     /// Estimated chip widths (full label, icon only) from font metrics at the current text size.
@@ -670,7 +686,7 @@ struct ChatComposer: View {
                             }
                         }.frame(width: 16, height: 16).accessibilityHidden(true)
                 }
-                if !compact { Text(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)).lineLimit(1).fixedSize() }
+                if !compact { Text(chipDisplay(chipText(kind), limit: kind == .model ? 22 : 28)).lineLimit(1).truncationMode(.tail) }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
                 .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
