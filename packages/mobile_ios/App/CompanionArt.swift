@@ -91,7 +91,7 @@ struct CompanionAvatar: View {
         let s = width / 46
         let size = character.designSize
         let theme = CharacterTheme.current
-        Canvas { context, _ in
+        return Canvas { context, _ in
             let art = ArtContext(context: context, s: Double(s), origin: CGPoint(x: Self.inset.left * Double(s), y: Self.inset.top * Double(s)))
             switch character {
             case .sprout: drawSprout(art, theme)
