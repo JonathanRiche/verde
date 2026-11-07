@@ -176,13 +176,14 @@ extension VerdeTheme {
 struct PrimaryButtonStyle: ButtonStyle {
     /// False for an inline action (Commit, Retry, Ask agent) that sizes to its label.
     var fullWidth = true
+    var horizontalPadding: CGFloat = 16
     @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(VerdeTheme.ui(16, bold: true))
             .foregroundStyle(enabled ? VerdeTheme.onAccent : VerdeTheme.disabledContent)
             .multilineTextAlignment(.center)
-            .padding(.horizontal, 16).padding(.vertical, 10)
+            .padding(.horizontal, horizontalPadding).padding(.vertical, 10)
             .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: fullWidth ? 50 : 44)
             .background(enabled ? VerdeTheme.accent : VerdeTheme.disabledFill, in: RoundedRectangle(cornerRadius: 12))
             .opacity(configuration.isPressed ? 0.8 : 1)
@@ -195,16 +196,17 @@ struct PrimaryButtonStyle: ButtonStyle {
 struct TonalButtonStyle: ButtonStyle {
     var destructive = false
     var fullWidth = true
+    var horizontalPadding: CGFloat = 16
     /// Matches a primary button's 50-point height beside it (Deny next to Approve).
     var tall = false
     @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(VerdeTheme.ui(15, bold: true))
+            .font(VerdeTheme.ui(16, bold: true))
             .foregroundStyle(enabled ? (destructive ? VerdeTheme.danger : VerdeTheme.text) : VerdeTheme.disabledContent)
             .multilineTextAlignment(.center)
-            .padding(.horizontal, 16).padding(.vertical, 10)
-            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: tall ? 50 : 44)
+            .padding(.horizontal, horizontalPadding).padding(.vertical, 10)
+            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: fullWidth || tall ? 50 : 44)
             .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
             .opacity(configuration.isPressed ? 0.8 : 1)

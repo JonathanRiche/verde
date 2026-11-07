@@ -467,14 +467,27 @@ struct ScheduleForm: View {
                 .accessibilityIdentifier("schedule-repeat")
             switch draft.repeatKind {
             case .once:
-                DatePicker("Run at", selection: $draft.at, displayedComponents: [.date, .hourAndMinute])
+                ScheduleDateField(title: "Run at", selection: $draft.at, components: [.date, .hourAndMinute])
             case .interval:
-                Stepper(value: $draft.every, in: draft.unit.range, step: draft.unit.step) {
+                HStack {
                     Text("Every \(draft.every) \(draft.unit.noun(draft.every))")
+                    Spacer(minLength: 8)
+                    Button { draft.every = max(draft.unit.range.lowerBound, draft.every - draft.unit.step) } label: {
+                        Image(systemName: "minus").frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Decrease interval")
+                    .disabled(draft.every <= draft.unit.range.lowerBound)
+                    Button { draft.every = min(draft.unit.range.upperBound, draft.every + draft.unit.step) } label: {
+                        Image(systemName: "plus").frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Increase interval")
+                    .disabled(draft.every >= draft.unit.range.upperBound)
                 }
+                .buttonStyle(.borderless)
+                .accessibilityValue("Every \(draft.every) \(draft.unit.noun(draft.every))")
                 SegmentedChoice(title: "Unit", options: ScheduleIntervalUnit.allCases.map { ($0, $0.title) }, selection: $draft.unit)
             case .daily:
-                DatePicker("At", selection: timeBinding, displayedComponents: .hourAndMinute)
+                ScheduleDateField(title: "At", selection: timeBinding, components: .hourAndMinute)
                 WeekdayChips(selection: $draft.weekdays)
             }
         } header: { SectionTitle("Repeat") } footer: {
@@ -661,5 +674,39 @@ struct SegmentedChoice<Value: Hashable>: View {
         .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+    }
+}
+
+/// A full-height date/time row opens the system wheel picker. The compact system picker only
+/// exposes a 36-point chip and provides no public action for forwarding taps from its label.
+private struct ScheduleDateField: View {
+    let title: String
+    @Binding var selection: Date
+    let components: DatePickerComponents
+    @State private var presented = false
+
+    var body: some View {
+        Button { presented = true } label: {
+            HStack {
+                Text(title)
+                Spacer(minLength: 8)
+                Text(selection.formatted(date: components.contains(.date) ? .abbreviated : .omitted, time: .shortened))
+                    .foregroundStyle(VerdeTheme.muted)
+            }.frame(minHeight: 44).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .sheet(isPresented: $presented) {
+            NavigationStack {
+                DatePicker(title, selection: $selection, displayedComponents: components)
+                    .datePickerStyle(.wheel).labelsHidden().padding()
+                    .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            BarButton("Done", bold: true) { presented = false }.keyboardShortcut(.cancelAction)
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
+        }
     }
 }

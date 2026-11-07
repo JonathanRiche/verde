@@ -95,6 +95,8 @@ struct LiveSetupCard: View {
             // S46: a tonal "Not now" and a filled primary, one height (as on Android). Labels never
             // wrap (a wrapped primary made the pair two heights on iPad); when the pair doesn't fit on
             // one line it stacks, each button full width.
+            // The 360-point pane leaves 312 points here after card margins. Tighter inline
+            // padding lets the default labels fit; larger text still gets full-width actions.
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
                     Spacer(minLength: 0)
@@ -118,12 +120,12 @@ struct LiveSetupCard: View {
 
     private func notNow(fullWidth: Bool) -> some View {
         Button(action: close) { Text("Not now").lineLimit(1) }
-            .buttonStyle(TonalButtonStyle(fullWidth: fullWidth))
+            .buttonStyle(TonalButtonStyle(fullWidth: fullWidth, horizontalPadding: fullWidth ? 16 : 6))
     }
 
     private func openSettings(fullWidth: Bool) -> some View {
         Button(action: setup) { Text("Open Companion settings").lineLimit(1) }
-            .buttonStyle(PrimaryButtonStyle(fullWidth: fullWidth))
+            .buttonStyle(PrimaryButtonStyle(fullWidth: fullWidth, horizontalPadding: fullWidth ? 16 : 6))
             .accessibilityHint("Add a live voice provider key.")
     }
 }

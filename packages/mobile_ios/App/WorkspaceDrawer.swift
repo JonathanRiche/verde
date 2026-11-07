@@ -123,12 +123,7 @@ struct WorkspaceDrawer: View {
             }.padding(.horizontal, 12)
             if !all.isEmpty { switcher(all, scoped: scoped) }
             HStack(spacing: 4) {
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle)
-                    // S38: the field itself is the 44-point target, not just the capsule around it.
-                    TextField("Search", text: $search).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .frame(minHeight: 44)
-                }.padding(.horizontal, 12).background(VerdeTheme.alternate, in: Capsule())
+                DrawerSearchField(title: "Search", text: $search, identifier: "drawer-search")
                 if !all.isEmpty {
                     Button { open(.newChat(target?.workspace_id)) } label: { Image(systemName: "square.and.pencil").frame(width: 44, height: 44).contentShape(Rectangle()) }
                         .accessibilityLabel("New chat")
@@ -223,12 +218,8 @@ struct WorkspaceDrawer: View {
     private func switcherMenu(_ all: [Workspace], scoped: Workspace?) -> some View {
         let canManage = manage?.view?.can_manage_workspaces == true
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle)
-                TextField("Search workspaces", text: $workspaceQuery).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .frame(minHeight: 44)
-                    .accessibilityIdentifier("workspace-switcher-search")
-            }.padding(.horizontal, 12).padding(.vertical, 2)
+            DrawerSearchField(title: "Search workspaces", text: $workspaceQuery, identifier: "workspace-switcher-search")
+                .padding(.vertical, 2)
             Divider().overlay(VerdeTheme.border)
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -401,5 +392,35 @@ struct WorkspaceDrawer: View {
             Button("Close", role: .destructive) { action("close", thread) }.disabled(manage == nil || manage?.busy == true)
         }
         .accessibilityIdentifier("drawer-chat").accessibilityAddTraits(selected == target ? .isSelected : [])
+    }
+}
+
+/// The entire capsule focuses the native field. Its AX frame follows the capsule too, rather
+/// than UIKit's intrinsic 20–22-point text rect, while retaining native editing and selection.
+private struct DrawerSearchField: View {
+    let title: String
+    @Binding var text: String
+    let identifier: String
+    @FocusState private var focused: Bool
+    @State private var bounds: CGRect = .zero
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
+            TextField(title, text: $text)
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                .focused($focused)
+                .accessibilityIdentifier(identifier)
+                .accessibilityFrame(bounds)
+        }
+        .padding(.horizontal, 12).frame(minHeight: 44)
+        .background(VerdeTheme.alternate, in: Capsule())
+        .contentShape(Capsule())
+        .onTapGesture { focused = true }
+        .background(GeometryReader { geometry in
+            Color.clear.onChange(of: geometry.frame(in: .global), initial: true) { _, frame in
+                if bounds != frame { bounds = frame }
+            }
+        })
     }
 }
