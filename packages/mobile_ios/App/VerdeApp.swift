@@ -152,6 +152,12 @@ struct RootView: View {
                     workspaceDrawer(permanent: false, width: min(380, geometry.size.width * 0.92))
                     .allowsHitTesting(true).disabled(false).zIndex(2)
                     .frame(width: min(380, geometry.size.width * 0.92))
+                    .simultaneousGesture(DragGesture(minimumDistance: 20).onEnded { gesture in
+                        // A left swipe dismisses the overlay; vertical drags still scroll its list.
+                        if gesture.translation.width < -60 && abs(gesture.translation.width) > abs(gesture.translation.height) * 1.5 {
+                            drawer = false
+                        }
+                    })
                     .transition(.move(edge: .leading))
                 }
                 if companion.available {
