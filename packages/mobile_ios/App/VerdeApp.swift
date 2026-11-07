@@ -76,6 +76,7 @@ struct RootView: View {
     @State private var tab: RootTab = .home
     @State private var path: [BrowseRoute] = []
     @State private var drawer = false
+    @GestureState private var drawerSwiping = false
     /// The width the shell has; drives the layout from outside its geometry reader too.
     @State private var windowWidth: CGFloat = 0
     /// The user hid the permanent sidebar (for a full-width diff or terminal).
@@ -268,7 +269,12 @@ struct RootView: View {
                     .accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
                 workspaceDrawer(permanent: false, width: min(380, geometry.size.width * 0.92))
                     .frame(width: min(380, geometry.size.width * 0.92))
-                    .simultaneousGesture(DragGesture(minimumDistance: 20).onEnded { gesture in
+                    // Cancel button tracking once a horizontal drag is underway, so releasing
+                    // a swipe over a chat cannot also activate its row. Vertical drags scroll.
+                    .disabled(drawerSwiping)
+                    .simultaneousGesture(DragGesture(minimumDistance: 20).updating($drawerSwiping) { gesture, swiping, _ in
+                        swiping = gesture.translation.width < -20 && abs(gesture.translation.width) > abs(gesture.translation.height) * 1.5
+                    }.onEnded { gesture in
                         if gesture.translation.width < -60 && abs(gesture.translation.width) > abs(gesture.translation.height) * 1.5 {
                             drawer = false
                         }
