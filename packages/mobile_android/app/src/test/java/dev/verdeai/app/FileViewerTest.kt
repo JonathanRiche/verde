@@ -104,6 +104,26 @@ class FileViewerTest {
         assertEquals(0, sink.size())
     }
 
+    @Test fun fileErrorsKeepTimeoutAndServerFailuresDistinctFromNetwork() {
+        val mapping = mapOf("offline" to FileProblem.Offline, "timeout" to FileProblem.Timeout,
+            "cancelled" to FileProblem.Interrupted, "busy" to FileProblem.Busy,
+            "server_unavailable" to FileProblem.ServerUnavailable, "forbidden" to FileProblem.Forbidden,
+            "host_file_too_large" to FileProblem.GatewayTooLarge, "too_large" to FileProblem.TooLarge,
+            "unsupported" to FileProblem.Unsupported)
+        for ((code, problem) in mapping) {
+            assertEquals(problem, fileProblem(code))
+            if (code != "offline") assertNotEquals("Can't reach the host", problemText(problem, MAX_DOCUMENT_BYTES).first)
+        }
+        for ((code, problem) in mapping.filterKeys { it !in setOf("too_large", "unsupported") }) {
+            assertEquals(problem, (readFailure(code, true) as FileViewState).problem)
+        }
+        assertEquals(ViewerKind.Audio, viewerKind("a.M4A"))
+        assertEquals(ViewerKind.Html, viewerKind("a.HTML"))
+        assertEquals(FileKind.audio, viewerFetchKind("a.mp3"))
+        assertTrue(isolatedHtml("<script>1</script>").contains("default-src 'none'"))
+        assertTrue(isolatedHtml("<script>1</script>").contains("<script>1</script>"))
+    }
+
     @Test fun pathsKindsAndLinesAreParsedConservatively() {
         assertEquals(ViewerKind.Markdown, viewerKind("/a/README.MD"))
         assertEquals(ViewerKind.Image, viewerKind("/a/b.JPeG"))

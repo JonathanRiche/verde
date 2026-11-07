@@ -103,7 +103,15 @@ internal fun readFailure(code: String?, retryable: Boolean): Any? = when (code) 
     "unsupported", "method_not_found" -> null
     "not_found", "root_not_found", "resource_not_found" -> readProblem(FileProblem.NotFound)
     "path_outside_roots", "scope_denied", "forbidden" -> readProblem(FileProblem.Forbidden)
-    "offline", "cancelled", "timeout" -> readProblem(FileProblem.Offline, retryable = true)
+    "offline", "network" -> readProblem(FileProblem.Offline, retryable = true)
+    "cancelled" -> readProblem(FileProblem.Interrupted, retryable = true)
+    "timeout" -> readProblem(FileProblem.Timeout, retryable = true)
+    "unauthorized" -> readProblem(FileProblem.Unauthorized)
+    "identity", "tls" -> readProblem(FileProblem.Identity)
+    "busy" -> readProblem(FileProblem.Busy, retryable = true)
+    "server_unavailable", "store_unavailable" -> readProblem(FileProblem.ServerUnavailable, retryable = true)
+    "host_file_too_large" -> readProblem(FileProblem.GatewayTooLarge)
+    "too_large", "response_too_large" -> readProblem(FileProblem.TooLarge)
     "invalid_path", "invalid_params", "not_file" -> readProblem(FileProblem.Unresolved)
     else -> readProblem(FileProblem.Failed, retryable = true)
 }
@@ -122,13 +130,16 @@ internal fun readOutcome(view: ExplorerFileView): Any? {
     view.error?.let { return readFailure(it.code, it.retryable) }
     if (!view.supported) return null
     val result = view.result ?: return readProblem(FileProblem.Failed, retryable = true)
+    // Fetch native media outside JSON/base64 and the explorer preview caps.
+    if (viewerKind(result.path) in setOf(ViewerKind.Audio, ViewerKind.Image)) return null
     return when (result.kind) {
         "text", "markdown", "image" -> when (result.encoding) {
             "base64" -> try { java.util.Base64.getDecoder().decode(result.content) } catch (_: IllegalArgumentException) { readProblem(FileProblem.Unreadable) }
             else -> result.content.encodeToByteArray()
         }.let { if (it is ByteArray && result.truncated) PartialBytes(it, FilePartial(READ_TEXT_BYTES, result.size.toLong())) else it }
-        "binary" -> readProblem(FileProblem.Binary)
+        "binary" -> FileContent.Unsupported(result.size.toLong(), result.mime ?: fileTypeLabel(result.path))
         "too_large" -> readProblem(FileProblem.TooLarge)
+        "external" -> if (viewerKind(result.path) == ViewerKind.Text) FileContent.Unsupported(result.size.toLong(), result.mime ?: fileTypeLabel(result.path)) else null
         else -> null
     }
 }
@@ -146,7 +157,7 @@ internal suspend fun readWorkspaceFile(host: CoreHost, workspaceId: String, root
             if (op.state != "succeeded") return@withTimeoutOrNull readFailure(op.error?.code, op.error?.retryable == true)
             val view = CoreJson.decodeFromJsonElement<ExplorerFileQuery>(host.query("workspace_file")).data
             if (view == null || view.root != root || view.path != path) readProblem(FileProblem.Failed, retryable = true) else readOutcome(view)
-        } ?: readProblem(FileProblem.Offline, retryable = true)
+        } ?: readProblem(FileProblem.Timeout, retryable = true)
     } finally {
         withContext(NonCancellable) {
             try { host.send { n, w -> EventWorkspacePreviewClose(now_ms = n, wall_time_ms = w, intent_id = UUID.randomUUID().toString(), workspace_id = workspaceId) } }

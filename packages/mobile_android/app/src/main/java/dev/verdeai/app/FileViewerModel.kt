@@ -28,7 +28,7 @@ import java.util.UUID
  * The one exception is an explicit Download, which writes the original bytes only to the
  * document the user picked in the system file picker.
  */
-internal enum class ViewerKind { Text, Markdown, Image, Svg, Pdf, Office }
+internal enum class ViewerKind { Text, Markdown, Image, Svg, Pdf, Office, Audio, Html }
 
 private val IMAGE_EXTS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp")
 private val MARKDOWN_EXTS = setOf("md", "markdown")
@@ -45,6 +45,8 @@ internal fun fileExtension(path: String) = path.substringAfterLast('/').let { na
 internal fun viewerKind(path: String): ViewerKind = when (val ext = fileExtension(path)) {
     in IMAGE_EXTS -> ViewerKind.Image
     "svg" -> ViewerKind.Svg
+    "mp3", "m4a", "wav", "ogg" -> ViewerKind.Audio
+    "html", "htm" -> ViewerKind.Html
     in MARKDOWN_EXTS -> ViewerKind.Markdown
     "pdf" -> ViewerKind.Pdf
     in OFFICE_EXTS -> ViewerKind.Office
@@ -54,6 +56,7 @@ internal fun viewerKind(path: String): ViewerKind = when (val ext = fileExtensio
 /** How [path] is fetched for viewing: Office converts to PDF; script-capable types come as attachments. */
 internal fun viewerFetchKind(path: String): FileKind = when {
     viewerKind(path) == ViewerKind.Office -> FileKind.preview
+    viewerKind(path) == ViewerKind.Audio -> FileKind.audio
     fileExtension(path) in ATTACHMENT_EXTS -> FileKind.download
     else -> FileKind.file
 }
@@ -69,10 +72,13 @@ internal const val MAX_DOCUMENT_BYTES = 32L * 1024 * 1024
 
 /** Per-kind phone limit, enforced while streaming; bigger files get the "too large" state. */
 internal fun viewerLimit(kind: ViewerKind) = when (kind) {
-    ViewerKind.Text, ViewerKind.Markdown -> MAX_TEXT_BYTES
-    ViewerKind.Image, ViewerKind.Svg -> MAX_IMAGE_BYTES
-    ViewerKind.Pdf, ViewerKind.Office -> MAX_DOCUMENT_BYTES
+    ViewerKind.Text, ViewerKind.Markdown, ViewerKind.Html -> MAX_TEXT_BYTES
+    ViewerKind.Image -> MAX_DOCUMENT_BYTES
+    ViewerKind.Svg -> MAX_IMAGE_BYTES
+    ViewerKind.Pdf, ViewerKind.Office, ViewerKind.Audio -> MAX_DOCUMENT_BYTES
 }
+
+internal fun fileTypeLabel(path: String) = fileExtension(path).takeIf { it.isNotEmpty() }?.uppercase()?.plus(" file") ?: "Binary file"
 
 internal fun sizeLabel(bytes: Long) = if (bytes >= 1024 * 1024) "${bytes / (1024 * 1024)} MB" else "${bytes / 1024} KB"
 
@@ -102,8 +108,8 @@ internal data class LineTarget(val line: Int, val end: Int? = null) {
 
 internal enum class FileProblem {
     Offline, Timeout, Interrupted, Busy, ServerUnavailable, Unauthorized, Identity,
-    Forbidden, NotFound, TooLarge, Unsupported, PreviewUnavailable, Binary, Unresolved,
-    PdfNeedsNewerAndroid, Unreadable, Unavailable, Failed,
+    Forbidden, NotFound, TooLarge, GatewayTooLarge, Unsupported, PreviewUnavailable, Binary, Unresolved,
+    PdfNeedsNewerAndroid, Unreadable, Unavailable, Failed, Storage,
 }
 
 /** Maps a `file_open` receipt error code (files.zig) onto a viewer state. */
@@ -118,9 +124,11 @@ internal fun fileProblem(code: String?): FileProblem = when (code) {
     "forbidden" -> FileProblem.Forbidden
     "not_found" -> FileProblem.NotFound
     "too_large" -> FileProblem.TooLarge
+    "host_file_too_large" -> FileProblem.GatewayTooLarge
     "unsupported" -> FileProblem.Unsupported
     "invalid_path" -> FileProblem.Unresolved
     "preview_unavailable" -> FileProblem.PreviewUnavailable
+    "storage_unavailable" -> FileProblem.Storage
     "unavailable" -> FileProblem.Unavailable
     else -> FileProblem.Failed
 }
@@ -130,6 +138,9 @@ internal sealed interface FileContent {
     class Text(val text: String, val lineStarts: IntArray, val spans: List<RenderSpan>) : FileContent
     class Markdown(val source: Text, val nodes: List<MarkdownNode>) : FileContent
     class Image(val bitmap: ImageBitmap) : FileContent
+    class Audio(val body: FileBody) : FileContent
+    class Html(val source: Text) : FileContent
+    class Unsupported(val size: Long, val type: String) : FileContent
     /** Rendered by a sandboxed WebView (no scripts, network or file access); [source] is the XML. */
     class Svg(val source: Text, val base64: String) : FileContent
     class Pdf(val document: PdfDocument) : FileContent
@@ -304,7 +315,7 @@ internal class FileViewerModel(
 
     fun retry() {
         val host = core ?: return
-        if (state.value.loading) return
+        if (state.value.loading || state.value.problem == FileProblem.GatewayTooLarge) return
         load(host)
     }
 
@@ -312,15 +323,16 @@ internal class FileViewerModel(
      * Fetches the original file (never the Office preview) and hands it to [write], which targets
      * the document the user just picked. [discard] removes that document if nothing was saved.
      */
-    fun save(write: (ByteArray) -> Unit, discard: () -> Unit) {
+    fun save(write: (java.io.InputStream) -> Unit, discard: () -> Unit) {
         val target = path ?: return
+        if (state.value.problem == FileProblem.GatewayTooLarge) return
         if (download.value == DownloadStatus.Saving) return
         val host = core ?: run { discard(); mutableDownload.value = DownloadStatus.Failed(FileProblem.Unavailable); return }
         mutableDownload.value = DownloadStatus.Saving
         scope.launch {
             val next = try {
                 when (val bytes = fetchBytes(host, target, FileKind.download, MAX_DOCUMENT_BYTES)) {
-                    is ByteArray -> { withContext(Dispatchers.IO) { write(bytes) }; DownloadStatus.Saved }
+                    is FileBody -> { withContext(Dispatchers.IO) { bytes.use { it.openStream().use(write) } }; DownloadStatus.Saved }
                     else -> DownloadStatus.Failed((bytes as FileViewState).problem ?: FileProblem.Failed)
                 }
             } catch (e: CancellationException) { withContext(NonCancellable + Dispatchers.IO) { runCatching(discard) }; throw e }
@@ -341,14 +353,14 @@ internal class FileViewerModel(
             val next = try { fetch(host, target) }
                 catch (e: CancellationException) { throw e }
                 catch (_: CoreInputRejected) { FileViewState(loading = false, problem = FileProblem.Failed, retryable = true) }
-                catch (_: Exception) { FileViewState(loading = false, problem = FileProblem.Unavailable, retryable = true) }
+                catch (_: Exception) { FileViewState(loading = false, problem = FileProblem.Failed, retryable = true) }
             replace(next)
         }
     }
 
     /** Returns the body as a [ByteArray], or a failed [FileViewState]. */
     private suspend fun fetchBytes(host: CoreHost, target: String, fetchKind: FileKind, maxBytes: Long): Any {
-        return withTimeoutOrNull(waitMs) {
+        return withTimeoutOrNull(if (fetchKind in setOf(FileKind.download, FileKind.audio)) maxOf(waitMs, 650_000L) else waitMs) {
             // The document picker backgrounds the process. Its result can be delivered before
             // ON_START reaches the core; sending now would be rejected as cancelled. Wait for
             // the core's projection, then let it refresh the bearer before emitting the GET.
@@ -359,21 +371,28 @@ internal class FileViewerModel(
                 return@withTimeoutOrNull FileViewState(loading = false, problem = FileProblem.Unavailable, retryable = true)
             }
             val intent = UUID.randomUUID().toString()
+            try {
             host.send { n, w -> EventFileOpen(now_ms = n, wall_time_ms = w, intent_id = intent, path = target,
                 kind = fetchKind, max_bytes = maxBytes) }
             val op = host.operations.map { q -> q?.data?.items?.find { it.intent_id == intent } }
                 .first { it != null && it.state != "pending" }!!
             if (op.state != "succeeded") {
                 FileViewState(loading = false, problem = fileProblem(op.error?.code), retryable = op.error?.retryable == true)
-            } else host.takeFile(intent)?.bytes ?: FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
+            } else host.takeFile(intent) ?: FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
+            } finally { host.discardFile(intent) }
         } ?: FileViewState(loading = false, problem = FileProblem.Timeout, retryable = true)
     }
 
     private suspend fun fetch(host: CoreHost, target: String): FileViewState {
         var partial: FilePartial? = null
-        val bytes = when (val body = reader?.invoke(host) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
+        val bytes = when (val body = (if (kind in setOf(ViewerKind.Audio, ViewerKind.Image)) null else reader?.invoke(host)) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
+            is FileBody -> {
+                if (kind == ViewerKind.Audio) return FileViewState(loading = false, content = FileContent.Audio(body))
+                body.use { it.bytes }
+            }
             is ByteArray -> body
             is PartialBytes -> body.bytes.also { partial = body.partial }
+            is FileContent.Unsupported -> return FileViewState(loading = false, content = body)
             else -> return body as FileViewState
         }
         val content = try { withContext(Dispatchers.Default) { decode(host, bytes) } }
@@ -394,15 +413,16 @@ internal class FileViewerModel(
         } ?: FileProblem.Unreadable
         ViewerKind.Pdf, ViewerKind.Office ->
             (if (bytes.isEmpty()) null else decoders.pdf(bytes))?.let { FileContent.Pdf(it) } ?: FileProblem.Unreadable
-        ViewerKind.Text, ViewerKind.Markdown -> {
+        ViewerKind.Audio -> FileContent.Audio(FileBody(bytes, null))
+        ViewerKind.Text, ViewerKind.Markdown, ViewerKind.Html -> {
             val text = decodeText(bytes)
-            if (text == null) FileProblem.Binary
+            if (text == null) FileContent.Unsupported(bytes.size.toLong(), path?.let(::fileTypeLabel) ?: "Binary file")
             else {
                 val language = path?.let(::diffLanguage)
                 val spans = if (language != null) highlight(text, language).value.orEmpty() else emptyList()
                 val plain = FileContent.Text(text, lineStarts(text), spans)
                 val nodes = if (kind == ViewerKind.Markdown) markdown(host, text) else null
-                if (nodes != null) FileContent.Markdown(plain, nodes) else plain
+                if (kind == ViewerKind.Html) FileContent.Html(plain) else if (nodes != null) FileContent.Markdown(plain, nodes) else plain
             }
         }
     }
@@ -430,11 +450,13 @@ internal class FileViewerModel(
     private fun replace(next: FileViewState) {
         val old = mutableState.value.content
         mutableState.value = next
+        if (old is FileContent.Audio && old !== next.content) old.body.close()
         if (old is FileContent.Pdf && old !== next.content) closeDocument(old.document)
     }
 
     override fun onCleared() {
         scope.cancel()
+        (mutableState.value.content as? FileContent.Audio)?.body?.close()
         (mutableState.value.content as? FileContent.Pdf)?.let { closeDocument(it.document) }
         mutableState.value = FileViewState(loading = false)
     }

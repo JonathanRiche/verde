@@ -276,18 +276,64 @@ class EffectExecutor(
                         response.use {
                             if (!it.isSuccessful) { done(it.code, null); return }
                             val body = it.body
-                            if (body != null && body.contentLength() > e.max_response_bytes) throw ResponseLimit()
-                            val output = ByteArrayOutputStream()
-                            val buffer = ByteArray(64 * 1024)
-                            val input = body?.byteStream()
-                            if (input != null) while (true) {
-                                val count = input.read(buffer)
-                                if (count < 0) break
-                                if (output.size().toLong() + count > e.max_response_bytes) throw ResponseLimit()
-                                output.write(buffer, 0, count)
+                            val audioProbe = e.headers.any { h -> h.name.equals("Range", true) && h.value == "bytes=0-0" }
+                            val range = it.header("Content-Range")?.let { value -> Regex("bytes 0-0/([0-9]+)").matchEntire(value) }
+                            if (audioProbe && it.code == 206 && range != null && it.header("Accept-Ranges").equals("bytes", true)) {
+                                val length = range.groupValues[1].toLong()
+                                val validator = it.header("ETag") ?: it.header("Last-Modified")
+                                val source = RangeAudioSource(length) { offset, count ->
+                                    val rangeClient = client(url, e.tls, 30_000)
+                                    try {
+                                        val builder = Request.Builder().url(url).get()
+                                        e.headers.filterNot { h -> h.name.equals("Range", true) }.forEach { h -> builder.addHeader(h.name, h.value) }
+                                        builder.header("Range", "bytes=$offset-${offset + count - 1}")
+                                        validator?.let { tag -> builder.header("If-Range", tag) }
+                                        val rangeCall = rangeClient.newCall(builder.build())
+                                        calls[e.effect_id + ":audio"] = rangeCall
+                                        rangeCall.execute().use { response ->
+                                            if (response.code != 206 || response.header("Content-Range") != "bytes $offset-${offset + count - 1}/$length") throw IOException("audio_range_rejected")
+                                            val data = ByteArray(count)
+                                            val input = response.body?.byteStream() ?: throw IOException("audio_range_empty")
+                                            var read = 0
+                                            while (read < count) { val n = input.read(data, read, count - read); if (n < 0) throw IOException("audio_range_short"); read += n }
+                                            data
+                                        }
+                                    } finally { calls.remove(e.effect_id + ":audio"); release(rangeClient) }
+                                }
+                                source.onClose = { calls.remove(e.effect_id + ":audio")?.cancel() }
+                                files.put(e.intent_id, FileBody(source, it.header("Content-Type")))
+                                done(it.code, null)
+                                return
                             }
-                            if (call.isCanceled()) throw IOException()
-                            files.put(e.intent_id, FileBody(output.toByteArray(), it.header("Content-Type")))
+                            if (e.max_response_bytes == 0L) {
+                                val file = try { java.io.File.createTempFile("verde-download-", ".tmp") } catch (_: IOException) { throw FileWriteFailure() }
+                                try {
+                                    val output = try { file.outputStream() } catch (_: IOException) { throw FileWriteFailure() }
+                                    output.use { target -> body?.byteStream()?.use { input ->
+                                        val buffer = ByteArray(64 * 1024)
+                                        while (true) {
+                                            val count = input.read(buffer)
+                                            if (count < 0) break
+                                            try { target.write(buffer, 0, count) } catch (_: IOException) { throw FileWriteFailure() }
+                                        }
+                                    } }
+                                    if (call.isCanceled()) throw IOException()
+                                    files.put(e.intent_id, FileBody(file, it.header("Content-Type")))
+                                } catch (error: Exception) { file.delete(); throw error }
+                            } else {
+                                if (body != null && body.contentLength() > e.max_response_bytes) throw ResponseLimit()
+                                val output = ByteArrayOutputStream()
+                                val buffer = ByteArray(64 * 1024)
+                                val input = body?.byteStream()
+                                if (input != null) while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    if (output.size().toLong() + count > e.max_response_bytes) throw ResponseLimit()
+                                    output.write(buffer, 0, count)
+                                }
+                                if (call.isCanceled()) throw IOException()
+                                files.put(e.intent_id, FileBody(output.toByteArray(), it.header("Content-Type")))
+                            }
                             done(it.code, null)
                         }
                     } catch (error: Exception) {
@@ -417,9 +463,11 @@ class EffectExecutor(
         networkDispatcher.executorService.shutdown()
     }
 
+    private class FileWriteFailure : IOException()
     private class ResponseLimit : IOException()
     private fun failure(kind: TransportFailureKind, code: TransportFailureCode) = TransportFailure(kind, code)
     private fun transport(error: Throwable): TransportFailure = when (error) {
+        is FileWriteFailure -> failure(TransportFailureKind.resource, TransportFailureCode.unavailable)
         is ResponseLimit -> failure(TransportFailureKind.resource, TransportFailureCode.resource)
         is SSLPeerUnverifiedException -> failure(TransportFailureKind.tls,
             if (error.message?.startsWith("Certificate pinning failure!") == true) TransportFailureCode.pin_mismatch else TransportFailureCode.hostname)

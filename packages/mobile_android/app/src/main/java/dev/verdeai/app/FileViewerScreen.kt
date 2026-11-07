@@ -1,6 +1,14 @@
 package dev.verdeai.app
 
 import android.net.Uri
+import android.content.Intent
+import android.media.MediaPlayer
+import android.media.MediaDataSource
+import android.webkit.WebViewClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import androidx.compose.foundation.text.selection.SelectionContainer
+import kotlinx.coroutines.delay
 import android.provider.DocumentsContract
 import android.webkit.WebView
 import android.widget.Toast
@@ -97,16 +105,17 @@ internal fun FileViewerScreen(
     val saving = model.download.collectAsState().value == DownloadStatus.Saving
     val download = rememberDownload(model, title)
     // A cited line is only visible in the source; a plain markdown link opens formatted.
-    var formatted by rememberSaveable { mutableStateOf(target == null) }
+    var formatted by rememberSaveable { mutableStateOf(target == null && model.kind != ViewerKind.Html) }
     val toggle = when (state.content) {
+        is FileContent.Html -> if (formatted) "Source" else "Preview"
         is FileContent.Markdown -> if (formatted) "Source" else "Formatted"
         is FileContent.Svg -> if (formatted) "Source" else "Image"
         else -> null
     }
     val subtitle = target?.let { if (it.end != null && it.end > it.line) "Lines ${it.line}–${it.end}" else "Line ${it.line}" }
     FileScaffold(title, subtitle, onBack, actions = {
-        if (toggle != null) TextButton(onClick = { formatted = !formatted }) { Text(toggle) }
-        if (model.path != null) {
+        if (toggle != null) TextButton(onClick = { formatted = !formatted }, modifier = Modifier.heightIn(min = 48.dp).named(if (formatted) "Show source" else "Preview")) { Text(toggle) }
+        if (model.path != null && state.problem != FileProblem.GatewayTooLarge) {
             if (saving) CircularProgressIndicator(Modifier.padding(12.dp).size(24.dp).testTag("file-saving"), strokeWidth = 2.dp)
             else IconButton(onClick = download, modifier = Modifier.named("Download file")) { Icon(DownloadIcon, contentDescription = null) }
         }
@@ -121,6 +130,15 @@ internal fun FileViewerScreen(
                         is FileContent.Text -> TextFile(content, target)
                         is FileContent.Markdown -> if (formatted) MarkdownFile(content, model, onCitation) else TextFile(content.source, target)
                         is FileContent.Image -> ImageFile(content.bitmap)
+                        is FileContent.Audio -> AudioFile(content.body)
+                        is FileContent.Html -> if (formatted) HtmlFile(content.source.text) else TextFile(content.source, target)
+                        is FileContent.Unsupported -> Centered {
+                            SelectionContainer { Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("No preview for this file type", style = MaterialTheme.typography.titleMedium)
+                                Text("${entrySize(content.size)} · ${content.type}", textAlign = TextAlign.Center)
+                            } }
+                            Button(onClick = download, enabled = !saving) { Text("Download file") }
+                        }
                         is FileContent.Svg -> if (formatted) SvgFile(content.base64) else TextFile(content.source, target)
                         is FileContent.Pdf -> PdfFile(content.document)
                     }
@@ -155,7 +173,7 @@ private fun rememberDownload(model: FileViewerModel, name: String): () -> Unit {
         if (uri == null) return@rememberLauncherForActivityResult
         val resolver = context.contentResolver
         model.save(
-            write = { bytes -> (resolver.openOutputStream(uri, "wt") ?: error("unwritable")).use { it.write(bytes) } },
+            write = { bytes -> (resolver.openOutputStream(uri, "wt") ?: error("unwritable")).use { bytes.copyTo(it, 64 * 1024) } },
             discard = { DocumentsContract.deleteDocument(resolver, uri) },
         )
     }
@@ -194,6 +212,8 @@ private fun Centered(content: @Composable ColumnScope.() -> Unit) {
 }
 
 internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String> = when (problem) {
+    FileProblem.Storage -> "Couldn't save the file" to "The phone could not save this file. Check its free space and try again."
+    FileProblem.GatewayTooLarge -> "Too large to open" to "This file is too large to open on your phone (over 32 MB). Open it on your computer."
     FileProblem.TooLarge -> "Too large to preview" to "This file is over the ${sizeLabel(limit)} limit for viewing on the phone. Download it or open it on the host."
     FileProblem.Forbidden -> "No access" to "The host refused access. Check its shared workspaces and this phone's file permissions."
     FileProblem.NotFound -> "File not found" to "It may have been moved or deleted on the host."
@@ -204,9 +224,9 @@ internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String
     FileProblem.ServerUnavailable -> "Host couldn't serve the file" to "Try again. If this keeps happening, check verde on the host."
     FileProblem.Unauthorized -> "Phone access refused" to "Reconnect to the host. If access is still refused, pair this phone again."
     FileProblem.Identity -> "Host identity not verified" to "Check the host's certificate and trust settings before reconnecting."
-    FileProblem.Unsupported -> "No preview for this file" to "This file type can't be previewed on the phone. Download it to open it in another app."
+    FileProblem.Unsupported -> "No preview for this file type" to "This file type can't be previewed on the phone. Download it to open it in another app."
     FileProblem.PreviewUnavailable -> "No preview available" to "Office previews need LibreOffice on the host."
-    FileProblem.Binary -> "No preview for this file" to "This file isn't text or a supported image or document. Download it to open it in another app."
+    FileProblem.Binary -> "No preview for this file type" to "This file isn't text or a supported image or document. Download it to open it in another app."
     FileProblem.Unresolved -> "Can't open this link" to "The path couldn't be resolved to a file in the workspace."
     FileProblem.PdfNeedsNewerAndroid -> "Needs Android 11" to "PDF viewing needs Android 11 or newer."
     FileProblem.Unreadable -> "Can't display this file" to "The file couldn't be decoded."
@@ -215,6 +235,8 @@ internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String
 }
 
 internal fun downloadFailureText(problem: FileProblem): String = when (problem) {
+    FileProblem.Storage -> "The phone could not save this file. Check its free space and try again."
+    FileProblem.GatewayTooLarge -> "This file is too large to open on your phone (over 32 MB). Open it on your computer."
     FileProblem.TooLarge -> "Too large to download (over ${sizeLabel(MAX_DOCUMENT_BYTES)})"
     FileProblem.NotFound -> "File not found on the host"
     FileProblem.Forbidden -> "Host refused file access. Check shared workspaces and phone permissions"
@@ -249,10 +271,11 @@ private fun PartialBanner(partial: FilePartial, onDownload: (() -> Unit)?, savin
 private fun ProblemState(problem: FileProblem, limit: Long, onRetry: (() -> Unit)?, onDownload: (() -> Unit)?, saving: Boolean) {
     val (title, detail) = problemText(problem, limit)
     Centered {
-        Text(title, Modifier.testTag(FILE_PROBLEM_TAG), style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(8.dp))
-        Text(detail, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        SelectionContainer { Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, Modifier.testTag(FILE_PROBLEM_TAG), style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(8.dp))
+            Text(detail, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } }
         if (onRetry != null) {
             Spacer(Modifier.height(12.dp))
             Button(onClick = onRetry) { Text("Retry") }
@@ -380,5 +403,87 @@ private fun PdfFile(document: PdfDocument) {
                 }
             }
         }
+    }
+}
+
+/** Native decoder, with a seekable memory source; disposal stops playback when leaving the file. */
+@Composable
+private fun AudioFile(body: dev.verdeai.core.FileBody) {
+    val player = remember(body) { MediaPlayer() }
+    var ready by remember(body) { mutableStateOf(false) }
+    var failed by remember(body) { mutableStateOf(false) }
+    var playing by remember(body) { mutableStateOf(false) }
+    var position by remember(body) { mutableFloatStateOf(0f) }
+    var duration by remember(body) { mutableFloatStateOf(1f) }
+    DisposableEffect(player) {
+        player.setOnPreparedListener { duration = it.duration.toFloat().coerceAtLeast(1f); ready = true }
+        player.setOnCompletionListener { playing = false; position = duration }
+        player.setOnErrorListener { _, _, _ -> failed = true; playing = false; true }
+        try {
+            if (body.audioSource != null) { player.setDataSource(body.audioSource) }
+            else if (body.file != null) {
+                body.file.inputStream().use { player.setDataSource(it.fd) }
+            } else player.setDataSource(object : MediaDataSource() {
+                private val bytes = body.bytes
+                override fun getSize() = bytes.size.toLong()
+                override fun readAt(offset: Long, buffer: ByteArray, start: Int, size: Int): Int {
+                    if (offset >= bytes.size) return -1
+                    val count = minOf(size, bytes.size - offset.toInt())
+                    bytes.copyInto(buffer, start, offset.toInt(), offset.toInt() + count)
+                    return count
+                }
+                override fun close() {}
+            })
+            player.prepareAsync()
+        } catch (_: Exception) { failed = true }
+        onDispose { player.release() }
+    }
+    LaunchedEffect(player, playing) {
+        while (playing) { position = player.currentPosition.toFloat(); delay(250) }
+    }
+    Centered {
+        if (failed) SelectionContainer { Text("Can't play this audio file. Download it to open it in another app.") }
+        else {
+            Button(enabled = ready, onClick = {
+                if (playing) player.pause() else { if (position >= duration) player.seekTo(0); player.start() }
+                playing = !playing
+            }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (playing) "Pause" else "Play") }
+            Slider(value = position.coerceIn(0f, duration), onValueChange = { position = it; player.seekTo(it.toInt()) },
+                valueRange = 0f..duration, enabled = ready, modifier = Modifier.named("Playback position"))
+            SelectionContainer { Text("${audioTime(position.toLong())} / ${audioTime(duration.toLong())}") }
+        }
+    }
+}
+
+private fun audioTime(milliseconds: Long): String = "${milliseconds / 60000}:" + ((milliseconds / 1000) % 60).toString().padStart(2, '0')
+
+/** A document-only origin, no bridge, storage, host credentials, network, or local-file access. */
+internal fun isolatedHtml(source: String) = """<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; media-src data:; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width, initial-scale=1">""" + source
+
+@Composable
+private fun HtmlFile(source: String) {
+    val html = remember(source) { isolatedHtml(source) }
+    Column(Modifier.fillMaxSize()) {
+        SelectionContainer { Text("Linked files aren't loaded", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
+        AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.allowFileAccess = false
+                settings.allowContentAccess = false
+                settings.domStorageEnabled = false
+                settings.blockNetworkLoads = true
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        if (request.isForMainFrame && request.hasGesture() && request.url.scheme in listOf("https", "http")) {
+                            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                        }
+                        return true
+                    }
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest) =
+                        WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                }
+                loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+            }
+        }, onRelease = { it.stopLoading(); it.destroy() })
     }
 }

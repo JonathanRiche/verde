@@ -195,6 +195,7 @@ class CoreHost private constructor(
 
     /** D-12: the body fetched for a succeeded `file_open` intent, once; memory only. */
     fun takeFile(intentId: String): FileBody? = executor.files.take(intentId)
+    fun discardFile(intentId: String) = executor.files.discard(intentId)
 
     suspend fun query(selector: String): JsonElement = withContext(dispatcher) {
         check(!closed) { "host_closed" }

@@ -227,6 +227,44 @@ class CoreHostTest {
         }
     }
 
+    @Test fun streamedDownloadsAndAudioRangesStayOffTheHeap() = runBlocking<Unit> {
+        TlsFixture().use { fixture ->
+            val core = FakeCore()
+            val host = CoreHost.create(config, executor(client=fixture.client), core)
+            fun effect(id: String, ranges: Boolean = false) = EffectFileFetch(id, "1", id,
+                fixture.server.url("/api/file?download=1&path=/w/audio.mp3").toString(),
+                if (ranges) listOf(Header("Range", "bytes=0-0")) else emptyList(), 3000, 0, Tls(fixture.origin, fixture.pin))
+            try {
+                val payload = okio.Buffer()
+                val chunk = ByteArray(64 * 1024) { 42 }
+                repeat(528) { payload.write(chunk) }
+                fixture.server.enqueue(MockResponse().setBody(payload))
+                core.effects = listOf(effect("disk")); start(host)
+                assertEquals(200, core.next<EventHttpResponse>().status)
+                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+                val disk = host.takeFile("disk")!!
+                val file = disk.file!!
+                assertEquals(528L * chunk.size, disk.size)
+                disk.openStream().use { assertEquals(42, it.read()) }
+                disk.close(); assertFalse(file.exists())
+
+                fixture.server.enqueue(MockResponse().setResponseCode(206).setHeader("Accept-Ranges", "bytes")
+                    .setHeader("Content-Range", "bytes 0-0/1000").setBody("a"))
+                core.effects = listOf(effect("ranges", true)); start(host)
+                assertEquals(206, core.next<EventHttpResponse>().status)
+                assertEquals("bytes=0-0", fixture.server.takeRequest(2, TimeUnit.SECONDS)!!.getHeader("Range"))
+                val audio = host.takeFile("ranges")!!
+                fixture.server.enqueue(MockResponse().setResponseCode(206).setHeader("Content-Range", "bytes 500-999/1000")
+                    .setBody("b".repeat(500)))
+                val bytes = ByteArray(12)
+                assertEquals(12, audio.audioSource!!.readAt(500, bytes, 0, bytes.size))
+                assertEquals("b".repeat(12), bytes.decodeToString())
+                assertEquals("bytes=500-999", fixture.server.takeRequest(2, TimeUnit.SECONDS)!!.getHeader("Range"))
+                audio.close()
+            } finally { host.close() }
+        }
+    }
+
     @Test fun httpSuccessPinMismatchAndSystemTrust() = runBlocking {
         TlsFixture().use { fixture ->
             val core = FakeCore()
