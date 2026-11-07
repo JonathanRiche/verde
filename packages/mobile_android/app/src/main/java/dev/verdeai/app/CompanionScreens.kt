@@ -97,7 +97,11 @@ internal data class CompanionSnapshot(
     val activity: List<CompanionActivity> = emptyList(),
     /** A11-3: something asks for an approval or input (amber); false when the only needs are failures (red). */
     val asking: Boolean = needKeys.isNotEmpty(),
-)
+    /** A7-1: the core's unseen failures (`failed`), shown red beside the needs-you count. */
+    val failedChats: List<dev.verdeai.core.AttentionChat> = emptyList(),
+) {
+    val failed get() = failedChats.size
+}
 
 internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
     val active = state.active
@@ -119,7 +123,8 @@ internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): Co
             crew.any { crewStatus(it).needsYou && crewStatus(it) != ChildStatus.Failed } || thread?.status == "waiting_approval")
     return CompanionSnapshot(active, needs, crew, pulse,
         keys, crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
-        companionActivity(panes, crew, hidden, attention?.running), asking = asking)
+        companionActivity(panes, crew, hidden, attention?.running), asking = asking,
+        failedChats = attention?.failed.orEmpty().filter { it.thread_id !in hidden })
 }
 
 /**
@@ -199,7 +204,7 @@ internal fun CompanionSheet(
             val handoff = handoffStatus(state.view?.brain_switch)
             val shownStrip = shownPanel(strip, snapshot)
             // S32: the pills under the header carry the counts; the header doesn't repeat them.
-            val pillsShown = snapshot.needKeys.isNotEmpty() || activitySummary(snapshot.activity.map { it.status }) != null
+            val pillsShown = snapshot.needKeys.isNotEmpty() || snapshot.failed > 0 || activitySummary(snapshot.activity.map { it.status }) != null
             CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.pulse.needsYou, snapshot.pulse.running).takeIf { !pillsShown },
                 enabled = state.view?.can_edit == true && !state.saving,
                 // The status count toggles the panel it summarizes.
@@ -404,7 +409,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
     }
 }
 
-internal enum class StripPanel { Needs, Crew }
+internal enum class StripPanel { Needs, Failed, Crew }
 
 /** The panel the header's status count stands for: needs first, then running; null when idle. */
 internal fun headerPanel(snapshot: CompanionSnapshot): StripPanel? = when {
@@ -416,6 +421,7 @@ internal fun headerPanel(snapshot: CompanionSnapshot): StripPanel? = when {
 /** [open] while its pill still exists; a panel whose pill went away reads as closed. */
 internal fun shownPanel(open: StripPanel?, snapshot: CompanionSnapshot): StripPanel? = when (open) {
     StripPanel.Needs -> open.takeIf { snapshot.needKeys.isNotEmpty() }
+    StripPanel.Failed -> open.takeIf { snapshot.failed > 0 }
     StripPanel.Crew -> open.takeIf { snapshot.activity.isNotEmpty() }
     null -> null
 }
@@ -434,13 +440,18 @@ private enum class StripTone { Attention, Failed, Running, Quiet }
 private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace>, open: StripPanel?, onToggle: (StripPanel?) -> Unit,
     onOpenPane: (Pane) -> Unit, onOpenChat: (String, String) -> Unit) {
     val needsCount = snapshot.pulse.needsYou
+    val failedCount = snapshot.failed
     val crewLabel = activitySummary(snapshot.activity.map { it.status })
-    if (needsCount == 0 && crewLabel == null) return
+    if (needsCount == 0 && failedCount == 0 && crewLabel == null) return
     fun label(ws: String) = workspaces.find { it.workspace_id == ws }?.label
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically) {
         if (needsCount > 0) StripPill(needsLabel(needsCount), VerdeColors.Warning, open == StripPanel.Needs, warning = true) {
             onToggle(if (open == StripPanel.Needs) null else StripPanel.Needs)
+        }
+        // A7-1: unseen failures get their own red pill next to the needs-you one.
+        if (failedCount > 0) StripPill("$failedCount failed", VerdeColors.Danger, open == StripPanel.Failed, warning = true) {
+            onToggle(if (open == StripPanel.Failed) null else StripPanel.Failed)
         }
         if (crewLabel != null) StripPill(crewLabel, if (snapshot.activity.any { it.status.running }) VerdeColors.Accent else VerdeColors.Subtle,
             open == StripPanel.Crew) {
@@ -460,6 +471,11 @@ private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace
                 StripRow("c:" + t.thread_id, t.title.ifBlank { snapshot.active?.name ?: "Companion" }, label(t.workspace_id), StripTone.Attention) {
                     onOpenChat(t.workspace_id, t.thread_id)
                 } })
+        StripPanel.Failed -> snapshot.failedChats.map { chat ->
+            StripRow("f:${chat.workspace_id}:${chat.thread_id}", chat.title.ifBlank { "Chat" }, label(chat.workspace_id), StripTone.Failed) {
+                onOpenChat(chat.workspace_id, chat.thread_id)
+            }
+        }
         StripPanel.Crew -> snapshot.activity.map { item ->
             val status = item.status
             StripRow(item.key, item.title, label(item.workspaceId), when {
@@ -723,6 +739,11 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
         LiveOverModal()
         // X: never so tall that its handle sits under the status bar or camera cutout.
         Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight()).verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
+            // A7-6: a visible Close in the header.
+            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Companion settings", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                SheetCloseButton(onDismiss)
+            }
             VerdeSection("Companions")
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {

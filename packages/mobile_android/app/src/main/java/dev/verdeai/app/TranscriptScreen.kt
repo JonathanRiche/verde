@@ -10,6 +10,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -398,25 +399,45 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     }
     val newest = reversed.firstOrNull()?.key
     LaunchedEffect(newest, reversed.size) { if (follow && reversed.isNotEmpty()) list.scrollToItem(0) }
-    // F3: across a fold/unfold (activity recreation) the list comes back on the same row and offset,
-    // found by the row's key: the restored index alone drifted a row toward older content.
+    // F3 / A7-5: across a fold/unfold or any resize (each recreates the activity) the reader keeps the
+    // row at the top of the screen where it was, found by its key: the TOP row and its gap below the
+    // viewport's top edge (the restored index anchored the bottom row, so the top drifted each cycle).
     var anchorKey by rememberSaveable { mutableStateOf<String?>(null) }
-    var anchorOffset by rememberSaveable { mutableIntStateOf(0) }
+    var anchorGap by rememberSaveable { mutableIntStateOf(0) }
     val currentItems by rememberUpdatedState(reversed)
     var anchored by remember { mutableStateOf(false) }
     LaunchedEffect(list) {
-        snapshotFlow { Triple(anchored, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset) }.collect { (ready, index, offset) ->
-            // Only after the restore below, so the restored (drifted) index can't overwrite the anchor.
-            if (ready) currentItems.getOrNull(index)?.key?.let { anchorKey = it; anchorOffset = offset }
+        snapshotFlow { Triple(anchored && list.isScrollInProgress, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset) }.collect { (scrolling, _, _) ->
+            // Only real scrolls after the restore below move the anchor; a relayout at a new width
+            // shifts offsets too, and recording those made the row drift on every fold cycle.
+            if (!scrolling) return@collect
+            val info = list.layoutInfo
+            val top = info.visibleItemsInfo.filter { it.index < currentItems.size }.maxByOrNull { it.index } ?: return@collect
+            anchorKey = currentItems[top.index].key
+            anchorGap = topGap(info, top)
         }
     }
     LaunchedEffect(reversed.isNotEmpty()) {
         if (anchored || reversed.isEmpty()) return@LaunchedEffect
-        anchored = true
-        val key = anchorKey ?: return@LaunchedEffect
-        if (follow) return@LaunchedEffect
-        val index = reversed.indexOfFirst { it.key == key }
-        if (index >= 0 && (index != list.firstVisibleItemIndex || anchorOffset != list.firstVisibleItemScrollOffset)) list.scrollToItem(index, anchorOffset)
+        try {
+            val key = anchorKey ?: return@LaunchedEffect
+            if (follow) return@LaunchedEffect
+            val index = reversed.indexOfFirst { it.key == key }
+            if (index < 0) return@LaunchedEffect
+            if (list.layoutInfo.visibleItemsInfo.none { it.index == index }) list.scrollToItem(index)
+            // Re-applied while the new layout settles (the Latest strip and composer find their size
+            // after the first frames), so the row ends exactly where it was.
+            repeat(8) {
+                withFrameNanos { }
+                val info = list.layoutInfo
+                val row = info.visibleItemsInfo.find { it.index == index } ?: return@repeat
+                val delta = anchorGap - topGap(info, row)
+                if (delta != 0) list.scrollBy(delta.toFloat())
+                kotlinx.coroutines.delay(60)
+            }
+        } finally {
+            anchored = true
+        }
     }
     // U1: the running-tasks bar scrolls to a task's row.
     LaunchedEffect(jump?.target) {
@@ -424,11 +445,12 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
         val index = reversed.indexOfFirst { item -> item is TranscriptItem.Background && item.rows.any { it.id == id } }
         if (index >= 0) {
             follow = false
-            // S41: the row lands clear of the Latest strip that appears once the list leaves the bottom.
-            list.animateScrollToItem(index, -with(density) { 72.dp.roundToPx() })
-            // (a) Outline the task for a moment so the eye finds it, as on iOS.
+            // (a) / A7-9: outline the task for a moment so the eye finds it, as on iOS: first, so it
+            // shows even when the row is already in view or the scroll is interrupted.
             jump.highlight = id
             scope.launch { kotlinx.coroutines.delay(2_500); if (jump.highlight == id) jump.highlight = null }
+            // S41: the row lands clear of the Latest strip that appears once the list leaves the bottom.
+            runCatching { list.animateScrollToItem(index, -with(density) { 72.dp.roundToPx() }) }
         }
         jump.target = null
     }
@@ -507,7 +529,10 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
     val steer = remember(row.role, row.body) { parentSteerBody(row.role, row.body) }
     val body = steer ?: row.body
     val colors = MaterialTheme.colorScheme
-    Box(Modifier.fillMaxWidth(), contentAlignment = if (mine) Alignment.CenterEnd else Alignment.CenterStart) {
+    // A7-4: Tab goes from the card to its own controls (Copy code, links) before the next row, and
+    // the card's focus stop has a name.
+    val who = when { steer != null -> "Parent agent"; mine -> "You"; else -> row.author.ifEmpty { "Assistant" } }
+    Box(Modifier.fillMaxWidth().then(rememberGroupTab(expanded = true)), contentAlignment = if (mine) Alignment.CenterEnd else Alignment.CenterStart) {
         Column(
             Modifier.fillMaxWidth()
                 .background(when { steer != null -> VerdeColors.Panel; mine -> VerdeColors.UserBubble; else -> VerdeColors.Assistant }, RoundedCornerShape(10.dp))
@@ -515,6 +540,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
                 // S29: a message is focusable and long-pressable, not an unnamed tap target (the
                 // transcript already puts the keyboard away on a tap).
                 .focusRequester(rowFocus)
+                .semantics { contentDescription = "$who message" }
                 .focusable()
                 .longPressMenu("Message actions") { menu = true }
                 .padding(horizontal = 12.dp, vertical = 10.dp),
@@ -772,6 +798,10 @@ private fun FailedSend(row: ChatRow, model: TranscriptModel) {
  * under the header. The size is only recorded during layout; the correction runs afterwards, from
  * a coroutine, because scrolling inside a measure/layout callback crashes Compose.
  */
+/** The gap in px between the viewport's top edge and [item]'s top edge (either layout direction). */
+internal fun topGap(info: androidx.compose.foundation.lazy.LazyListLayoutInfo, item: androidx.compose.foundation.lazy.LazyListItemInfo): Int =
+    if (info.reverseLayout) info.viewportEndOffset - (item.offset + item.size) else item.offset - info.viewportStartOffset
+
 @Composable
 internal fun Modifier.keepTopRowOnResize(list: LazyListState, atBottom: () -> Boolean): Modifier {
     val viewport = remember { mutableIntStateOf(-1) }

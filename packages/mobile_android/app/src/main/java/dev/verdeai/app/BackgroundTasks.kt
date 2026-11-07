@@ -120,11 +120,12 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
     val title = runningTasksLabel(tasks.size)
     val labels = tasks.joinToString(" · ") { backgroundSpokenLabel(it.label) }
     // S41: the iOS bar: full width, outlined, the task titles, a chevron to its row.
+    // A7-9: the label shows the commands; the accessible name stays short (the count only).
     val shape = RoundedCornerShape(10.dp)
     Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(shape)
         .background(VerdeColors.Panel, shape).border(1.dp, colors.outlineVariant, shape)
         .clickable(role = Role.Button, onClickLabel = "Show") { onJump(tasks.first().row_id) }
-        .nameOnly("$title: " + tasks.joinToString(", ") { backgroundSpokenLabel(it.label) }).padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
+        .nameOnly(title).padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         RunningDot(colors.primary)
         Text(title, style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)

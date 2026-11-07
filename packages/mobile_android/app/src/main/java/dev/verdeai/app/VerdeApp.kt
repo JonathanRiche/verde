@@ -23,6 +23,7 @@ import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.runtime.withFrameNanos
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
@@ -214,11 +215,13 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         // A Live call carries on in the background like a phone call (LiveCallService); talk and read-aloud stop.
         if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) voice.pause()
     }
+    var liveStarting by remember { mutableStateOf(false) }
     fun toggleLive() {
         when {
             live.ui.value.active -> live.stop()
-            // Granting the microphone carries straight on into the call.
-            !mic.granted() -> mic.request { if (!live.ui.value.active) { voice.pause(); live.start() } }
+            // Granting the microphone carries straight on into the call. A7-8: the call bar is set up
+            // while the permission dialog is open, so "Connecting…" shows the first frame after it.
+            !mic.granted() -> { liveStarting = true; mic.request { if (!live.ui.value.active) { voice.pause(); live.start() } } }
             else -> { voice.pause(); live.start() }
         }
     }
@@ -233,7 +236,11 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // LiveOverModal and LiveOverMenu keep the bar on top of them.
     // S9: the call bar only during a call; a failed call's reason and repair live in the companion
     // sheet, which opens to show them and clears them when it closes.
-    val callUp = liveUi.active
+    val callUp = liveUi.active || liveStarting
+    LaunchedEffect(liveStarting, liveUi.active) {
+        // Started, or the permission was declined: the bar's early host goes once it has no call.
+        if (liveUi.active) liveStarting = false else if (liveStarting) { kotlinx.coroutines.delay(30_000); liveStarting = false }
+    }
     LaunchedEffect(liveUi.phase) {
         // One message: a speech-recognition hiccup from the same attempt isn't shown beside it.
         if (liveUi.phase == LivePhase.Failed) voice.clearError()
@@ -346,19 +353,26 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         quietKeys = openChatKey?.let(::setOf).orEmpty())
     val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
-        onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
+        onToggle = { companionSettings = false; companionOpen = !companionOpen }, failed = companionNow.failed) else null
     val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
         companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
-        onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
+        onToggle = { companionSettings = false; companionOpen = !companionOpen }, failed = companionNow.failed) else null
     // A6-2: when no control has focus (a tap on the transcript, a closed dialog), the shell itself
     // holds it, so a stray Space or Enter does nothing instead of giving the first control (Back,
     // the drawer button) focus and pressing it. Tab still moves on to the first control.
     val shellFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     var shellHolds by remember { mutableStateOf(false) }
+    val shellFocusManager = androidx.compose.ui.platform.LocalFocusManager.current
     LaunchedEffect(shellFocus) { withFrameNanos { }; runCatching { shellFocus.requestFocus() } }
     Box(Modifier.fillMaxSize().focusRequester(shellFocus)
         .onFocusChanged { shellHolds = it.isFocused }
         .onPreviewKeyEvent { event ->
+            // A7-3: the first Tab after a touch (the shell holds focus) goes to the first control.
+            if (shellHolds && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
+                @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                shellFocusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Enter)
+                return@onPreviewKeyEvent true
+            }
             // Enter would otherwise "enter" the shell and land on its first control.
             shellHolds && event.key in setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
         }
@@ -408,7 +422,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         }
     }
     if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
-        companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive,
+        companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
         onOpen = { companionSettings = false; companionOpen = true })
     // Last, so it floats above every screen, the drawer and the bubble.
     if (callUp) LiveShellBar(liveBar, statusTop)

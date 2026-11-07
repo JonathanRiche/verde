@@ -389,7 +389,7 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
     val label = chat?.let { chatStateLabel(it, pane.status) } ?: paneLabel(pane)
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
         styledSupporting = stateLine(listOf(kindLabel, label, timer), label, kind),
-        mark = chat,
+        mark = chat?.takeIf { it != ChatState.Running },
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             val glyph = Modifier.size(20.dp)
             if (pane.kind == "chat") ProviderGlyph(provider, glyph) else if (pane.provider != null) ProviderGlyph(pane.provider, glyph)
@@ -409,7 +409,8 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
     MenuRow(thread.title, parts.filterNotNull().joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
         styledSupporting = stateLine(parts, state, kind).takeIf { it.isNotEmpty() },
-        mark = chat,
+        // A7-10: the subtitle's accent "Working" says it; no trailing dot beside it.
+        mark = chat.takeIf { it != ChatState.Running },
         leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProviderGlyph(thread.provider, Modifier.size(20.dp))
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
@@ -670,7 +671,7 @@ internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> U
             return@BrowseFrame
         }
         // S27: the same icon rows as iOS (New chat, History, Add workspace), then Open / Closed.
-        if (onNewChat != null) item(key = "new-chat") { ActionRow(Icons.Filled.Edit, "New chat", onClick = onNewChat) }
+        // A7-11: New chat is the top bar's pencil (the docked sidebar's "+"), not a second row here.
         if (onHistory != null) item(key = "history") { ActionRow(painterResource(R.drawable.ic_schedule), "History", onClick = onHistory) }
         if (onAddWorkspace != null) item(key = "add-workspace") { ActionRow(painterResource(R.drawable.ic_folder), "Add workspace", onClick = onAddWorkspace) }
         header("Open")

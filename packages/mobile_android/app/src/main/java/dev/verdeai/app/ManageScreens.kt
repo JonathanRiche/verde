@@ -57,20 +57,30 @@ internal const val IDENTITY_COLOR = "identity-color-"
 internal const val SEARCH_DEBOUNCE_MS = 300L
 
 /** History rows in core order with a header whenever the core's bucket changes. */
-internal fun historySections(items: List<ThreadSummary>, live: Map<Pair<String, String>, ThreadSummary> = emptyMap()):
-    List<Pair<String, List<ThreadSummary>>> {
-    val out = mutableListOf<Pair<String, MutableList<ThreadSummary>>>()
-    for (raw in items.filterNot(::subagent)) {
-        // A11-3: the same live last activity Home and the drawer show, so a workspace filter can't
-        // show older ages or another order than All.
+internal fun historySections(items: List<ThreadSummary>, live: Map<Pair<String, String>, ThreadSummary> = emptyMap(),
+    nowMs: Long = System.currentTimeMillis()): List<Pair<String, List<ThreadSummary>>> {
+    // A11-3 / A7-2: the same live last activity Home and the drawer show, and the core's own bucket
+    // rule applied to it (Today < 1 day < This week < 7 days < Older), so a workspace filter keeps
+    // All's ages, order and grouping.
+    val rows = items.filterNot(::subagent).map { raw ->
         val now = live[raw.workspace_id to raw.thread_id]
-        val item = if (now == null) raw else raw.copy(
-            last_activity_at_ms = maxOf(now.last_activity_at_ms ?: 0L, raw.last_activity_at_ms ?: 0L).takeIf { it > 0L })
-        if (out.lastOrNull()?.first != item.history_bucket) out += item.history_bucket to mutableListOf()
-        out.last().second += item
+        val at = maxOf(now?.last_activity_at_ms ?: 0L, raw.last_activity_at_ms ?: 0L).takeIf { it > 0L }
+        val bucket = at?.let { historyBucket(nowMs - it) } ?: raw.history_bucket
+        raw.copy(last_activity_at_ms = at, history_bucket = bucket)
+    }.sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: Long.MIN_VALUE })
+    val out = mutableListOf<Pair<String, MutableList<ThreadSummary>>>()
+    for (item in rows) {
+        val section = out.find { it.first == item.history_bucket } ?: (item.history_bucket to mutableListOf<ThreadSummary>()).also { out += it }
+        section.second += item
     }
-    out.forEach { (_, rows) -> rows.sortWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: Long.MIN_VALUE }) }
     return out
+}
+
+/** The core's History bucket for an age (chat.zig / projection.zig). */
+internal fun historyBucket(ageMs: Long): String = when {
+    ageMs < 86_400_000L -> "Today"
+    ageMs < 604_800_000L -> "This week"
+    else -> "Older"
 }
 
 private fun connected(state: BrowseState) = state.host?.phase == "ready" && state.host?.auth_state == "paired"
@@ -202,7 +212,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                     leadingContent = { ProviderGlyph(thread.provider) },
                     // F2: the state reads as on Home (coloured "Working", amber waiting, red failed).
                     supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(stateLine(it, state, chat.rowState()), maxLines = 1) } },
-                    trailingContent = chat.takeIf { it != ChatState.Idle }?.let { { StateMark(it) } },
+                    trailingContent = chat.takeIf { it != ChatState.Idle && it != ChatState.Running }?.let { { StateMark(it) } },
                     modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open") { onOpenThread(thread) }
                         .nameOnly((listOf(thread.title) + parts + listOfNotNull("Unread".takeIf { chat == ChatState.Unread })).joinToString(", ")))
             }
@@ -403,7 +413,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
                         { Text("in $p", maxLines = 1, overflow = TextOverflow.Ellipsis) } },
                     leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
                     trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
-                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }.nameOnly("Browse $root"))
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button) { manage.listDirectory(root) }.nameOnly("Open folder ${basename(root)}"))
             }
         }
         if (directory.path.isNotEmpty()) {
@@ -428,7 +438,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             VerdeListRow(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp)) },
                 trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted) },
-                modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Browse") { manage.listDirectory(entry.path) }.nameOnly(entry.name))
+                modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Browse") { manage.listDirectory(entry.path) }.nameOnly("Open folder ${entry.name}"))
         }
         if (!directory.loading && directory.error == null && directory.entries.isEmpty() && directory.path.isNotEmpty()) line("browse-empty", "No folders here.")
     }

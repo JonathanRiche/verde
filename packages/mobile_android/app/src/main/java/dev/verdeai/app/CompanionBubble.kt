@@ -133,7 +133,9 @@ internal fun bubbleNeedKeys(needs: List<Pane>, crew: List<CompanionLink>, compan
 
 /** The avatar ring: amber for an approval or input, red when only failures need the user. */
 @Composable
-internal fun needsRing(pose: CompanionPose, count: Int): androidx.compose.ui.graphics.Color = when {
+internal fun needsRing(pose: CompanionPose, count: Int, failed: Int = 0): androidx.compose.ui.graphics.Color = when {
+    // A7-1: an unseen failure alone rings red.
+    count == 0 && failed > 0 -> VerdeColors.Danger
     count == 0 -> VerdeColors.Border
     pose == CompanionPose.Approval -> VerdeColors.Warning
     else -> VerdeColors.Danger
@@ -142,9 +144,12 @@ internal fun needsRing(pose: CompanionPose, count: Int): androidx.compose.ui.gra
 /** "1" … "99", then "99+". */
 internal fun badgeLabel(count: Int): String = if (count > 99) "99+" else count.toString()
 
-internal fun bubbleDescription(name: String, count: Int): String = when (count) {
-    0 -> "$name, nothing needs you"
-    1 -> "$name, 1 thing needs you"
+internal fun bubbleDescription(name: String, count: Int, failed: Int = 0): String = when {
+    // A7-1: unseen failures are named beside the needs-you count (which stays the core's needs_you).
+    count > 0 && failed > 0 -> "$name, $count need${if (count == 1) "s" else ""} you, $failed failed"
+    failed > 0 -> "$name, $failed chat${if (failed == 1) "" else "s"} failed"
+    count == 0 -> "$name, nothing needs you"
+    count == 1 -> "$name, 1 thing needs you"
     else -> "$name, $count things need you"
 }
 
@@ -309,12 +314,13 @@ internal fun CompanionBubbleLayer(
     running: Boolean,
     talk: BubbleTalk?,
     live: BubbleLive? = null,
+    failed: Int = 0,
     onOpen: () -> Unit,
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { BubblePrefs.of(context) }
     if (!shown) return
-    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live,
+    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live, failed,
         // While Live, a tap ends it; otherwise it opens the sheet.
         onOpen = {
             chip.clear()
@@ -329,7 +335,9 @@ internal const val COMPANION_DOCK = "companion-dock"
 
 /** Everything the docked Moss shows; the same hooks the floating bubble has. */
 internal class CompanionDockState(val name: String, val character: CompanionCharacter, val pose: CompanionPose, val count: Int,
-    val running: Boolean, val chip: BubbleChip, val talk: BubbleTalk?, val live: BubbleLive?, val opened: Boolean, val onToggle: () -> Unit)
+    val running: Boolean, val chip: BubbleChip, val talk: BubbleTalk?, val live: BubbleLive?, val opened: Boolean, val onToggle: () -> Unit,
+    /** A7-1: chats the core lists as failed and unseen. */
+    val failed: Int = 0)
 
 /** Moss in the permanent sidebar instead of floating over content: tap to open, plus talk and Live. */
 @Composable
@@ -345,7 +353,7 @@ internal fun CompanionDock(state: CompanionDockState) {
             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
                 .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
                 .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-                .semantics { contentDescription = bubbleDescription(state.name, state.count) }
+                .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed) }
                 .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DockAvatar(state)
                 Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -363,7 +371,7 @@ internal fun CompanionRailDock(state: CompanionDockState) {
     state.talk?.let { DockTalk(it, state.name) }
     Box(Modifier.size(48.dp).clip(CircleShape)
         .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-        .semantics { contentDescription = bubbleDescription(state.name, state.count) }
+        .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed) }
         .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
 }
 
@@ -476,7 +484,7 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
         }
         .semantics {
             role = Role.Button
-            contentDescription = bubbleDescription(state.name, state.count)
+            contentDescription = bubbleDescription(state.name, state.count, state.failed)
             onClick(label = "Open ${state.name}") { open(); true }
             customActions = buildList {
                 val talk = state.talk
@@ -501,7 +509,7 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
         Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
             if (state.live?.active == true) LiveRing(state.live.level()) else if (state.running || talking) RunningRing(reduced)
             Box(Modifier.size(36.dp).background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
-                .border(1.dp, if (talking) VerdeColors.Accent else needsRing(state.pose, state.count), CircleShape),
+                .border(1.dp, if (talking) VerdeColors.Accent else needsRing(state.pose, state.count, state.failed), CircleShape),
                 contentAlignment = Alignment.Center) {
                 CompanionAvatar(state.character, if (talking) CompanionPose.Working else state.pose, size = 30.dp)
             }
@@ -532,7 +540,7 @@ private enum class BubbleGesture { Tap, Drag, Hold }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompanionBubble(prefs: BubblePrefs, name: String, character: CompanionCharacter, pose: CompanionPose, count: Int,
-    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, onOpen: () -> Unit, onHide: () -> Unit) {
+    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, failed: Int, onOpen: () -> Unit, onHide: () -> Unit) {
     val context = LocalContext.current
     val reduced = remember(context) { reducedMotion(context) }
     val haptics = LocalHapticFeedback.current
@@ -639,7 +647,7 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                 }
                 .semantics {
                     role = Role.Button
-                    contentDescription = bubbleDescription(name, count)
+                    contentDescription = bubbleDescription(name, count, failed)
                     onClick(label = "Open $name") { onOpen(); true }
                     customActions = buildList {
                         if (talk != null) add(CustomAccessibilityAction(if (talking) "Stop and send" else "Talk to $name") {
@@ -657,7 +665,7 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                 Box(Modifier.align(Alignment.Center).size(50.dp)
                     .background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
                     // A11-3: amber only while something asks for approval or input; failures alone are red.
-                    .border(1.dp, if (talking) VerdeColors.Accent else needsRing(pose, count), CircleShape),
+                    .border(1.dp, if (talking) VerdeColors.Accent else needsRing(pose, count, failed), CircleShape),
                     contentAlignment = Alignment.Center) {
                     CompanionAvatar(character, if (talking) CompanionPose.Working else pose, size = 42.dp)
                 }

@@ -144,4 +144,25 @@ class ScreenSpecTest {
         assertEquals(listOf("b", "a"), rows.map { it.thread_id })
         assertEquals(900L, rows.first().last_activity_at_ms)
     }
+
+    /** A7-2: a filtered History groups and orders by the live time, as All does. */
+    @Test fun historyRegroupsByLiveTime() {
+        val now = 10L * 86_400_000L
+        fun t(id: String, at: Long, bucket: String) = dev.verdeai.core.ThreadSummary("ws", id, id, "codex", null, null, open = true, archived = false,
+            last_activity_at_ms = at, status = "idle", history_bucket = bucket)
+        val stale = listOf(t("sprout", now - 3 * 3_600_000L, "Today"), t("deploy", now - 3 * 86_400_000L, "This week"))
+        val live = mapOf(("ws" to "deploy") to t("deploy", now - 3 * 60_000L, "This week"))
+        val sections = historySections(stale, live, now)
+        assertEquals(listOf("Today"), sections.map { it.first })
+        assertEquals(listOf("deploy", "sprout"), sections.single().second.map { it.thread_id })
+    }
+
+    /** A7-1: unseen failures are named on the bubble beside the needs-you count, and ring red alone. */
+    @Test fun bubbleNamesFailures() {
+        assertEquals("Sprout, nothing needs you", bubbleDescription("Sprout", 0))
+        assertEquals("Sprout, 1 chat failed", bubbleDescription("Sprout", 0, failed = 1))
+        assertEquals("Sprout, 2 chats failed", bubbleDescription("Sprout", 0, failed = 2))
+        assertEquals("Sprout, 1 needs you, 1 failed", bubbleDescription("Sprout", 1, failed = 1))
+        assertEquals("Sprout, 1 thing needs you", bubbleDescription("Sprout", 1))
+    }
 }

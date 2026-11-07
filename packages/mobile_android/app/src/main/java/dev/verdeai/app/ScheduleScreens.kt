@@ -137,6 +137,7 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
                     Spacer(Modifier.width(4.dp))
                     Text("New")
                 }
+                SheetCloseButton(onDismiss)
             }
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {

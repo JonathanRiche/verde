@@ -13,6 +13,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -373,5 +374,13 @@ internal fun NamedButton(label: String, onClick: () -> Unit, modifier: Modifier 
         .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick).nameOnly(label)
         .padding(padding), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
         CompositionLocalProvider(LocalContentColor provides ink, LocalTextStyle provides MaterialTheme.typography.labelLarge) { body() }
+    }
+}
+
+/** A7-6: every sheet's visible 48dp Close, in its header. */
+@Composable
+internal fun SheetCloseButton(onClose: () -> Unit) {
+    IconButton(onClick = onClose, modifier = Modifier.named("Close")) {
+        Icon(androidx.compose.material.icons.Icons.Filled.Close, contentDescription = null, tint = VerdeColors.Muted)
     }
 }

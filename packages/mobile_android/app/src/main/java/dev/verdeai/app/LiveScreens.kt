@@ -350,6 +350,8 @@ internal fun LiveCallBar(ui: LiveUi, input: () -> Float, output: () -> Float, ch
     onRetry: () -> Unit, onClose: () -> Unit, modifier: Modifier = Modifier, statusBarHeight: Dp? = null) {
     // Floats: no backdrop, so only the pill and captions cover what's under them. The shell passes
     // the screen's top inset: in a dialog's window or a menu's popup the bar's own insets aren't the screen's.
+    // Takes no space until a call is live (the host can be set up early, see A7-8).
+    if (!ui.active) return
     val top = if (statusBarHeight != null) Modifier.padding(top = statusBarHeight)
         else Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
     Column(modifier.fillMaxWidth().then(top).testTag(LIVE_CALL_BAR)) {

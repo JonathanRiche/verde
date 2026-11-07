@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -212,11 +213,26 @@ private fun AccessoryRow(state: TerminalUiState, enabled: Boolean, send: (TermIn
         val list = androidx.compose.foundation.lazy.rememberLazyListState()
         val keyPx = with(LocalDensity.current) { keyWidth.toPx() }
         // A slow drag ends without a fling, so settle on the nearest key boundary when scrolling stops.
+        // A7-7: also after a short partial drag; settle once the row has been still for a moment.
+        // The settle runs in its own job: its scroll flips isScrollInProgress, which must not cancel it.
         LaunchedEffect(list, keyPx) {
-            snapshotFlow { list.isScrollInProgress }.collect { moving ->
-                val offset = list.firstVisibleItemScrollOffset
-                if (!moving && offset != 0) list.animateScrollToItem(list.firstVisibleItemIndex + if (offset > keyPx / 2) 1 else 0)
-            }
+            var pending: kotlinx.coroutines.Job? = null
+            var settling = false
+            snapshotFlow { Triple(list.isScrollInProgress, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset) }
+                .collect { (moving, index, offset) ->
+                    if (moving && settling) return@collect
+                    pending?.cancel()
+                    if (moving || offset == 0) return@collect
+                    pending = launch {
+                        kotlinx.coroutines.delay(120)
+                        settling = true
+                        try {
+                            list.animateScrollToItem(index + if (offset > keyPx / 2) 1 else 0)
+                        } finally {
+                            settling = false
+                        }
+                    }
+                }
         }
         androidx.compose.foundation.lazy.LazyRow(Modifier.fillMaxSize(), state = list,
             flingBehavior = androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior(list),

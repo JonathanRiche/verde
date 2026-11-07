@@ -911,7 +911,11 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         modifier = Modifier.testTag(COMPOSER_PICKER)) {
         LiveOverModal()
-        Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
+        // A7-6: a visible Close beside the title.
+        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            SheetCloseButton(onDismiss)
+        }
         Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(bottom = 16.dp).selectableGroup()) {
             PickerRows(kind, choices, current, c, provider, onPick)
         }
