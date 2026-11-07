@@ -2,6 +2,11 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -64,6 +69,45 @@ class CompanionHeaderTest {
         compose.onNodeWithText("Chat").assertExists()
         compose.onNodeWithContentDescription("Idle").assertDoesNotExist()
         assertEquals(1, compose.onRoot().fetchSemanticsNode().children.size)
+    }
+
+    @OptIn(ExperimentalTestApi::class)
+    @Test fun sidebarAndRailDockHaveOneNamedKeyboardTargetWithTheActualState() {
+        var rail by mutableStateOf(false)
+        var opened = 0
+        var shown by mutableStateOf(state(0) { opened++ })
+        compose.setContent {
+            VerdeTheme {
+                androidx.compose.foundation.layout.Column(Modifier.requiredWidth(300.dp)) {
+                    androidx.compose.material3.Button({}, Modifier.testTag("before")) { Text("Before") }
+                    if (rail) CompanionRailDock(shown) else CompanionDock(shown)
+                    androidx.compose.material3.Button({}, Modifier.testTag("after")) { Text("After") }
+                }
+            }
+        }
+        for (collapsed in listOf(false, true)) {
+            rail = collapsed
+            for ((current, value) in listOf(state(0) { opened++ } to "Ready",
+                state(0, running = true) { opened++ } to "Working",
+                state(0, failed = 1) { opened++ } to "Failed", state(1) { opened++ } to "Needs you")) {
+                shown = current
+                compose.waitForIdle()
+                val description = bubbleDescription(current.name, current.count, current.failed)
+                compose.onAllNodesWithContentDescription(description, useUnmergedTree = true).assertCountEquals(1)
+                compose.onAllNodesWithText("Sprout").assertCountEquals(0)
+                compose.onAllNodes(hasClickAction(), useUnmergedTree = true).assertCountEquals(3)
+                val target = compose.onNodeWithContentDescription(description)
+                target.assertHasClickAction().assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+                    .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, value))
+                compose.onNodeWithTag("before").performSemanticsAction(SemanticsActions.RequestFocus) { it() }
+                compose.onRoot().performKeyInput { pressKey(Key.Tab) }
+                target.assertIsFocused()
+                compose.onRoot().performKeyInput { pressKey(Key.Enter) }
+                compose.onRoot().performKeyInput { pressKey(Key.Tab) }
+                compose.onNodeWithTag("after").assertIsFocused()
+            }
+        }
+        assertEquals(8, opened)
     }
 
     @Test

@@ -375,7 +375,7 @@ internal fun CompanionDock(state: CompanionDockState) {
             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
                 .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
                 .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-                .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
+                .nameOnly(bubbleDescription(state.name, state.count, state.failed), state = bubbleStateValue(state))
                 .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DockAvatar(state)
                 Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -393,7 +393,7 @@ internal fun CompanionRailDock(state: CompanionDockState) {
     state.talk?.let { DockTalk(it, state.name) }
     Box(Modifier.size(48.dp).clip(CircleShape)
         .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-        .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
+        .nameOnly(bubbleDescription(state.name, state.count, state.failed), state = bubbleStateValue(state))
         .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
 }
 
