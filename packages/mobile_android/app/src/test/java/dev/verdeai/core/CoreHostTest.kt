@@ -221,7 +221,7 @@ class CoreHostTest {
                     assertNull(host.takeFile("intent-image-$index"))
                     val repeated=fixture.server.takeRequest(2, TimeUnit.SECONDS)!!
                     assertEquals("Bearer t", repeated.getHeader("Authorization"))
-                    assertEquals(index + 1, repeated.sequenceNumber)
+                    assertEquals(index + 2, repeated.sequenceNumber)
                 }
 
                 fixture.server.enqueue(MockResponse().setResponseCode(403).setBody("{\"error\":\"path_outside_workspace\"}"))

@@ -124,6 +124,18 @@ class FileViewerTest {
         assertTrue(isolatedHtml("<script>1</script>").contains("<script>1</script>"))
     }
 
+    @Test fun previewRangesDoNotSkipTheReturnedSliceTwice() {
+        for (start in listOf(7L, 35_000_000L, 5_000_000_000L)) {
+            WebViewRangeStream("xyz".byteInputStream(), start).use { stream ->
+                assertEquals(0, stream.available())
+                assertEquals(start, stream.skip(start))
+                assertEquals("xyz", stream.readBytes().decodeToString())
+            }
+        }
+        // Also works when a future WebView consumes a partial body directly.
+        WebViewRangeStream("xyz".byteInputStream(), 7).use { assertEquals("xyz", it.readBytes().decodeToString()) }
+    }
+
     @Test fun previewAssetsStayInsideTheWorkspace() {
         val location = PreviewLocation("/w/story/index.html", "/w")
         assertEquals("/w/story/img/a b.png", location.resolve(android.net.Uri.parse("https://$PREVIEW_HOST/w/story/img/a%20b.png")))
