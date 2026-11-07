@@ -1,7 +1,7 @@
 //! D-12 authenticated workspace file fetch (`/api/file`, `/api/preview`).
 //! The core owns the URL, bearer, TLS pin, lifecycle gate and outcome
 //! classification. The platform runs `file_fetch` like `http_request`, but
-//! keeps the body in its own memory and reports `http_response` without it,
+//! keeps bounded previews in memory or streams downloads to private disk, and reports `http_response` without it,
 //! so document bytes never enter core JSON, state or receipts.
 const std = @import("std");
 const h = @import("host.zig");
@@ -11,7 +11,7 @@ const E = h.ApiError;
 const A = std.mem.Allocator;
 const eq = h.eq;
 
-/// The gateway serves at most 32 MiB (`MAX_SERVED_FILE_BYTES`).
+/// Bounded preview ceiling; original downloads stream independently of this cap.
 pub const MAX_FILE_BYTES: u32 = 32 * 1024 * 1024;
 pub const MAX_PATH_BYTES = 4096;
 /// Concurrent fetches per host; a viewer needs one, a retry may briefly overlap.
@@ -20,9 +20,11 @@ const FILE_TIMEOUT_MS: u32 = 30_000;
 /// Office conversion runs LibreOffice on the host.
 const PREVIEW_TIMEOUT_MS: u32 = 120_000;
 
+/// Download effects use max_response_bytes=0: the platform must stream to private disk,
+/// never to an unbounded memory buffer. Older hosts can still answer HTTP 413.
 /// `download` fetches the original bytes as an attachment, which the gateway
 /// also allows for types it refuses to serve inline (HTML, SVG, scripts).
-pub const Kind = enum { file, preview, theme, download };
+pub const Kind = enum { file, preview, theme, download, audio };
 const Fetch = struct {
     intent_id: []const u8,
     path: []const u8,
@@ -90,7 +92,7 @@ pub fn complete(tx: *h.Transaction, p: h.Pending, event: V) E!bool {
         s.fetches = rest;
         const transport = try h.field(event, "error");
         if (transport != .null) {
-            operation(tx, f.intent_id, "failed", transportFailure(try h.string(transport, "kind")));
+            operation(tx, f.intent_id, "failed", transportFailure(try h.string(transport, "kind"), try h.string(transport, "code")));
             return true;
         }
         const status = try h.integer(event, "status");
@@ -119,7 +121,7 @@ fn send(tx: *h.Transaction, f: Fetch) E![]const u8 {
     try url.appendSlice(a, switch (f.kind) {
         .preview => "/api/preview?path=",
         .file => "/api/file?path=",
-        .download => "/api/file?download=1&path=",
+        .download, .audio => "/api/file?download=1&path=",
         .theme => "/api/theme",
     });
     for (if (f.kind == .theme) "" else f.path) |c| {
@@ -127,12 +129,18 @@ fn send(tx: *h.Transaction, f: Fetch) E![]const u8 {
             try url.append(a, c);
         } else try url.print(a, "%{X:0>2}", .{c});
     }
+    const Header = @import("wire.zig").Header;
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tx.state.rpc.bearer.?});
+    const headers: []const Header = if (f.kind == .audio)
+        &.{ .{ .name = "Authorization", .value = bearer }, .{ .name = "Range", .value = "bytes=0-0" } }
+    else
+        &.{.{ .name = "Authorization", .value = bearer }};
     const id = try tx.emit("file_fetch", .{
         .intent_id = f.intent_id,
         .url = url.items,
-        .headers = .{.{ .name = "Authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{tx.state.rpc.bearer.?}) }},
-        .timeout_ms = if (f.kind == .preview) PREVIEW_TIMEOUT_MS else FILE_TIMEOUT_MS,
-        .max_response_bytes = f.max_bytes,
+        .headers = headers,
+        .timeout_ms = if (f.kind == .preview) PREVIEW_TIMEOUT_MS else if (f.kind == .download or f.kind == .audio) @as(u32, 600_000) else FILE_TIMEOUT_MS,
+        .max_response_bytes = if (f.kind == .download or f.kind == .audio) @as(u32, 0) else f.max_bytes,
         .tls = .{ .origin = origin, .spki_sha256 = tx.state.rpc.spki_sha256.? },
     });
     try tx.track(.http, id, "file");
@@ -182,7 +190,7 @@ fn statusFailure(status: i64) h.LocalError {
         401 => failure("unauthorized", "This phone's access was refused.", true),
         403 => failure("forbidden", "This file is outside the host's workspaces.", false),
         404 => failure("not_found", "This file no longer exists on the host.", false),
-        413 => failure("too_large", "This file is too large to open on the phone.", false),
+        413 => failure("host_file_too_large", "This host only serves files up to 32 MB. Open it on your computer.", false),
         400, 415 => failure("unsupported", "This file type can't be shown.", false),
         501 => failure("preview_unavailable", "Previews need LibreOffice on the host.", false),
         429, 500, 502...599 => failure("server_unavailable", "The host couldn't serve this file.", true),
@@ -190,7 +198,8 @@ fn statusFailure(status: i64) h.LocalError {
     };
 }
 
-fn transportFailure(kind: []const u8) h.LocalError {
+fn transportFailure(kind: []const u8, code: []const u8) h.LocalError {
+    if (eq(kind, "resource") and eq(code, "unavailable")) return failure("storage_unavailable", "The phone could not save this file. Check its free space and try again.", false);
     if (eq(kind, "resource")) return failure("too_large", "This file is too large to open on the phone.", false);
     if (eq(kind, "tls")) return failure("identity", "The host's identity couldn't be verified.", false);
     if (eq(kind, "timeout")) return failure("timeout", "The host took too long to respond.", true);

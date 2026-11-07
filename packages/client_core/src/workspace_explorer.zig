@@ -606,7 +606,14 @@ fn failure(code: []const u8, message: []const u8) h.LocalError {
 /// Daemon codes the UI acts on become the local code; everything else keeps
 /// a readable message without raw host text.
 fn named(e: h.LocalError) h.LocalError {
-    const code = e.rpc_code orelse e.code;
+    const code = e.rpc_code orelse blk: {
+        const kind = e.failure_kind orelse break :blk e.code;
+        if (eq(kind, "server_unavailable")) break :blk "server_unavailable";
+        if (eq(kind, "identity")) break :blk "identity";
+        if (eq(kind, "resource")) break :blk "too_large";
+        if (eq(kind, "authentication") or eq(kind, "session_authentication")) break :blk "unauthorized";
+        break :blk e.code;
+    };
     const message = if (eq(code, "method_not_found"))
         "Update verde on the computer to use this."
     else if (eq(code, "path_outside_roots"))

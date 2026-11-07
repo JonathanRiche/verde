@@ -1982,6 +1982,7 @@ enum class FileKind {
     `preview`,
     `theme`,
     `download`,
+    `audio`,
 }
 
 @Serializable

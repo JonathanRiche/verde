@@ -165,3 +165,26 @@ test "a 401 refreshes the bearer once and resends; a stale completion is ignored
     try eql("unauthorized", f.op(opened.id).@"error".?.code);
     try expect(f.host.state.files.fetches.len == 0);
 }
+
+test "download streams outside the preview cap and preserves old host 413" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const opened = try f.open("/home/u/large.bin", "download", 1024);
+    const fetch = find(opened.batch, "file_fetch").?;
+    try expect(fetch.object.get("max_response_bytes").?.integer == 0);
+    _ = try f.respond(fetch, 413, null);
+    try eql("host_file_too_large", f.op(opened.id).@"error".?.code);
+    try expect(!f.op(opened.id).@"error".?.retryable);
+}
+
+test "audio probes byte ranges without embedding credentials in the player URL" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const opened = try f.open("/home/u/narration.mp3", "audio", 1024);
+    const fetch = find(opened.batch, "file_fetch").?;
+    try expect(fetch.object.get("max_response_bytes").?.integer == 0);
+    try eql("bytes=0-0", fetch.object.get("headers").?.array.items[1].object.get("value").?.string);
+    try eql("https://host.example/api/file?download=1&path=/home/u/narration.mp3", fetch.object.get("url").?.string);
+    _ = try f.respond(fetch, 206, null);
+    try eql("succeeded", f.op(opened.id).state);
+}

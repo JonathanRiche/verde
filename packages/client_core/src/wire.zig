@@ -121,7 +121,8 @@ pub const Effect = union(enum) {
     log: struct { effect_id: []const u8, generation: []const u8, level: []const u8, code: []const u8, fields: std.json.Value },
     tls_probe: struct { effect_id: []const u8, generation: []const u8, origin: []const u8 },
     terminal_output: struct { effect_id: []const u8, generation: []const u8, terminal_id: []const u8, reset: bool, bytes_base64: []const u8, next_offset: []const u8 },
-    /// Like `http_request` (GET), but the platform keeps the body in memory and reports
+    /// Like `http_request` (GET), but the platform keeps bounded previews in memory,
+    /// spools max_response_bytes=0 downloads to private disk, and reports
     /// `http_response` with `body_base64: null`; see files.zig.
     file_fetch: struct { effect_id: []const u8, generation: []const u8, intent_id: []const u8, url: []const u8, headers: []const Header, timeout_ms: u32, max_response_bytes: u32, tls: Tls },
 };
