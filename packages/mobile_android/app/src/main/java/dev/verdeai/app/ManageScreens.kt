@@ -440,7 +440,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             section("Contents of ${basename(directory.path)}")
             item(key = "current") {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(directory.path, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(basename(directory.path), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     NamedButton("Use this folder", { path = directory.path }, enabled = directory.error == null && !directory.loading)
                 }
             }
