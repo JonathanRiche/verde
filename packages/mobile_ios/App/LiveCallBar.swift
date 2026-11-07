@@ -99,15 +99,15 @@ struct LiveSetupCard: View {
             // padding lets the default labels fit; larger text still gets full-width actions.
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
-                    Spacer(minLength: 0)
                     notNow(fullWidth: false)
                     openSettings(fullWidth: false)
-                }
+                }.fixedSize()
                 VStack(spacing: 8) {
                     openSettings(fullWidth: true)
                     notNow(fullWidth: true)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .trailing)
             .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)

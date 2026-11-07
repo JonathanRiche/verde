@@ -455,8 +455,8 @@ private struct CapsuleSearchInput: UIViewRepresentable {
         field.accessibilityLabel = title
         field.accessibilityIdentifier = identifier
         if focused && !field.isFirstResponder {
-            DispatchQueue.main.async { if context.coordinator.parent.focused { field.becomeFirstResponder() } }
-        } else if !focused && field.isFirstResponder { field.resignFirstResponder() }
+            DispatchQueue.main.async { field.becomeFirstResponder() }
+        }
     }
 
     final class Coordinator: NSObject, UITextFieldDelegate {
