@@ -449,10 +449,12 @@ private fun BrowseFrame(
                 navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
         }
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
-            // Top-level lists keep their last rows clear of the New chat button and the companion bubble (S1).
+            // Focus scrolling uses the viewport, not content padding. Exclude the fixed band so a
+            // focused last row (and its ring) stays above it; keep the same total scroll clearance.
             // The scroll container is not a keyboard stop; its rows are.
-            LazyColumn(Modifier.fillMaxSize().focusProperties { canFocus = false }.testTag(BROWSE_LIST),
-                contentPadding = PaddingValues(bottom = if (band) BOTTOM_BAND + 8.dp else 16.dp)) {
+            LazyColumn(Modifier.fillMaxSize().padding(bottom = if (band) BOTTOM_BAND + 8.dp else 0.dp)
+                .focusProperties { canFocus = false }.testTag(BROWSE_LIST),
+                contentPadding = PaddingValues(bottom = if (band) 0.dp else 16.dp)) {
                 if (onBack == null) item(key = "title") {
                     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp)) {
                         Text(title, style = MaterialTheme.typography.titleLarge)
