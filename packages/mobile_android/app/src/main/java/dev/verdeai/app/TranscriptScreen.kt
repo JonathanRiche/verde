@@ -49,7 +49,9 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -171,6 +173,30 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
         gitChanges = git, threads = knownThreads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
+/** One flexible title slot: subtitles never cost the title its second line. */
+@Composable
+internal fun TranscriptTitle(title: String, provider: String?) {
+    val measurer = rememberTextMeasurer()
+    val style = MaterialTheme.typography.bodyMedium
+    val defaultScale = LocalDensity.current.fontScale == 1f
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // Measure at the exact slot width before layout, avoiding a subtitle/height feedback frame.
+        val layout = measurer.measure(AnnotatedString(title), style = style, maxLines = 2, overflow = TextOverflow.Ellipsis,
+            constraints = Constraints(maxWidth = constraints.maxWidth))
+        Column {
+            Text(title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = style)
+            if (defaultScale && layout.lineCount == 1 && !layout.hasVisualOverflow && provider != null) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    ProviderGlyph(provider, Modifier.size(12.dp))
+                    Text(PROVIDERS.find { it.first == provider }?.second ?: provider.replaceFirstChar { it.uppercase() },
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted)
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun TranscriptScreen(
@@ -214,20 +240,9 @@ internal fun TranscriptScreen(
         Box(Modifier.focusRequester(headerEntry).keyboardRegion(composerFocus)) {
         VerdeTopBar(
             title = {
-                // S10: [back] [drawer] title over the provider's name … [companion] [⋯], the same on every launch.
-                val provider = state.thread?.thread?.provider
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ProviderGlyph(provider)
-                    Column {
-                        // Cover screens give the full title its own row below the controls.
-                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = if (tier.wide) 1 else Int.MAX_VALUE,
-                            overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                        provider?.let { id -> Text(PROVIDERS.find { it.first == id }?.second ?: id.replaceFirstChar { it.uppercase() }, maxLines = 1,
-                            style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted) }
-                    }
-                }
+                TranscriptTitle(state.thread?.thread?.title ?: title ?: "Chat", state.thread?.thread?.provider)
             },
-            showWorkspaceMenu = false, titleBelowControls = !tier.wide,
+            showWorkspaceMenu = false,
             navigationIcon = {
                 // Beside a permanent sidebar neither has a job: chats are switched from the list.
                 if (!tier.docked) Row {

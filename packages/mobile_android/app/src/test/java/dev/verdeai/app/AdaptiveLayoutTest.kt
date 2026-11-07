@@ -5,12 +5,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Row
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -120,23 +124,41 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("count 1").assertExists()
     }
 
-    @Test fun coverTitleGetsTheWholeWidthBelowTheControls() {
-        var layout: TextLayoutResult? = null
+    @Test fun chatTitleSharesOneBarAndOnlyAddsSubtitleWhenOneDefaultSizeLineFits() {
+        var width by mutableIntStateOf(360)
+        var scale by mutableStateOf(1f)
+        var title by mutableStateOf("Chat")
         compose.setContent {
             VerdeTheme {
-                Box(Modifier.requiredWidth(360.dp)) {
-                    VerdeTopBar(titleBelowControls = true,
-                        title = { androidx.compose.material3.Text("Steering Delays in Orchestrated Chats", onTextLayout = { layout = it }) },
-                        navigationIcon = { TextButton({}, Modifier.testTag("back")) { Text("Back") } },
-                        actions = { TextButton({}, Modifier.testTag("actions")) { Text("More") } })
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
+                    Box(Modifier.requiredWidth(width.dp)) {
+                        VerdeTopBar(showWorkspaceMenu = false, companion = false,
+                            title = { TranscriptTitle(title, "codex") },
+                            navigationIcon = { Box(Modifier.size(96.dp, 48.dp).testTag("navigation")) },
+                            actions = { Row { Box(Modifier.size(48.dp).testTag("companion")); Box(Modifier.size(48.dp).testTag("actions")) } })
+                    }
                 }
             }
         }
-        val title = compose.onNodeWithText("Steering Delays in Orchestrated Chats").getUnclippedBoundsInRoot()
-        val controls = compose.onNodeWithTag("actions").getUnclippedBoundsInRoot()
-        assertTrue(title.top >= controls.bottom)
-        assertTrue(title.width > controls.width)
-        assertFalse(layout!!.hasVisualOverflow)
+        for (w in listOf(360, 411)) for (s in listOf(1f, 1.3f, 2f)) for (t in listOf("Chat", "Investigate transcript memory growth")) {
+            compose.runOnIdle { width = w; scale = s; title = t }
+            val layouts = mutableListOf<TextLayoutResult>()
+            compose.onNodeWithText(t).performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            assertTrue("$w dp/$s: at most two title lines", layouts.single().lineCount <= 2)
+            if (t != "Chat") assertEquals("wrap before truncating", 2, layouts.single().lineCount)
+            val bounds = compose.onNodeWithText(t).getUnclippedBoundsInRoot()
+            val nav = compose.onNodeWithTag("navigation").getUnclippedBoundsInRoot()
+            val actions = compose.onNodeWithTag("actions").getUnclippedBoundsInRoot()
+            val companion = compose.onNodeWithTag("companion").getUnclippedBoundsInRoot()
+            assertTrue("title uses flexible middle", bounds.left >= nav.right && bounds.right <= companion.left)
+            val middle = (bounds.top + bounds.bottom) / 2
+            assertTrue("title stays in the controls' bar", middle >= actions.top && middle <= actions.bottom)
+            assertEquals(nav.top, actions.top)
+            assertEquals(companion.top, actions.top)
+            if (s == 1f && t == "Chat") compose.onNodeWithText("Codex").assertExists()
+            else compose.onNodeWithText("Codex").assertDoesNotExist()
+        }
     }
 
     /** The frame at a real measured width, with a Moss flag the test controls. */

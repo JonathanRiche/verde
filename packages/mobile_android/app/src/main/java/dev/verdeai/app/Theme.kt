@@ -295,7 +295,7 @@ internal val LocalWorkspaceMenu = staticCompositionLocalOf<(() -> Unit)?> { null
 /** Insets are owned by the app shell (or the containing dialog). */
 @Composable
 internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composable () -> Unit = {},
-    showWorkspaceMenu: Boolean = true, companion: Boolean = true, titleBelowControls: Boolean = false, actions: @Composable RowScope.() -> Unit = {}) {
+    showWorkspaceMenu: Boolean = true, companion: Boolean = true, actions: @Composable RowScope.() -> Unit = {}) {
     // Above the content below it, so a transcript row scrolled under the bar never takes the bar's
     // touch or accessibility area (its 48dp buttons were reported 25dp tall).
     Column(Modifier.zIndex(1f).background(VerdeColors.Panel)) {
@@ -306,14 +306,11 @@ internal fun VerdeTopBar(title: @Composable () -> Unit, navigationIcon: @Composa
                 IconButton(onClick = open, modifier = Modifier.named("Open workspace drawer")) { Icon(Icons.Filled.Menu, contentDescription = null) }
             }
             Box(Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 6.dp)) {
-                if (!titleBelowControls) ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
+                ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
             }
             // S1: on content screens the companion sits here, trailing, before the screen's own actions and ⋯ menu.
             if (companion) LocalCompanionHeader.current?.let { CompanionHeaderButton(it) }
             actions()
-        }
-        if (titleBelowControls) Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-            ProvideTextStyle(MaterialTheme.typography.titleMedium) { title() }
         }
         HorizontalDivider(color = VerdeColors.Border)
     }
