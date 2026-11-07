@@ -118,14 +118,20 @@ struct LiveSetupCard: View {
     }
 
     private func notNow(fullWidth: Bool) -> some View {
-        Button(action: close) { Text("Not now").lineLimit(fullWidth ? 2 : 1, reservesSpace: fullWidth) }
+        Button(action: close) { actionLabel("Not now", fullWidth: fullWidth) }
             .buttonStyle(TonalButtonStyle(fullWidth: fullWidth, horizontalPadding: fullWidth ? 16 : 6))
     }
 
     private func openSettings(fullWidth: Bool) -> some View {
-        Button(action: setup) { Text("Open Companion settings").lineLimit(fullWidth ? 2 : 1, reservesSpace: fullWidth) }
+        Button(action: setup) { actionLabel("Open Companion settings", fullWidth: fullWidth) }
             .buttonStyle(PrimaryButtonStyle(fullWidth: fullWidth, horizontalPadding: fullWidth ? 16 : 6))
             .accessibilityHint("Add a live voice provider key.")
+    }
+
+    private func actionLabel(_ title: LocalizedStringKey, fullWidth: Bool) -> some View {
+        // Reserve the same two-line height, but center a shorter label within it.
+        Text(title).lineLimit(fullWidth ? 2 : 1, reservesSpace: fullWidth).hidden()
+            .overlay { Text(title).lineLimit(fullWidth ? 2 : 1) }
     }
 }
 
