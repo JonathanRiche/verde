@@ -56,7 +56,7 @@ func explorerErrorText(_ error: LocalError?) -> String? {
     guard let error else { return nil }
     switch error.code {
     case "unsupported", "method_not_found": return explorerUpdateText
-    case "scope_denied", "forbidden": return "This phone isn't allowed to browse workspace files."
+    case "scope_denied", "forbidden": return "This \(localDeviceModel) isn't allowed to browse workspace files."
     case "offline", "cancelled": return "Connect to the host to refresh."
     case "path_outside_roots": return "This path is outside the workspace folders."
     case "not_found": return "This no longer exists on the host."

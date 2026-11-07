@@ -41,7 +41,7 @@ func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64, sendError: Local
     let browse = state.browse
     if state.unavailable { return Banner(text: "Connection unavailable — reopen verde.", error: true) }
     if needsPairing(browse) {
-        return Banner(text: "This phone isn't paired with \(browse.row?.saved.label ?? "this host").", action: .hosts, error: true)
+        return Banner(text: "This \(localDeviceModel) isn't paired with \(browse.row?.saved.label ?? "this host").", action: .hosts, error: true)
     }
     var gates = browse
     gates.home = nil

@@ -510,7 +510,7 @@ private struct LatestStrip: View {
 ///
 /// A jump to the bottom realizes rows at estimated heights, so it moves the geometry again. Anchoring
 /// on every change turned that into a loop that threw the transcript around (worst while the
-/// composer was resized), so re-anchors wait for the geometry to settle and are capped per output.
+/// composer was resized), so re-anchors wait for the geometry to settle and stay capped until output or dimensions change.
 private struct TailFollower: ViewModifier {
     @Binding var follow: Bool
     @Binding var atBottom: Bool
@@ -527,7 +527,7 @@ private struct TailFollower: ViewModifier {
     }
 }
 
-/// Re-anchors allowed per output before following gives up; the reader or new output resets it.
+/// Re-anchors allowed per layout before following gives up; new output or dimensions reset it.
 private let tailReanchors = 3
 /// Quiet time before a settled geometry is re-anchored.
 private let tailSettle: Duration = .milliseconds(150)
@@ -538,6 +538,7 @@ let eagerTranscriptLimit = 160
 /// count as changes.
 struct TailGeometry: Equatable {
     var gap: CGFloat
+    var content: CGFloat
     var container: CGFloat
     var width: CGFloat
     var nearTop: Bool
@@ -545,6 +546,7 @@ struct TailGeometry: Equatable {
     init(offset: CGFloat, insetTop: CGFloat, insetBottom: CGFloat, content: CGFloat, container: CGFloat, width: CGFloat = 0) {
         let last = max(-insetTop, content + insetBottom - container)
         gap = ((last - offset) / 4).rounded() * 4
+        self.content = content.rounded()
         self.container = container.rounded()
         self.width = width.rounded()
         nearTop = offset + insetTop < 400
@@ -583,9 +585,11 @@ private struct TailFollowerGeometry: ViewModifier {
                              content: g.contentSize.height, container: g.containerSize.height, width: g.containerSize.width)
             } action: { previous, next in
                 tail.geometry = next
-                // Width reflow (sidebar or Companion) is new geometry too. It must not spend
-                // the retry budget left over from laying out the wider transcript.
-                if previous.container != next.container || previous.width != next.width { tail.allowance = tailReanchors }
+                // Decoded images can resize rows without new output. Each new content height,
+                // like a viewport reflow, needs its own allowance; offset-only retries stay capped.
+                if previous.content != next.content || previous.container != next.container || previous.width != next.width {
+                    tail.allowance = tailReanchors
+                }
                 if next.nearTop && !previous.nearTop && !follow { nearTop() }
                 let bottom = transcriptAtBottom(atBottom, gap: next.gap)
                 if bottom != atBottom { atBottom = bottom }

@@ -5,6 +5,21 @@ import XCTest
 private typealias Fg = AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute
 private typealias LinkKey = AttributeScopes.FoundationAttributes.LinkAttribute
 
+final class TailGeometryTests: XCTestCase {
+    func testContentResizeIsObservedEvenWhenTheOffsetKeepsTheSameGap() {
+        let before = TailGeometry(offset: 600, insetTop: 0, insetBottom: 0, content: 1200, container: 600)
+        let decoded = TailGeometry(offset: 800, insetTop: 0, insetBottom: 0, content: 1400, container: 600)
+        XCTAssertEqual(before.gap, decoded.gap)
+        XCTAssertNotEqual(before, decoded)
+    }
+
+    func testSubpointLayoutNoiseDoesNotChangeGeometry() {
+        let before = TailGeometry(offset: 600, insetTop: 0, insetBottom: 0, content: 1200, container: 600)
+        let noise = TailGeometry(offset: 600.2, insetTop: 0, insetBottom: 0, content: 1200.2, container: 600)
+        XCTAssertEqual(before, noise)
+    }
+}
+
 /// Pure transcript rules over real K-11 core render results (shared Android fixtures, d06/README.md).
 final class TranscriptRulesTests: XCTestCase {
     func testSelectorsOffsetsAndLinkSafety() throws {

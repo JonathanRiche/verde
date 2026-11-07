@@ -320,7 +320,7 @@ private struct LiveProviderEditor: View {
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("live-api-key")
             } header: { SectionTitle("API key") } footer: {
-                Text("\(provider.keyDescription). A new key is sent to your desktop and stored only there; it never stays on this phone. Subscriptions like ChatGPT, SuperGrok or Gemini don't include API access — create a key in the provider's developer console.")
+                Text("\(provider.keyDescription). A new key is sent to your desktop and stored only there; it never stays on this \(localDeviceModel). Subscriptions like ChatGPT, SuperGrok or Gemini don't include API access — create a key in the provider's developer console.")
             }
             if !provider.voices.isEmpty {
                 TitledSection("Voice") {

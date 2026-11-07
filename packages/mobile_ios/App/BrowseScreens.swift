@@ -365,7 +365,7 @@ private struct Gate: View {
             Text("No host selected.")
             Button("Choose a host", action: pair).modifier(PrimaryRow())
         } else if needsPairing(state) {
-            Text("This phone isn't paired with \(state.row?.saved.label ?? "this host") yet.")
+            Text("This \(localDeviceModel) isn't paired with \(state.row?.saved.label ?? "this host") yet.")
             Button("Pair with this host", action: pair).modifier(PrimaryRow()).accessibilityIdentifier("pairHost")
         } else if showSpinner(state) {
             HStack { Spacer(); ProgressView("Loading workspaces…"); Spacer() }.padding(.vertical, 24)

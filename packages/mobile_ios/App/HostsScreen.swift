@@ -44,7 +44,7 @@ struct HostsScreen: View {
             .modifier(BubbleReserve())
         }
         .modifier(AddHostAlert(model: model, isPresented: $adding))
-        .alert(confirmation.map { $0.forget ? "Remove \($0.name) from this phone?" : "Sign out of \($0.name)?" } ?? "",
+        .alert(confirmation.map { $0.forget ? "Remove \($0.name) from this \(localDeviceModel)?" : "Sign out of \($0.name)?" } ?? "",
                isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }),
                presenting: confirmation) { item in
             Button(item.forget ? "Remove anyway" : "Sign out", role: .destructive) {
@@ -54,7 +54,7 @@ struct HostsScreen: View {
         } message: { item in
             Text(item.forget
                  ? "This removes the local credential and host trust. This device may remain listed on the desktop until you revoke it there."
-                 : "verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.")
+                 : "verde will revoke this \(localDeviceModel)'s access to this host and remove its local credential and trust. Other hosts stay paired.")
         }
     }
 }
@@ -183,18 +183,18 @@ private struct HostCard: View {
             .buttonStyle(.borderless)
             .disabled(pending || row.fatal)
             .alert("Rename machine", isPresented: $renaming) {
-                TextField("Name on this phone", text: $nickname)
+                TextField("Name on this \(localDeviceModel)", text: $nickname)
                 Button("Cancel", role: .cancel) {}
                 Button("Save") { model.rename(id, label: nickname) }
                     .disabled(nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || nickname.count > 128)
-            } message: { Text("This nickname is saved on this phone.") }
+            } message: { Text("This nickname is saved on this \(localDeviceModel).") }
         }
         if failure?.code == "sign_out_unconfirmed" {
             Text("Sign out could not be confirmed. Your local pairing is still saved.")
             Text("If you remove it anyway, this device may remain listed on the desktop. Revoke it there when you can.")
                  .font(VerdeTheme.ui(13)).foregroundStyle(.secondary)
             Button("Retry sign out") { model.signOut(id) }.disabled(pending)
-            Button("Remove from this phone anyway") { confirm(Confirmation(id: id, name: row.saved.label, forget: true)) }
+            Button("Remove from this \(localDeviceModel) anyway") { confirm(Confirmation(id: id, name: row.saved.label, forget: true)) }
                 .disabled(pending).accessibilityIdentifier("forgetHost")
         } else if failure?.code == "sign_out_delete_failed" {
             Text("Local data could not be removed. Unlock your phone and retry.")

@@ -136,7 +136,7 @@ func terminalNotice(failure: String?, terminalID: String?, view: TerminalView?, 
     if view.session_status == "exited" { return "The session has ended." }
     if view.session_status == "unknown" || (view.error != nil && !view.attached) { return "This terminal is no longer available." }
     if view.session_status == "starting" { return "Starting shell…" }
-    if !canWrite(b.host) { return "View only: this phone was paired without terminal access." }
+    if !canWrite(b.host) { return "View only: this \(localDeviceModel) was paired without terminal access." }
     if view.error != nil && view.stale { return "Connection interrupted. Catching up…" }
     if replayGap { return replayGapNotice }
     return nil
@@ -328,7 +328,7 @@ final class TerminalModel {
 
     /// The core needs a measured grid and a ready connection; creation is never retried automatically.
     private func create(_ host: CoreHost, _ size: GridSize) async {
-        guard canWrite(browse.state.host) else { fail("This phone can view terminals but not open them."); return }
+        guard canWrite(browse.state.host) else { fail("This \(localDeviceModel) can view terminals but not open them."); return }
         creating = true
         let event = EventTerminalCreate(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString,
                                         workspace_id: workspaceID, cwd: nil, cols: size.cols, rows: size.rows)

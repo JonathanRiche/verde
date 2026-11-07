@@ -119,7 +119,7 @@ struct ScheduledScreen: View {
                         .contextMenu { menu(entry, canEdit: view.can_edit) }
                 }
             } footer: {
-                Text("Your computer runs these on its own clock, even while this phone is away.")
+                Text("Your computer runs these on its own clock, even while this \(localDeviceModel) is away.")
             }
         }
         .listStyle(.insetGrouped)
@@ -166,7 +166,7 @@ struct ScheduledScreen: View {
                 Image(systemName: "clock.arrow.circlepath").font(.system(size: 40)).foregroundStyle(VerdeTheme.accent)
                     .accessibilityHidden(true)
                 Text("No scheduled tasks yet").font(VerdeTheme.ui(18, bold: true)).accessibilityAddTraits(.isHeader)
-                Text("A scheduled task sends a prompt later or on repeat, to \(companionName)'s chat or a new chat in a workspace. Your computer runs it, even while this phone is away.")
+                Text("A scheduled task sends a prompt later or on repeat, to \(companionName)'s chat or a new chat in a workspace. Your computer runs it, even while this \(localDeviceModel) is away.")
                     .font(VerdeTheme.ui(14)).foregroundStyle(VerdeTheme.muted).multilineTextAlignment(.center)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("For example").font(VerdeTheme.ui(12, bold: true)).foregroundStyle(VerdeTheme.subtle)
@@ -194,7 +194,7 @@ struct ScheduledScreen: View {
     }
 
     private var readOnlyNote: some View {
-        Text("Changes are off: this phone is offline or can only read chats on this host.")
+        Text("Changes are off: this \(localDeviceModel) is offline or can only read chats on this host.")
             .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
     }
 

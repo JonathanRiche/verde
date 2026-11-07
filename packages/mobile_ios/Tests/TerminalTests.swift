@@ -331,7 +331,7 @@ final class TerminalModelTests: XCTestCase {
         let model = open()
         model.setMeasured(GridSize(cols: 40, rows: 12))
         try await waitUntil("view only") {
-            model.snapshot != nil && model.notice == "View only: this phone was paired without terminal access."
+            model.snapshot != nil && model.notice == "View only: this \(localDeviceModel) was paired without terminal access."
         }
         XCTAssertFalse(model.writable)
         XCTAssertFalse(model.interactive)
@@ -342,7 +342,7 @@ final class TerminalModelTests: XCTestCase {
         XCTAssertTrue(resizes.isEmpty)
         let fresh = open(nil)
         fresh.setMeasured(GridSize(cols: 20, rows: 4))
-        try await waitUntil("cannot create") { fresh.notice == "This phone can view terminals but not open them." }
+        try await waitUntil("cannot create") { fresh.notice == "This \(localDeviceModel) can view terminals but not open them." }
         XCTAssertTrue(creates.isEmpty)
     }
 
