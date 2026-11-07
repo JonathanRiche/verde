@@ -18,6 +18,9 @@ internal fun Modifier.keyboardRegion(next: FocusRequester, previous: FocusReques
                 FocusDirection.Previous -> previous
                 else -> FocusRequester.Default
             }
-            if (target != FocusRequester.Default) target.requestFocus(direction)
+            // A linked region can be absent (not composed on this screen or in this layout); its
+            // requester then throws "not initialized". Fall back to Compose's own search instead of
+            // crashing (r9 crash: Tab from the composer).
+            if (target != FocusRequester.Default) runCatching { target.requestFocus(direction) }
         }
     }.focusGroup()
