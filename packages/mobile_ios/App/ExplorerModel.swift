@@ -110,7 +110,7 @@ func readFailure(_ code: String?) -> WorkspaceReadOutcome? {
     case "unsupported", "method_not_found": return nil
     case "not_found", "root_not_found", "resource_not_found": return .problem(.of("not_found", limit: 0))
     case "path_outside_roots", "scope_denied", "forbidden": return .problem(.of("forbidden", limit: 0))
-    case "offline", "cancelled", "timeout", "busy", "server_unavailable", "host_file_too_large": return .problem(.of(code, limit: 0))
+    case "offline", "connecting", "cancelled", "timeout", "busy", "server_unavailable", "host_file_too_large": return .problem(.of(code, limit: 0))
     case "network": return .problem(.of("offline", limit: 0))
     case "unauthorized", "identity": return .problem(.of(code, limit: 0))
     case "too_large", "response_too_large": return .problem(.of("too_large", limit: 32 * 1024 * 1024))

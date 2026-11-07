@@ -33,7 +33,7 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(FileProblem.of(nil, limit: 1), .failed)
     }
     func testFileErrorsAndHTMLIsolation() {
-        for code in ["timeout", "cancelled", "busy", "server_unavailable", "too_large", "host_file_too_large", "unsupported", "forbidden", "identity", "unauthorized"] {
+        for code in ["connecting", "timeout", "cancelled", "busy", "server_unavailable", "too_large", "host_file_too_large", "unsupported", "forbidden", "identity", "unauthorized"] {
             XCTAssertNotEqual(FileProblem.of(code, limit: ViewerKind.downloadLimit).title, "Can't reach the host", code)
         }
         XCTAssertEqual(FileProblem.of("offline", limit: 1).title, "Can't reach the host")

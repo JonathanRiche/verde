@@ -17,6 +17,7 @@ struct FileProblem: LocalizedError, Equatable {
     static func of(_ code: String?, limit: UInt32) -> FileProblem {
         switch code {
         case "offline": return FileProblem(title: "Can't reach the host", detail: "Check your connection and try again.")
+        case "connecting": return FileProblem(title: "Connecting to the host", detail: "Wait for the connection, then try again.")
         case "timeout": return FileProblem(title: "Host took too long", detail: "Try again. If this keeps happening, check the host's connection.")
         case "cancelled": return FileProblem(title: "Loading interrupted", detail: "Return to verde and try again.")
         case "busy": return FileProblem(title: "Too many files loading", detail: "Wait for the other files to finish, then try again.")
@@ -40,7 +41,7 @@ struct FileProblem: LocalizedError, Equatable {
         code == "too_large" ? FileProblem(title: "Too large to download", detail: "This file is over the \(sizeLabel(limit)) download limit for the phone. Open it on the host.") : of(code, limit: limit)
     }
     static let hostTooLarge = FileProblem(title: "Too large to open", detail: "This file is too large to open on your phone (over 32 MB). Open it on your computer.")
-    var retryable: Bool { ["Can't reach the host", "Host took too long", "Loading interrupted", "Too many files loading", "Host couldn't serve the file", "Couldn't open the file"].contains(title) }
+    var retryable: Bool { ["Can't reach the host", "Connecting to the host", "Host took too long", "Loading interrupted", "Too many files loading", "Host couldn't serve the file", "Couldn't open the file"].contains(title) }
     static let binary = FileProblem(title: "No preview for this file type", detail: "This file isn't text or a supported image or document. Download it to open it in another app.")
     static let unresolved = FileProblem(title: "Can't open this link", detail: "The path couldn't be resolved to a file in the workspace.")
     static let unreadable = FileProblem(title: "Can't display this file", detail: "The file couldn't be decoded.")
@@ -245,6 +246,8 @@ final class FileViewerModel: HighlightSource {
     }
 }
 
+@MainActor private enum ViewerPreferences { static var htmlPreview = false }
+
 struct ViewerRequest: Identifiable { let id = UUID(); let citation: FileCitation }
 struct FileViewer: View {
     let browse: BrowseModel
@@ -259,6 +262,7 @@ struct FileViewer: View {
     @State private var model = FileViewerModel()
     @State private var source = false
     @State private var htmlPreview = false
+    @State private var htmlChoiceLoaded = false
     @State private var attempt = 0
     @State private var share: SharedFile?
     @State private var host: CoreHost?
@@ -272,6 +276,7 @@ struct FileViewer: View {
         .tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
         .task(id: attempt) {
             source = citation.line != nil
+            if !htmlChoiceLoaded { htmlPreview = ViewerPreferences.htmlPreview; htmlChoiceLoaded = true }
             guard path != nil || reader != nil, let session = browse.session else { model.problem = .unresolved; return }
             await session.start()
             guard let host = session.host else { self.host = nil; model.problem = .unavailable; return }
@@ -330,7 +335,7 @@ struct FileViewer: View {
             if !embedded { ToolbarItem(placement: .cancellationAction) { BarButton("Done", bold: true) { dismiss() } } }
             ToolbarItemGroup(placement: .primaryAction) {
                 if ViewerKind.of(citation.path) == .html, model.text != nil {
-                    Button { htmlPreview.toggle() } label: { Label(htmlPreview ? "Source" : "Preview", systemImage: htmlPreview ? "chevron.left.forwardslash.chevron.right" : "eye").frame(minWidth: 44, minHeight: 44) }
+                    Button { htmlPreview.toggle(); ViewerPreferences.htmlPreview = htmlPreview } label: { Label(htmlPreview ? "Source" : "Preview", systemImage: htmlPreview ? "chevron.left.forwardslash.chevron.right" : "eye").frame(minWidth: 44, minHeight: 44) }
                         .accessibilityLabel(htmlPreview ? "Show source" : "Preview")
                 }
                 if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
