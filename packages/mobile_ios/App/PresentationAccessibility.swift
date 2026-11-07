@@ -1,5 +1,6 @@
 import SwiftUI
 import Observation
+import UIKit
 
 /// One scene's modal stack. Each sheet keeps its own layer, so dismissing a child restores
 /// the parent sheet rather than exposing the screen behind both of them.
@@ -36,7 +37,53 @@ private struct PresentationAccessibilityLayer: ViewModifier {
             // native wrappers) from overriding the visibility of the presenting layer.
             .accessibilityElement(children: .contain)
             .accessibilityHidden(covered || context.state.topLayer > context.layer)
+            .background(PresentationAccessibilityBridge(hidden: covered || context.state.topLayer > context.layer,
+                                                         layer: context.layer, topLayer: context.state.topLayer))
             .environment(\.presentationAccessibility, context)
+    }
+}
+
+/// NavigationStack and native list wrappers can remain in UIKit's AX tree despite the SwiftUI
+/// modifier. Hide the presenting hosting controller's content, leaving presented controllers alone.
+private struct PresentationAccessibilityBridge: UIViewRepresentable {
+    let hidden: Bool
+    let layer: Int
+    let topLayer: Int
+    func makeUIView(context: Context) -> LayerView { LayerView() }
+    func updateUIView(_ view: LayerView, context: Context) {
+        view.hiddenFromAccessibility = hidden
+        view.accessibilityIdentifier = "presentation-layer-\(layer)-top-\(topLayer)"
+        view.updateVisibility()
+        DispatchQueue.main.async { [weak view] in view?.updateVisibility() }
+    }
+
+    final class LayerView: UIView {
+        var hiddenFromAccessibility = false
+        private weak var hostingView: UIView?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            updateVisibility()
+        }
+
+        func updateVisibility() {
+            guard window != nil else { return }
+            var responder: UIResponder? = self
+            while let current = responder {
+                if var controller = current as? UIViewController {
+                    while let parent = controller.parent { controller = parent }
+                    if hostingView !== controller.view {
+                        hostingView?.accessibilityElementsHidden = false
+                        hostingView = controller.view
+                    }
+                    controller.view.accessibilityElementsHidden = hiddenFromAccessibility
+                    return
+                }
+                responder = current.next
+            }
+        }
+
+        deinit { hostingView?.accessibilityElementsHidden = false }
     }
 }
 
