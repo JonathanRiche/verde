@@ -348,11 +348,13 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULE_FORM)) {
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULE_FORM),
+        contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
+        SheetDismissBackdrop(onDismiss)
         LiveOverModal()
-        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight() - 48.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
-            Text(if (original == null) "New scheduled task" else "Edit scheduled task", Modifier.padding(horizontal = 16.dp),
-                style = MaterialTheme.typography.titleLarge)
+        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight() - 48.dp).navigationBarsPadding()) {
+            SheetHeader(if (original == null) "New scheduled task" else "Edit scheduled task", onDismiss)
+            Column(Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             OutlinedTextField(draft.prompt, onValueChange = { draft = draft.copy(prompt = it) }, label = { Text("Prompt") },
                 placeholder = { Text("Check CI for every workspace and summarize what failed.") }, minLines = 3, maxLines = 10,
                 enabled = canEdit, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("schedule-prompt"))
@@ -477,6 +479,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
                         else -> "Save"
                     })
                 }
+            }
             }
         }
     }
