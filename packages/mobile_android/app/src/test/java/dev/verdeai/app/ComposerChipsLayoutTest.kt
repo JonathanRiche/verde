@@ -2,13 +2,22 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.width
 import dev.verdeai.core.*
 import org.junit.Assert.*
 import org.junit.Rule
@@ -103,4 +112,61 @@ class ComposerChipsLayoutTest {
     @Test fun axlIdleClaude() = check(2.0f, codex = false, steer = false)
     @Test fun axlSteerCodex() = check(2.0f, codex = true, steer = true)
     @Test fun defaultSizeCodexKeepsEveryLabel() = check(1.0f, codex = true, steer = false)
+
+    @Test
+    @OptIn(ExperimentalTestApi::class)
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35], qualifiers = "w411dp-h900dp-420dpi")
+    fun phoneAndCoverIncludeAttachAndSendBeforeDecidingToWrap() {
+        var width by mutableStateOf(411)
+        var scale by mutableStateOf(1f)
+        var codex by mutableStateOf(true)
+        var steer by mutableStateOf(false)
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
+                VerdeTheme {
+                    // The phone card has 8dp outer +12dp inner padding on each side. Send owns
+                    // another 48dp plus its 4dp gap, which a SettingsControls-only test misses.
+                    Row(Modifier.requiredWidth((width - 40).dp), verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Box(Modifier.weight(1f)) {
+                            SettingsControls(view(codex), state(steer), if (codex) "codex" else "claude",
+                                leading = { Box(Modifier.size(48.dp).testTag("attach")) }) {}
+                        }
+                        Box(Modifier.size(48.dp).testTag("send"))
+                    }
+                }
+            }
+        }
+        for (w in listOf(411, 360)) for (s in listOf(1f, 1.3f, 2f))
+            for (provider in listOf(true, false)) for (working in listOf(false, true)) {
+                width = w; scale = s; codex = provider; steer = working; compose.waitForIdle()
+                val attach = compose.onNodeWithTag("attach").getUnclippedBoundsInRoot()
+                val send = compose.onNodeWithTag("send").getUnclippedBoundsInRoot()
+                val kinds = if (provider) listOf("Model", "Effort", "Speed", "Access") else listOf("Model", "Effort", "Access")
+                for (kind in kinds) {
+                    val node = compose.onNodeWithContentDescription("$kind:", substring = true)
+                    val bounds = node.getUnclippedBoundsInRoot()
+                    node.assertTouchHeightIsEqualTo(48.dp).assertTouchWidthIsEqualTo(maxOf(48.dp, bounds.width))
+                    assertTrue("$kind stays before Send at $w/$s", bounds.right <= send.left && bounds.left >= attach.left)
+                    if (s == 1f) assertTrue("One row at $w/$s, codex=$provider, steer=$working: $bounds",
+                        kotlin.math.abs((bounds.top + bounds.bottom - send.top - send.bottom).value) < 1f)
+                }
+                val model = compose.onNode(hasText(if (provider) "GPT" else "Opu", substring = true), useUnmergedTree = true)
+                val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+                model.performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+                val text = layouts.single().layoutInput.text.text
+                assertTrue("Readable model at $w/$s: $text", if (provider) text.startsWith("GPT") && text.endsWith("Sol")
+                    else text.startsWith("Opu") && text.endsWith("5.5"))
+                val layout = layouts.single()
+                // Native paragraph widths can exceed an integer text box by a float rounding
+                // fraction at1.3x. Check the painted line and available slot with a 1px tolerance.
+                assertEquals(1, layout.lineCount)
+                assertFalse(layout.isLineEllipsized(0))
+                assertTrue("Model stays in its slot at $w/$s: $text",
+                    layout.getLineRight(0) <= layout.size.width + 1f &&
+                        layout.multiParagraph.intrinsics.maxIntrinsicWidth <= layout.layoutInput.constraints.maxWidth + 1f)
+            }
+    }
 }

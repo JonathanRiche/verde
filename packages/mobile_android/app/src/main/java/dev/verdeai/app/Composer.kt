@@ -726,8 +726,8 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
 
     val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
     // S31 (locked): model · effort · speed · access; every chip is glyph + short label, always.
-    // The model name truncates in the middle first; when even that doesn't fit, or at large text,
-    // the chips wrap to more rows. Idle, running and Steer use this same row.
+    // Shorten the model before wrapping. Narrow default-font rows reduce only inner spacing;
+    // every target stays 48dp. Idle, running and Steer use this same row.
     data class Chip(val name: String, val value: String, val short: String, val provider: String?, val icon: Int?, val fill: Float,
         val picker: ComposerPicker)
     val effortValue = effortValueLabel(c, s)
@@ -750,16 +750,28 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
     val labelStyle = MaterialTheme.typography.labelMedium
     val density = LocalDensity.current
     BoxWithConstraints(Modifier.fillMaxWidth().testTag(COMPOSER_CHIPS)) {
-        fun textWidth(text: String) = with(density) { measurer.measure(text, labelStyle).size.width.toDp().value }
-        fun width(chip: Chip): Float = kotlin.math.ceil(textWidth(chip.short)) + 4f + (if (chip.icon == null && chip.provider == null) CHIP_CHROME.value - 18f else CHIP_CHROME.value)
-        val available = (maxWidth - (if (leading != null) 52.dp else 0.dp)).value
         val modelChip = chips.first { it.picker == ComposerPicker.Model }
-        val modelFull = width(modelChip)
-        // A model name narrower than this (with its glyph) reads as noise: wrap rather than squeeze it.
-        val modelFloor = minOf(modelFull, maxOf(84f, textWidth("Auto") + CHIP_CHROME.value))
-        val others = chips.filter { it !== modelChip }.sumOf { width(it).toDouble() }.toFloat() + chips.size * 4f
+        fun pixels(dp: Dp) = with(density) { dp.roundToPx() }
+        fun textWidth(text: String) = measurer.measure(text, labelStyle).size.width
+        fun gap(dense: Boolean) = if (dense) 1.dp else 4.dp
+        fun chrome(chip: Chip, dense: Boolean): Int {
+            val icon = if (chip.provider != null) 14.dp else if (chip.icon != null) 16.dp else 0.dp
+            return pixels(if (dense) 2.dp else 7.dp) + pixels(if (dense) 2.dp else 8.dp) +
+                pixels(icon) + if (icon > 0.dp) pixels(if (dense) 2.dp else 4.dp) else 0
+        }
+        fun width(chip: Chip, dense: Boolean, text: String = chip.short) =
+            maxOf(pixels(48.dp), textWidth(text) + chrome(chip, dense))
+        // Keep short labels whole (especially Auto); long ones retain at least three characters at
+        // either end, such as GPT…Sol. Measure the same rounded pixels the actual chips consume.
+        val readableModel = model.takeIf { it.length <= 7 }
+            ?: (model.take(3).trimEnd() + "…" + model.takeLast(3).trimStart())
+        fun modelFloor(dense: Boolean) = minOf(width(modelChip, dense), width(modelChip, dense, readableModel))
+        fun room(dense: Boolean) = constraints.maxWidth - (if (leading != null) pixels(48.dp) else 0) -
+            pixels(gap(dense)) * (chips.size - 1 + if (leading != null) 1 else 0) -
+            chips.filter { it !== modelChip }.sumOf { width(it, dense) }
+        val dense = !large && room(false) < modelFloor(false)
         val rowWidth = maxWidth
-        if (large || available - others < modelFloor) {
+        if (large || room(dense) < modelFloor(dense)) {
             FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(0.dp),
                 itemVerticalAlignment = Alignment.CenterVertically) {
                 leading?.invoke()
@@ -770,14 +782,14 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
             }
             return@BoxWithConstraints
         }
-        val modelRoom = (available - others).coerceIn(modelFloor, modelFull)
+        val modelRoom = with(density) { minOf(room(dense), width(modelChip, dense)).toDp() }
         // Fit only inside the final text slot. Subtracting estimated chrome here loses a fraction
         // of a pixel at cover-screen densities and can turn a fitting "Auto" into "A…o".
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(gap(dense)), verticalAlignment = Alignment.CenterVertically) {
             leading?.invoke()
             chips.forEach {
                 SettingChip(it.name, it.value, it.provider, it.icon, it.fill, shown = it.short,
-                    maxWidth = if (it === modelChip) modelRoom.dp else 220.dp) { open(it.picker) }
+                    dense = dense, maxWidth = if (it === modelChip) modelRoom else 220.dp) { open(it.picker) }
             }
         }
     }
@@ -799,9 +811,6 @@ internal fun middleFit(text: String, max: Float, width: (String) -> Float): Stri
 
 /** S31 / I10-2: the speed a label or picker names: "Standard" or "Fast", never the core's "Normal". */
 internal fun speedLabel(id: String?) = if (id == "on") "Fast" else "Standard"
-
-/** A compact chip's padding, icon and gap around its label. */
-private val CHIP_CHROME = 34.dp
 
 /**
  * The wide-window composer's single row: attach, the settings chips, then send. The model chip takes
@@ -845,7 +854,7 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
     icon: Int? = null, fill: Float = 1f, compact: Boolean = false, iconOnly: Boolean = false,
     /** The label to draw (a short form of [value]); TalkBack always reads [value]. */
     shown: String = value,
-    modifier: Modifier = Modifier, maxWidth: Dp = 220.dp, onClick: () -> Unit) {
+    modifier: Modifier = Modifier, maxWidth: Dp = 220.dp, dense: Boolean = false, onClick: () -> Unit) {
     val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
     } else icon?.let { resource -> {
@@ -863,8 +872,9 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
     // A 32dp chip inside a 48dp target; icon-only when the row is short of room (S18).
     // S29: the clickable node itself carries "Name: value. Change" (no unnamed wrapper over a named child).
     ChipSurface(label, onClick, RoundedCornerShape(14.dp), modifier.widthIn(max = maxWidth)) {
-        Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 7.dp, end = if (iconOnly) 12.dp else 8.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else if (dense) 2.dp else 7.dp,
+            end = if (iconOnly) 12.dp else if (dense) 2.dp else 8.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (dense) 2.dp else 4.dp)) {
             leading?.invoke()
             if (!iconOnly) {
                 if (name == "Model") ModelChipLabel(shown)
