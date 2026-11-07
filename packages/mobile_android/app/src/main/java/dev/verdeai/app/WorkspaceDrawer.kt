@@ -15,6 +15,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -155,7 +156,9 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                 ExplorerLinks({ onChanges(target.workspace_id) }, { onFiles(target.workspace_id) }, target.label.takeIf { scoped == null },
                     Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
             }
-            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 12.dp)) {
+            // A different scope starts at Active, rather than retaining the previous Open-row anchor.
+            val listState = key(scope) { rememberLazyListState() }
+            LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(bottom = 12.dp)) {
                 if (ready) {
                     if (scoped != null && !scoped.open) item { Text("${scoped.label} is closed.", Modifier.padding(16.dp), color = VerdeColors.Muted) }
                     val (active, open) = drawerItems(all, scope, hidden)
