@@ -69,7 +69,14 @@ let bubbleListReserve: CGFloat = BubbleLayout.diameter + 32
 
 func needsYouPhrase(_ count: Int) -> String { count == 1 ? "1 thing needs you" : "\(count) things need you" }
 
-func bubbleAccessibilityLabel(name: String, count: Int) -> String { "\(name), \(needsYouPhrase(count))" }
+/// B1: "Sprout, 1 thing needs you", "Sprout, 1 chat failed", "Sprout, 1 needs you, 1 failed".
+func bubbleAccessibilityLabel(name: String, count: Int, failed: Int = 0) -> String {
+    switch (count, failed) {
+    case (_, 0): return "\(name), \(needsYouPhrase(count))"
+    case (0, _): return "\(name), \(failed) chat\(failed == 1 ? "" : "s") failed"
+    default: return "\(name), \(needsYouCount(count)), \(failed) failed"
+    }
+}
 
 /// Decides when the collapsed bubble shows its speech-bubble chip: only for needs-you items it
 /// hasn't seen before, or a companion reply newer than the last one seen. The first observation
@@ -287,12 +294,12 @@ struct CompanionBubbleLayer: View {
         let d = layout.diameter
         let liveOn = live.active
         return bubbleFace(active, diameter: d)
-            .overlay(alignment: .topTrailing) { bubbleBadge(badge) }
+            .overlay(alignment: .topTrailing) { bubbleBadge(badge, failed: model.failedCount) }
             .overlay(alignment: .bottom) { bubbleLiveTag(liveOn) }
             .overlay(alignment: edge == .leading ? .leading : .trailing) { bubbleSideCallout(diameter: d) }
         .contentShape(Circle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
+        .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge, failed: model.failedCount))
         .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
         .accessibilityHint(liveOn ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
         .accessibilityAddTraits(.isButton)
@@ -318,16 +325,23 @@ struct CompanionBubbleLayer: View {
             }
             Circle().fill(VerdeTheme.panel)
                 .shadow(color: .black.opacity(0.28), radius: 6, y: 3)
-            Circle().stroke(running ? VerdeTheme.accent : VerdeTheme.border, lineWidth: running ? 2 : 1)
-                .modifier(Pulse(active: running, minimum: 0.4))
+            // B1: an unseen failure rings the bubble red (it is listed, not counted in the badge).
+            let failed = model.failedCount > 0
+            Circle().stroke(failed ? VerdeTheme.danger : running ? VerdeTheme.accent : VerdeTheme.border, lineWidth: failed || running ? 2 : 1)
+                .modifier(Pulse(active: running && !failed, minimum: 0.4))
             CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.6)
         }
         .frame(width: d, height: d)
     }
 
     @ViewBuilder
-    private func bubbleBadge(_ badge: Int) -> some View {
-        if badge > 0 {
+    private func bubbleBadge(_ badge: Int, failed: Int) -> some View {
+        if badge == 0 && failed > 0 {
+            // B1: a red dot when only failures wait.
+            Circle().fill(VerdeTheme.danger).frame(width: 12, height: 12)
+                .overlay(Circle().stroke(VerdeTheme.background, lineWidth: 1.5))
+                .offset(x: 1, y: -1)
+        } else if badge > 0 {
             Text(badge > 99 ? "99+" : "\(badge)")
                 .font(VerdeTheme.ui(11, bold: true)).foregroundStyle(Color.white)
                 .padding(.horizontal, 5).frame(minWidth: 20, minHeight: 20)

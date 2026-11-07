@@ -192,9 +192,9 @@ private struct CompanionHeader: View {
         let working = presence.pose == .working && running == 0
         let connected = presence.pose != .paused
         let suffix = companionStatusSuffix(needsYou: needs, crewRunning: running, working: working,
-                                           failed: presence.failure, connected: connected)
+                                           failed: presence.failure, connected: connected, failedChats: model.failedCount)
         let target = companionHeaderPanel(needsYou: needs, running: running, working: working,
-                                          failed: presence.failure, connected: connected)
+                                          failed: presence.failure, connected: connected, failedChats: model.failedCount)
         let companions = model.roster?.companions ?? []
         HStack(spacing: 8) {
             CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
@@ -293,13 +293,19 @@ private struct CompanionSummary: View {
         let needs = model.needsYou
         let activity = model.activity
         let needsText = needsSummary(model.badgeCount)
+        let failed = model.failedChats
+        let failedText = failedSummary(failed.count)
         let activityText = activitySummary(activity)
         Group {
-            if needsText != nil || activityText != nil {
+            if needsText != nil || failedText != nil || activityText != nil {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         if let needsText {
                             capsule(.needs, icon: "exclamationmark.triangle.fill", text: needsText, color: VerdeTheme.warning)
+                        }
+                        // B1: unseen failures get their own red pill beside "needs you".
+                        if let failedText {
+                            capsule(.failed, icon: "xmark.octagon.fill", text: failedText, color: VerdeTheme.danger)
                         }
                         if let activityText {
                             capsule(.activity, icon: "circle.fill", text: activityText,
@@ -310,6 +316,12 @@ private struct CompanionSummary: View {
                     if expanded == .needs && !needs.isEmpty {
                         list(needs.map { item in
                             SummaryRow(id: item.id, color: VerdeTheme.warning, title: item.title,
+                                       detail: item.workspaceLabel ?? item.reason, label: item.reason,
+                                       route: .thread(workspace: item.workspaceID, thread: item.threadID))
+                        })
+                    } else if expanded == .failed && !failed.isEmpty {
+                        list(failed.map { item in
+                            SummaryRow(id: item.id, color: VerdeTheme.danger, title: item.title,
                                        detail: item.workspaceLabel ?? item.reason, label: item.reason,
                                        route: .thread(workspace: item.workspaceID, thread: item.threadID))
                         })
@@ -328,6 +340,7 @@ private struct CompanionSummary: View {
         }
         // Outside the `if` so a panel whose capsule vanished closes even while the strip is gone.
         .onChange(of: needsText == nil) { _, hidden in if hidden && expanded == .needs { expanded = nil } }
+        .onChange(of: failedText == nil) { _, hidden in if hidden && expanded == .failed { expanded = nil } }
         .onChange(of: activityText == nil) { _, hidden in if hidden && expanded == .activity { expanded = nil } }
     }
 

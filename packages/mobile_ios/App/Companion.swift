@@ -555,10 +555,18 @@ func needsYouItems(attention: AttentionView?, home: HomeView?, workspaces: Works
         NeedsYouItem(workspaceID: workspace, threadID: thread, title: title.isEmpty ? "Untitled chat" : title,
                      workspaceLabel: labels[workspace], reason: reason)
     }
-    // S39: the core's lists only (C11): what needs you, then the unseen failures listed beside it.
+    // S39: the core's list only (C11). Unseen failures have their own list (`failedItems`).
     guard let attention else { return [] }
     return attention.needs.map { item($0.workspace_id, $0.thread_id, $0.title, needReason($0.kind)) }
-        + attention.failed.map { item($0.workspace_id, $0.thread_id, $0.title, "Failed") }
+}
+
+/// B1: the core's unseen failures (C11), listed under the companion's "1 failed" pill.
+func failedItems(attention: AttentionView?, workspaces: WorkspacesView?) -> [NeedsYouItem] {
+    let labels = Dictionary((workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
+    return (attention?.failed ?? []).map {
+        NeedsYouItem(workspaceID: $0.workspace_id, threadID: $0.thread_id, title: $0.title.isEmpty ? "Untitled chat" : $0.title,
+                     workspaceLabel: labels[$0.workspace_id], reason: "Failed")
+    }
 }
 
 /// The badge count: the core's `needs_you` (failures are listed, never counted).
@@ -739,10 +747,12 @@ enum SummaryTone: Equatable { case attention, busy, failure, quiet }
 
 /// The header's short status suffix ("· working"). What waits on you shows once, in the strip's
 /// "needs you" capsule below, never in the header too (I11-3, U1 iPad).
-func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool) -> (text: String, tone: SummaryTone) {
+func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool, failedChats: Int = 0) -> (text: String, tone: SummaryTone) {
     if !connected { return ("offline", .quiet) }
     // Pass 16: the status says something waits; the strip's capsule carries the count.
     if needsYou > 0 { return ("needs you", .attention) }
+    // B1: an unseen failure is never "ready".
+    if failedChats > 0 { return ("a chat failed", .failure) }
     if failed { return ("needs a look", .failure) }
     if working { return ("working", .busy) }
     if crewRunning > 0 { return ("\(crewRunning) running", .busy) }
@@ -750,13 +760,17 @@ func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, faile
 }
 
 /// The summary strip's expandable panels.
-enum CompanionPanel: Equatable { case needs, activity }
+enum CompanionPanel: Equatable { case needs, failed, activity }
+
+/// "1 failed", "2 failed"; nil hides the pill (B1).
+func failedSummary(_ count: Int) -> String? { count > 0 ? "\(count) failed" : nil }
 
 /// The panel the header's count opens; nil when the suffix shows no count. Mirrors
 /// `companionStatusSuffix`, so every count in the header has a capsule to expand.
-func companionHeaderPanel(needsYou: Int, running: Int, working: Bool, failed: Bool, connected: Bool) -> CompanionPanel? {
+func companionHeaderPanel(needsYou: Int, running: Int, working: Bool, failed: Bool, connected: Bool, failedChats: Int = 0) -> CompanionPanel? {
     if !connected { return nil }
     if needsYou > 0 { return .needs }
+    if failedChats > 0 { return .failed }
     if failed || working { return nil }
     return running > 0 ? .activity : nil
 }

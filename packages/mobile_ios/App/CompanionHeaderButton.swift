@@ -82,15 +82,16 @@ private struct CompanionHeaderFace: View {
 
     var body: some View {
         let badge = entry.model.badgeCount
+        let failed = entry.model.failedCount
         face
-            .overlay(alignment: .topTrailing) { badgeView(badge) }
+            .overlay(alignment: .topTrailing) { badgeView(badge, failed: failed) }
             .frame(width: 44, height: 44)
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { value in changed(value) }
                 .onEnded { value in ended(value) })
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
+            .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge, failed: failed))
             .accessibilityValue(accessibilityValue)
             .accessibilityHint(entry.live.active ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
             .accessibilityAddTraits(.isButton)
@@ -122,8 +123,13 @@ private struct CompanionHeaderFace: View {
         .frame(width: d, height: d)
     }
 
-    @ViewBuilder private func badgeView(_ badge: Int) -> some View {
-        if badge > 0 {
+    @ViewBuilder private func badgeView(_ badge: Int, failed: Int) -> some View {
+        if badge == 0 && failed > 0 {
+            Circle().fill(VerdeTheme.danger).frame(width: 10, height: 10)
+                .overlay(Circle().stroke(VerdeTheme.panel, lineWidth: 1.5))
+                .offset(x: 1, y: 1)
+                .accessibilityHidden(true)
+        } else if badge > 0 {
             Text(badge > 99 ? "99+" : "\(badge)")
                 .font(VerdeTheme.ui(10, bold: true)).foregroundStyle(Color.white)
                 .padding(.horizontal, 4).frame(minWidth: 17, minHeight: 17)

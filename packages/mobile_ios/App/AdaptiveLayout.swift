@@ -232,7 +232,10 @@ struct CompanionDock: View {
                 Button(action: toggle) {
                     HStack(spacing: 8) {
                         CompanionAvatar(character: active.character, pose: model.presence.pose, failure: model.presence.failure, width: 28)
-                            .overlay(alignment: .topTrailing) { if badge > 0 { badgeView(badge) } }
+                            .overlay(alignment: .topTrailing) {
+                                if badge > 0 { badgeView(badge) }
+                                else if model.failedCount > 0 { Circle().fill(VerdeTheme.danger).frame(width: 9, height: 9).offset(x: 3, y: -3) }
+                            }
                         VStack(alignment: .leading, spacing: 0) {
                             Text(active.name).font(VerdeTheme.ui(13, bold: true)).lineLimit(1)
                             status
@@ -244,7 +247,7 @@ struct CompanionDock: View {
                 }
                 .buttonStyle(.plain)
                 .contextMenu { Button("Settings", action: settings) }
-                .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
+                .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge, failed: model.failedCount))
                 .accessibilityValue(model.presence.status)
                 .accessibilityAddTraits(open ? .isSelected : [])
                 .accessibilityAction(named: "Settings", settings)

@@ -81,6 +81,10 @@ final class CompanionModel {
         return needsYouItems(attention: state.attention, home: state.home, workspaces: state.workspaces)
     }
 
+    /// B1: unseen failures (the core's, C11): listed beside what needs you, never in the badge.
+    var failedChats: [NeedsYouItem] { failedItems(attention: browse.state.attention, workspaces: browse.state.workspaces) }
+    var failedCount: Int { Int(browse.state.attention?.failed_count ?? 0) }
+
     /// The sheet's activity panel: crew plus every other chat running on the machine.
     var activity: [ActivityItem] {
         let state = browse.state
