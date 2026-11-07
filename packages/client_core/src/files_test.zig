@@ -188,3 +188,12 @@ test "audio probes byte ranges without embedding credentials in the player URL" 
     _ = try f.respond(fetch, 206, null);
     try eql("succeeded", f.op(opened.id).state);
 }
+
+test "HTML previews use attachments with a bounded body" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const opened = try f.open("/home/u/story/index.html", "html", 4096);
+    const fetch = find(opened.batch, "file_fetch").?;
+    try expect(fetch.object.get("max_response_bytes").?.integer == 4096);
+    try eql("https://host.example/api/file?download=1&path=/home/u/story/index.html", fetch.object.get("url").?.string);
+}

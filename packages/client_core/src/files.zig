@@ -24,7 +24,7 @@ const PREVIEW_TIMEOUT_MS: u32 = 120_000;
 /// never to an unbounded memory buffer. Older hosts can still answer HTTP 413.
 /// `download` fetches the original bytes as an attachment, which the gateway
 /// also allows for types it refuses to serve inline (HTML, SVG, scripts).
-pub const Kind = enum { file, preview, theme, download, audio };
+pub const Kind = enum { file, preview, theme, download, audio, html };
 const Fetch = struct {
     intent_id: []const u8,
     path: []const u8,
@@ -121,7 +121,7 @@ fn send(tx: *h.Transaction, f: Fetch) E![]const u8 {
     try url.appendSlice(a, switch (f.kind) {
         .preview => "/api/preview?path=",
         .file => "/api/file?path=",
-        .download, .audio => "/api/file?download=1&path=",
+        .download, .audio, .html => "/api/file?download=1&path=",
         .theme => "/api/theme",
     });
     for (if (f.kind == .theme) "" else f.path) |c| {

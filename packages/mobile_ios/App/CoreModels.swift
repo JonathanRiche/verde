@@ -7923,6 +7923,7 @@ enum FileKind: String, Codable {
     case `theme`
     case `download`
     case `audio`
+    case `html`
 }
 
 enum AttentionStatus: String, Codable {
