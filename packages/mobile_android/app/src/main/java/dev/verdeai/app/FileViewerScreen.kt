@@ -39,6 +39,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -116,7 +118,7 @@ internal fun FileViewerScreen(
     }
     val subtitle = target?.let { if (it.end != null && it.end > it.line) "Lines ${it.line}–${it.end}" else "Line ${it.line}" }
     FileScaffold(title, subtitle, onBack, actions = {
-        if (toggle != null) TextButton(onClick = { formatted = !formatted; if (model.kind == ViewerKind.Html) ViewerPreferences.htmlPreview = formatted }, modifier = Modifier.heightIn(min = 48.dp).named(if (formatted) "Show source" else "Preview")) { Text(toggle) }
+        if (toggle != null) TextButton(onClick = { formatted = !formatted; if (model.kind == ViewerKind.Html) ViewerPreferences.htmlPreview = formatted }, modifier = Modifier.heightIn(min = 48.dp).pointerHoverIcon(PointerIcon.Hand).named(if (formatted) "Show source" else "Preview")) { Text(toggle) }
         if (model.path != null && state.problem != FileProblem.GatewayTooLarge) {
             if (saving) CircularProgressIndicator(Modifier.padding(12.dp).size(24.dp).testTag("file-saving"), strokeWidth = 2.dp)
             else IconButton(onClick = download, modifier = Modifier.named("Download file")) { Icon(DownloadIcon, contentDescription = null) }
@@ -135,11 +137,11 @@ internal fun FileViewerScreen(
                         is FileContent.Audio -> AudioFile(content.body)
                         is FileContent.Html -> if (formatted) HtmlFile(content.source.text) else TextFile(content.source, target)
                         is FileContent.Unsupported -> Centered {
-                            SelectionContainer { Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text("No preview for this file type", style = MaterialTheme.typography.titleMedium)
                                 Text("${entrySize(content.size)} · ${content.type}", textAlign = TextAlign.Center)
                             } }
-                            Button(onClick = download, enabled = !saving) { Text("Download file") }
+                            Button(onClick = download, enabled = !saving, modifier = Modifier.pointerHoverIcon(PointerIcon.Hand)) { Text("Download file") }
                         }
                         is FileContent.Svg -> if (formatted) SvgFile(content.base64) else TextFile(content.source, target)
                         is FileContent.Pdf -> PdfFile(content.document)
@@ -172,7 +174,7 @@ private fun rememberDownload(model: FileViewerModel, name: String): () -> Unit {
     (status as? DownloadStatus.Failed)?.let { failed ->
         val (title, detail) = problemText(failed.problem, model.limit)
         AlertDialog(onDismissRequest = model::downloadShown, title = { Text(title) },
-            text = { SelectionContainer { Text(detail) } },
+            text = { SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Text(detail) } },
             confirmButton = { TextButton(onClick = model::downloadShown) { Text("OK") } })
     }
     val mime = remember(model.path) { model.path?.let(::downloadMime) ?: "application/octet-stream" }
@@ -280,7 +282,7 @@ private fun PartialBanner(partial: FilePartial, onDownload: (() -> Unit)?, savin
 private fun ProblemState(problem: FileProblem, limit: Long, onRetry: (() -> Unit)?, onDownload: (() -> Unit)?, saving: Boolean) {
     val (title, detail) = problemText(problem, limit)
     Centered {
-        SelectionContainer { Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(title, Modifier.testTag(FILE_PROBLEM_TAG), style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
             Spacer(Modifier.height(8.dp))
             Text(detail, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -451,15 +453,15 @@ private fun AudioFile(body: dev.verdeai.core.FileBody) {
         while (playing) { position = player.currentPosition.toFloat(); delay(250) }
     }
     Centered {
-        if (failed) SelectionContainer { Text("Can't play this audio file. Download it to open it in another app.") }
+        if (failed) SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Text("Can't play this audio file. Download it to open it in another app.") }
         else {
             Button(enabled = ready, onClick = {
                 if (playing) player.pause() else { if (position >= duration) player.seekTo(0); player.start() }
                 playing = !playing
-            }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (playing) "Pause" else "Play") }
+            }, modifier = Modifier.heightIn(min = 48.dp).pointerHoverIcon(PointerIcon.Hand)) { Text(if (playing) "Pause" else "Play") }
             Slider(value = position.coerceIn(0f, duration), onValueChange = { position = it; player.seekTo(it.toInt()) },
-                valueRange = 0f..duration, enabled = ready, modifier = Modifier.named("Playback position"))
-            SelectionContainer { Text("${audioTime(position.toLong())} / ${audioTime(duration.toLong())}") }
+                valueRange = 0f..duration, enabled = ready, modifier = Modifier.named("Playback position").pointerHoverIcon(PointerIcon.Hand))
+            SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Text("${audioTime(position.toLong())} / ${audioTime(duration.toLong())}") }
         }
     }
 }
@@ -473,7 +475,7 @@ internal fun isolatedHtml(source: String) = """<!doctype html><meta charset="utf
 private fun HtmlFile(source: String) {
     val html = remember(source) { isolatedHtml(source) }
     Column(Modifier.fillMaxSize()) {
-        SelectionContainer { Text("Linked files aren't loaded", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
+        SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Text("Linked files aren't loaded", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
         AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { context ->
             WebView(context).apply {
                 settings.javaScriptEnabled = true
