@@ -57,6 +57,25 @@ class KeyboardTraversalTest {
         listOf("row2", "row1", "row0", "host", "drawer").forEach { tag -> tab(true); compose.onNodeWithTag(tag).assertIsFocused() }
     }
 
+    @Test fun bubbleJoinsTheCycleAndReverseReturnsToTheLastRow() {
+        val header = FocusRequester(); val body = FocusRequester(); val bubble = FocusRequester()
+        compose.setContent {
+            Column {
+                Row(Modifier.focusRequester(header).keyboardRegion(body, bubble)) {
+                    Button({}, Modifier.testTag("drawer")) { Text("Drawer") }
+                    Button({}, Modifier.testTag("host")) { Text("Host") }
+                }
+                Column(Modifier.focusRequester(body).keyboardRegion(bubble)) {
+                    repeat(2) { i -> Button({}, Modifier.testTag("row$i")) { Text("Chat $i") } }
+                }
+                Text("Bubble", Modifier.focusRequester(bubble).keyboardBridge(header).focusable().testTag("bubble"))
+            }
+        }
+        compose.runOnIdle { header.requestFocus() }
+        listOf("host", "row0", "row1", "bubble", "drawer").forEach { tag -> tab(); compose.onNodeWithTag(tag).assertIsFocused() }
+        listOf("bubble", "row1", "row0", "host", "drawer").forEach { tag -> tab(true); compose.onNodeWithTag(tag).assertIsFocused() }
+    }
+
     @Test fun composerTabLeavesForHeaderAndReverseReturnsToLastControl() {
         val header = FocusRequester(); val composer = FocusRequester(); val field = FocusRequester(); val actions = FocusRequester()
         compose.setContent {

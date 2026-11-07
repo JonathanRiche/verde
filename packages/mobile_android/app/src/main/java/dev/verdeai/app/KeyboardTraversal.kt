@@ -5,6 +5,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.input.key.*
 
 /** Link regions before Compose wraps its search inside a navigation destination. Keep the entry
  * direction: returning a group requester from the old exit API always enters its first child. */
@@ -24,3 +25,10 @@ internal fun Modifier.keyboardRegion(next: FocusRequester, previous: FocusReques
             if (target != FocusRequester.Default) runCatching { target.requestFocus(direction) }
         }
     }.focusGroup()
+
+/** Link forward to the header; native reverse search enters the preceding group's last child. */
+internal fun Modifier.keyboardBridge(next: FocusRequester): Modifier = onPreviewKeyEvent { event ->
+    val tab = event.key == Key.Tab && event.type == KeyEventType.KeyDown && !event.isShiftPressed
+    if (tab) runCatching { next.requestFocus() }
+    tab
+}

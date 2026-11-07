@@ -377,13 +377,14 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
     val hasShellHeader = !pairing && route in TABS
     var shellHolds by remember { mutableStateOf(false) }
+    var shellHasFocus by remember { mutableStateOf(false) }
     LaunchedEffect(shellFocus) { shellFocus.requestFocus() }
     Box(Modifier.fillMaxSize().focusRequester(shellFocus.requester)
         .focusProperties { canFocus = shellFocus.parked }
-        .onFocusChanged { shellHolds = it.isFocused }
+        .onFocusChanged { shellHolds = it.isFocused; shellHasFocus = it.hasFocus }
         .onPreviewKeyEvent { event ->
             // A7-3: the first Tab after a touch (the shell holds focus) goes to the first control.
-            if ((shellHolds || shellFocus.pendingPark) && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
+            if ((shellHolds || shellFocus.pendingPark || !shellHasFocus) && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
                 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
                 // Request a real region, not Enter on the parking target (which can stay empty).
                 inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard)
@@ -443,9 +444,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     }
     if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
         companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
-        focusModifier = Modifier.focusRequester(bubbleFocus).focusProperties {
-            if (hasShellHeader) { next = headerFocus; previous = contentFocus }
-        },
+        focusModifier = Modifier.focusRequester(bubbleFocus)
+            .then(if (hasShellHeader) Modifier.keyboardBridge(headerFocus) else Modifier),
         onOpen = { companionSettings = false; companionOpen = true })
     // Last, so it floats above every screen, the drawer and the bubble.
     if (callUp) LiveShellBar(liveBar, statusTop)
