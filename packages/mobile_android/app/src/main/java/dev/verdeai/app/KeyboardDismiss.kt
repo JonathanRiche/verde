@@ -6,6 +6,12 @@ import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.withFrameNanos
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.geometry.Offset
@@ -21,7 +27,15 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 internal val LocalDismissKeyboard = compositionLocalOf<(() -> Unit)?> { null }
 
 /** The app shell's own focus target (A6-2): where focus rests when no control holds it. */
-internal val LocalShellFocus = compositionLocalOf<androidx.compose.ui.focus.FocusRequester?> { null }
+internal class ShellFocus(private val scope: CoroutineScope) {
+    val requester = androidx.compose.ui.focus.FocusRequester()
+    var parked by mutableStateOf(true)
+    fun requestFocus() {
+        parked = true
+        scope.launch { withFrameNanos { }; runCatching { requester.requestFocus() } }
+    }
+}
+internal val LocalShellFocus = compositionLocalOf<ShellFocus?> { null }
 
 @Composable
 internal fun rememberKeyboardDismiss(): () -> Unit {

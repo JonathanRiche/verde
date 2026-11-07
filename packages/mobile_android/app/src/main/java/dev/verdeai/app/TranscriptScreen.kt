@@ -205,10 +205,13 @@ internal fun TranscriptScreen(
     val jump = remember { TranscriptJump() }
     // A8-6: where Shift+Tab lands when it leaves the top of the transcript (the header's last control).
     val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val headerEntry = remember { androidx.compose.ui.focus.FocusRequester() }
+    val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val tabletop = rememberTabletopHinge()
     val columnBounds = remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().then(if (tabletop != null) Modifier.onGloballyPositioned { columnBounds.value = it.boundsInWindow() } else Modifier)) {
+        Box(Modifier.focusRequester(headerEntry).keyboardRegion(composerFocus)) {
         VerdeTopBar(
             title = {
                 // S10: [back] [drawer] title over the provider's name … [companion] [⋯], the same on every launch.
@@ -252,6 +255,7 @@ internal fun TranscriptScreen(
                     }
                 }
             })
+        }
         gitChanges?.let { GitChangesHeader(it) }
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
@@ -262,7 +266,6 @@ internal fun TranscriptScreen(
         // skips to the composer; Shift+Tab from the composer comes back into the transcript at the
         // newest row. Inside, Tab walks every control (Copy code, tool rows, Copy output) and goes
         // on to the composer instead of wrapping back to the header.
-        val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
         val newestFocus = remember { androidx.compose.ui.focus.FocusRequester() }
         val groupTab = remember { GroupTabHolder() }
         val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
@@ -291,6 +294,16 @@ internal fun TranscriptScreen(
             .onFocusChanged { transcriptFocused = it.hasFocus }
             .focusProperties {
                 @Suppress("DEPRECATION") @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                // The list reverses Tab's search direction. Redirect at its boundary before
+                // the search wraps back into the destination and loses the header.
+                exit = { direction ->
+                    when (direction) {
+                        androidx.compose.ui.focus.FocusDirection.Next -> headerFocus
+                        androidx.compose.ui.focus.FocusDirection.Previous -> composerFocus
+                        else -> androidx.compose.ui.focus.FocusRequester.Default
+                    }
+                }
+                @Suppress("DEPRECATION") @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
                 enter = { direction ->
                     if (direction == androidx.compose.ui.focus.FocusDirection.Next) composerFocus
                     else androidx.compose.ui.focus.FocusRequester.Default
@@ -305,8 +318,6 @@ internal fun TranscriptScreen(
         }
         // A8-6: Shift+Tab from the composer's first control goes into the transcript at the newest
         // message (not the oldest one on screen); within the composer it moves back as usual.
-        val backScope = rememberCoroutineScope()
-        var composerFocused by remember { mutableStateOf(false) }
         // F7: half-opened with a horizontal fold (tabletop), the transcript ends at the hinge and the
         // composer and its controls sit below it; nothing crosses the fold.
         val lower = tabletop?.let { (hingeTop, hingeBottom) ->
@@ -319,19 +330,7 @@ internal fun TranscriptScreen(
         Column(if (lower != null) Modifier.fillMaxWidth().height(lower.second) else Modifier.fillMaxWidth()) {
         // U1: running background commands stay in view above the composer.
         state.thread?.background_tasks?.takeIf { it.isNotEmpty() }?.let { tasks -> RunningTasksBar(tasks) { jump.target = it } }
-        Box(Modifier.fillMaxWidth().onFocusChanged { composerFocused = it.hasFocus }.onPreviewKeyEvent { event ->
-            val back = event.key == androidx.compose.ui.input.key.Key.Tab && event.isShiftPressed &&
-                event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
-            if (back) {
-                focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Previous)
-                backScope.launch {
-                    withFrameNanos { }
-                    withFrameNanos { }
-                    if (!composerFocused) runCatching { newestFocus.requestFocus() }
-                }
-            }
-            back
-        }.focusGroup()) {
+        Box(Modifier.fillMaxWidth().keyboardRegion(headerEntry, newestFocus)) {
             CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
         }
         }

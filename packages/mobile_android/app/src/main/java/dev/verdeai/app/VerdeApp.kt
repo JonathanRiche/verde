@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusTarget
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -360,17 +361,22 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // A6-2: when no control has focus (a tap on the transcript, a closed dialog), the shell itself
     // holds it, so a stray Space or Enter does nothing instead of giving the first control (Back,
     // the drawer button) focus and pressing it. Tab still moves on to the first control.
-    val shellFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val shellFocus = remember { ShellFocus(scope) }
+    val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val contentFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val hasShellHeader = !pairing && route in TABS
     var shellHolds by remember { mutableStateOf(false) }
-    val shellFocusManager = androidx.compose.ui.platform.LocalFocusManager.current
-    LaunchedEffect(shellFocus) { withFrameNanos { }; runCatching { shellFocus.requestFocus() } }
-    Box(Modifier.fillMaxSize().focusRequester(shellFocus)
+    LaunchedEffect(shellFocus) { shellFocus.requestFocus() }
+    Box(Modifier.fillMaxSize().focusRequester(shellFocus.requester)
+        .focusProperties { canFocus = shellFocus.parked }
         .onFocusChanged { shellHolds = it.isFocused }
         .onPreviewKeyEvent { event ->
             // A7-3: the first Tab after a touch (the shell holds focus) goes to the first control.
             if (shellHolds && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
                 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
-                shellFocusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Enter)
+                // Request a real region, not Enter on the parking target (which can stay empty).
+                runCatching { (if (hasShellHeader) headerFocus else contentFocus).requestFocus() }
+                shellFocus.parked = false
                 return@onPreviewKeyEvent true
             }
             // Enter would otherwise "enter" the shell and land on its first control.
@@ -391,7 +397,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         Scaffold(
             contentWindowInsets = contentWindowInsets(tier, panes),
             topBar = {
-                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()) {
+                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding().focusRequester(headerFocus)
+                    .keyboardRegion(contentFocus)) {
                     // S28: one logo: beside the full sidebar (which carries it) the content bar has none.
                     VerdeTopBar(title = { if (panes.sidebar != SidebarMode.Full) VerdeWordmark() },
                         navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.named("Open workspace drawer")) {
@@ -411,7 +418,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 }
             },
         ) { padding ->
-            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding).focusRequester(contentFocus)
+                .keyboardRegion(if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
                     LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
                     LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {

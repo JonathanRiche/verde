@@ -20,6 +20,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -449,7 +450,8 @@ private fun BrowseFrame(
         }
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
             // Top-level lists keep their last rows clear of the New chat button and the companion bubble (S1).
-            LazyColumn(Modifier.fillMaxSize().testTag(BROWSE_LIST),
+            // The scroll container is not a keyboard stop; its rows are.
+            LazyColumn(Modifier.fillMaxSize().focusProperties { canFocus = false }.testTag(BROWSE_LIST),
                 contentPadding = PaddingValues(bottom = if (band) BOTTOM_BAND + 8.dp else 16.dp)) {
                 if (onBack == null) item(key = "title") {
                     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp)) {
