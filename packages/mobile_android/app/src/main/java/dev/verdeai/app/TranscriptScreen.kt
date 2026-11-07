@@ -449,7 +449,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
             jump.highlight = id
             scope.launch { kotlinx.coroutines.delay(2_500); if (jump.highlight == id) jump.highlight = null }
             // S41: the row lands clear of the Latest strip that appears once the list leaves the bottom.
-            runCatching { list.animateScrollToItem(index, -with(density) { 72.dp.roundToPx() }) }
+            runCatching { list.showBackgroundTask(index, with(density) { 12.dp.roundToPx() }) }
         }
         jump.target = null
     }
@@ -506,6 +506,11 @@ private fun PageHeader(page: ChatPage?, model: TranscriptModel) {
             else -> Text("Start of conversation", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         }
     }
+}
+
+/** A negative logical offset insets a row from the physical bottom in this reversed list. The strip/bar are outside it. */
+internal suspend fun LazyListState.showBackgroundTask(index: Int, bottomGap: Int) {
+    animateScrollToItem(index, -bottomGap)
 }
 
 /** A8-6: focus for the newest transcript row (Shift+Tab from the composer lands there). */

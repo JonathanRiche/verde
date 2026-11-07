@@ -118,9 +118,8 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
     if (tasks.isEmpty()) return
     val colors = MaterialTheme.colorScheme
     val title = runningTasksLabel(tasks.size)
-    val labels = tasks.joinToString(" · ") { backgroundSpokenLabel(it.label) }
     // S41: the iOS bar: full width, outlined, the task titles, a chevron to its row.
-    // A7-9: the label shows the commands; the accessible name stays short (the count only).
+    // Keep commands in the task details; the pinned bar summarizes the work.
     val shape = RoundedCornerShape(10.dp)
     Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(shape)
         .background(VerdeColors.Panel, shape).border(1.dp, colors.outlineVariant, shape)
@@ -128,9 +127,7 @@ internal fun RunningTasksBar(tasks: List<ChatBackgroundTask>, onJump: (String) -
         .nameOnly(title).padding(horizontal = 16.dp).testTag(RUNNING_TASKS_BAR),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         RunningDot(colors.primary)
-        Text(title, style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)
-        Text(labels, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall.copy(fontFamily = VerdeMono),
-            color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = colors.onSurface, maxLines = 1)
         Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = VerdeColors.Muted, modifier = Modifier.size(20.dp))
     }
 }
