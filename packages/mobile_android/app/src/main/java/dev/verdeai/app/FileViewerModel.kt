@@ -22,9 +22,8 @@ import java.io.Closeable
 import java.util.UUID
 
 /**
- * D-12 file viewer. Bytes come from the core's authenticated `file_open` fetch (the host's bearer
- * and TLS pin) and live only in this model's memory: never written to disk, cached, logged or
- * backed up. PDFs are handed to [PdfRenderer] through an anonymous in-memory file (memfd).
+ * D-12 file viewer. Bytes come from the core's authenticated `file_open` fetch (the host's bearer and TLS pin). Bounded previews stay in memory; downloads use private temporary
+ * files, and range-capable hosts supply native audio through bounded reads. PDFs are handed to [PdfRenderer] through an anonymous in-memory file (memfd).
  * The one exception is an explicit Download, which writes the original bytes only to the
  * document the user picked in the system file picker.
  */
@@ -338,6 +337,7 @@ internal class FileViewerModel(
             } catch (e: CancellationException) { withContext(NonCancellable + Dispatchers.IO) { runCatching(discard) }; throw e }
                 catch (_: Exception) { DownloadStatus.Failed(FileProblem.Failed) }
             if (next is DownloadStatus.Failed) withContext(Dispatchers.IO) { runCatching(discard) }
+            if (next is DownloadStatus.Failed && next.problem == FileProblem.GatewayTooLarge) replace(FileViewState(loading = false, problem = FileProblem.GatewayTooLarge))
             mutableDownload.value = next
         }
     }

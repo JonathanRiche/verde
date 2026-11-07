@@ -162,11 +162,16 @@ private fun rememberDownload(model: FileViewerModel, name: String): () -> Unit {
     LaunchedEffect(status) {
         val message = when (val current = status) {
             DownloadStatus.Saved -> "Saved $name"
-            is DownloadStatus.Failed -> downloadFailureText(current.problem)
             else -> null
         } ?: return@LaunchedEffect
         Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
         model.downloadShown()
+    }
+    (status as? DownloadStatus.Failed)?.let { failed ->
+        val (title, detail) = problemText(failed.problem, model.limit)
+        AlertDialog(onDismissRequest = model::downloadShown, title = { Text(title) },
+            text = { SelectionContainer { Text(detail) } },
+            confirmButton = { TextButton(onClick = model::downloadShown) { Text("OK") } })
     }
     val mime = remember(model.path) { model.path?.let(::downloadMime) ?: "application/octet-stream" }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(mime)) { uri: Uri? ->
@@ -214,7 +219,7 @@ private fun Centered(content: @Composable ColumnScope.() -> Unit) {
 internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String> = when (problem) {
     FileProblem.Storage -> "Couldn't save the file" to "The phone could not save this file. Check its free space and try again."
     FileProblem.GatewayTooLarge -> "Too large to open" to "This file is too large to open on your phone (over 32 MB). Open it on your computer."
-    FileProblem.TooLarge -> "Too large to preview" to "This file is over the ${sizeLabel(limit)} limit for viewing on the phone. Download it or open it on the host."
+    FileProblem.TooLarge -> "Too large to preview" to "This file is over the ${sizeLabel(limit)} limit for viewing on the phone. Download it or open it on your computer."
     FileProblem.Forbidden -> "No access" to "The host refused access. Check its shared workspaces and this phone's file permissions."
     FileProblem.NotFound -> "File not found" to "It may have been moved or deleted on the host."
     FileProblem.Offline -> "Can't reach the host" to "Check your connection and try again."
