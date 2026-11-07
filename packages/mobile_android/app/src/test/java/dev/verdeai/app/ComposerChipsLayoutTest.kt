@@ -127,13 +127,14 @@ class ComposerChipsLayoutTest {
             CompositionLocalProvider(LocalDensity provides Density(density.density, scale)) {
                 VerdeTheme {
                     // The phone card has 8dp outer +12dp inner padding on each side. Send owns
-                    // another 48dp plus its 4dp gap, which a SettingsControls-only test misses.
+                    // another 48dp plus its 4dp gap. Typed Steer also keeps Stop beside Send.
                     Row(Modifier.requiredWidth((width - 40).dp), verticalAlignment = Alignment.Bottom,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         Box(Modifier.weight(1f)) {
                             SettingsControls(view(codex), state(steer), if (codex) "codex" else "claude",
                                 leading = { Box(Modifier.size(48.dp).testTag("attach")) }) {}
                         }
+                        if (steer && codex) Box(Modifier.size(48.dp).testTag("stop"))
                         Box(Modifier.size(48.dp).testTag("send"))
                     }
                 }
@@ -144,13 +145,15 @@ class ComposerChipsLayoutTest {
                 width = w; scale = s; codex = provider; steer = working; compose.waitForIdle()
                 val attach = compose.onNodeWithTag("attach").getUnclippedBoundsInRoot()
                 val send = compose.onNodeWithTag("send").getUnclippedBoundsInRoot()
+                val actionsLeft = if (working && provider) compose.onNodeWithTag("stop").getUnclippedBoundsInRoot().left else send.left
                 val kinds = if (provider) listOf("Model", "Effort", "Speed", "Access") else listOf("Model", "Effort", "Access")
                 for (kind in kinds) {
                     val node = compose.onNodeWithContentDescription("$kind:", substring = true)
                     val bounds = node.getUnclippedBoundsInRoot()
                     node.assertTouchHeightIsEqualTo(48.dp).assertTouchWidthIsEqualTo(maxOf(48.dp, bounds.width))
-                    assertTrue("$kind stays before Send at $w/$s", bounds.right <= send.left && bounds.left >= attach.left)
-                    if (s == 1f) assertTrue("One row at $w/$s, codex=$provider, steer=$working: $bounds",
+                    assertTrue("$kind stays before actions at $w/$s", bounds.right <= actionsLeft && bounds.left >= attach.left)
+                    // At 360dp, seven 48dp targets (Attach, four chips, Stop, Send) need two rows.
+                    if (s == 1f && (w == 411 || !provider || !working)) assertTrue("One row at $w/$s, codex=$provider, steer=$working: $bounds",
                         kotlin.math.abs((bounds.top + bounds.bottom - send.top - send.bottom).value) < 1f)
                 }
                 val model = compose.onNode(hasText(if (provider) "GPT" else "Opu", substring = true), useUnmergedTree = true)
