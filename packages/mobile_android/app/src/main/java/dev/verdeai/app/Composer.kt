@@ -693,7 +693,9 @@ internal fun modelChoices(c: ChatCatalogs): List<ChatChoice> {
 /** The id the picker marks for [selected]: a hidden duplicate of the default selects the default row. */
 internal fun modelCurrent(c: ChatCatalogs, selected: String?): String? {
     val shown = modelChoices(c)
-    return selected?.takeIf { id -> shown.any { it.id == id } } ?: shown.firstOrNull { isDefaultChoice(it.id) }?.id ?: selected ?: c.models.firstOrNull()?.id
+    return selected?.takeIf { id -> shown.any { it.id == id } }
+        ?: shown.firstOrNull { isDefaultChoice(it.id) }?.id
+        ?: if (isDefaultChoice(selected)) shown.firstOrNull { it.label == c.default_model_label }?.id ?: shown.firstOrNull()?.id else selected
 }
 
 /** S18: the access chip names the mode the chat runs with; an unset one is [DEFAULT_ACCESS]. */

@@ -17,6 +17,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -32,8 +33,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.verdeai.core.*
@@ -58,11 +61,11 @@ internal const val SEARCH_DEBOUNCE_MS = 300L
 
 /** History rows in core order with a header whenever the core's bucket changes. */
 internal fun historySections(items: List<ThreadSummary>, live: Map<Pair<String, String>, ThreadSummary> = emptyMap(),
-    nowMs: Long = System.currentTimeMillis()): List<Pair<String, List<ThreadSummary>>> {
+    nowMs: Long = System.currentTimeMillis(), hidden: Set<String> = emptySet()): List<Pair<String, List<ThreadSummary>>> {
     // A11-3 / A7-2: the same live last activity Home and the drawer show, and the core's own bucket
     // rule applied to it (Today < 1 day < This week < 7 days < Older), so a workspace filter keeps
     // All's ages, order and grouping.
-    val rows = items.filterNot(::subagent).map { raw ->
+    val rows = items.filterNot { subagent(it) || it.thread_id in hidden }.map { raw ->
         val now = live[raw.workspace_id to raw.thread_id]
         val at = maxOf(now?.last_activity_at_ms ?: 0L, raw.last_activity_at_ms ?: 0L).takeIf { it > 0L }
         val bucket = at?.let { historyBucket(nowMs - it) } ?: raw.history_bucket
@@ -147,6 +150,7 @@ private fun LazyListScope.ready(state: BrowseState): Boolean {
 @Composable
 internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThread: (ThreadSummary) -> Unit, onBack: () -> Unit) {
     val state by browse.state.collectAsState()
+    val hidden = LocalHiddenThreads.current
     val history = state.workspaces?.history
     val workspaces = state.workspaces?.items.orEmpty()
     val labels = workspaceLabels(workspaces)
@@ -198,7 +202,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
             }
         }
         if (history == null) return@ManageFrame
-        val sections = historySections(history.items, workspaces.flatMap { it.threads }.associateBy { it.workspace_id to it.thread_id })
+        val sections = historySections(history.items, workspaces.flatMap { it.threads }.associateBy { it.workspace_id to it.thread_id }, hidden = hidden)
         for ((bucket, threads) in sections) {
             section(bucket)
             items(threads, key = { "history:${it.workspace_id}:${it.thread_id}" }) { thread ->
@@ -233,8 +237,9 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
 // ---- New chat ----
 
 @Composable
-internal fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, providerIcons: Boolean = false, onPick: (String) -> Unit) {
+internal fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, providerIcons: Boolean = false, selectedId: String? = null, onPick: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
+    val current = selectedId?.takeIf { id -> choices.any { it.id == id } } ?: choices.firstOrNull { it.label == value }?.id
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Text(label, style = MaterialTheme.typography.labelMedium)
         Box {
@@ -254,6 +259,8 @@ internal fun Picker(label: String, value: String, choices: List<ChatChoice>, ena
                 LiveOverMenu()
                 choices.forEach { choice ->
                     DropdownMenuItem(text = { Text(choice.label) },
+                        modifier = Modifier.semantics { selected = choice.id == current; role = Role.RadioButton },
+                        trailingIcon = if (choice.id == current) ({ Icon(Icons.Filled.Check, contentDescription = null) }) else null,
                         leadingIcon = if (providerIcons) ({ ProviderGlyph(choice.id) }) else null, enabled = choice.enabled, onClick = { open = false; onPick(choice.id) })
                 }
             }
@@ -262,6 +269,17 @@ internal fun Picker(label: String, value: String, choices: List<ChatChoice>, ena
 }
 
 private fun label(choices: List<ChatChoice>, id: String?, fallback: String) = choices.find { it.id == id }?.label ?: id ?: fallback
+
+/** Some providers expose only explicit model IDs. Still name their effective default once. */
+internal fun newChatModelChoices(catalogs: ChatCatalogs, selected: String?): List<ChatChoice> {
+    val choices = modelChoices(catalogs)
+    val hasDefault = choices.any { isDefaultChoice(it.id) }
+    val fallback = modelCurrent(catalogs, selected).takeIf { isDefaultChoice(selected) && catalogs.default_model_label.isNullOrBlank() }
+    return choices.map { choice ->
+        val explicitDefault = !hasDefault && (choice.label == catalogs.default_model_label || choice.id == fallback)
+        choice.copy(label = if (explicitDefault) defaultMarked(choice.label) else pickerRowLabel(ComposerPicker.Model, choice, catalogs))
+    }
+}
 
 @Composable
 internal fun NewChatScreen(
@@ -309,30 +327,32 @@ internal fun NewChatScreen(
         val busy = result == JobOutcome.Pending
         item(key = "workspace") {
             Picker("Workspace", open.find { it.workspace_id == ws }?.label ?: "Workspace",
-                open.map { ChatChoice(it.workspace_id, it.label) }, !busy) { workspaceId = it }
+                open.map { ChatChoice(it.workspace_id, it.label) }, !busy, selectedId = ws) { workspaceId = it }
         }
         item(key = "provider") {
             val providers = chat?.providers.orEmpty()
-            Picker("Provider", label(providers, selection.provider, "Provider"), providers, chat != null && !busy, providerIcons = true) {
+            Picker("Provider", label(providers, selection.provider, "Provider"), providers, chat != null && !busy, providerIcons = true, selectedId = selection.provider) {
                 if (it != selection.provider) manage.select(ws, ChatSelection(provider=it))
             }
         }
         item(key = "model") {
             // S25: no bare "Default": the default model names what it resolves to.
-            val models = modelChoices(catalogs).map { it.copy(label = pickerRowLabel(ComposerPicker.Model, it, catalogs)) }
-            Picker("Model", modelValueLabel(catalogs, selection), models, chat != null && !busy) {
+            val models = newChatModelChoices(catalogs, selection.model)
+            Picker("Model", modelValueLabel(catalogs, selection), models, chat != null && !busy, selectedId = modelCurrent(catalogs, selection.model)) {
                 manage.select(ws, selection.copy(model=it))
             }
         }
         if (catalogs.efforts.isNotEmpty()) item(key = "effort") {
             val efforts = catalogs.efforts.map { it.copy(label = pickerRowLabel(ComposerPicker.Effort, it, catalogs)) }
-            Picker("Effort", effortValueLabel(catalogs, selection), efforts, chat != null && !busy) {
+            Picker("Effort", effortValueLabel(catalogs, selection), efforts, chat != null && !busy,
+                selectedId = selection.effort ?: efforts.firstOrNull { isDefaultChoice(it.id) }?.id) {
                 manage.select(ws, selection.copy(effort=it))
             }
         }
         if (catalogs.access.isNotEmpty()) item(key = "access") {
             Picker("Access", accessChipLabel(catalogs.access, selection.access),
-                catalogs.access.map { it.copy(label = pickerRowLabel(ComposerPicker.Access, it, catalogs)) }, chat != null && !busy) {
+                catalogs.access.map { it.copy(label = pickerRowLabel(ComposerPicker.Access, it, catalogs)) }, chat != null && !busy,
+                selectedId = effectiveAccess(selection.access)) {
                 manage.select(ws, selection.copy(access=it))
             }
         }
