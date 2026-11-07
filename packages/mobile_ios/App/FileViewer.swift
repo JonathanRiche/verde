@@ -27,7 +27,7 @@ struct FileProblem: LocalizedError, Equatable {
         case "host_file_too_large": return hostTooLarge
         case "forbidden": return FileProblem(title: "No access", detail: "The host refused access. Check its shared workspaces and this phone's file permissions.")
         case "not_found": return FileProblem(title: "File not found", detail: "It may have been moved or deleted on the host.")
-        case "too_large": return FileProblem(title: "Too large to open", detail: "This file is over the \(sizeLabel(limit)) limit for viewing on the phone. Open it on the host.")
+        case "too_large": return FileProblem(title: "Too large to preview", detail: "This file is over the \(sizeLabel(limit)) limit for viewing on the phone. Download it or open it on your computer.")
         case "unsupported": return FileProblem(title: "No preview for this file type", detail: "This file type can't be previewed on the phone. Download it to open it in another app.")
         case "invalid_path": return unresolved
         case "preview_unavailable": return FileProblem(title: "No preview available", detail: "Office previews need LibreOffice on the host.")
@@ -375,7 +375,10 @@ struct FileViewer: View {
                 else { write(file.data, name: name) }
             } catch is CancellationError {
             } catch let failure as FileFetchFailure {
-                if !Task.isCancelled { downloadProblem = .download(failure.code, limit: ViewerKind.downloadLimit) }
+                if !Task.isCancelled {
+                    downloadProblem = .download(failure.code, limit: ViewerKind.downloadLimit)
+                    if failure.code == "host_file_too_large" { model.clear(); model.problem = .hostTooLarge }
+                }
             } catch {
                 if !Task.isCancelled { downloadProblem = .unavailable }
             }

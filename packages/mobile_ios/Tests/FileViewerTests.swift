@@ -26,7 +26,7 @@ final class FileViewerTests: XCTestCase {
         XCTAssertTrue(html.contains("default-src 'none'; img-src data:; style-src 'unsafe-inline'"))
         XCTAssertTrue(html.contains("<img alt=\"\" src=\"data:image/svg+xml;base64,"))
         XCTAssertFalse(html.contains("<script"))
-        XCTAssertEqual(FileProblem.of("too_large", limit: 2 * 1024 * 1024).detail, "This file is over the 2 MB limit for viewing on the phone. Open it on the host.")
+        XCTAssertEqual(FileProblem.of("too_large", limit: 2 * 1024 * 1024).detail, "This file is over the 2 MB limit for viewing on the phone. Download it or open it on your computer.")
         XCTAssertEqual(FileProblem.of("unsupported", limit: 1).title, "No preview for this file type")
         XCTAssertEqual(FileProblem.of("timeout", limit: 1).title, "Host took too long")
         XCTAssertEqual(FileProblem.download("too_large", limit: ViewerKind.downloadLimit).title, "Too large to download")
