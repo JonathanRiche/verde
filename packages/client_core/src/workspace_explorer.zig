@@ -202,7 +202,12 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
         return receipt(tx, id, "succeeded", null);
     }
     if (!scoped(&tx.state, "repository:read")) return receipt(tx, id, "failed", failure("scope_denied", "This device can't browse workspace files."));
-    if (!online(&tx.state)) return receipt(tx, id, "failed", failure("offline", "Connect to the host to browse this workspace."));
+    if (!online(&tx.state)) {
+        const code: []const u8 = if (!tx.state.network_available) "offline" else if (tx.state.lifecycle != .foreground) "cancelled" else "connecting";
+        var err = failure(code, "Wait for the host connection, then try again.");
+        err.retryable = true;
+        return receipt(tx, id, "failed", err);
+    }
     if (eq(tag, "workspace_files_list")) {
         const r = try h.decode(ListIntent, a, v);
         const path = std.mem.trimEnd(u8, r.path orelse "", "/");

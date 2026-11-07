@@ -240,3 +240,17 @@ test "file preview reads by root id with transport caps, keeps the newest and cl
     const again = try g.intent("workspace_file_read", .{ .workspace_id = "ws-1", .root = "home", .path = "a" });
     try eql("unsupported", (try g.receipt(again)).@"error".?.code);
 }
+
+test "workspace preview distinguishes a pending handshake from network loss" {
+    for ([_]bool{ true, false }) |network| {
+        var f = try Fixture.init(read_scopes);
+        defer f.deinit();
+        f.host.state.rpc.phase = .handshaking;
+        f.host.state.network_available = network;
+        const id = try f.intent("workspace_file_read", .{ .workspace_id = "ws-1", .root = "home", .path = "narration.mp3" });
+        const op = try f.receipt(id);
+        try eql(if (network) "connecting" else "offline", op.@"error".?.code);
+        try expect(op.@"error".?.retryable);
+        try expect(f.pending("workspace.files.read") == 0);
+    }
+}
