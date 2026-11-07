@@ -54,6 +54,9 @@ class EffectExecutor(
         maxRequests = 256
         maxRequestsPerHost = 256
     }
+    private val fileRequests = ConcurrentHashMap<String, String>()
+    fun discardFile(intentId: String) { files.discard(intentId); fileRequests.remove(intentId)?.let { calls[it]?.cancel() } }
+
     private val calls = ConcurrentHashMap<String, Call>()
     private val sockets = ConcurrentHashMap<String, SocketState>()
     private val socketSequence = AtomicLong()
@@ -255,9 +258,13 @@ class EffectExecutor(
      */
     private fun fileFetch(e: EffectFileFetch) {
         var client: OkHttpClient? = null
-        fun done(status: Int?, error: TransportFailure?) = emit { n, w ->
+        fileRequests[e.intent_id] = e.effect_id
+        fun done(status: Int?, error: TransportFailure?) {
+            fileRequests.remove(e.intent_id, e.effect_id)
+            emit { n, w ->
             EventHttpResponse(now_ms=n, wall_time_ms=w, effect_id=e.effect_id, generation=e.generation,
                 status=status, headers=emptyList(), body_base64=null, error=error)
+            }
         }
         try {
             val url = secureUrl(e.url, e.tls)
