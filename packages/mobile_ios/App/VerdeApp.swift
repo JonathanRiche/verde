@@ -90,6 +90,7 @@ struct RootView: View {
     @State private var lock = AppLock()
     @State private var appearance = AppearanceSettings.shared
     @State private var settings = false
+    @State private var settingsAfterDrawer = false
     /// The user opened Moss: a sheet on narrow windows, a pane on wide ones. Only explicit user
     /// actions set this, so Moss never opens itself and a resize keeps it as it was.
     @State private var companionSheet = false
@@ -119,7 +120,7 @@ struct RootView: View {
                             else { WorkspacesScreen(model: browse, actions: actions) }
                         }
                     }
-                }.accessibilityContentHost(covered: drawer).allowsHitTesting(!drawer)
+                }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
                 .environment(\.companionEntry, companionEntry(dockShown: (panes.tier.docked && panes.showsChats) || panes.mossVisible))
                 .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
@@ -146,19 +147,6 @@ struct RootView: View {
                     .overlay(alignment: .leading) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
                     .offset(x: panes.mossLeading)
                     .adaptivePaneHidden(!panes.mossVisible)
-                }
-                if drawer {
-                    Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { drawer = false }.accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
-                    workspaceDrawer(permanent: false, width: min(380, geometry.size.width * 0.92))
-                    .allowsHitTesting(true).disabled(false).zIndex(2)
-                    .frame(width: min(380, geometry.size.width * 0.92))
-                    .simultaneousGesture(DragGesture(minimumDistance: 20).onEnded { gesture in
-                        // A left swipe dismisses the overlay; vertical drags still scroll its list.
-                        if gesture.translation.width < -60 && abs(gesture.translation.width) > abs(gesture.translation.height) * 1.5 {
-                            drawer = false
-                        }
-                    })
-                    .transition(.move(edge: .leading))
                 }
                 if companion.available {
                     CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: floatingBubble(docked: panes.tier.docked),
@@ -263,11 +251,32 @@ struct RootView: View {
             openRoute(route)
             drawer = false
         }, root: { next in tab = next; path = []; drawer = false }, settings: {
-            drawer = false
             // I11-6: beside a permanent sidebar Settings opens in the content pane like the other tabs.
-            if currentPanes.tier.docked { tab = .settings; path = [] } else { settings = true }
+            if permanent { tab = .settings; path = [] } else { settingsAfterDrawer = true }
+            drawer = false
         },
         permanent: permanent, dock: permanent && companion.available ? AnyView(companionDock) : nil, width: width)
+    }
+
+    /// Keep the custom drawer in a native modal layer, so UIKit navigation wrappers
+    /// behind it are excluded from accessibility along with the SwiftUI content.
+    private var phoneDrawer: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Color.black.opacity(0.5).ignoresSafeArea()
+                    .onTapGesture { drawer = false }
+                    .accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
+                workspaceDrawer(permanent: false, width: min(380, geometry.size.width * 0.92))
+                    .frame(width: min(380, geometry.size.width * 0.92))
+                    .simultaneousGesture(DragGesture(minimumDistance: 20).onEnded { gesture in
+                        if gesture.translation.width < -60 && abs(gesture.translation.width) > abs(gesture.translation.height) * 1.5 {
+                            drawer = false
+                        }
+                    })
+            }
+        }
+        .presentationBackground(.clear)
+        .preferredColorScheme(appearance.resolvedScheme)
     }
 
     private var companionDock: some View {
@@ -323,6 +332,9 @@ struct RootView: View {
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
         .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.active || (live.failure != nil && !companionSheet), covered: lock.covered,
                                 prepare: prepareLiveTarget, present: presentLiveTarget).frame(width: 0, height: 0))
+        .accessibleFullScreenCover(isPresented: $drawer, onDismiss: {
+            if settingsAfterDrawer { settingsAfterDrawer = false; settings = true }
+        }) { phoneDrawer }
         .accessibleSheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
     }
 
