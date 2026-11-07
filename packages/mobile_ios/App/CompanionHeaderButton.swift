@@ -118,7 +118,7 @@ private struct CompanionHeaderFace: View {
         return ZStack {
             Circle().fill(VerdeTheme.panel)
             Circle().stroke(ring, lineWidth: press == .talk || entry.live.active ? 2 : 1)
-            CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.62)
+            CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.62, decorative: true)
         }
         .frame(width: d, height: d)
     }

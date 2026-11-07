@@ -388,7 +388,7 @@ struct WorkspaceActions: View {
             .accessibilityValue(workspaceIconNames[((Int(workspace.icon_index) % 16) + 16) % 16])
             .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier("workspace-identity")
-            .sheet(isPresented: $styling) {
+            .accessibleSheet(isPresented: $styling) {
                 WorkspaceIdentitySheet(workspace: workspace) { icon, color in
                     Task { await manage.identity(workspace.workspace_id, icon: icon, color: color) }
                 }.presentationDetents([.medium, .large])

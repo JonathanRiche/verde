@@ -78,7 +78,7 @@ private struct GitPresentations: ViewModifier {
     let model: GitChangesModel
     func body(content: Content) -> some View {
         content
-            .sheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
+            .accessibleSheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
             .confirmationDialog("Push repository", isPresented: Binding(get: { model.choosePush }, set: { model.choosePush = $0 })) {
                 ForEach(model.repos.filter { $0.has_remote && $0.ahead > 0 }, id: \.root) { repo in
                     Button("\(repo.name) · ↑\(repo.ahead)") { Task { await model.push(root: repo.root) } }

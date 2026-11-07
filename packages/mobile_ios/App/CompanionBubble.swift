@@ -336,7 +336,7 @@ struct CompanionBubbleLayer: View {
             let failed = model.failedCount > 0
             Circle().stroke(failed ? VerdeTheme.danger : running ? VerdeTheme.accent : VerdeTheme.border, lineWidth: failed || running ? 2 : 1)
                 .modifier(Pulse(active: running && !failed, minimum: 0.4))
-            CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.6)
+            CompanionAvatar(character: active.character, pose: presence.pose, failure: presence.failure, width: d * 0.6, decorative: true)
         }
         .frame(width: d, height: d)
     }

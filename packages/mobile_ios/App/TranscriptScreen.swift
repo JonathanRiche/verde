@@ -179,7 +179,7 @@ struct TranscriptBody: View {
             }
             return safeLinkUrl(url.absoluteString) != nil ? .systemAction : .discarded
         })
-        .sheet(item: $file) { request in FileViewer(browse: browse, workspaceID: model.workspaceID, citation: request.citation) }
+        .accessibleSheet(item: $file) { request in FileViewer(browse: browse, workspaceID: model.workspaceID, citation: request.citation) }
     }
 }
 
@@ -254,7 +254,7 @@ private struct BottomOffsetKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
 }
 
-/// Softens the cropped history edge under the Companion's pinned header without moving its tail.
+/// Softens both cropped scroll edges without changing the Companion's viewport or tail spacing.
 private struct CompanionTranscriptFade: ViewModifier {
     let enabled: Bool
     func body(content: Content) -> some View {
@@ -263,6 +263,7 @@ private struct CompanionTranscriptFade: ViewModifier {
                 VStack(spacing: 0) {
                     LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom).frame(height: 18)
                     Color.black
+                    LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom).frame(height: 18)
                 }
             }
         } else { content }
@@ -776,7 +777,7 @@ private struct MessageRow: View {
             .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
         }
         .accessibilityIdentifier("message-row")
-        .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
+        .accessibleSheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
     }
 }
 
@@ -916,7 +917,7 @@ private struct CompactMessageRow: View {
             }
             .frame(maxWidth: mine ? nil : .infinity, alignment: mine ? .trailing : .leading)
             .contextMenu { MessageMenu(text: shown, model: model, selecting: $selecting) }
-            .sheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
+            .accessibleSheet(isPresented: $selecting) { SelectTextSheet(text: renderedPlainText(shown, model: model)) }
             if !mine { Spacer(minLength: 32) }
         }
         .accessibilityElement(children: .combine)

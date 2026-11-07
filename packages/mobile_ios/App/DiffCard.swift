@@ -195,7 +195,7 @@ private struct DiffFileBody: View {
             self.record = record
             render = await renderDiffFile(source, record, path: entry.path)
         }
-        .fullScreenCover(isPresented: $fullScreen) {
+        .accessibleFullScreenCover(isPresented: $fullScreen) {
             if case .parsed(let model) = render {
                 DiffFullScreen(path: entry.path, model: model, initialWrap: wrap, patch: record?.patch)
             }

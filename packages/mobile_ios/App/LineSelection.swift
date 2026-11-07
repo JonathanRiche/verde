@@ -379,7 +379,7 @@ struct SelectionScope<Content: View>: View {
             if roots == nil && !requestedRoots && explorer.files?.loaded != true { requestedRoots = true; explorer.loadRoots() }
         }
         .onChange(of: path) { selection.clear() }
-        .sheet(item: $asking, onDismiss: {
+        .accessibleSheet(item: $asking, onDismiss: {
             if let route = opening { opening = nil; openRoute(route) }
         }) { request in
             AskAgentSheet(picked: request.picked, path: path ?? "", chats: askTargets(workspace?.threads ?? []),

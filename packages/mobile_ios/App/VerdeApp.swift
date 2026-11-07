@@ -157,7 +157,7 @@ struct RootView: View {
                     CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: floatingBubble(docked: panes.tier.docked),
                                          docked: panes.tier.docked, open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
-                        .sheet(isPresented: Binding(get: { companionSheet && !AdaptiveTier(width: windowWidth).docked },
+                        .accessibleSheet(isPresented: Binding(get: { companionSheet && !AdaptiveTier(width: windowWidth).docked },
                                                     // Growing past the threshold hands Moss to the pane; only a dismissal closes it.
                                                     set: { if !$0 && !AdaptiveTier(width: windowWidth).docked { companionSheet = false } })) {
                             companionScreen(docked: false)
@@ -165,7 +165,7 @@ struct RootView: View {
                             .presentationDragIndicator(.visible)
                             .preferredColorScheme(appearance.resolvedScheme)
                         }
-                        .sheet(isPresented: $companionSettings) {
+                        .accessibleSheet(isPresented: $companionSettings) {
                             CompanionSettings(model: companion, browse: browse, focusLiveVoice: companionSettingsLive).preferredColorScheme(appearance.resolvedScheme)
                         }
                 }
@@ -307,7 +307,7 @@ struct RootView: View {
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
         .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.active || (live.failure != nil && !companionSheet), covered: lock.covered,
                                 prepare: prepareLiveTarget, present: presentLiveTarget).frame(width: 0, height: 0))
-        .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
+        .accessibleSheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
     }
 
     private var themeRefreshKey: String {
@@ -466,11 +466,12 @@ struct RootView: View {
         .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
             if let url = activity.webpageURL { hosts.open(url: url) }
         }
-        .sheet(item: Binding(get: { hosts.pairing.map(PairingSheet.init) },
+        .accessibleSheet(item: Binding(get: { hosts.pairing.map(PairingSheet.init) },
                              set: { hosts.showPairing($0?.id) })) { sheet in
             if let session = hosts.session(sheet.id) {
                 PairingView(model: session) { hosts.showPairing(nil) }
             }
         }
+        .presentationAccessibilityRoot(covered: lock.covered)
     }
 }

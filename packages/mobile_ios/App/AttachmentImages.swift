@@ -334,7 +334,7 @@ struct AttachmentThumbnail: View {
             guard image == nil, requested else { return }
             Task { await receive(AttachmentSnapshots.shared.state(key, in: data)) }
         }
-        .fullScreenCover(item: $viewer) { request in AttachmentViewer(url: request.url) }
+        .accessibleFullScreenCover(item: $viewer) { request in AttachmentViewer(url: request.url) }
     }
 
     /// `force` (Retry) skips the core's remembered failure and asks for the bytes again.

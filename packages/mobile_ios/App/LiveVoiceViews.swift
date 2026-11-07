@@ -41,7 +41,7 @@ struct LivePill: View {
             HStack(spacing: 6) {
                 Button(action: expand) {
                     HStack(spacing: 10) {
-                        CompanionAvatar(character: character, width: 26)
+                        CompanionAvatar(character: character, width: 26, decorative: true)
                             .frame(width: 40, height: 40)
                             .background(VerdeTheme.accent.opacity(0.19), in: Circle())
                             .overlay(Circle().stroke(speaking ? VerdeTheme.accent : VerdeTheme.border))

@@ -114,7 +114,7 @@ struct PairingView: View {
                 // Lifecycle signals are app-wide (RootView); this screen only hides secrets.
                 if phase == .background { scanning = false; clearSecrets() }
             }
-            .sheet(isPresented: $scanning) {
+            .accessibleSheet(isPresented: $scanning) {
                 NavigationStack {
                     PairingScanner { value in
                         scanning = false

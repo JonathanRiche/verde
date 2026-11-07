@@ -150,18 +150,16 @@ private struct RowContent: View {
         HStack(spacing: 12) {
             if let provider { ProviderGlyph(provider: provider, size: min(glyphSize, 40)) } else { dot }
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(VerdeTheme.ui(16)).lineLimit(2)
+                Text(title).font(VerdeTheme.ui(16).weight(unread ? .semibold : .regular)).lineLimit(2)
                 if let detail { subtitle(detail) }
             }
             Spacer(minLength: 4)
             // A running row says "Working" (in the accent) in its subtitle; no extra trailing mark.
             if state == .working && stateText == nil { ProgressView().controlSize(.mini).accessibilityHidden(true) }
-            if unread {
-                Circle().fill(VerdeTheme.muted).frame(width: 8, height: 8).accessibilityLabel("Unread")
-            }
             if let badge { AttentionBadge(text: badge) }
         }
         .accessibilityElement(children: .combine)
+        .accessibilityValue(unread ? "Unread" : "")
     }
 
     private func subtitle(_ detail: String) -> some View {
@@ -223,7 +221,7 @@ private struct ThreadItem: View {
     let thread: ThreadSummary
     let now: Int64
     var workspaceLabel: String?
-    /// A finished chat not yet read: a neutral dot, never amber (S26).
+    /// A finished chat not yet read: a semibold title, separate from the state slot.
     var unread = false
     /// A running turn's start, for its elapsed time.
     var startedAt: Int64? = nil

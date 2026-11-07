@@ -398,7 +398,7 @@ struct ChatComposer: View {
         }
         .onChange(of: scenePhase) { _, phase in if phase != .active { model.flushNow() } }
         .onDisappear { model.flushNow() }
-        .sheet(item: $picker) { kind in
+        .accessibleSheet(item: $picker) { kind in
             NavigationStack {
                 let (rows, current) = pickerRows(kind)
                 List(rows, id: \.id) { choice in
@@ -407,8 +407,8 @@ struct ChatComposer: View {
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { BarButton("Done", bold: true) { picker = nil } }
             }.presentationDetents([.medium, .large])
         }
-        .sheet(isPresented: $camera) { ComposerCamera { image in camera = false; if let image { prepare(image) } } }
-        .sheet(isPresented: Binding(get: { model.view?.shell_confirmation != nil }, set: { shown in
+        .accessibleSheet(isPresented: $camera) { ComposerCamera { image in camera = false; if let image { prepare(image) } } }
+        .accessibleSheet(isPresented: Binding(get: { model.view?.shell_confirmation != nil }, set: { shown in
             if !shown, let confirmation = model.view?.shell_confirmation { model.confirmShell(confirmation, accept: false) }
         })) {
             if let confirmation = model.view?.shell_confirmation {
@@ -422,6 +422,7 @@ struct ChatComposer: View {
                 }.presentationDetents([.medium])
             }
         }
+        .trackedAccessibilityPresentation(photos || files || anchored != nil)
         // Several at once, in the order picked, up to the room left on the draft.
         .photosPicker(isPresented: $photos, selection: $photoItems,
                       maxSelectionCount: max(1, ComposerModel.maxImages - model.attachedImageCount),

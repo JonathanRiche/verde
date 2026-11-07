@@ -71,12 +71,23 @@ struct CompanionAvatar: View {
     var pose: CompanionPose = .idle
     var failure = false
     var width: CGFloat = 46
+    /// A named control/header already owns these semantics; don't create a second Ready node.
+    var decorative = false
     @Environment(\.colorScheme) private var scheme
 
     /// Overhang in design units: left (tail/badge), top (badge), right (leaf).
     private static let inset = (left: 10.0, top: 3.0, right: 3.0)
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        if decorative { artwork.accessibilityHidden(true) }
+        else {
+            artwork.accessibilityElement()
+                .accessibilityLabel(character.displayName)
+                .accessibilityValue(poseLabel)
+        }
+    }
+
+    private var artwork: some View {
         let s = width / 46
         let size = character.designSize
         let theme = CharacterTheme.current
@@ -91,9 +102,6 @@ struct CompanionAvatar: View {
         }
         .frame(width: (size.width + Self.inset.left + Self.inset.right) * s, height: (size.height + Self.inset.top) * s)
         .id(scheme) // Theme colors are read when drawing; redraw on appearance change.
-        .accessibilityElement()
-        .accessibilityLabel(character.displayName)
-        .accessibilityValue(poseLabel)
     }
 
     private var poseLabel: String {

@@ -47,9 +47,9 @@ struct CompanionSheet: View {
         .tint(VerdeTheme.accent)
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
-        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain, focusLiveVoice: settingsLive) }
-        .sheet(isPresented: $brainPicker) { CompanionBrainSheet(model: model, browse: browse) }
-        .sheet(isPresented: $conversations) {
+        .accessibleSheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain, focusLiveVoice: settingsLive) }
+        .accessibleSheet(isPresented: $brainPicker) { CompanionBrainSheet(model: model, browse: browse) }
+        .accessibleSheet(isPresented: $conversations) {
             CompanionConversations(model: model, browse: browse, startNew: { conversations = false; confirmNew = true })
                 .presentationDetents([.medium, .large])
         }
@@ -59,7 +59,7 @@ struct CompanionSheet: View {
         } message: {
             Text(newConversationMessage(name: model.active?.name ?? "Your companion"))
         }
-        .sheet(isPresented: $scheduled) {
+        .accessibleSheet(isPresented: $scheduled) {
             ScheduledScreen(model: model.schedules, companion: model, browse: browse, openChat: { workspace, thread in
                 scheduled = false
                 // The companion's own chat is already under this sheet.
@@ -167,9 +167,10 @@ private struct CompanionHeader: View {
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    /// Name and status on one line at every size; at the accessibility sizes they shrink a little
-    /// rather than wrap (U1 iPad).
-    private var nameLayout: AnyLayout { AnyLayout(HStackLayout(spacing: 0)) }
+    /// Give the status its own line at accessibility sizes, before it can truncate beside controls.
+    private var nameLayout: AnyLayout {
+        dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+    }
 
     var body: some View {
         let presence = model.presence
@@ -186,10 +187,10 @@ private struct CompanionHeader: View {
                                           failed: presence.failure, connected: connected, failedChats: model.failedCount)
         let companions = model.roster?.companions ?? []
         HStack(spacing: 8) {
-            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
+            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28, decorative: true)
             nameLayout {
                 Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1).minimumScaleFactor(0.7).layoutPriority(1)
-                    .accessibilityLabel("\(entry.name), \(presence.status)")
+                    .accessibilityLabel("\(entry.name), \(suffix.text)")
                     .accessibilityAddTraits(.isHeader)
                 if let target {
                     let isOpen = panel == target
@@ -197,7 +198,11 @@ private struct CompanionHeader: View {
                         withAnimation(AppearanceSettings.shared.reducedMotion ? nil : .easeOut(duration: 0.15)) { panel = isOpen ? nil : target }
                     } label: {
                         HStack(spacing: 3) {
-                            Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1).minimumScaleFactor(0.6)
+                            Text((dynamicTypeSize.isAccessibilitySize ? "" : " · ") + suffix.text)
+                                .font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone))
+                                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                                .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 1 : 0.6)
+                                .multilineTextAlignment(.leading)
                             Image(systemName: isOpen ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .bold))
                                 .foregroundStyle(VerdeTheme.subtle)
                         }
@@ -210,7 +215,10 @@ private struct CompanionHeader: View {
                     .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
                     .accessibilityIdentifier("companion-header-status")
                 } else {
-                    Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1).minimumScaleFactor(0.6)
+                    Text((dynamicTypeSize.isAccessibilitySize ? "" : " · ") + suffix.text)
+                        .font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone))
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                        .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 1 : 0.6)
                         .accessibilityHidden(true)
                 }
             }

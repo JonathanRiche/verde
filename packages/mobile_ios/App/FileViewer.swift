@@ -258,7 +258,7 @@ struct FileViewer: View {
         .onChange(of: browse.hostID) { dismiss(); model.clear(); host = nil; download?.cancel() }
         .onChange(of: browse.state.host?.auth_state) { _, state in if state != "paired" { dismiss(); model.clear(); host = nil; download?.cancel() } }
         .onDisappear { model.clear(); host = nil; download?.cancel(); share?.remove() }
-        .sheet(item: $share, onDismiss: { SharedFile.cleanup() }) { file in ShareFile(url: file.url) }
+        .accessibleSheet(item: $share, onDismiss: { SharedFile.cleanup() }) { file in ShareFile(url: file.url) }
         .alert(downloadProblem?.title ?? "", isPresented: Binding(get: { downloadProblem != nil }, set: { if !$0 { downloadProblem = nil } }), presenting: downloadProblem) { _ in
             Button("OK", role: .cancel) {}
         } message: { problem in Text(problem.detail) }

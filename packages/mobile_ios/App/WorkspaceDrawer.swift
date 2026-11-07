@@ -211,6 +211,7 @@ struct WorkspaceDrawer: View {
             }.padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
         }.buttonStyle(.plain).padding(.horizontal, 8)
         .accessibilityLabel("Workspace scope: " + (scoped?.label ?? "All Workspaces")).accessibilityIdentifier("workspace-switcher")
+        .trackedAccessibilityPresentation(switching)
         .popover(isPresented: $switching, arrowEdge: .top) {
             switcherMenu(all, scoped: scoped).presentationCompactAdaptation(.popover)
         }
@@ -369,15 +370,16 @@ struct WorkspaceDrawer: View {
     }
     private func chat(_ thread: ThreadSummary, chip: Workspace? = nil) -> some View {
         let target = BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)
+        let state = coreChatState(thread.state)
         return Button { open(target) } label: {
             HStack(spacing: 10) {
                 if let chip { WorkspaceChip(workspace: chip, size: chipSize) }
                 ProviderGlyph(provider: thread.provider, size: glyphSize)
-                Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(2)
+                Text(thread.title.isEmpty ? "New chat" : thread.title)
+                    .font(VerdeTheme.ui(13).weight(state == .unread ? .semibold : .regular)).lineLimit(2)
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                 // S32/S40: a dot only with state (the core's, C11), as on Android; never a grey idle dot.
-                let state = coreChatState(thread.state)
                 if state.isActive {
                     StatusPip(active: state == .running, attention: state == .needs_you, failed: state == .failed)
                 }
@@ -393,6 +395,7 @@ struct WorkspaceDrawer: View {
             Button("Close", role: .destructive) { action("close", thread) }.disabled(manage == nil || manage?.busy == true)
         }
         .accessibilityIdentifier("drawer-chat").accessibilityAddTraits(selected == target ? .isSelected : [])
+        .accessibilityValue(state == .unread ? "Unread" : "")
     }
 }
 

@@ -231,7 +231,7 @@ struct CompanionDock: View {
             HStack(spacing: 2) {
                 Button(action: toggle) {
                     HStack(spacing: 8) {
-                        CompanionAvatar(character: active.character, pose: model.presence.pose, failure: model.presence.failure, width: 28)
+                        CompanionAvatar(character: active.character, pose: model.presence.pose, failure: model.presence.failure, width: 28, decorative: true)
                             .overlay(alignment: .topTrailing) {
                                 if badge > 0 { badgeView(badge) }
                                 else if model.failedCount > 0 { Circle().fill(VerdeTheme.danger).frame(width: 9, height: 9).offset(x: 3, y: -3) }

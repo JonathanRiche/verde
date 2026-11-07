@@ -119,7 +119,7 @@ struct ChangesRoute: View {
         .onAppear { model.openChanges() }
         .onDisappear { model.closeChanges() }
         .overlay(alignment: .bottom) { if let git, !git.sheet { GitActionToastCard(model: git) } }
-        .sheet(isPresented: Binding(get: { git?.sheet == true }, set: { if !$0 { git?.dismissSheet() } })) {
+        .accessibleSheet(isPresented: Binding(get: { git?.sheet == true }, set: { if !$0 { git?.dismissSheet() } })) {
             if let git { GitCommitSheet(model: git) }
         }
         .alert("Commit & push to \(git?.mainBranch ?? "main")?", isPresented: Binding(get: { git?.confirmMain == true }, set: { git?.confirmMain = $0 })) {
@@ -640,7 +640,7 @@ private struct PatchScreen: View {
             render = next
             rendered = patch
         }
-        .sheet(item: $viewer) { request in
+        .accessibleSheet(item: $viewer) { request in
             FileViewer(browse: browse, workspaceID: model.workspaceID, citation: request.citation)
         }
     }

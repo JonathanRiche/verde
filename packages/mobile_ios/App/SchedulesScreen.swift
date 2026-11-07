@@ -74,7 +74,7 @@ struct ScheduledScreen: View {
                         .accessibilityIdentifier("schedule-new")
                 }
             }
-            .sheet(item: $form) { subject in
+            .accessibleSheet(item: $form) { subject in
                 ScheduleForm(model: model, companion: companion, browse: browse, subject: subject)
             }
             .confirmationDialog("Delete this scheduled task?",
@@ -695,7 +695,7 @@ private struct ScheduleDateField: View {
             }.frame(minHeight: 44).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .sheet(isPresented: $presented) {
+        .accessibleSheet(isPresented: $presented) {
             NavigationStack {
                 DatePicker(title, selection: $selection, displayedComponents: components)
                     .datePickerStyle(.wheel).labelsHidden().padding()
