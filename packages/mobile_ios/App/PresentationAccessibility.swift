@@ -135,20 +135,63 @@ private struct AccessibilityContentHost<Content: View>: UIViewControllerRepresen
 
     private var hidden: Bool { covered || (layer.map { $0.state.topLayer > $0.layer } ?? false) }
 
-    func makeUIViewController(context: Context) -> UIHostingController<AnyView> {
-        let controller = UIHostingController(rootView: hostedContent)
-        controller.view.backgroundColor = .clear
-        controller.view.accessibilityElementsHidden = hidden
+    func makeUIViewController(context: Context) -> ContentController {
+        let controller = ContentController(content: hostedContent)
+        controller.update(content: hostedContent, hidden: hidden)
         return controller
     }
 
-    func updateUIViewController(_ controller: UIHostingController<AnyView>, context: Context) {
-        controller.rootView = hostedContent
-        controller.view.accessibilityElementsHidden = hidden
+    func updateUIViewController(_ controller: ContentController, context: Context) {
+        controller.update(content: hostedContent, hidden: hidden)
     }
 
     private var hostedContent: AnyView {
         AnyView(content.environment(\.self, environment).accessibilityHidden(hidden))
+    }
+
+    final class ContentController: UIViewController {
+        private let hosting: UIHostingController<AnyView>
+        private var hiddenFromAccessibility = false
+
+        init(content: AnyView) {
+            hosting = UIHostingController(rootView: content)
+            super.init(nibName: nil, bundle: nil)
+        }
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.backgroundColor = .clear
+            addChild(hosting)
+            hosting.view.backgroundColor = .clear
+            hosting.view.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(hosting.view)
+            NSLayoutConstraint.activate([
+                hosting.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                hosting.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                hosting.view.topAnchor.constraint(equalTo: view.topAnchor),
+                hosting.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            ])
+            hosting.didMove(toParent: self)
+        }
+
+        func update(content: AnyView, hidden: Bool) {
+            hosting.rootView = content
+            hiddenFromAccessibility = hidden
+            // SwiftUI owns the child hosting view's AX flags. This plain UIKit parent is
+            // the stable boundary, including the navigation controller's native descendants.
+            updateVisibility()
+            DispatchQueue.main.async { [weak self] in self?.updateVisibility() }
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            updateVisibility()
+        }
+
+        private func updateVisibility() {
+            view.accessibilityElementsHidden = hiddenFromAccessibility
+        }
     }
 }
 
