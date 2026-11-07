@@ -1,8 +1,17 @@
 import Foundation
 
-struct FileBytes {
-    let data: Data
+final class FileBytes: @unchecked Sendable {
+    private let memory: Data?
+    let url: URL?
     let mime: String?
+    var audio: RangeAudio?
+    let size: Int64
+    init(data: Data, mime: String?) { memory = data; url = nil; self.mime = mime; size = Int64(data.count) }
+    init(url: URL, size: Int64, mime: String?) { memory = nil; self.url = url; self.size = size; self.mime = mime }
+    // Used only by bounded previews. Download and native audio use the file URL.
+    var data: Data { memory ?? ((try? Data(contentsOf: url!, options: .mappedIfSafe)) ?? Data()) }
+    init(audio: RangeAudio, size: Int64, mime: String?) { memory = nil; url = nil; self.audio = audio; self.size = size; self.mime = mime }
+    deinit { audio?.close(); if let url { try? FileManager.default.removeItem(at: url) } }
 }
 
 /// Raw file bytes never enter core JSON or persistent storage. Bounded per host;
@@ -15,9 +24,9 @@ final class FileBuffer: @unchecked Sendable {
     private var ignoredOrder: [String] = []
     func put(_ id: String, _ bytes: FileBytes) {
         lock.lock(); defer { lock.unlock() }
-        guard !ignored.contains(id), bytes.data.count <= 32 * 1024 * 1024 else { return }
+        guard !ignored.contains(id), bytes.audio != nil || bytes.url != nil || bytes.size <= 32 * 1024 * 1024 else { return }
         entries[id] = bytes; order.removeAll { $0 == id }; order.append(id)
-        while entries.count > 4 || entries.values.reduce(0, { $0 + $1.data.count }) > 64 * 1024 * 1024 {
+        while entries.count > 4 || entries.values.reduce(0, { $0 + ($1.url == nil && $1.audio == nil ? Int($1.size) : 0) }) > 64 * 1024 * 1024 {
             entries.removeValue(forKey: order.removeFirst())
         }
     }

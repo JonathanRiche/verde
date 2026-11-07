@@ -3,6 +3,7 @@ import PDFKit
 import ImageIO
 import Observation
 import WebKit
+import AVFoundation
 
 /// Failure code from the core's file operation (`LocalError.code`), mapped to text by callers.
 struct FileFetchFailure: Error { let code: String? }
@@ -15,14 +16,22 @@ struct FileProblem: LocalizedError, Equatable {
     static func sizeLabel(_ bytes: UInt32) -> String { bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB" }
     static func of(_ code: String?, limit: UInt32) -> FileProblem {
         switch code {
-        case "offline", "cancelled", "timeout", "busy", "server_unavailable": return FileProblem(title: "Can't reach the host", detail: "Check your connection and try again.")
-        case "forbidden": return FileProblem(title: "No access", detail: "This file is outside the host's shared workspaces.")
+        case "offline": return FileProblem(title: "Can't reach the host", detail: "Check your connection and try again.")
+        case "timeout": return FileProblem(title: "Host took too long", detail: "Try again. If this keeps happening, check the host's connection.")
+        case "cancelled": return FileProblem(title: "Loading interrupted", detail: "Return to verde and try again.")
+        case "busy": return FileProblem(title: "Too many files loading", detail: "Wait for the other files to finish, then try again.")
+        case "server_unavailable": return FileProblem(title: "Host couldn't serve the file", detail: "Try again. If this keeps happening, check verde on the host.")
+        case "identity": return FileProblem(title: "Host identity not verified", detail: "Check the host's certificate and trust settings before reconnecting.")
+        case "unauthorized": return FileProblem(title: "Phone access refused", detail: "Reconnect to the host. If access is still refused, pair this phone again.")
+        case "storage_unavailable": return FileProblem(title: "Couldn't save the file", detail: "The phone could not save this file. Check its free space and try again.")
+        case "host_file_too_large": return hostTooLarge
+        case "forbidden": return FileProblem(title: "No access", detail: "The host refused access. Check its shared workspaces and this phone's file permissions.")
         case "not_found": return FileProblem(title: "File not found", detail: "It may have been moved or deleted on the host.")
         case "too_large": return FileProblem(title: "Too large to open", detail: "This file is over the \(sizeLabel(limit)) limit for viewing on the phone. Open it on the host.")
-        case "unsupported": return FileProblem(title: "Can't show this file", detail: "The host doesn't serve this file type to the phone.")
+        case "unsupported": return FileProblem(title: "No preview for this file type", detail: "This file type can't be previewed on the phone. Download it to open it in another app.")
         case "invalid_path": return unresolved
         case "preview_unavailable": return FileProblem(title: "No preview available", detail: "Office previews need LibreOffice on the host.")
-        case "unavailable", "unauthorized": return unavailable
+        case "unavailable": return unavailable
         default: return failed
         }
     }
@@ -30,7 +39,9 @@ struct FileProblem: LocalizedError, Equatable {
     static func download(_ code: String?, limit: UInt32) -> FileProblem {
         code == "too_large" ? FileProblem(title: "Too large to download", detail: "This file is over the \(sizeLabel(limit)) download limit for the phone. Open it on the host.") : of(code, limit: limit)
     }
-    static let binary = FileProblem(title: "Binary file", detail: "This file isn't text, so it can't be shown here.")
+    static let hostTooLarge = FileProblem(title: "Too large to open", detail: "This file is too large to open on your phone (over 32 MB). Open it on your computer.")
+    var retryable: Bool { ["Can't reach the host", "Host took too long", "Loading interrupted", "Too many files loading", "Host couldn't serve the file", "Couldn't open the file"].contains(title) }
+    static let binary = FileProblem(title: "No preview for this file type", detail: "This file isn't text or a supported image or document. Download it to open it in another app.")
     static let unresolved = FileProblem(title: "Can't open this link", detail: "The path couldn't be resolved to a file in the workspace.")
     static let unreadable = FileProblem(title: "Can't display this file", detail: "The file couldn't be decoded.")
     static let unavailable = FileProblem(title: "Host not connected", detail: "Reconnect to the host to view files.")
@@ -44,7 +55,7 @@ extension CoreHost {
         let id = UUID().uuidString
         defer { discardFile(id) }
         try await send(.file_open(EventFileOpen(now_ms: 0, wall_time_ms: 0, intent_id: id, path: path, kind: kind, max_bytes: limit)))
-        let deadline = ContinuousClock.now.advanced(by: .seconds(kind == .preview ? 125 : 40))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(kind == .preview ? 125 : ((kind == .download || kind == .audio) ? 650 : 40)))
         repeat {
             try Task.checkCancellation()
             let result = try JSONDecoder().decode(OperationsQuery.self, from: query("operations"))
@@ -61,16 +72,18 @@ extension CoreHost {
     }
 }
 
-enum ViewerKind { case text, markdown, image, svg, pdf, office
+enum ViewerKind { case text, markdown, image, svg, pdf, office, audio, html
     /// Largest original file the Download/Share action fetches.
     static let downloadLimit: UInt32 = 32 * 1024 * 1024
     var limit: UInt32 {
-        switch self { case .text, .markdown: return 2 * 1024 * 1024; case .image, .svg: return 16 * 1024 * 1024; case .pdf, .office: return 32 * 1024 * 1024 }
+        switch self { case .text, .markdown, .html: return 2 * 1024 * 1024; case .svg: return 16 * 1024 * 1024; case .image, .pdf, .office, .audio: return 32 * 1024 * 1024 }
     }
     static func of(_ path: String) -> ViewerKind {
         switch (path as NSString).pathExtension.lowercased() {
         case "png", "jpg", "jpeg", "webp", "gif", "bmp": return .image
         case "svg": return .svg
+        case "mp3", "m4a", "wav", "ogg": return .audio
+        case "html", "htm": return .html
         case "md", "markdown": return .markdown
         case "pdf": return .pdf
         case "pptx", "ppt", "odp", "docx", "doc", "odt", "xlsx", "xls", "ods", "rtf": return .office
@@ -82,6 +95,7 @@ enum ViewerKind { case text, markdown, image, svg, pdf, office
         switch of(path) {
         case .office: return .preview
         case .svg: return .download
+        case .audio: return .audio
         default: return ["html", "htm", "js", "mjs", "cjs", "wasm"].contains((path as NSString).pathExtension.lowercased()) ? .download : .file
         }
     }
@@ -122,6 +136,8 @@ final class FileViewerModel: HighlightSource {
     var blocks: [MdBlock]?
     var image: UIImage?
     var pdf: PDFDocument?
+    var audio: FileBytes?
+    var unsupported: String?
     /// Syntax ranges over `text` (UTF-16), when the host highlighted it.
     var syntax: [DiffRange]?
     @ObservationIgnored private var cachedLines: (FileSplit, [AttributedString])?
@@ -142,7 +158,7 @@ final class FileViewerModel: HighlightSource {
         return lines
     }
     private func language(_ path: String) -> String { (path as NSString).pathExtension.lowercased() }
-    func clear() { syntax = nil; cachedLines = nil; bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
+    func clear() { audio = nil; unsupported = nil; syntax = nil; cachedLines = nil; bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
     /// `text` split into display lines once, for the line-selectable viewer.
     func split() -> FileSplit? {
         guard let text else { return nil }
@@ -160,18 +176,23 @@ final class FileViewerModel: HighlightSource {
             let kind = ViewerKind.of(path)
             var read: Data?
             var cut: FilePartial?
-            if let reader {
+            if let reader, kind != .audio && kind != .image {
                 switch try await reader(host) {
                 case .bytes(let bytes): read = bytes
                 case .partial(let bytes, let partial): read = bytes; cut = partial
                 case .problem(let problem): throw problem
+                case .unsupported(let size, let type): unsupported = "\(FilePartial.label(size)) · \(type)"; return
                 case nil: break
                 }
             }
             let data: Data
             if let read { data = read }
             else {
-                do { data = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit).data }
+                do {
+                    let file = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit)
+                    if kind == .audio { audio = file; return }
+                    data = file.data
+                }
                 catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
             }
             try Task.checkCancellation()
@@ -188,8 +209,9 @@ final class FileViewerModel: HighlightSource {
                 guard let source = CGImageSourceCreateWithData(data as CFData, nil),
                       let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 4096] as CFDictionary) else { throw FileProblem.unreadable }
                 image = UIImage(cgImage: thumbnail)
-            case .text, .markdown:
-                guard !data.contains(0), let decoded = String(data: data, encoding: .utf8) else { throw FileProblem.binary }
+            case .audio: break
+            case .text, .markdown, .html:
+                guard !data.contains(0), let decoded = String(data: data, encoding: .utf8) else { unsupported = "\(FilePartial.label(UInt64(data.count))) · \(fileTypeLabel(path))"; return }
                 text = decoded
                 // S13: plain-text files are highlighted with the shared syntax palette.
                 if kind == .text, !language(path).isEmpty, decoded.utf8.count <= 64 * 1024 {
@@ -203,7 +225,7 @@ final class FileViewerModel: HighlightSource {
                 }
             }
         } catch is CancellationError { clear() }
-        catch { clear(); problem = (error as? FileProblem) ?? .unavailable }
+        catch { clear(); problem = (error as? FileProblem) ?? .failed }
     }
     private func utility(_ utility: String, _ text: String, language: String? = nil) async -> Data? {
         guard let host, text.utf8.count <= 64 * 1024 else { return nil }
@@ -236,6 +258,7 @@ struct FileViewer: View {
     @Environment(\.lineSelection) private var lineSelection
     @State private var model = FileViewerModel()
     @State private var source = false
+    @State private var htmlPreview = false
     @State private var attempt = 0
     @State private var share: SharedFile?
     @State private var host: CoreHost?
@@ -276,9 +299,18 @@ struct FileViewer: View {
                             if download != nil { ProgressView() } else { Label("Download file", systemImage: "arrow.down.circle") }
                         }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).disabled(download != nil).padding(.top, 8)
                     }
-                    Button("Retry") { attempt += 1 }.padding(.top, 4)
-                }.padding()
+                    if problem.retryable { Button("Retry") { attempt += 1 }.padding(.top, 4) }
+                }.textSelection(.enabled).padding()
             }
+            else if let detail = model.unsupported {
+                VStack(spacing: 12) {
+                    Text("No preview for this file type").font(VerdeTheme.ui(17, bold: true))
+                    Text(detail).foregroundStyle(VerdeTheme.muted)
+                    if canDownload { Button("Download file") { export() }.buttonStyle(PrimaryButtonStyle(fullWidth: false)) }
+                }.textSelection(.enabled).padding()
+            }
+            else if let audio = model.audio { NativeAudio(file: audio) }
+            else if htmlPreview, ViewerKind.of(citation.path) == .html, let text = model.text { HTMLPreview(source: text) }
             else if let pdf = model.pdf { NativePDF(document: pdf) }
             else if let image = model.image { ZoomImage(image: image) }
             else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
@@ -297,6 +329,10 @@ struct FileViewer: View {
         .toolbar {
             if !embedded { ToolbarItem(placement: .cancellationAction) { BarButton("Done", bold: true) { dismiss() } } }
             ToolbarItemGroup(placement: .primaryAction) {
+                if ViewerKind.of(citation.path) == .html, model.text != nil {
+                    Button { htmlPreview.toggle() } label: { Label(htmlPreview ? "Source" : "Preview", systemImage: htmlPreview ? "chevron.left.forwardslash.chevron.right" : "eye").frame(minWidth: 44, minHeight: 44) }
+                        .accessibilityLabel(htmlPreview ? "Show source" : "Preview")
+                }
                 if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
                 if canDownload {
                     if download != nil { ProgressView() }
@@ -324,7 +360,7 @@ struct FileViewer: View {
         let first = Int(line)
         return first...max(first, Int(clamping: citation.end_line ?? line))
     }
-    private var canDownload: Bool { path != nil && host != nil }
+    private var canDownload: Bool { path != nil && host != nil && model.problem != .hostTooLarge }
     /// Shares the original file (Save to Files included), reusing preview bytes when they are the original.
     private func export() {
         guard download == nil, let path, let host else { return }
@@ -335,7 +371,8 @@ struct FileViewer: View {
             do {
                 let file = try await host.fetchFile(path: path, kind: .download, limit: ViewerKind.downloadLimit)
                 try Task.checkCancellation()
-                write(file.data, name: name)
+                if let url = file.url { share = try SharedFile(copying: url, name: name) }
+                else { write(file.data, name: name) }
             } catch is CancellationError {
             } catch let failure as FileFetchFailure {
                 if !Task.isCancelled { downloadProblem = .download(failure.code, limit: ViewerKind.downloadLimit) }
@@ -460,6 +497,16 @@ struct SharedFile: Identifiable {
             url = target
         } catch { try? FileManager.default.removeItem(at: folder); throw error }
     }
+    init(copying source: URL, name: String) throws {
+        let folder = Self.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.complete])
+        var target = folder.appendingPathComponent((name as NSString).lastPathComponent)
+        do {
+            try FileManager.default.copyItem(at: source, to: target)
+            var values = URLResourceValues(); values.isExcludedFromBackup = true; try target.setResourceValues(values)
+            url = target
+        } catch { try? FileManager.default.removeItem(at: folder); throw error }
+    }
     func remove() { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
     static func cleanup() { try? FileManager.default.removeItem(at: directory) }
 }
@@ -467,4 +514,91 @@ private struct ShareFile: UIViewControllerRepresentable {
     let url: URL
     func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: [url], applicationActivities: nil) }
     func updateUIViewController(_ view: UIActivityViewController, context: Context) {}
+}
+
+func fileTypeLabel(_ path: String) -> String {
+    let ext = (path as NSString).pathExtension
+    return ext.isEmpty ? "Binary file" : ext.uppercased() + " file"
+}
+
+private struct NativeAudio: View {
+    let file: FileBytes
+    @State private var player: AVPlayer?
+    @State private var playing = false
+    @State private var position = 0.0
+    @State private var duration = 1.0
+    @State private var editing = false
+    @State private var failed = false
+    private let clock = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+    var body: some View {
+        VStack(spacing: 16) {
+            if failed { Text("Can't play this audio file. Download it to open it in another app.").textSelection(.enabled) }
+            else {
+                Button(playing ? "Pause" : "Play") {
+                    guard let player else { return }
+                    if playing { player.pause() } else { if position >= duration { player.seek(to: .zero) }; player.play() }
+                    playing.toggle()
+                }.buttonStyle(PrimaryButtonStyle(fullWidth: false)).frame(minHeight: 44).disabled(player == nil)
+                Slider(value: $position, in: 0...max(duration, 1), onEditingChanged: { active in
+                    editing = active
+                    if !active { player?.seek(to: CMTime(seconds: position, preferredTimescale: 600)) }
+                }).accessibilityLabel("Playback position")
+                Text("\(audioTime(position)) / \(audioTime(duration))").monospacedDigit().textSelection(.enabled)
+            }
+        }.padding(24)
+        .onAppear {
+            if let audio = file.audio { player = AVPlayer(playerItem: AVPlayerItem(asset: audio.asset)) }
+            else if let url = file.url { player = AVPlayer(url: url) }
+            else { failed = true }
+        }
+        .onReceive(clock) { _ in
+            guard let player else { return }
+            failed = player.currentItem?.status == .failed
+            if let time = player.currentItem?.duration.seconds, time.isFinite, time > 0 { duration = time }
+            if !editing { position = max(0, min(duration, player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0)) }
+            if player.timeControlStatus == .paused { playing = false }
+        }
+        .onDisappear { player?.pause(); player = nil }
+    }
+}
+private func audioTime(_ seconds: Double) -> String { String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
+
+func isolatedHTML(_ source: String) -> String {
+    #"<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; media-src data:; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width, initial-scale=1">"# + source
+}
+private struct HTMLPreview: View {
+    let source: String
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Linked files aren't loaded").font(.footnote).textSelection(.enabled).padding(12)
+            IsolatedHTML(html: isolatedHTML(source))
+        }
+    }
+}
+private struct IsolatedHTML: UIViewRepresentable {
+    let html: String
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        config.userContentController = WKUserContentController() // No message handlers or injected app scripts.
+        let view = WKWebView(frame: .zero, configuration: config)
+        view.navigationDelegate = context.coordinator
+        view.allowsLinkPreview = false
+        return view
+    }
+    func updateUIView(_ view: WKWebView, context: Context) {
+        if context.coordinator.html != html { context.coordinator.html = html; view.loadHTMLString(html, baseURL: nil) }
+    }
+    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) { view.stopLoading(); view.navigationDelegate = nil }
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate {
+        var html: String?
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
+            if action.navigationType == .linkActivated, let url = action.request.url, ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
+                await UIApplication.shared.open(url)
+                return .cancel
+            }
+            return action.request.url?.absoluteString == "about:blank" ? .allow : .cancel
+        }
+    }
 }

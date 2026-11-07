@@ -91,6 +91,7 @@ enum WorkspaceReadOutcome: Equatable {
     /// The leading bytes of a file the host cut at its read cap.
     case partial(Data, FilePartial)
     case problem(FileProblem)
+    case unsupported(UInt64, String)
 }
 
 /// A cut read: `shown` leading bytes of a `total`-byte file (0 when unknown).
@@ -109,7 +110,11 @@ func readFailure(_ code: String?) -> WorkspaceReadOutcome? {
     case "unsupported", "method_not_found": return nil
     case "not_found", "root_not_found", "resource_not_found": return .problem(.of("not_found", limit: 0))
     case "path_outside_roots", "scope_denied", "forbidden": return .problem(.of("forbidden", limit: 0))
-    case "offline", "cancelled", "timeout": return .problem(.of("offline", limit: 0))
+    case "offline", "cancelled", "timeout", "busy", "server_unavailable", "host_file_too_large": return .problem(.of(code, limit: 0))
+    case "network": return .problem(.of("offline", limit: 0))
+    case "unauthorized", "identity": return .problem(.of(code, limit: 0))
+    case "too_large", "response_too_large": return .problem(.of("too_large", limit: 32 * 1024 * 1024))
+    case "store_unavailable": return .problem(.of("server_unavailable", limit: 0))
     case "invalid_path", "invalid_params", "not_file": return .problem(.unresolved)
     default: return .problem(.failed)
     }
@@ -121,6 +126,7 @@ func readOutcome(_ view: ExplorerFileView, limit: UInt32 = ViewerKind.text.limit
     if let error = view.error { return readFailure(error.code) }
     if !view.supported { return nil }
     guard let result = view.result else { return .problem(.failed) }
+    if [.audio, .image].contains(ViewerKind.of(result.path)) { return nil }
     switch result.kind {
     case "text", "markdown", "image":
         let data: Data
@@ -129,8 +135,9 @@ func readOutcome(_ view: ExplorerFileView, limit: UInt32 = ViewerKind.text.limit
             data = decoded
         } else { data = Data(result.content.utf8) }
         return result.truncated ? .partial(data, FilePartial(shown: FilePartial.readTextBytes, total: result.size)) : .bytes(data)
-    case "binary": return .problem(.binary)
+    case "binary": return .unsupported(result.size, result.mime ?? fileTypeLabel(result.path))
     case "too_large": return .problem(.of("too_large", limit: limit))
+    case "external": return ViewerKind.of(result.path) == .text ? .unsupported(result.size, result.mime ?? fileTypeLabel(result.path)) : nil
     default: return nil
     }
 }
