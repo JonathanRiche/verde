@@ -14,6 +14,11 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.CustomAccessibilityAction
@@ -217,9 +222,13 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     val density = LocalDensity.current
     val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     val keyboardHeight = with(density) { WindowInsets.ime.getBottom(this).toDp() }
-    val maxFieldHeight = ((screenHeight - keyboardHeight) * .6f).coerceAtLeast(56.dp)
     var resizedHeight by rememberSaveable { mutableStateOf<Float?>(null) }
     var measuredHeight by remember { mutableStateOf(56f) }
+    var cardHeight by remember { mutableStateOf(56f) }
+    var pickerAnchor by remember { mutableStateOf<Rect?>(null) }
+    // Budget the whole composer, including controls, rather than giving the field 60% on its own.
+    val chromeHeight = (cardHeight - measuredHeight).coerceAtLeast(0f).dp
+    val maxFieldHeight = ((screenHeight - keyboardHeight) * .4f - chromeHeight - 12.dp).coerceAtLeast(56.dp)
     val resizeField: (Float) -> Unit = { delta ->
         resizedHeight = ((resizedHeight ?: measuredHeight) + delta).coerceIn(56f, maxFieldHeight.value)
     }
@@ -236,6 +245,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
             // S17: the composer lines up with the capped transcript at every width.
             .then(if (!compact) Modifier.wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH + 16.dp).fillMaxWidth() else Modifier)
             .padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
+            .onSizeChanged { cardHeight = it.height / density.density }
+            .onGloballyPositioned { pickerAnchor = it.boundsInWindow() }
             .onFocusChanged { composerFocused = it.hasFocus }.focusGroup()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = if (dense) 8.dp else 12.dp, vertical = if (dense) 2.dp else 6.dp),
             verticalArrangement = Arrangement.spacedBy(if (dense) 0.dp else 6.dp)) {
@@ -332,7 +343,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 onValueChange = { if (!sendPending) composer.edit(it) },
                 modifier = Modifier.fillMaxWidth()
                     .then(resizedHeight?.let { Modifier.height(it.dp.coerceIn(56.dp, maxFieldHeight)) }
-                        ?: Modifier.heightIn(min = 56.dp))
+                        ?: Modifier.heightIn(min = 56.dp, max = maxFieldHeight))
                     .onSizeChanged { measuredHeight = it.height / density.density }
                     .focusRequester(fieldFocus).ownsFocusRing().tabMovesFocus().testTag(COMPOSER_FIELD),
                 readOnly = sendPending,
@@ -375,7 +386,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
 
     val open = picker
     if (open != null && view != null) {
-        PickerSheet(open, view, provider, onDismiss = { picker = null }) { id -> picker = null; composer.select(open, id) }
+        PickerSheet(open, view, provider, pickerAnchor, onDismiss = { picker = null }) { id -> picker = null; composer.select(open, id) }
     }
     view?.shell_confirmation?.let { ShellSheet(it, composer) }
 }
@@ -887,7 +898,7 @@ private fun SettingGlyph(resource: Int, fill: Float = 1f) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: String?, onDismiss: () -> Unit, onPick: (String) -> Unit) {
+private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: String?, anchor: Rect?, onDismiss: () -> Unit, onPick: (String) -> Unit) {
     val c = view.catalogs
     val s = view.selection
     val (title, choices, current) = when (kind) {
@@ -898,16 +909,38 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         ComposerPicker.Access -> Triple("Access", c.access, effectiveAccess(s.access))
         ComposerPicker.Speed -> Triple("Speed", c.speeds, s.speed ?: c.speeds.firstOrNull()?.id)
     }
-    // F5: on wide windows (the unfolded Fold, tablets) the choices open as a menu over the composer,
-    // inside the chat pane, instead of a sheet centred across the whole window over the sidebar.
+    // Wide pickers are modal cards inside the chat pane. The dimmed window and opaque elevated
+    // card separate the choices from transcript text instead of splicing a menu through its lines.
     if (LocalWindowTier.current.wide) {
-        DropdownMenu(expanded = true, onDismissRequest = onDismiss,
-            modifier = Modifier.widthIn(min = 280.dp, max = 380.dp).heightIn(max = 480.dp).testTag(COMPOSER_PICKER)) {
-            LiveOverMenu()
-            Column(Modifier.heightIn(max = 440.dp)) {
-                SheetHeader(title, onDismiss, style = MaterialTheme.typography.titleSmall)
-                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).selectableGroup()) {
-                    PickerRows(kind, choices, current, c, provider, onPick)
+        Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+            DialogSystemBars()
+            SheetDismissBackdrop(onDismiss)
+            LiveOverModal()
+            val density = LocalDensity.current
+            BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                .pointerInput(onDismiss) { detectTapGestures(onTap = { onDismiss() }) }
+                .onPreviewKeyEvent { event ->
+                    val close = event.key == androidx.compose.ui.input.key.Key.Escape && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown
+                    if (close) onDismiss()
+                    close
+                }) {
+                val left = with(density) { (anchor?.left ?: 0f).toDp() }.coerceIn(0.dp, maxWidth)
+                val right = (maxWidth - with(density) { (anchor?.right ?: constraints.maxWidth.toFloat()).toDp() }).coerceAtLeast(0.dp)
+                val pickerHeight = maxHeight * .8f
+                Box(Modifier.fillMaxSize().padding(start = left, end = right).padding(16.dp), contentAlignment = Alignment.Center) {
+                    Surface(color = VerdeColors.Panel, shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, VerdeColors.Border), tonalElevation = 8.dp, shadowElevation = 16.dp,
+                        modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth().heightIn(max = pickerHeight)
+                            .pointerInput(Unit) { detectTapGestures { } }.testTag(COMPOSER_PICKER)) {
+                        KeyboardFocusRing(VerdeColors.Accent) {
+                            Column {
+                                SheetHeader(title, onDismiss, style = MaterialTheme.typography.titleSmall)
+                                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).selectableGroup()) {
+                                    PickerRows(kind, choices, current, c, provider, onPick)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
