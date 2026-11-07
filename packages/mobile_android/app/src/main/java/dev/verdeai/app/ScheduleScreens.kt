@@ -25,6 +25,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -122,11 +123,12 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULED_SHEET)) {
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULED_SHEET), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
+        SheetDismissBackdrop(onDismiss)
         LiveOverModal()
-        // S49: the sheet leaves at least 48dp of scrim above it, so "Close sheet" is a full target.
-        Column(Modifier.fillMaxWidth().height(sheetMaxContentHeight() - 48.dp)) {
-            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        // The pinned header and its Close stay outside the scrolling task list.
+        Column(Modifier.fillMaxWidth().height(sheetMaxContentHeight() - 48.dp).navigationBarsPadding()) {
+            Row(Modifier.fillMaxWidth().zIndex(1f).background(VerdeColors.Panel).padding(start = 16.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Scheduled", style = MaterialTheme.typography.titleLarge)
                     Text("Prompts that run on a timer and report back to ${home.name}.", style = MaterialTheme.typography.bodySmall,

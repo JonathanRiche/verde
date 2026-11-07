@@ -909,15 +909,14 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
     }
     // The list scrolls inside a fully expanded sheet, so the last choice is never cut off.
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        modifier = Modifier.testTag(COMPOSER_PICKER)) {
+        modifier = Modifier.testTag(COMPOSER_PICKER), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
+        SheetDismissBackdrop(onDismiss)
         LiveOverModal()
-        // A7-6: a visible Close beside the title.
-        Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            SheetCloseButton(onDismiss)
-        }
-        Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(bottom = 16.dp).selectableGroup()) {
-            PickerRows(kind, choices, current, c, provider, onPick)
+        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight() - 48.dp).navigationBarsPadding()) {
+            SheetHeader(title, onDismiss, style = MaterialTheme.typography.titleMedium)
+            Column(Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(bottom = 16.dp).selectableGroup()) {
+                PickerRows(kind, choices, current, c, provider, onPick)
+            }
         }
     }
 }

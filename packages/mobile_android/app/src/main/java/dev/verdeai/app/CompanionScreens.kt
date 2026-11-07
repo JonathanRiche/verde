@@ -735,42 +735,40 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     LaunchedEffect(Unit) { companion.clearSaveError() }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        modifier = Modifier.testTag(COMPANION_SETTINGS)) {
+        modifier = Modifier.testTag(COMPANION_SETTINGS), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
+        SheetDismissBackdrop(onDismiss)
         LiveOverModal()
-        // X: never so tall that its handle sits under the status bar or camera cutout.
-        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight()).verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
-            // A7-6: a visible Close in the header.
-            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Companion settings", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
-                SheetCloseButton(onDismiss)
-            }
-            VerdeSection("Companions")
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                roster.companions.forEach { entry ->
-                    val selected = entry.id == active.id && !adding
-                    FilterChip(selected = selected, onClick = { adding = false; if (entry.id != active.id) companion.switchTo(entry.id) },
-                        enabled = !state.saving && state.view?.can_edit == true,
-                        label = { Text(entry.name.ifBlank { CompanionCharacter.of(entry.character).label }, maxLines = 1) },
-                        leadingIcon = { CompanionAvatar(CompanionCharacter.of(entry.character), CompanionPose.Idle, size = 24.dp) })
+        Column(Modifier.fillMaxWidth().heightIn(max = sheetMaxContentHeight() - 48.dp).navigationBarsPadding()) {
+            SheetHeader("Companion settings", onDismiss)
+            Column(Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(sheetScroll).padding(bottom = 24.dp)) {
+                VerdeSection("Companions")
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    roster.companions.forEach { entry ->
+                        val selected = entry.id == active.id && !adding
+                        FilterChip(selected = selected, onClick = { adding = false; if (entry.id != active.id) companion.switchTo(entry.id) },
+                            enabled = !state.saving && state.view?.can_edit == true,
+                            label = { Text(entry.name.ifBlank { CompanionCharacter.of(entry.character).label }, maxLines = 1) },
+                            leadingIcon = { CompanionAvatar(CompanionCharacter.of(entry.character), CompanionPose.Idle, size = 24.dp) })
+                    }
+                    if (roster.companions.size < MAX_COMPANIONS) FilterChip(selected = adding, onClick = { adding = true },
+                        enabled = !state.saving && state.view?.can_edit == true, label = { Text("Add") },
+                        leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp)) })
                 }
-                if (roster.companions.size < MAX_COMPANIONS) FilterChip(selected = adding, onClick = { adding = true },
-                    enabled = !state.saving && state.view?.can_edit == true, label = { Text("Add") },
-                    leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp)) })
-            }
-            if (adding) AddCompanion(companion, state, roster) { adding = false }
-            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, companionBrainLabel(active, transcriptState), onRemove = { confirmRemove = true }, onDone = onDismiss,
-                onBrain = { brain = true }) }
-            if (voice != null) {
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
-                VoiceSettings(voice)
-            }
-            if (live != null) {
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
-                Box(Modifier.fillMaxWidth().onGloballyPositioned { liveTop = it.positionInParent().y.toInt() }
-                    .then(if (liveHighlight) Modifier.padding(horizontal = 4.dp)
-                        .border(2.dp, VerdeColors.Accent, RoundedCornerShape(12.dp)) else Modifier)) {
-                    Column { LiveVoiceSettings(live) }
+                if (adding) AddCompanion(companion, state, roster) { adding = false }
+                else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, companionBrainLabel(active, transcriptState), onRemove = { confirmRemove = true }, onDone = onDismiss,
+                    onBrain = { brain = true }) }
+                if (voice != null) {
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
+                    VoiceSettings(voice)
+                }
+                if (live != null) {
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
+                    Box(Modifier.fillMaxWidth().onGloballyPositioned { liveTop = it.positionInParent().y.toInt() }
+                        .then(if (liveHighlight) Modifier.padding(horizontal = 4.dp)
+                            .border(2.dp, VerdeColors.Accent, RoundedCornerShape(12.dp)) else Modifier)) {
+                        Column { LiveVoiceSettings(live) }
+                    }
                 }
             }
         }
