@@ -16,6 +16,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -71,7 +77,8 @@ internal val LocalWindowTier = staticCompositionLocalOf { WindowTier.Compact }
 @Composable
 internal fun AdaptiveWindow(content: @Composable () -> Unit) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        CompositionLocalProvider(LocalWindowTier provides windowTier(maxWidth.value), content = content)
+        val hinge = rememberHalfOpenHinge()
+        CompositionLocalProvider(LocalWindowTier provides windowTier(maxWidth.value), LocalHalfOpenHinge provides hinge, content = content)
     }
 }
 
@@ -108,25 +115,42 @@ internal fun AdaptiveShellFrame(panes: ShellPanes, sidebar: @Composable () -> Un
     moss: @Composable () -> Unit, content: @Composable () -> Unit) {
     // These panes sit outside any Surface, whose content color icons and text would otherwise inherit.
     CompositionLocalProvider(LocalContentColor provides VerdeColors.Text) {
-    Row(Modifier.fillMaxSize()) {
+    val hinge = LocalHalfOpenHinge.current?.takeUnless { it.horizontal }
+    val density = LocalDensity.current
+    var bounds by remember { mutableStateOf<Rect?>(null) }
+    val segments = bounds?.let { area -> hinge?.let {
+        hingeSegments(area.left, area.right, it.bounds.left, it.bounds.right, with(density) { 8.dp.toPx() })
+    } }
+    val sideWidth = segments?.let { with(density) { it.before.toDp() } }
+    Row(Modifier.fillMaxSize().onGloballyPositioned { bounds = it.boundsInWindow() }) {
         when (panes.sidebar) {
             SidebarMode.Full -> {
-                Box(Modifier.width(SIDEBAR_WIDTH).fillMaxHeight().testTag(SHELL_SIDEBAR)) { sidebar() }
-                PaneDivider()
+                Box(Modifier.width(sideWidth ?: SIDEBAR_WIDTH).fillMaxHeight().testTag(SHELL_SIDEBAR)) { sidebar() }
+                if (segments == null) PaneDivider()
             }
             SidebarMode.Rail -> {
-                Box(Modifier.fillMaxHeight().testTag(SHELL_RAIL)) { rail() }
-                PaneDivider()
+                Box(Modifier.width(sideWidth ?: SIDEBAR_RAIL_WIDTH).fillMaxHeight().testTag(SHELL_RAIL)) { rail() }
+                if (segments == null) PaneDivider()
             }
             SidebarMode.Hidden -> Unit
         }
         if (panes.moss == MossPlacement.SidebarSlot) {
             // r5: a little wider than the sidebar, so the companion's composer shows its brain in full
             // ("Codex · GPT-6.1 Sol") beside the attach, mic and send controls.
-            MossPane(MOSS_SLOT_WIDTH, WindowInsetsSides.Start, moss)
-            PaneDivider()
+            MossPane(sideWidth ?: MOSS_SLOT_WIDTH, WindowInsetsSides.Start, moss)
+            if (segments == null) PaneDivider()
         }
-        Box(Modifier.weight(1f).fillMaxHeight().testTag(SHELL_CONTENT)) { content() }
+        if (segments != null) {
+            if (panes.sidebar == SidebarMode.Hidden && panes.moss != MossPlacement.SidebarSlot)
+                Spacer(Modifier.width(sideWidth ?: 0.dp))
+            Spacer(Modifier.width(with(density) { segments.gap.toDp() }))
+        }
+        Box(Modifier.weight(1f).fillMaxHeight().testTag(SHELL_CONTENT)) {
+            // A book posture's content pane is a cover-sized window even when the full display is wide.
+            CompositionLocalProvider(LocalWindowTier provides (segments?.let { windowTier(it.after / density.density) } ?: LocalWindowTier.current)) {
+                content()
+            }
+        }
         if (panes.moss == MossPlacement.ThirdPane) {
             PaneDivider()
             MossPane(MOSS_PANE_WIDTH, WindowInsetsSides.End, moss)
@@ -194,12 +218,21 @@ internal fun TranscriptItemFrame(item: TranscriptItem, content: @Composable () -
 
 internal fun transcriptItemGoesWide(item: TranscriptItem): Boolean = item is TranscriptItem.Diff
 
-/**
- * F7: the hinge (top, bottom in window px) while the device is half-opened with a horizontal fold
- * (tabletop); null otherwise, or where Jetpack WindowManager reports no folding feature.
- */
+/** Half-open fold coordinates in the app window, in either tabletop or book posture. */
+internal data class HalfOpenHinge(val bounds: Rect, val horizontal: Boolean)
+internal val LocalHalfOpenHinge = staticCompositionLocalOf<HalfOpenHinge?> { null }
+internal data class HingeSegments(val before: Float, val gap: Float, val after: Float)
+
+/** Leave clearance on both sides even for a zero-width crease. Reject folds outside this pane. */
+internal fun hingeSegments(start: Float, end: Float, hingeStart: Float, hingeEnd: Float, clearance: Float): HingeSegments? {
+    val before = hingeStart - clearance - start
+    val after = end - hingeEnd - clearance
+    if (before <= 0f || after <= 0f) return null
+    return HingeSegments(before, hingeEnd - hingeStart + 2f * clearance, after)
+}
+
 @Composable
-internal fun rememberTabletopHinge(): Pair<Float, Float>? {
+private fun rememberHalfOpenHinge(): HalfOpenHinge? {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = remember(context) {
         generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull()
@@ -210,8 +243,12 @@ internal fun rememberTabletopHinge(): Pair<Float, Float>? {
     }
     val info by layouts.collectAsState(initial = null)
     val fold = info?.displayFeatures?.filterIsInstance<androidx.window.layout.FoldingFeature>()?.firstOrNull {
-        it.state == androidx.window.layout.FoldingFeature.State.HALF_OPENED &&
-            it.orientation == androidx.window.layout.FoldingFeature.Orientation.HORIZONTAL
+        it.state == androidx.window.layout.FoldingFeature.State.HALF_OPENED
     } ?: return null
-    return fold.bounds.top.toFloat() to fold.bounds.bottom.toFloat()
+    return HalfOpenHinge(Rect(fold.bounds.left.toFloat(), fold.bounds.top.toFloat(), fold.bounds.right.toFloat(), fold.bounds.bottom.toFloat()), fold.orientation == androidx.window.layout.FoldingFeature.Orientation.HORIZONTAL)
+}
+
+@Composable
+internal fun rememberTabletopHinge(): Pair<Float, Float>? = LocalHalfOpenHinge.current?.takeIf { it.horizontal }?.let {
+    it.bounds.top to it.bounds.bottom
 }

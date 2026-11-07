@@ -130,8 +130,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onHos
     val settings = state.settings
     val lockOn = settings.enabled
     Column(Modifier.fillMaxSize()) {
-        VerdeTopBar(title = { Text("Settings") },
-            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.named("Back")) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null) } })
+        VerdeTopBar(title = { Text("Settings") })
         // S8: Appearance, Notifications, Security, Companion, Hosts, About (iOS has the same order).
         CompositionLocalProvider(LocalSectionInset provides 0.dp) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 24.dp),

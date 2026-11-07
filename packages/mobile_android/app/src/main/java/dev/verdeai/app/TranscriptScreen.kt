@@ -219,15 +219,15 @@ internal fun TranscriptScreen(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ProviderGlyph(provider)
                     Column {
-                        // F6: on narrow screens (the Fold's cover screen) a long title takes a second line.
-                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = if (tier.wide) 1 else 2,
+                        // Cover screens give the full title its own row below the controls.
+                        Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = if (tier.wide) 1 else Int.MAX_VALUE,
                             overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
                         provider?.let { id -> Text(PROVIDERS.find { it.first == id }?.second ?: id.replaceFirstChar { it.uppercase() }, maxLines = 1,
                             style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted) }
                     }
                 }
             },
-            showWorkspaceMenu = false,
+            showWorkspaceMenu = false, titleBelowControls = !tier.wide,
             navigationIcon = {
                 // Beside a permanent sidebar neither has a job: chats are switched from the list.
                 if (!tier.docked) Row {
@@ -323,8 +323,9 @@ internal fun TranscriptScreen(
         val lower = tabletop?.let { (hingeTop, hingeBottom) ->
             val density = LocalDensity.current
             val bottom = columnBounds.value?.bottom ?: return@let null
-            if (hingeTop <= (columnBounds.value?.top ?: 0f) || hingeBottom >= bottom) return@let null
-            with(density) { (hingeBottom - hingeTop).toDp() to (bottom - hingeBottom).toDp() }
+            val parts = hingeSegments(columnBounds.value?.top ?: 0f, bottom, hingeTop, hingeBottom,
+                with(density) { 8.dp.toPx() }) ?: return@let null
+            with(density) { parts.gap.toDp() to parts.after.toDp() }
         }
         if (lower != null) Spacer(Modifier.height(lower.first))
         Column(if (lower != null) Modifier.fillMaxWidth().height(lower.second) else Modifier.fillMaxWidth()) {

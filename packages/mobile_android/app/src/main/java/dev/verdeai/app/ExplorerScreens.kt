@@ -539,7 +539,8 @@ internal fun entrySize(bytes: Long) = if (bytes < 1024) "$bytes B" else sizeLabe
 /** "Changes · Files" entry points (drawer and workspace screen); [workspace] names the target when ambiguous. */
 @Composable
 internal fun ExplorerLinks(onChanges: () -> Unit, onFiles: () -> Unit, workspace: String? = null, modifier: Modifier = Modifier) {
-    Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         // In All Workspaces scope the target is named ("in demo-app"), on screen and for TalkBack.
         val target = workspace?.let { " in $it" }.orEmpty()
         // S16: tonal 48dp chips with an icon (iOS's Changes / Files).
@@ -556,7 +557,8 @@ internal fun ExplorerLinks(onChanges: () -> Unit, onFiles: () -> Unit, workspace
             Icon(painterResource(R.drawable.ic_folder), contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp)); Text("Files")
         }
-        workspace?.let { Text("in $it", Modifier.weight(1f).clearAndSetSemantics {}, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        }
+        workspace?.let { Text("in $it", Modifier.fillMaxWidth().clearAndSetSemantics {},
             style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted) }
     }
 }

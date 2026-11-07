@@ -1,5 +1,6 @@
 package dev.verdeai.app
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -77,6 +78,65 @@ class AdaptiveLayoutTest {
         assertEquals(SidebarMode.Rail, sidebar(WindowTier.TwoPane, collapsed = true))
         assertEquals(SidebarMode.Hidden, sidebar(WindowTier.Compact, collapsed = true))
         assertEquals(SidebarMode.Hidden, sidebar(WindowTier.TwoPane, pairing = true))
+    }
+
+    @Test fun hingeClearanceKeepsBothPanesAwayFromTabletopCrease() {
+        val parts = hingeSegments(50f, 900f, 450f, 450f, 8f)!!
+        assertEquals(392f, parts.before)
+        assertEquals(16f, parts.gap)
+        assertEquals(442f, parts.after)
+        assertEquals(null, hingeSegments(500f, 900f, 450f, 450f, 8f))
+    }
+
+    @Test
+    @Config(sdk = [35], qualifiers = "w750dp-h900dp")
+    fun bookPostureSeparatesPanesAndKeepsContentState() {
+        var folded by mutableStateOf(false)
+        compose.setContent {
+            val density = androidx.compose.ui.platform.LocalDensity.current.density
+            val hinge = HalfOpenHinge(androidx.compose.ui.geometry.Rect(373f * density, 0f, 377f * density, 900f * density), false)
+            CompositionLocalProvider(LocalWindowTier provides WindowTier.TwoPane, LocalHalfOpenHinge provides if (folded) hinge else null) {
+                AdaptiveShellFrame(shellPanes(WindowTier.TwoPane, false, false, false),
+                    sidebar = { Text("Chats") }, rail = {}, moss = {}) {
+                    var count by rememberSaveable { mutableIntStateOf(0) }
+                    Column {
+                        Text("tier ${LocalWindowTier.current}")
+                        TextButton({ count++ }) { Text("count $count") }
+                    }
+                }
+            }
+        }
+        compose.onNodeWithText("count 0").performClick()
+        folded = true
+        compose.waitForIdle()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertWidthIsEqualTo(365.dp)
+        val content = compose.onNodeWithTag(SHELL_CONTENT).getUnclippedBoundsInRoot()
+        assertEquals(385.dp, content.left)
+        compose.onNodeWithText("tier Compact").assertExists()
+        compose.onNodeWithText("count 1").assertExists()
+        folded = false
+        compose.waitForIdle()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertWidthIsEqualTo(SIDEBAR_WIDTH)
+        compose.onNodeWithText("count 1").assertExists()
+    }
+
+    @Test fun coverTitleGetsTheWholeWidthBelowTheControls() {
+        var layout: TextLayoutResult? = null
+        compose.setContent {
+            VerdeTheme {
+                Box(Modifier.requiredWidth(360.dp)) {
+                    VerdeTopBar(titleBelowControls = true,
+                        title = { androidx.compose.material3.Text("Steering Delays in Orchestrated Chats", onTextLayout = { layout = it }) },
+                        navigationIcon = { TextButton({}, Modifier.testTag("back")) { Text("Back") } },
+                        actions = { TextButton({}, Modifier.testTag("actions")) { Text("More") } })
+                }
+            }
+        }
+        val title = compose.onNodeWithText("Steering Delays in Orchestrated Chats").getUnclippedBoundsInRoot()
+        val controls = compose.onNodeWithTag("actions").getUnclippedBoundsInRoot()
+        assertTrue(title.top >= controls.bottom)
+        assertTrue(title.width > controls.width)
+        assertFalse(layout!!.hasVisualOverflow)
     }
 
     /** The frame at a real measured width, with a Moss flag the test controls. */

@@ -904,8 +904,12 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         DropdownMenu(expanded = true, onDismissRequest = onDismiss,
             modifier = Modifier.widthIn(min = 280.dp, max = 380.dp).heightIn(max = 480.dp).testTag(COMPOSER_PICKER)) {
             LiveOverMenu()
-            Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-            Column(Modifier.selectableGroup()) { PickerRows(kind, choices, current, c, provider, onPick) }
+            Column(Modifier.heightIn(max = 440.dp)) {
+                SheetHeader(title, onDismiss, style = MaterialTheme.typography.titleSmall)
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).selectableGroup()) {
+                    PickerRows(kind, choices, current, c, provider, onPick)
+                }
+            }
         }
         return
     }
