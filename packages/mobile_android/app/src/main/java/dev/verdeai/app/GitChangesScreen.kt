@@ -168,7 +168,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
             dismissButton = { TextButton(onClick = model::dismiss, enabled = !state.busy) { Text("Abort") } })
     }
     if (state.sheet) {
-        ModalBottomSheet(onDismissRequest = model::dismiss,
+        ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = model::dismiss,
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = { !committing }),
             containerColor = VerdeColors.Panel, modifier = Modifier.testTag("git-sheet")) {
             LiveOverModal()

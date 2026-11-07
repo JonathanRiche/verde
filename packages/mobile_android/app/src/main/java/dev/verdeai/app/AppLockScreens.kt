@@ -83,6 +83,7 @@ internal fun AppLockGate(model: AppLockModel, auth: DeviceAuth, content: @Compos
         properties = DialogProperties(dismissOnBackPress = true, dismissOnClickOutside = false,
             usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
+        ModalAccessibility()
         // The dialog window has its own system bars; keep their icons readable in the selected theme.
         val view = LocalView.current
         val dark = VerdeColors.dark

@@ -328,7 +328,7 @@ internal fun rememberMicPermission(): MicPermission {
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> pending.finish(granted) }
     fun cancel() { rationale.value = false; pending.finish(false) }
     if (rationale.value) AlertDialog(onDismissRequest = ::cancel,
-        title = { Text("Talk to your companion") },
+        title = { LiveOverModal(); Text("Talk to your companion") },
         text = { Text("verde listens only while you hold the bubble or the mic. Your phone's speech service turns what you say into text (on the device when it can), and verde sends that text as a message. verde doesn't record or keep audio.") },
         confirmButton = { TextButton(onClick = { rationale.value = false; launcher.launch(Manifest.permission.RECORD_AUDIO) }) { Text("Continue") } },
         dismissButton = { TextButton(onClick = ::cancel) { Text("Not now") } })

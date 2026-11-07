@@ -273,7 +273,7 @@ internal fun CompanionSheet(
         ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
             modifier = Modifier.testTag(COMPANION_SHEET),
-            dragHandle = { CompanionSheetHandle(tall) { tall = it } }) {
+            dragHandle = { TopModalDragHandle { CompanionSheetHandle(tall) { tall = it } } }) {
             LiveOverModal()
             // A share of the screen, not of the sheet's window: Live's bar joining the window (and
             // padding it) during "Connecting…" no longer drops the sheet to a lower height.
@@ -738,7 +738,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     var adding by rememberSaveable { mutableStateOf(false) }
     var confirmRemove by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { companion.clearSaveError() }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         modifier = Modifier.testTag(COMPANION_SETTINGS), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
         SheetDismissBackdrop(onDismiss)
@@ -880,7 +880,7 @@ private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, cur
     val state by companion.state.collectAsState()
     val now = rememberNow(false)
     val enabled = state.view?.can_edit == true && !state.saving
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_CONVERSATIONS)) {
         LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {

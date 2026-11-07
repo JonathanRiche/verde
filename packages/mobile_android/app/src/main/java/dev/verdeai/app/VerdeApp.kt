@@ -97,7 +97,7 @@ internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = r
     VerdeTheme {
         AppearanceSystemBars()
         CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient,
-            LocalPushControls provides push) {
+            LocalPushControls provides push, LocalModalLayers provides remember { ModalLayers() }) {
             val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else AdaptiveWindow { Shell(hosts, browse, hostsState) } }
             if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
         }

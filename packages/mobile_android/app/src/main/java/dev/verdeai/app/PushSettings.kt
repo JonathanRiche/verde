@@ -80,7 +80,7 @@ internal fun PushOptInPrompt(hostsState: HostsState) {
     if (!justPaired || dismissed || !state.loaded || !state.available || state.asked || state.enabled) return
     AlertDialog(
         onDismissRequest = { dismissed = true; scope.launch { controls.markAsked() } },
-        title = { Text("Turn on notifications?") },
+        title = { LiveOverModal(); Text("Turn on notifications?") },
         text = { Text("verde can tell you when an agent finishes, fails or needs your approval, even when your phone is locked. " +
             "Notification content is encrypted on your host and only this phone can read it.") },
         confirmButton = { TextButton(onClick = { dismissed = true; enable() }) { Text("Turn on") } },

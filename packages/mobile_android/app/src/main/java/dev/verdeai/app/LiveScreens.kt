@@ -109,6 +109,7 @@ internal val LocalLiveBar = compositionLocalOf<LiveBarHost?> { null }
  */
 @Composable
 internal fun LiveOverModal() {
+    ModalAccessibility()
     if (LocalAppLocked.current) return
     val host = LocalLiveBar.current ?: return
     val view = LocalView.current

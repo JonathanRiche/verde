@@ -962,7 +962,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         return
     }
     // The list scrolls inside a fully expanded sheet, so the last choice is never cut off.
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         modifier = Modifier.testTag(COMPOSER_PICKER), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
         SheetDismissBackdrop(onDismiss)
         LiveOverModal()
@@ -1018,7 +1018,7 @@ private fun PickerRows(kind: ComposerPicker, choices: List<ChatChoice>, current:
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ShellSheet(confirmation: ChatShellConfirmation, composer: ComposerModel) {
-    ModalBottomSheet(onDismissRequest = { composer.confirmShell(confirmation, false) }, modifier = Modifier.testTag(COMPOSER_SHELL)) {
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = { composer.confirmShell(confirmation, false) }, modifier = Modifier.testTag(COMPOSER_SHELL)) {
         LiveOverModal()
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Run this command on the host?", style = MaterialTheme.typography.titleMedium)

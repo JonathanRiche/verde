@@ -122,7 +122,7 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
         form = ScheduleFormRequest.New(if (example) exampleDraft(home, defaultWorkspace, phoneNow) else newDraft(home, defaultWorkspace, phoneNow))
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULED_SHEET), contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
         SheetDismissBackdrop(onDismiss)
         LiveOverModal()
@@ -347,7 +347,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
         if (draft.sendTo == ScheduleSendTo.NewChat && draft.provider.isEmpty() && provider != null) draft = draft.copy(provider = provider)
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULE_FORM),
         contentWindowInsets = { WindowInsets(0) }, scrimColor = androidx.compose.ui.graphics.Color.Unspecified) {
         SheetDismissBackdrop(onDismiss)

@@ -70,7 +70,7 @@ internal fun CompanionBrainSheet(companion: CompanionModel, manage: ManageModel,
         }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_BRAIN)) {
         LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {

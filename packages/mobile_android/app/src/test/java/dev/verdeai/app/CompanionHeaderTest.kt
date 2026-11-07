@@ -1,5 +1,7 @@
 package dev.verdeai.app
 
+import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -42,8 +44,10 @@ class CompanionHeaderTest {
     @Test fun accessibleValueChangesWithTheCompanionsActualState() {
         var shown by mutableStateOf(state(0) {})
         compose.setContent { VerdeTheme { CompanionHeaderButton(shown) } }
-        fun value(text: String) = compose.onNodeWithTag(COMPANION_HEADER)
-            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text))
+        fun value(text: String) {
+            compose.onNodeWithTag(COMPANION_HEADER).assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text))
+            compose.onAllNodes(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text), useUnmergedTree = true).assertCountEquals(1)
+        }
         value("Ready")
         shown = state(0, running = true) {}; compose.waitForIdle(); value("Working")
         shown = state(0, failed = 1) {}; compose.waitForIdle(); value("Failed")
@@ -60,6 +64,47 @@ class CompanionHeaderTest {
         compose.onNodeWithText("Chat").assertExists()
         compose.onNodeWithContentDescription("Idle").assertDoesNotExist()
         assertEquals(1, compose.onRoot().fetchSemanticsNode().children.size)
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun largestCoverHeaderStatusWrapsInsteadOfTruncatingBesideActions() {
+        compose.setContent {
+            VerdeTheme {
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(density.density, 2f)) {
+                    androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.requiredWidth(360.dp)) {
+                        CompanionHeader(dev.verdeai.core.CompanionEntry("sprout", "Sprout"), null, CompanionPose.Idle,
+                            "1 chat failed", true, {}, {}, {}, {}, onLive = {}, onScheduled = {})
+                    }
+                }
+            }
+        }
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithText("1 chat failed").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        org.junit.Assert.assertFalse(layouts.single().hasVisualOverflow)
+        org.junit.Assert.assertFalse(layouts.single().isLineEllipsized(layouts.single().lineCount - 1))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun selectedCoverDrawerTitleWrapsAndUnreadUsesWeightWithNoStateMark() {
+        val title = "Investigate transcript memory growth"
+        compose.setContent {
+            VerdeTheme {
+                androidx.compose.foundation.layout.Column(androidx.compose.ui.Modifier.requiredWidth(315.dp)) {
+                    DrawerChat(dev.verdeai.core.ThreadSummary("w", "t", title, "cursor", null, null,
+                        open = true, archived = false, last_activity_at_ms = null, status = "idle", history_bucket = "today", state = "unread"),
+                        active = true, canEdit = false, onAction = { _, _ -> }) {}
+                    StateMark(ChatState.Unread)
+                }
+            }
+        }
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithText(title, useUnmergedTree = true).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertEquals(2, layouts.single().lineCount)
+        assertEquals(androidx.compose.ui.text.font.FontWeight.SemiBold, layouts.single().layoutInput.style.fontWeight)
+        compose.onNodeWithContentDescription("Unread").assertDoesNotExist()
     }
 
     @Test fun noHeaderButtonWithoutTheShellsState() {

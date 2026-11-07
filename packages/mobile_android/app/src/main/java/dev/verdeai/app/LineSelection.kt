@@ -202,7 +202,7 @@ internal fun AskAgentSheet(
 ) {
     var chat by rememberSaveable { mutableStateOf(chats.firstOrNull()?.thread_id) }
     var instruction by rememberSaveable { mutableStateOf("") }
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+    ModalBottomSheet(dragHandle = { TopModalDragHandle() }, onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(ASK_SHEET_TAG)) {
         LiveOverModal()
         Column(Modifier.fillMaxWidth().imePadding().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -787,7 +787,7 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
 @Composable
 private fun SelectTextDialog(content: @Composable () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss,
-        title = { Text("Select text") },
+        title = { LiveOverModal(); Text("Select text") },
         text = {
             Box(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
                 androidx.compose.foundation.text.selection.SelectionContainer { content() }

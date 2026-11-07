@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -41,6 +42,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -373,7 +375,7 @@ internal fun CompanionDock(state: CompanionDockState) {
             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
                 .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
                 .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-                .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
+                .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
                 .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DockAvatar(state)
                 Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -391,7 +393,7 @@ internal fun CompanionRailDock(state: CompanionDockState) {
     state.talk?.let { DockTalk(it, state.name) }
     Box(Modifier.size(48.dp).clip(CircleShape)
         .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-        .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
+        .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
         .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
 }
 
@@ -502,7 +504,17 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
                 }
             }
         }
-        .semantics {
+        // A5-3: reachable with Tab; Enter or Space opens it like a tap.
+        .onKeyEvent { event ->
+            val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
+                (event.key == androidx.compose.ui.input.key.Key.Enter || event.key == androidx.compose.ui.input.key.Key.Spacebar ||
+                    event.key == androidx.compose.ui.input.key.Key.NumPadEnter)
+            if (activate) open()
+            activate
+        }
+        .focusable()
+        .clearAndSetSemantics {
+            testTag = COMPANION_HEADER
             role = Role.Button
             contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state)
             onClick(label = "Open ${state.name}") { open(); true }
@@ -515,17 +527,7 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
                 if (talk?.speaking == true) add(CustomAccessibilityAction("Stop speaking") { talk.stopSpeaking(); true })
                 state.live?.let { live -> add(CustomAccessibilityAction(if (live.active) "End live voice" else "Start live voice") { live.toggle(); true }) }
             }
-        }
-        // A5-3: reachable with Tab; Enter or Space opens it like a tap.
-        .onKeyEvent { event ->
-            val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
-                (event.key == androidx.compose.ui.input.key.Key.Enter || event.key == androidx.compose.ui.input.key.Key.Spacebar ||
-                    event.key == androidx.compose.ui.input.key.Key.NumPadEnter)
-            if (activate) open()
-            activate
-        }
-        .focusable()
-        .testTag(COMPANION_HEADER), contentAlignment = Alignment.Center) {
+        }, contentAlignment = Alignment.Center) {
         Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
             if (state.live?.active == true) LiveRing(state.live.level()) else if (state.running || talking) RunningRing(reduced)
             Box(Modifier.size(36.dp).background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
@@ -672,7 +674,16 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                         }
                     }
                 }
-                .semantics {
+                .then(focusModifier)
+                .onKeyEvent { event ->
+                    val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
+                        event.key in setOf(androidx.compose.ui.input.key.Key.Enter, androidx.compose.ui.input.key.Key.NumPadEnter, androidx.compose.ui.input.key.Key.Spacebar)
+                    if (activate) onOpen()
+                    activate
+                }
+                .focusable()
+                .clearAndSetSemantics {
+                    testTag = COMPANION_BUBBLE
                     role = Role.Button
                     contentDescription = bubbleDescription(name, count, failed)
                     stateDescription = bubbleStateValue(pose, count, running, failed, talk?.state ?: TalkState.Idle, talk?.speaking == true, live?.active == true)
@@ -686,16 +697,7 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                         if (live != null) add(CustomAccessibilityAction(if (live.active) "End live voice" else "Start live voice") { live.toggle(); true })
                         add(CustomAccessibilityAction("Hide bubble") { onHide(); true })
                     }
-                }
-                .then(focusModifier)
-                .onKeyEvent { event ->
-                    val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
-                        event.key in setOf(androidx.compose.ui.input.key.Key.Enter, androidx.compose.ui.input.key.Key.NumPadEnter, androidx.compose.ui.input.key.Key.Spacebar)
-                    if (activate) onOpen()
-                    activate
-                }
-                .focusable()
-                .testTag(COMPANION_BUBBLE)) {
+                }) {
                 val liveOn = live?.active == true
                 if (liveOn) LiveRing(live?.level?.invoke() ?: 0f) else if (running || talking) RunningRing(reduced)
                 Box(Modifier.align(Alignment.Center).size(50.dp)
