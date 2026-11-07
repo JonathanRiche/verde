@@ -44,6 +44,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
@@ -152,6 +153,23 @@ internal fun bubbleDescription(name: String, count: Int, failed: Int = 0): Strin
     count == 1 -> "$name, 1 thing needs you"
     else -> "$name, $count things need you"
 }
+
+/** TalkBack's value follows the same live state as the avatar, ring and badge. */
+internal fun bubbleStateValue(pose: CompanionPose, count: Int, running: Boolean, failed: Int,
+    talk: TalkState = TalkState.Idle, speaking: Boolean = false, live: Boolean = false): String = when {
+    live -> "Live voice"
+    talk is TalkState.Listening -> if (talk.cancelArmed) "Release to cancel" else "Listening"
+    talk is TalkState.Finishing -> "Transcribing"
+    speaking -> "Speaking"
+    pose == CompanionPose.Paused -> "Offline"
+    count > 0 -> "Needs you"
+    failed > 0 -> "Failed"
+    running || pose == CompanionPose.Working -> "Working"
+    else -> "Ready"
+}
+
+private fun bubbleStateValue(state: CompanionDockState) = bubbleStateValue(state.pose, state.count, state.running, state.failed,
+    state.talk?.state ?: TalkState.Idle, state.talk?.speaking == true, state.live?.active == true)
 
 /** One line of a reply for the speech bubble. */
 internal fun replyPreview(body: String, max: Int = 80): String {
@@ -316,12 +334,13 @@ internal fun CompanionBubbleLayer(
     live: BubbleLive? = null,
     failed: Int = 0,
     focusModifier: Modifier = Modifier,
+    windowPadding: PaddingValues = PaddingValues(0.dp),
     onOpen: () -> Unit,
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { BubblePrefs.of(context) }
     if (!shown) return
-    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live, failed, focusModifier,
+    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live, failed, focusModifier, windowPadding,
         // While Live, a tap ends it; otherwise it opens the sheet.
         onOpen = {
             chip.clear()
@@ -354,7 +373,7 @@ internal fun CompanionDock(state: CompanionDockState) {
             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
                 .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
                 .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-                .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed) }
+                .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
                 .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DockAvatar(state)
                 Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -372,7 +391,7 @@ internal fun CompanionRailDock(state: CompanionDockState) {
     state.talk?.let { DockTalk(it, state.name) }
     Box(Modifier.size(48.dp).clip(CircleShape)
         .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
-        .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed) }
+        .semantics { contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state) }
         .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
 }
 
@@ -485,7 +504,7 @@ internal fun CompanionHeaderButton(state: CompanionDockState) {
         }
         .semantics {
             role = Role.Button
-            contentDescription = bubbleDescription(state.name, state.count, state.failed)
+            contentDescription = bubbleDescription(state.name, state.count, state.failed); stateDescription = bubbleStateValue(state)
             onClick(label = "Open ${state.name}") { open(); true }
             customActions = buildList {
                 val talk = state.talk
@@ -541,7 +560,7 @@ private enum class BubbleGesture { Tap, Drag, Hold }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompanionBubble(prefs: BubblePrefs, name: String, character: CompanionCharacter, pose: CompanionPose, count: Int,
-    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, failed: Int, focusModifier: Modifier, onOpen: () -> Unit, onHide: () -> Unit) {
+    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, failed: Int, focusModifier: Modifier, windowPadding: PaddingValues, onOpen: () -> Unit, onHide: () -> Unit) {
     val context = LocalContext.current
     val reduced = remember(context) { reducedMotion(context) }
     val haptics = LocalHapticFeedback.current
@@ -553,11 +572,18 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
         val direction = LocalLayoutDirection.current
         val size = with(density) { BUBBLE_SIZE.toPx() }
         val safe = WindowInsets.safeDrawing
-        val area = bubbleArea(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat(), size,
+        // The focus-group container may be Scaffold's inset content. Compute placement in the
+        // full window once, then translate it, so moving the node doesn't count system insets twice.
+        val left = with(density) { windowPadding.calculateLeftPadding(direction).toPx() }
+        val right = with(density) { windowPadding.calculateRightPadding(direction).toPx() }
+        val top = with(density) { windowPadding.calculateTopPadding().toPx() }
+        val bottom = with(density) { windowPadding.calculateBottomPadding().toPx() }
+        val fullArea = bubbleArea(constraints.maxWidth.toFloat() + left + right, constraints.maxHeight.toFloat() + top + bottom, size,
             safe.getLeft(density, direction).toFloat(), safe.getTop(density).toFloat(), safe.getRight(density, direction).toFloat(),
             safe.getBottom(density).toFloat(), reserveTop = with(density) { 56.dp.toPx() },
             // r5: at rest it sits in the bottom band beside the New chat button (16dp off the bottom), not above it.
             reserveBottom = with(density) { 8.dp.toPx() }, margin = with(density) { 8.dp.toPx() })
+        val area = BubbleArea(fullArea.left - left, fullArea.top - top, fullArea.right - left, fullArea.bottom - top)
         val currentArea by rememberUpdatedState(area)
         // S14: at rest the bubble stacks on the New chat button at the bottom of its side, where the
         // lists keep space free; a drag picks the side, and it settles back to the bottom.
@@ -649,6 +675,7 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                 .semantics {
                     role = Role.Button
                     contentDescription = bubbleDescription(name, count, failed)
+                    stateDescription = bubbleStateValue(pose, count, running, failed, talk?.state ?: TalkState.Idle, talk?.speaking == true, live?.active == true)
                     onClick(label = "Open $name") { onOpen(); true }
                     customActions = buildList {
                         if (talk != null) add(CustomAccessibilityAction(if (talking) "Stop and send" else "Talk to $name") {

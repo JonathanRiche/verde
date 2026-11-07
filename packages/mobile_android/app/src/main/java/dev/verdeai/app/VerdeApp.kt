@@ -343,7 +343,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val dockShown = companionUp && tier.docked && panes.moss != MossPlacement.SidebarSlot
     val companionCharacter = CompanionCharacter.of(companionActive?.character)
     val companionName = companionActive?.name?.ifBlank { null } ?: companionCharacter.label
-    val companionPoseNow = companionPose(browseState.host?.phase == "ready" && browseState.networkAvailable, companionNow.asking, companionNow.crewRunning)
+    val companionPoseNow = companionPose(browseState.host?.phase == "ready" && browseState.networkAvailable, companionNow.asking, companionNow.isWorking)
     val bubbleLive = if (liveView?.supported == false) null else BubbleLive(liveUi.active, { maxOf(liveLevel, liveInput) }, ::toggleLive)
     val bubbleTalk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
         start = {
@@ -362,10 +362,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk,
         quietKeys = openChatKey?.let(::setOf).orEmpty())
     val headerState = if (headerShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
-        companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
+        companionNow.isWorking, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }, failed = companionNow.failed) else null
     val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.pulse.needsYou,
-        companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
+        companionNow.isWorking, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
         onToggle = { companionSettings = false; companionOpen = !companionOpen }, failed = companionNow.failed) else null
     // A6-2: when no control has focus (a tap on the transcript, a closed dialog), the shell itself
     // holds it, so a stray Space or Enter does nothing instead of giving the first control (Back,
@@ -447,8 +447,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 // The overlay is the last content control, before Scaffold's header in reverse
                 // search. Insets are already consumed, so its screen position stays unchanged.
                 if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
-                    companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
-                    focusModifier = Modifier.focusRequester(bubbleFocus)
+                    companionNow.pulse.needsYou, companionNow.isWorking, bubbleTalk, bubbleLive, failed = companionNow.failed,
+                    windowPadding = padding,
+                focusModifier = Modifier.focusRequester(bubbleFocus)
                         .then(if (hasShellHeader) Modifier.keyboardBridge(headerFocus) else Modifier),
                     onOpen = { companionSettings = false; companionOpen = true })
             }

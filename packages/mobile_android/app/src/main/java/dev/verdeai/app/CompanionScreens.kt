@@ -102,6 +102,7 @@ internal data class CompanionSnapshot(
     val failedChats: List<dev.verdeai.core.AttentionChat> = emptyList(),
 ) {
     val failed get() = failedChats.size
+    val isWorking get() = pulse.running > 0 || crewRunning
 }
 
 internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
@@ -189,7 +190,7 @@ internal fun CompanionSheet(
     LaunchedEffect(liveOn, composerNotice) { if (liveOn && composerNotice != null) { voice?.clearError(); transcript?.composer?.clearNotice() } }
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
-    val working = transcriptState?.turn != null || snapshot.pulse.running > 0
+    val working = transcriptState?.turn != null || snapshot.isWorking
     val pose = companionPose(online, snapshot.asking || transcriptState?.thread?.approval != null, working)
 
     val inPane = placement != MossPlacement.Sheet
