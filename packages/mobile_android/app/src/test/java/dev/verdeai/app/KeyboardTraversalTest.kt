@@ -60,15 +60,18 @@ class KeyboardTraversalTest {
     @Test fun bubbleJoinsTheCycleAndReverseReturnsToTheLastRow() {
         val header = FocusRequester(); val body = FocusRequester(); val bubble = FocusRequester()
         compose.setContent {
-            Column {
+            androidx.compose.material3.Scaffold(topBar = {
                 Row(Modifier.focusRequester(header).keyboardRegion(body, bubble)) {
                     Button({}, Modifier.testTag("drawer")) { Text("Drawer") }
                     Button({}, Modifier.testTag("host")) { Text("Host") }
                 }
-                Column(Modifier.focusRequester(body).keyboardRegion(bubble)) {
-                    repeat(2) { i -> Button({}, Modifier.testTag("row$i")) { Text("Chat $i") } }
+            }) { padding ->
+                Column(Modifier.padding(padding).focusRequester(body).keyboardRegion(header)) {
+                    Column {
+                        repeat(2) { i -> Button({}, Modifier.testTag("row$i")) { Text("Chat $i") } }
+                    }
+                    Text("Bubble", Modifier.focusRequester(bubble).keyboardBridge(header).focusable().testTag("bubble"))
                 }
-                Text("Bubble", Modifier.focusRequester(bubble).keyboardBridge(header).focusable().testTag("bubble"))
             }
         }
         compose.runOnIdle { header.requestFocus() }

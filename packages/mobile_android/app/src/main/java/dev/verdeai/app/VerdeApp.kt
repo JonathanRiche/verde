@@ -438,21 +438,23 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)
                 .then(if (hasShellHeader) Modifier.dismissKeyboardOnTouch(parkTouch) else Modifier).focusRequester(contentFocus)
-                .keyboardRegion(if (bubbleShown && hasShellHeader) bubbleFocus else if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
+                .keyboardRegion(if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
                     LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
                     LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {
                     Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
                 }
+                // The overlay is the last content control, before Scaffold's header in reverse
+                // search. Insets are already consumed, so its screen position stays unchanged.
+                if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
+                    companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
+                    focusModifier = Modifier.focusRequester(bubbleFocus)
+                        .then(if (hasShellHeader) Modifier.keyboardBridge(headerFocus) else Modifier),
+                    onOpen = { companionSettings = false; companionOpen = true })
             }
         }
         }
     }
-    if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
-        companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
-        focusModifier = Modifier.focusRequester(bubbleFocus)
-            .then(if (hasShellHeader) Modifier.keyboardBridge(headerFocus) else Modifier),
-        onOpen = { companionSettings = false; companionOpen = true })
     // Last, so it floats above every screen, the drawer and the bubble.
     if (callUp) LiveShellBar(liveBar, statusTop)
     }
