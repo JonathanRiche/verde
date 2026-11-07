@@ -303,7 +303,6 @@ struct RootView: View {
         // S32: grouped section headers keep their sentence case (the default uppercases them).
         .headerProminence(.increased)
         .environment(\.defaultMinListRowHeight, 44)
-        .accessibilityHidden(lock.covered)
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
         .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.active || (live.failure != nil && !companionSheet), covered: lock.covered,
                                 prepare: prepareLiveTarget, present: presentLiveTarget).frame(width: 0, height: 0))

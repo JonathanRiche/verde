@@ -32,6 +32,9 @@ private struct PresentationAccessibilityLayer: ViewModifier {
     var covered = false
     func body(content: Content) -> some View {
         content
+            // A real container keeps child accessibility modifiers (including NavigationStack's
+            // native wrappers) from overriding the visibility of the presenting layer.
+            .accessibilityElement(children: .contain)
             .accessibilityHidden(covered || context.state.topLayer > context.layer)
             .environment(\.presentationAccessibility, context)
     }
