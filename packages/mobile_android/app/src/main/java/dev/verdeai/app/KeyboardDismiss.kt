@@ -37,6 +37,9 @@ internal class ShellFocus(private val scope: CoroutineScope) {
         parking?.cancel()
         parked = true
         pendingPark = true
+        // Keep the native Compose view focused before the next hardware key arrives; otherwise
+        // Android can spend that first Tab merely entering the view. Retry after properties settle.
+        runCatching { requester.requestFocus() }
         parking = scope.launch {
             withFrameNanos { }
             runCatching { requester.requestFocus() }

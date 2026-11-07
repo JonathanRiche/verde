@@ -379,6 +379,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     var shellHolds by remember { mutableStateOf(false) }
     var shellHasFocus by remember { mutableStateOf(false) }
     LaunchedEffect(shellFocus) { shellFocus.requestFocus() }
+    // Navigation can dispose the composer's focused node while the parking target is disabled.
+    // Park again on top-level destinations so Android doesn't spend the next Tab entering the view.
+    LaunchedEffect(route) { if (hasShellHeader) shellFocus.requestFocus() }
+    val parkTouch = remember(shellFocus) { { shellFocus.requestFocus() } }
     Box(Modifier.fillMaxSize().focusRequester(shellFocus.requester)
         .focusProperties { canFocus = shellFocus.parked }
         .onFocusChanged { shellHolds = it.isFocused; shellHasFocus = it.hasFocus }
@@ -410,7 +414,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         Scaffold(
             contentWindowInsets = contentWindowInsets(tier, panes),
             topBar = {
-                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding().focusRequester(headerFocus)
+                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()
+                    .dismissKeyboardOnTouch(parkTouch).focusRequester(headerFocus)
                     .keyboardRegion(contentFocus, if (bubbleShown) bubbleFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                     // S28: one logo: beside the full sidebar (which carries it) the content bar has none.
                     VerdeTopBar(title = { if (panes.sidebar != SidebarMode.Full) VerdeWordmark() },
@@ -431,7 +436,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 }
             },
         ) { padding ->
-            Box(Modifier.padding(padding).consumeWindowInsets(padding).focusRequester(contentFocus)
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)
+                .then(if (hasShellHeader) Modifier.dismissKeyboardOnTouch(parkTouch) else Modifier).focusRequester(contentFocus)
                 .keyboardRegion(if (bubbleShown && hasShellHeader) bubbleFocus else if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
                     LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
