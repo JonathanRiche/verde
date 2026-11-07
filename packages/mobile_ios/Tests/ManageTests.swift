@@ -88,9 +88,15 @@ final class ManageTests: XCTestCase {
             ThreadSummary(workspace_id: "w", thread_id: id, title: id, provider: "codex", model: nil, cwd: "",
                           open: true, archived: false, last_activity_at_ms: ms, status: "idle", history_bucket: bucket)
         }
-        let sections = historySections([t("sprout", 1_000, "Today"), t("rotate", 5_000, "Today"), t("undated", nil, "Today"), t("old", 9_000, "Earlier")])
-        XCTAssertEqual(sections.map(\.0), ["Today", "Earlier"])
+        let day: Int64 = 86_400_000
+        let now: Int64 = 30 * day
+        // B2: each row's own time picks its section, whatever bucket the core stamped.
+        let sections = historySections([t("sprout", now - 3_600_000, "This week"), t("rotate", now - 600_000, "This week"),
+                                        t("undated", nil, "Today"), t("week", now - 3 * day, "Today"), t("old", now - 20 * day, "Today")], now: now)
+        XCTAssertEqual(sections.map(\.0), ["Today", "This week", "Older"])
         XCTAssertEqual(sections[0].1.map(\.thread_id), ["rotate", "sprout", "undated"])
+        XCTAssertEqual(sections[1].1.map(\.thread_id), ["week"])
+        XCTAssertEqual(sections[2].1.map(\.thread_id), ["old"])
     }
 
     func testDrawerActiveIsRunningOrNeedsYou() {

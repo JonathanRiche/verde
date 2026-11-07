@@ -151,7 +151,8 @@ private struct RowContent: View {
                 if let detail { subtitle(detail) }
             }
             Spacer(minLength: 4)
-            if state == .working { ProgressView().controlSize(.mini).accessibilityHidden(true) }
+            // A running row says "Working" (in the accent) in its subtitle; no extra trailing mark.
+            if state == .working && stateText == nil { ProgressView().controlSize(.mini).accessibilityHidden(true) }
             if unread {
                 Circle().fill(VerdeTheme.muted).frame(width: 8, height: 8).accessibilityLabel("Unread")
             }

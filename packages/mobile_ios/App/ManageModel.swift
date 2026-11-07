@@ -96,15 +96,28 @@ func historySubtitle(_ thread: ThreadSummary, workspace: String?, now: Int64) ->
         .compactMap { $0?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " · ")
 }
 
-func historySections(_ items: [ThreadSummary]) -> [(String, [ThreadSummary])] {
-    var sections: [(String, [ThreadSummary])] = []
+/// B2: a row's History section from its own activity time, the same rule as the core's buckets
+/// (under a day "Today", under a week "This week", else "Older"), so a 10-minute-old chat is under
+/// Today whether or not the list is filtered. An undated row keeps the core's bucket.
+func historyBucket(_ thread: ThreadSummary, now: Int64) -> String {
+    guard let at = thread.last_activity_at_ms else { return thread.history_bucket.isEmpty ? "Older" : thread.history_bucket }
+    let age = max(0, now - at)
+    return age < 86_400_000 ? "Today" : age < 604_800_000 ? "This week" : "Older"
+}
+
+func historySections(_ items: [ThreadSummary], now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> [(String, [ThreadSummary])] {
+    let order = ["Today", "This week", "Older"]
+    var grouped: [String: [ThreadSummary]] = [:]
+    var extra: [String] = []
     for item in items where !isSubagent(item) {
-        if sections.last?.0 == item.history_bucket { sections[sections.count - 1].1.append(item) }
-        else { sections.append((item.history_bucket, [item])) }
+        let bucket = historyBucket(item, now: now)
+        if grouped[bucket] == nil && !order.contains(bucket) { extra.append(bucket) }
+        grouped[bucket, default: []].append(item)
     }
-    // I10-5: newest activity first inside each bucket (undated last, ties keep the host's order).
-    return sections.map { bucket, rows in
-        (bucket, rows.enumerated().sorted {
+    // I10-5: newest activity first inside each section (undated last, ties keep the host's order).
+    return (order + extra).compactMap { bucket in
+        guard let rows = grouped[bucket], !rows.isEmpty else { return nil }
+        return (bucket, rows.enumerated().sorted {
             let (l, r) = ($0.element.last_activity_at_ms ?? .min, $1.element.last_activity_at_ms ?? .min)
             return l != r ? l > r : $0.offset < $1.offset
         }.map(\.element))
