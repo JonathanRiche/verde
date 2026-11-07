@@ -124,6 +124,19 @@ class FileViewerTest {
         assertTrue(isolatedHtml("<script>1</script>").contains("<script>1</script>"))
     }
 
+    @Test fun previewAssetsStayInsideTheWorkspace() {
+        val location = PreviewLocation("/w/story/index.html", "/w")
+        assertEquals("/w/story/img/a b.png", location.resolve(android.net.Uri.parse("https://$PREVIEW_HOST/w/story/img/a%20b.png")))
+        assertEquals("/w/font.ttf", location.resolve(android.net.Uri.parse("https://$PREVIEW_HOST/w/story/../font.ttf")))
+        for (url in listOf("https://$PREVIEW_HOST/w/../../secret", "https://$PREVIEW_HOST/w2/x", "https://other/w/x", "file:///w/x", "https://$PREVIEW_HOST/w/%2e%2e/secret", "https://$PREVIEW_HOST:8443/w/x")) {
+            assertNull(url, location.resolve(android.net.Uri.parse(url)))
+        }
+        assertEquals("text/css", previewMime("style.css", "application/octet-stream"))
+        assertEquals("text/javascript", previewMime("script.js", null))
+        assertEquals("audio/mpeg", previewMime("audio.mp3", null))
+        assertFalse(isolatedHtml("<body/>").contains("Linked files aren't loaded"))
+    }
+
     @Test fun pathsKindsAndLinesAreParsedConservatively() {
         assertEquals(ViewerKind.Markdown, viewerKind("/a/README.MD"))
         assertEquals(ViewerKind.Image, viewerKind("/a/b.JPeG"))
@@ -133,7 +146,7 @@ class FileViewerTest {
         assertEquals(ViewerKind.Text, viewerKind("/a/.env"))
         assertEquals(ViewerKind.Svg, viewerKind("/a/b.SVG"))
         assertEquals(FileKind.download, viewerFetchKind("/a/b.svg"))
-        assertEquals(FileKind.download, viewerFetchKind("/a/index.htm"))
+        assertEquals(FileKind.html, viewerFetchKind("/a/index.htm"))
         assertEquals(FileKind.preview, viewerFetchKind("/a/b.docx"))
         assertEquals(FileKind.file, viewerFetchKind("/a/b.ts"))
         assertEquals(MAX_TEXT_BYTES, viewerLimit(ViewerKind.Markdown))

@@ -5,11 +5,13 @@ class FileBody private constructor(private val memory: ByteArray?, val file: jav
     constructor(bytes: ByteArray, contentType: String?) : this(bytes, null, contentType)
     constructor(file: java.io.File, contentType: String?) : this(null, file, contentType)
     constructor(source: android.media.MediaDataSource, contentType: String?) : this(null, null, contentType, source)
+    var previewAccess: PreviewAccess? = null
+    fun takePreviewAccess() = previewAccess.also { previewAccess = null }
     val size: Long get() = audioSource?.size ?: file?.length() ?: memory!!.size.toLong()
     // Only bounded previews use bytes. Downloads copy streams directly to the chosen document.
     val bytes: ByteArray get() { check(size <= 32L * 1024 * 1024); return memory ?: file!!.readBytes() }
     fun openStream(): java.io.InputStream = file?.inputStream() ?: memory!!.inputStream()
-    override fun close() { audioSource?.close(); file?.delete() }
+    override fun close() { previewAccess?.close(); previewAccess = null; audioSource?.close(); file?.delete() }
 }
 
 /**

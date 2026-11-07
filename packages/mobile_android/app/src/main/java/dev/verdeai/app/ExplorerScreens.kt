@@ -509,7 +509,7 @@ internal fun WorkspaceFileRoute(hosts: HostsModel, browse: BrowseModel, workspac
     val (explorer, hostId) = rememberExplorer(hosts, browse, workspaceId)
     val workspace = browse.state.collectAsState().value.workspaces?.items?.find { it.workspace_id == workspaceId }
     val model: FileViewerModel = viewModel(key = "wfile:$hostId:$workspaceId:${dirKey(root, path)}", factory = viewModelFactory {
-        initializer { FileViewerModel(hosts, hostId, absolute.ifEmpty { path }, reader = { host -> readWorkspaceFile(host, workspaceId, root, path) }) }
+        initializer { FileViewerModel(hosts, hostId, absolute.ifEmpty { path }, reader = { host -> readWorkspaceFile(host, workspaceId, root, path) }, previewRoot = absolute.takeIf { it.endsWith(path) }?.removeSuffix(path)?.trimEnd('/')) }
     })
     SelectionScope(explorer, hostId, absolute.ifEmpty { null }, workspace, onOpenThread) {
         FileViewerScreen(model, null, onCitation, onBack, title = basename(path))

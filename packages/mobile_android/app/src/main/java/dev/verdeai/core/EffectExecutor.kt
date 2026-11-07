@@ -339,7 +339,19 @@ class EffectExecutor(
                                     output.write(buffer, 0, count)
                                 }
                                 if (call.isCanceled()) throw IOException()
-                                files.put(e.intent_id, FileBody(output.toByteArray(), it.header("Content-Type")))
+                                files.put(e.intent_id, FileBody(output.toByteArray(), it.header("Content-Type")).also { body ->
+                                    body.previewAccess = PreviewAccess { path, method, range, register ->
+                                        val target = url.newBuilder().setQueryParameter("path", path).setQueryParameter("download", "1").build()
+                                        val assetClient = client(target, e.tls, 30_000)
+                                        try {
+                                            val builder = Request.Builder().url(target).method(method, null)
+                                            e.headers.filterNot { h -> h.name.equals("Range", true) }.forEach { h -> builder.addHeader(h.name, h.value) }
+                                            range?.let { value -> builder.header("Range", value) }
+                                            builder.header("Accept-Encoding", "identity")
+                                            assetClient.newCall(builder.build()).also(register).execute()
+                                        } finally { release(assetClient) }
+                                    }
+                                })
                             }
                             done(it.code, null)
                         }

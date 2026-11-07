@@ -92,7 +92,7 @@ internal fun FileRoute(
     }
     val resolved = remember(rawPath, root) { resolveFilePath(rawPath, root) }
     val model: FileViewerModel = viewModel(key = "file:$hostId:${resolved ?: rawPath}",
-        factory = viewModelFactory { initializer { FileViewerModel(hosts, hostId, resolved) } })
+        factory = viewModelFactory { initializer { FileViewerModel(hosts, hostId, resolved, previewRoot = root) } })
     // Relative citations inside a viewed markdown file resolve against the same workspace.
     FileViewerScreen(model, LineTarget.of(line, endLine), onCitation, onBack, title = basename(rawPath))
 }
@@ -135,7 +135,7 @@ internal fun FileViewerScreen(
                         is FileContent.Markdown -> if (formatted) MarkdownFile(content, model, onCitation) else TextFile(content.source, target)
                         is FileContent.Image -> ImageFile(content.bitmap)
                         is FileContent.Audio -> AudioFile(content.body)
-                        is FileContent.Html -> if (formatted) HtmlFile(content.source.text) else TextFile(content.source, target)
+                        is FileContent.Html -> if (formatted) HtmlFile(content, model.path ?: "", model.previewRoot) else TextFile(content.source, target)
                         is FileContent.Unsupported -> Centered {
                             SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text("No preview for this file type", style = MaterialTheme.typography.titleMedium)
@@ -467,34 +467,3 @@ private fun AudioFile(body: dev.verdeai.core.FileBody) {
 }
 
 private fun audioTime(milliseconds: Long): String = "${milliseconds / 60000}:" + ((milliseconds / 1000) % 60).toString().padStart(2, '0')
-
-/** A document-only origin, no bridge, storage, host credentials, network, or local-file access. */
-internal fun isolatedHtml(source: String) = """<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; media-src data:; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width, initial-scale=1">""" + source
-
-@Composable
-private fun HtmlFile(source: String) {
-    val html = remember(source) { isolatedHtml(source) }
-    Column(Modifier.fillMaxSize()) {
-        SelectionContainer(modifier = Modifier.pointerHoverIcon(PointerIcon.Text)) { Text("Linked files aren't loaded", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
-        AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { context ->
-            WebView(context).apply {
-                settings.javaScriptEnabled = true
-                settings.allowFileAccess = false
-                settings.allowContentAccess = false
-                settings.domStorageEnabled = false
-                settings.blockNetworkLoads = true
-                webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                        if (request.isForMainFrame && request.hasGesture() && request.url.scheme in listOf("https", "http")) {
-                            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
-                        }
-                        return true
-                    }
-                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest) =
-                        WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
-                }
-                loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
-            }
-        }, onRelease = { it.stopLoading(); it.destroy() })
-    }
-}

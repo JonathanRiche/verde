@@ -56,6 +56,7 @@ internal fun viewerKind(path: String): ViewerKind = when (val ext = fileExtensio
 internal fun viewerFetchKind(path: String): FileKind = when {
     viewerKind(path) == ViewerKind.Office -> FileKind.preview
     viewerKind(path) == ViewerKind.Audio -> FileKind.audio
+    viewerKind(path) == ViewerKind.Html -> FileKind.html
     fileExtension(path) in ATTACHMENT_EXTS -> FileKind.download
     else -> FileKind.file
 }
@@ -139,7 +140,7 @@ internal sealed interface FileContent {
     class Markdown(val source: Text, val nodes: List<MarkdownNode>) : FileContent
     class Image(val bitmap: ImageBitmap) : FileContent
     class Audio(val body: FileBody) : FileContent
-    class Html(val source: Text) : FileContent
+    class Html(val source: Text, val access: PreviewAccess? = null) : FileContent
     class Unsupported(val size: Long, val type: String) : FileContent
     /** Rendered by a sandboxed WebView (no scripts, network or file access); [source] is the XML. */
     class Svg(val source: Text, val base64: String) : FileContent
@@ -278,6 +279,7 @@ internal class FileViewerModel(
     private val waitMs: Long = WAIT_MS,
     /** Alternate source (Files tab: `workspace.files.read`): bytes, a failed state, or null for the `/api/file` fetch. */
     private val reader: (suspend (CoreHost) -> Any?)? = null,
+    val previewRoot: String? = null,
 ) : ViewModel(), HighlightSource {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(FileViewState(loading = path != null,
@@ -386,9 +388,11 @@ internal class FileViewerModel(
 
     private suspend fun fetch(host: CoreHost, target: String): FileViewState {
         var partial: FilePartial? = null
-        val bytes = when (val body = (if (kind in setOf(ViewerKind.Audio, ViewerKind.Image)) null else reader?.invoke(host)) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
+        var preview: PreviewAccess? = null
+        val bytes = when (val body = (if (kind in setOf(ViewerKind.Audio, ViewerKind.Image, ViewerKind.Html)) null else reader?.invoke(host)) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
             is FileBody -> {
                 if (kind == ViewerKind.Audio) return FileViewState(loading = false, content = FileContent.Audio(body))
+                if (kind == ViewerKind.Html) preview = body.takePreviewAccess()
                 body.use { it.bytes }
             }
             is ByteArray -> body
@@ -401,7 +405,8 @@ internal class FileViewerModel(
             catch (_: PdfUnsupported) { return FileViewState(loading = false, problem = FileProblem.PdfNeedsNewerAndroid) }
             catch (_: OutOfMemoryError) { return FileViewState(loading = false, problem = FileProblem.TooLarge) }
             catch (_: Exception) { return FileViewState(loading = false, problem = FileProblem.Unreadable) }
-        return if (content is FileContent) FileViewState(loading = false, content = content, partial = partial)
+        if (content !is FileContent.Html) preview?.close()
+        return if (content is FileContent) FileViewState(loading = false, content = if (content is FileContent.Html) FileContent.Html(content.source, preview) else content, partial = partial)
             else FileViewState(loading = false, problem = content as FileProblem)
     }
 
@@ -451,12 +456,14 @@ internal class FileViewerModel(
     private fun replace(next: FileViewState) {
         val old = mutableState.value.content
         mutableState.value = next
+        if (old is FileContent.Html && old !== next.content) old.access?.close()
         if (old is FileContent.Audio && old !== next.content) old.body.close()
         if (old is FileContent.Pdf && old !== next.content) closeDocument(old.document)
     }
 
     override fun onCleared() {
         scope.cancel()
+        (mutableState.value.content as? FileContent.Html)?.access?.close()
         (mutableState.value.content as? FileContent.Audio)?.body?.close()
         (mutableState.value.content as? FileContent.Pdf)?.let { closeDocument(it.document) }
         mutableState.value = FileViewState(loading = false)

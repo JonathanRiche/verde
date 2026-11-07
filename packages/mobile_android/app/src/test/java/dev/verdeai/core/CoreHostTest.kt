@@ -190,6 +190,20 @@ class CoreHostTest {
                 val body = host.takeFile("intent-ok")!!
                 assertEquals("# secret notes", body.bytes.decodeToString())
                 assertEquals("text/markdown", body.contentType)
+                fixture.server.enqueue(MockResponse().setResponseCode(206).setHeader("Content-Type", "audio/mpeg")
+                    .setHeader("Content-Range", "bytes 7-9/10").setBody("xyz"))
+                body.previewAccess!!.open("/w/story/audio.mp3", "GET", "bytes=7-9").use { asset ->
+                    assertEquals(206, asset.code)
+                    assertEquals("bytes 7-9/10", asset.header("Content-Range"))
+                    body.previewAccess!!.stream(asset).use { assertEquals("xyz", it.readBytes().decodeToString()) }
+                }
+                val assetRequest = fixture.server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertEquals("/w/story/audio.mp3", assetRequest.requestUrl!!.queryParameter("path"))
+                assertEquals("1", assetRequest.requestUrl!!.queryParameter("download"))
+                assertEquals("bytes=7-9", assetRequest.getHeader("Range"))
+                assertEquals("Bearer t", assetRequest.getHeader("Authorization"))
+                body.close()
+
                 assertNull(host.takeFile("intent-ok"))
 
                 // Repeated downloads consume bodies independently while reusing the pinned socket.
