@@ -65,17 +65,20 @@ struct HistoryScreen: View {
                 Section {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
                         let subtitle = historySubtitle(withLiveActivity(thread, live), workspace: labels[thread.workspace_id], now: now)
+                        let unread = coreChatState(thread.state) == .unread
                         NavigationLink(value: BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)) {
                             HStack(alignment: .top, spacing: 12) {
                                 ProviderGlyph(provider: thread.provider).padding(.top, 2)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(thread.title.isEmpty ? "Untitled chat" : thread.title).font(VerdeTheme.ui(16)).lineLimit(2)
+                                    Text(thread.title.isEmpty ? "Untitled chat" : thread.title)
+                                        .font(VerdeTheme.ui(16).weight(unread ? .semibold : .regular)).lineLimit(2)
                                     if !subtitle.isEmpty { Text(subtitle).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).lineLimit(2) }
                                 }
                                 Spacer(minLength: 4)
                                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                             }
                             .accessibilityElement(children: .combine)
+                            .accessibilityValue(unread ? "Unread" : "")
                         }
                     }
                 } header: { SectionTitle(sections[index].0) }
