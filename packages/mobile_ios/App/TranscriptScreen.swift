@@ -525,12 +525,14 @@ let eagerTranscriptLimit = 160
 struct TailGeometry: Equatable {
     var gap: CGFloat
     var container: CGFloat
+    var width: CGFloat
     var nearTop: Bool
 
-    init(offset: CGFloat, insetTop: CGFloat, insetBottom: CGFloat, content: CGFloat, container: CGFloat) {
+    init(offset: CGFloat, insetTop: CGFloat, insetBottom: CGFloat, content: CGFloat, container: CGFloat, width: CGFloat = 0) {
         let last = max(-insetTop, content + insetBottom - container)
         gap = ((last - offset) / 4).rounded() * 4
         self.container = container.rounded()
+        self.width = width.rounded()
         nearTop = offset + insetTop < 400
     }
 }
@@ -564,11 +566,12 @@ private struct TailFollowerGeometry: ViewModifier {
             }
             .onScrollGeometryChange(for: TailGeometry.self) { g in
                 TailGeometry(offset: g.contentOffset.y, insetTop: g.contentInsets.top, insetBottom: g.contentInsets.bottom,
-                             content: g.contentSize.height, container: g.containerSize.height)
+                             content: g.contentSize.height, container: g.containerSize.height, width: g.containerSize.width)
             } action: { previous, next in
                 tail.geometry = next
-                // A resized container (keyboard, composer) is new geometry to follow, not a retry.
-                if previous.container != next.container { tail.allowance = tailReanchors }
+                // Width reflow (sidebar or Companion) is new geometry too. It must not spend
+                // the retry budget left over from laying out the wider transcript.
+                if previous.container != next.container || previous.width != next.width { tail.allowance = tailReanchors }
                 if next.nearTop && !previous.nearTop && !follow { nearTop() }
                 let bottom = transcriptAtBottom(atBottom, gap: next.gap)
                 if bottom != atBottom { atBottom = bottom }
@@ -590,7 +593,14 @@ private struct TailFollowerGeometry: ViewModifier {
         tail.pending = Task { @MainActor in
             try? await Task.sleep(for: tailSettle)
             guard !Task.isCancelled, follow, tail.phase == .idle, abs(tail.geometry?.gap ?? 0) > bottomSlack else { return }
-            if tail.allowance > 0 { tail.allowance -= 1; anchor() } else { follow = false }
+            if tail.allowance > 0 {
+                tail.allowance -= 1
+                // The panel animates its width; a corrective scroll must land immediately
+                // rather than inherit that animation and trigger more reflow retries.
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { anchor() }
+            } else { follow = false }
         }
     }
 }
