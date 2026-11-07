@@ -3,6 +3,7 @@ package dev.verdeai.app
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.border
@@ -225,7 +226,7 @@ internal fun CompanionSheet(
             // S9: a failed call explains itself here and offers its repair; it goes away with the sheet.
             if (live != null && liveUi?.phase == LivePhase.Failed) LiveFailureCard(liveUi,
                 onSettings = { live.dismissError(); settingsForLive = true; settings = true }, onRetry = onLive, onClose = live::dismissError)
-            HorizontalDivider(color = VerdeColors.Border)
+            HorizontalDivider(thickness = androidx.compose.ui.unit.Dp.Hairline, color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 val liveName = active.name.ifBlank { "your companion" }
                 // The call bar (LiveOverModal, above) controls Live and shows a failed call's reason; its
@@ -538,7 +539,7 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
     val name = active.name.ifBlank { "your companion" }
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds().topEdgeFade(VerdeColors.Background)) {
             when (transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, CompactTranscriptRenderers, spacing = 4.dp,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp))

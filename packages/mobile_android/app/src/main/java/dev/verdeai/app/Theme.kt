@@ -226,6 +226,13 @@ internal fun Modifier.horizontalEdgeFade(state: ScrollState, color: Color, width
         topLeft = Offset(size.width - w, 0f), size = Size(w, size.height))
 }
 
+/** A soft viewport edge below pinned sheet chrome; content keeps its existing bottom anchor. */
+internal fun Modifier.topEdgeFade(color: Color, height: Dp = 18.dp) = drawWithContent {
+    drawContent()
+    val h = height.toPx().coerceAtMost(size.height)
+    drawRect(Brush.verticalGradient(listOf(color, Color.Transparent), startY = 0f, endY = h), size = Size(size.width, h))
+}
+
 /**
  * A 2dp accent ring around the focused control, drawn only while focus came from a keyboard (Tab,
  * D-pad) and never after touch. It follows the focused node's bounds, so Material buttons and icon
