@@ -125,7 +125,38 @@ private struct TrackedAccessibilityPresentation: ViewModifier {
     }
 }
 
+/// A custom overlay shares the scene's hosting controller with the screen behind it. Give
+/// that screen its own native boundary so hiding it cannot also hide the overlay's controls.
+private struct AccessibilityContentHost<Content: View>: UIViewControllerRepresentable {
+    let content: Content
+    let covered: Bool
+    @Environment(\.self) private var environment
+    @Environment(\.presentationAccessibility) private var layer
+
+    private var hidden: Bool { covered || (layer.map { $0.state.topLayer > $0.layer } ?? false) }
+
+    func makeUIViewController(context: Context) -> UIHostingController<AnyView> {
+        let controller = UIHostingController(rootView: hostedContent)
+        controller.view.backgroundColor = .clear
+        controller.view.accessibilityElementsHidden = hidden
+        return controller
+    }
+
+    func updateUIViewController(_ controller: UIHostingController<AnyView>, context: Context) {
+        controller.rootView = hostedContent
+        controller.view.accessibilityElementsHidden = hidden
+    }
+
+    private var hostedContent: AnyView {
+        AnyView(content.environment(\.self, environment).accessibilityHidden(hidden))
+    }
+}
+
 extension View {
+    func accessibilityContentHost(covered: Bool) -> some View {
+        AccessibilityContentHost(content: self, covered: covered)
+    }
+
     func presentationAccessibilityRoot(covered: Bool = false) -> some View {
         modifier(PresentationAccessibilityRoot(covered: covered))
     }

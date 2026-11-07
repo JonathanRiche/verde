@@ -93,6 +93,7 @@ struct RootView: View {
     /// The user opened Moss: a sheet on narrow windows, a pane on wide ones. Only explicit user
     /// actions set this, so Moss never opens itself and a resize keeps it as it was.
     @State private var companionSheet = false
+    @State private var companionDetent: PresentationDetent = .medium
     @State private var companionSettings = false
     /// Companion settings open on the Live voice keys (a Live error's repair).
     @State private var companionSettingsLive = false
@@ -118,7 +119,7 @@ struct RootView: View {
                             else { WorkspacesScreen(model: browse, actions: actions) }
                         }
                     }
-                }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
+                }.accessibilityContentHost(covered: drawer).allowsHitTesting(!drawer)
                 .environment(\.companionEntry, companionEntry(dockShown: (panes.tier.docked && panes.showsChats) || panes.mossVisible))
                 .environment(\.companionBubbleShown, floatingBubble(docked: panes.tier.docked))
                 .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
@@ -161,7 +162,13 @@ struct RootView: View {
                                                     // Growing past the threshold hands Moss to the pane; only a dismissal closes it.
                                                     set: { if !$0 && !AdaptiveTier(width: windowWidth).docked { companionSheet = false } })) {
                             companionScreen(docked: false)
-                            .presentationDetents([.medium, .large])
+                            // The setup card and accessible composer cannot share a medium sheet.
+                            // Keep it large while the card is visible, including after a drag down.
+                            .presentationDetents(companionNeedsLargeSheet ? [.large] : [.medium, .large],
+                                                 selection: $companionDetent)
+                            .onChange(of: companionNeedsLargeSheet, initial: true) { _, needsLarge in
+                                if needsLarge { companionDetent = .large }
+                            }
                             .presentationDragIndicator(.visible)
                             .preferredColorScheme(appearance.resolvedScheme)
                         }
@@ -235,6 +242,10 @@ struct RootView: View {
                       mossPaneWidth: dynamicTypeSize.isAccessibilitySize ? 400 : AdaptivePanes.mossPaneWidth)
     }
     private var currentPanes: AdaptivePanes { panesFor(width: windowWidth) }
+
+    private var companionNeedsLargeSheet: Bool {
+        dynamicTypeSize >= .xxLarge && !live.active && live.failure != nil && live.failureNeedsSetup
+    }
 
     /// The overlay drawer on narrow windows, the permanent sidebar on wide ones.
     private func workspaceDrawer(permanent: Bool, width: CGFloat) -> some View {
