@@ -788,6 +788,7 @@ struct WorkspaceFileRoute: View {
                        reader: { [workspaceID, root, path] host in
                            try await host.readWorkspaceFile(workspaceID: workspaceID, root: root, path: path, limit: ViewerKind.of(path).limit)
                        },
+                       previewRoot: absolute.hasSuffix(path) ? "/" + String(absolute.dropLast(path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) : nil,
                        embedded: true)
         }
         .modifier(ExplorerSync(browse: browse, model: explorer))

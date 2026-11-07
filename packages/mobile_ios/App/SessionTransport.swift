@@ -208,8 +208,15 @@ enum TLSPolicy {
     }
 }
 
+struct HTTPStream {
+    let response: (HTTPURLResponse) -> Void
+    let data: (Data) -> Void
+    let complete: (Error?) -> Void
+}
+
 final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSocketDelegate, @unchecked Sendable {
     private let effect: Effect
+    private let stream: HTTPStream?
     private let fileIntent: String?
     private let streamFile: Bool
     private var spoolURL: URL?
@@ -232,12 +239,13 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private var sending = false
     private var openedAt: TimeInterval?
 
-    init(effect: Effect, queue: DispatchQueue, pool: HTTPConnectionPool? = nil, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, ended: @escaping () -> Void) {
+    init(effect: Effect, queue: DispatchQueue, pool: HTTPConnectionPool? = nil, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, stream: HTTPStream? = nil, ended: @escaping () -> Void) {
         if case .file_fetch(let e) = effect {
             self.effect = .http_request(EffectHttpRequest(effect_id: e.effect_id, generation: e.generation, method: "GET", url: e.url, headers: e.headers, body_base64: nil, timeout_ms: e.timeout_ms, max_response_bytes: e.max_response_bytes == 0 ? UInt32.max : min(e.max_response_bytes, 32 * 1024 * 1024), tls: e.tls))
             fileIntent = e.intent_id
             streamFile = e.max_response_bytes == 0
         } else { self.effect = effect; fileIntent = nil; streamFile = false }
+        self.stream = stream
         self.fileReceived = fileReceived
         self.queue = queue; self.pool = pool; self.emit = emit; self.ended = ended
     }
@@ -365,12 +373,14 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
             completionHandler(.cancel); fail(.tls, .certificate); return
         }
         self.response = http
+        if let stream { stream.response(http); completionHandler(.allow); return }
         if !streamFile && response.expectedContentLength > Int64(e.max_response_bytes) {
             completionHandler(.cancel); fail(.resource, .resource)
         } else { completionHandler(.allow) }
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !finished, case .http_request(let e) = effect else { return }
+        if let stream { stream.data(data); return }
         if streamFile {
             guard let response, (200..<300).contains(response.statusCode) else { return }
             do {
@@ -391,6 +401,10 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard !finished else { return }
         if let error { failure = failure ?? Self.map(error) }
+        if let stream {
+            stream.complete(failure == nil ? nil : NSError(domain: "VerdePreview", code: 1))
+            finish(); return
+        }
         switch effect {
         case .http_request(let e):
             if let fileIntent, failure == nil, let response, (200..<300).contains(response.statusCode) {
@@ -403,7 +417,11 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
                 } else if let url = spoolURL {
                     try? spool?.close(); spool = nil; spoolURL = nil
                     fileReceived(fileIntent, FileBytes(url: url, size: spoolSize, mime: response.mimeType))
-                } else { fileReceived(fileIntent, FileBytes(data: body, mime: response.mimeType)) }
+                } else {
+                    let bytes = FileBytes(data: body, mime: response.mimeType)
+                    bytes.previewAccess = PreviewAccess(request: e)
+                    fileReceived(fileIntent, bytes)
+                }
             }
             let headers = response?.allHeaderFields.map { Header(name: String(describing: $0.key), value: String(describing: $0.value)) } ?? []
             emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0,
@@ -486,6 +504,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         // Complete locally even if Foundation never delivers another callback.
         if let session, let task { urlSession(session, task: task, didCompleteWithError: nil) }
         else {
+            if let stream { stream.complete(NSError(domain: "VerdePreview", code: 1)); finish(); return }
             switch effect {
             case .http_request(let e):
                 emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,

@@ -5,13 +5,15 @@ final class FileBytes: @unchecked Sendable {
     let url: URL?
     let mime: String?
     var audio: RangeAudio?
+    var previewAccess: PreviewAccess?
+    func takePreviewAccess() -> PreviewAccess? { defer { previewAccess = nil }; return previewAccess }
     let size: Int64
     init(data: Data, mime: String?) { memory = data; url = nil; self.mime = mime; size = Int64(data.count) }
     init(url: URL, size: Int64, mime: String?) { memory = nil; self.url = url; self.size = size; self.mime = mime }
     // Used only by bounded previews. Download and native audio use the file URL.
     var data: Data { memory ?? ((try? Data(contentsOf: url!, options: .mappedIfSafe)) ?? Data()) }
     init(audio: RangeAudio, size: Int64, mime: String?) { memory = nil; url = nil; self.audio = audio; self.size = size; self.mime = mime }
-    deinit { audio?.close(); if let url { try? FileManager.default.removeItem(at: url) } }
+    deinit { previewAccess?.close(); audio?.close(); if let url { try? FileManager.default.removeItem(at: url) } }
 }
 
 /// Raw file bytes never enter core JSON or persistent storage. Bounded per host;

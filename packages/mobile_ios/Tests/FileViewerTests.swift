@@ -11,7 +11,7 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(ViewerKind.svg.limit, 16 * 1024 * 1024)
         XCTAssertEqual(ViewerKind.of("/w/index.html"), .html)
         XCTAssertEqual(ViewerKind.fetchKind("/w/a.svg"), .download)
-        for path in ["/w/index.html", "/w/a.htm", "/w/a.js", "/w/a.mjs", "/w/a.cjs", "/w/a.wasm"] { XCTAssertEqual(ViewerKind.fetchKind(path), .download, path) }
+        for path in ["/w/index.html", "/w/a.htm", "/w/a.js", "/w/a.mjs", "/w/a.cjs", "/w/a.wasm"] { XCTAssertEqual(ViewerKind.fetchKind(path), ["html", "htm"].contains((path as NSString).pathExtension) ? .html : .download, path) }
         XCTAssertEqual(ViewerKind.fetchKind("/w/a.swift"), .file)
         XCTAssertEqual(ViewerKind.fetchKind("/w/a.png"), .file)
         XCTAssertEqual(ViewerKind.fetchKind("/w/a.docx"), .preview)
@@ -44,8 +44,37 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(ViewerKind.fetchKind("a.mp3"), .audio)
         let html = isolatedHTML("<script>1</script>")
         XCTAssertTrue(html.contains("default-src 'none'"))
-        XCTAssertTrue(html.contains("base-uri 'none'; form-action 'none'"))
+        XCTAssertTrue(html.contains("base-uri verde-preview:; form-action 'none'"))
         XCTAssertTrue(html.contains("<script>1</script>"))
+    }
+    func testPreviewPathsStayInsideTheirWorkspace() throws {
+        let location = PreviewLocation(document: "/w/story/index.html", root: "/w")
+        XCTAssertEqual(location.resolve(try XCTUnwrap(URL(string: "img/a%20b.png", relativeTo: location.url)?.absoluteURL)), "/w/story/img/a b.png")
+        XCTAssertEqual(location.resolve(try XCTUnwrap(URL(string: "../font.ttf", relativeTo: location.url)?.absoluteURL)), "/w/font.ttf")
+        for value in ["verde-preview://workspace/w/../../secret", "verde-preview://workspace/w2/x", "verde-preview://other/w/x", "file:///w/x", "https://example.com/w/x", "verde-preview://workspace/w/%2e%2e/secret"] {
+            XCTAssertNil(location.resolve(try XCTUnwrap(URL(string: value))), value)
+        }
+        XCTAssertEqual(previewMime("style.css", reported: "application/octet-stream"), "text/css")
+        XCTAssertEqual(previewMime("script.js", reported: nil), "text/javascript")
+        XCTAssertEqual(previewMime("audio.mp3", reported: nil), "audio/mpeg")
+        XCTAssertTrue(isolatedHTML("<body/>").contains("linked files couldn't load"))
+        XCTAssertFalse(isolatedHTML("<body/>").contains("Linked files aren't loaded"))
+    }
+    func testPreviewStreamForwardsChunksWithoutCoreBodiesOrByteCaps() throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let url = try XCTUnwrap(URL(string: "https://preview.invalid/api/file"))
+        let task = session.dataTask(with: url)
+        var bytes = 0, finished = false
+        let stream = HTTPStream(response: { XCTAssertEqual($0.statusCode, 206); XCTAssertEqual($0.value(forHTTPHeaderField: "Content-Range"), "bytes 2-5/6") },
+                                data: { bytes += $0.count }, complete: { XCTAssertNil($0); finished = true })
+        let operation = SessionOperation(effect: .http_request(EffectHttpRequest(effect_id: "stream", generation: "1", method: "GET", url: url.absoluteString, headers: [], body_base64: nil, timeout_ms: 3000, max_response_bytes: 1, tls: Tls(origin: "https://preview.invalid", spki_sha256: "fixture"))), queue: DispatchQueue(label: "stream.test"), emit: { _ in XCTFail("Stream must not emit core bodies") }, stream: stream, ended: {})
+        let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil, headerFields: ["Content-Range":"bytes 2-5/6", "Content-Length":"4"]))
+        operation.urlSession(session, dataTask: task, didReceive: response) { XCTAssertEqual($0, .allow) }
+        operation.urlSession(session, dataTask: task, didReceive: Data([1, 2]))
+        operation.urlSession(session, dataTask: task, didReceive: Data([3, 4]))
+        operation.urlSession(session, task: task, didCompleteWithError: nil)
+        XCTAssertEqual(bytes, 4); XCTAssertTrue(finished)
     }
     func testDownloadSpoolsMoreThan32MBAndDeletesItsPrivateCopy() throws {
         var received: FileBytes?

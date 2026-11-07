@@ -97,6 +97,7 @@ enum ViewerKind { case text, markdown, image, svg, pdf, office, audio, html
         case .office: return .preview
         case .svg: return .download
         case .audio: return .audio
+        case .html: return .html
         default: return ["html", "htm", "js", "mjs", "cjs", "wasm"].contains((path as NSString).pathExtension.lowercased()) ? .download : .file
         }
     }
@@ -137,6 +138,7 @@ final class FileViewerModel: HighlightSource {
     var blocks: [MdBlock]?
     var image: UIImage?
     var pdf: PDFDocument?
+    var previewAccess: PreviewAccess?
     var audio: FileBytes?
     var unsupported: String?
     /// Syntax ranges over `text` (UTF-16), when the host highlighted it.
@@ -159,7 +161,7 @@ final class FileViewerModel: HighlightSource {
         return lines
     }
     private func language(_ path: String) -> String { (path as NSString).pathExtension.lowercased() }
-    func clear() { audio = nil; unsupported = nil; syntax = nil; cachedLines = nil; bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
+    func clear() { previewAccess?.close(); previewAccess = nil; audio = nil; unsupported = nil; syntax = nil; cachedLines = nil; bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
     /// `text` split into display lines once, for the line-selectable viewer.
     func split() -> FileSplit? {
         guard let text else { return nil }
@@ -177,7 +179,7 @@ final class FileViewerModel: HighlightSource {
             let kind = ViewerKind.of(path)
             var read: Data?
             var cut: FilePartial?
-            if let reader, kind != .audio && kind != .image {
+            if let reader, kind != .audio && kind != .image && kind != .html {
                 switch try await reader(host) {
                 case .bytes(let bytes): read = bytes
                 case .partial(let bytes, let partial): read = bytes; cut = partial
@@ -192,6 +194,7 @@ final class FileViewerModel: HighlightSource {
                 do {
                     let file = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit)
                     if kind == .audio { audio = file; return }
+                    if kind == .html { previewAccess = file.takePreviewAccess() }
                     data = file.data
                 }
                 catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
@@ -256,6 +259,7 @@ struct FileViewer: View {
     /// Reads the file some other way than by path (see `FileViewerModel.load`).
     var reader: ((CoreHost) async throws -> WorkspaceReadOutcome?)? = nil
     /// Pushed inside a navigation stack (no own stack, no Done button).
+    var previewRoot: String? = nil
     var embedded = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.lineSelection) private var lineSelection
@@ -315,7 +319,7 @@ struct FileViewer: View {
                 }.textSelection(.enabled).padding()
             }
             else if let audio = model.audio { NativeAudio(file: audio) }
-            else if htmlPreview, ViewerKind.of(citation.path) == .html, let text = model.text { HTMLPreview(source: text) }
+            else if htmlPreview, ViewerKind.of(citation.path) == .html, let text = model.text { HTMLPreview(source: text, location: PreviewLocation(document: path ?? citation.path, root: previewRoot ?? browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.path), access: model.previewAccess) }
             else if let pdf = model.pdf { NativePDF(document: pdf) }
             else if let image = model.image { ZoomImage(image: image) }
             else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
@@ -570,43 +574,3 @@ private struct NativeAudio: View {
     }
 }
 private func audioTime(_ seconds: Double) -> String { String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
-
-func isolatedHTML(_ source: String) -> String {
-    #"<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; media-src data:; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width, initial-scale=1">"# + source
-}
-private struct HTMLPreview: View {
-    let source: String
-    var body: some View {
-        VStack(spacing: 0) {
-            Text("Linked files aren't loaded").font(.footnote).textSelection(.enabled).padding(12)
-            IsolatedHTML(html: isolatedHTML(source))
-        }
-    }
-}
-private struct IsolatedHTML: UIViewRepresentable {
-    let html: String
-    func makeCoordinator() -> Coordinator { Coordinator() }
-    func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
-        config.userContentController = WKUserContentController() // No message handlers or injected app scripts.
-        let view = WKWebView(frame: .zero, configuration: config)
-        view.navigationDelegate = context.coordinator
-        view.allowsLinkPreview = false
-        return view
-    }
-    func updateUIView(_ view: WKWebView, context: Context) {
-        if context.coordinator.html != html { context.coordinator.html = html; view.loadHTMLString(html, baseURL: nil) }
-    }
-    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) { view.stopLoading(); view.navigationDelegate = nil }
-    @MainActor final class Coordinator: NSObject, WKNavigationDelegate {
-        var html: String?
-        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
-            if action.navigationType == .linkActivated, let url = action.request.url, ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
-                await UIApplication.shared.open(url)
-                return .cancel
-            }
-            return action.request.url?.absoluteString == "about:blank" ? .allow : .cancel
-        }
-    }
-}
