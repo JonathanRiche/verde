@@ -191,10 +191,12 @@ private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview) {
         if (expanded) {
             val total = remember(approval.body) { countLines(approval.body) }
             val (shown, truncated) = remember(approval.body, all) { if (all) approval.body.trim() to false else leadingLines(approval.body, DETAIL_LINES) }
-            Text(shown, Modifier.fillMaxWidth().background(colors.surfaceContainerHighest, RoundedCornerShape(8.dp))
-                .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp)
+            Text(shown, Modifier.fillMaxWidth()
+                .then(if (structured) Modifier.background(colors.surfaceContainerHighest, RoundedCornerShape(8.dp))
+                    .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp) else Modifier)
                 .semantics { contentDescription = "Approval details" },
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
+                style = if (structured) MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono) else MaterialTheme.typography.bodyMedium,
+                softWrap = !structured)
             if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }
         }
     }
