@@ -106,7 +106,7 @@ internal data class LineTarget(val line: Int, val end: Int? = null) {
 }
 
 internal enum class FileProblem {
-    Offline, Timeout, Interrupted, Busy, ServerUnavailable, Unauthorized, Identity,
+    Offline, Connecting, Timeout, Interrupted, Busy, ServerUnavailable, Unauthorized, Identity,
     Forbidden, NotFound, TooLarge, GatewayTooLarge, Unsupported, PreviewUnavailable, Binary, Unresolved,
     PdfNeedsNewerAndroid, Unreadable, Unavailable, Failed, Storage,
 }
@@ -114,6 +114,7 @@ internal enum class FileProblem {
 /** Maps a `file_open` receipt error code (files.zig) onto a viewer state. */
 internal fun fileProblem(code: String?): FileProblem = when (code) {
     "offline" -> FileProblem.Offline
+    "connecting" -> FileProblem.Connecting
     "timeout" -> FileProblem.Timeout
     "cancelled" -> FileProblem.Interrupted
     "busy" -> FileProblem.Busy
@@ -261,7 +262,7 @@ internal fun lineEnd(text: String, starts: IntArray, index: Int): Int {
 /** UTF-8 text, or null for binary content (a NUL byte, as the web viewer checks). */
 internal fun decodeText(bytes: ByteArray): String? {
     if (bytes.any { it == 0.toByte() }) return null
-    return bytes.decodeToString().removePrefix("﻿")
+    return try { bytes.decodeToString(throwOnInvalidSequence = true).removePrefix("﻿") } catch (_: java.nio.charset.CharacterCodingException) { null }
 }
 
 /**

@@ -53,6 +53,8 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.verdeai.core.FileCitation
 
+private object ViewerPreferences { var htmlPreview = false }
+
 internal const val FILE_LINE_TAG = "file-line"
 internal const val FILE_TARGET_TAG = "file-line-target"
 internal const val FILE_PROBLEM_TAG = "file-problem"
@@ -105,7 +107,7 @@ internal fun FileViewerScreen(
     val saving = model.download.collectAsState().value == DownloadStatus.Saving
     val download = rememberDownload(model, title)
     // A cited line is only visible in the source; a plain markdown link opens formatted.
-    var formatted by rememberSaveable { mutableStateOf(target == null && model.kind != ViewerKind.Html) }
+    var formatted by remember(model) { mutableStateOf(if (model.kind == ViewerKind.Html) ViewerPreferences.htmlPreview else target == null) }
     val toggle = when (state.content) {
         is FileContent.Html -> if (formatted) "Source" else "Preview"
         is FileContent.Markdown -> if (formatted) "Source" else "Formatted"
@@ -114,7 +116,7 @@ internal fun FileViewerScreen(
     }
     val subtitle = target?.let { if (it.end != null && it.end > it.line) "Lines ${it.line}–${it.end}" else "Line ${it.line}" }
     FileScaffold(title, subtitle, onBack, actions = {
-        if (toggle != null) TextButton(onClick = { formatted = !formatted }, modifier = Modifier.heightIn(min = 48.dp).named(if (formatted) "Show source" else "Preview")) { Text(toggle) }
+        if (toggle != null) TextButton(onClick = { formatted = !formatted; if (model.kind == ViewerKind.Html) ViewerPreferences.htmlPreview = formatted }, modifier = Modifier.heightIn(min = 48.dp).named(if (formatted) "Show source" else "Preview")) { Text(toggle) }
         if (model.path != null && state.problem != FileProblem.GatewayTooLarge) {
             if (saving) CircularProgressIndicator(Modifier.padding(12.dp).size(24.dp).testTag("file-saving"), strokeWidth = 2.dp)
             else IconButton(onClick = download, modifier = Modifier.named("Download file")) { Icon(DownloadIcon, contentDescription = null) }
@@ -223,6 +225,7 @@ internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String
     FileProblem.Forbidden -> "No access" to "The host refused access. Check its shared workspaces and this phone's file permissions."
     FileProblem.NotFound -> "File not found" to "It may have been moved or deleted on the host."
     FileProblem.Offline -> "Can't reach the host" to "Check your connection and try again."
+    FileProblem.Connecting -> "Connecting to the host" to "Wait for the connection, then try again."
     FileProblem.Timeout -> "Host took too long" to "Try again. If this keeps happening, check the host's connection."
     FileProblem.Interrupted -> "Loading interrupted" to "Return to verde and try again."
     FileProblem.Busy -> "Too many files loading" to "Wait for the other files to finish, then try again."
@@ -247,6 +250,7 @@ internal fun downloadFailureText(problem: FileProblem): String = when (problem) 
     FileProblem.Forbidden -> "Host refused file access. Check shared workspaces and phone permissions"
     FileProblem.Offline -> "Can't reach the host. Check Tailscale and your connection"
     FileProblem.Unavailable -> "Host not connected. Reconnect and try again"
+    FileProblem.Connecting -> "Wait for the connection, then try again."
     FileProblem.Timeout -> "Download timed out. Try again"
     FileProblem.Interrupted -> "Download interrupted. Return to verde and try again"
     FileProblem.Busy -> "Too many files loading. Wait and try again"

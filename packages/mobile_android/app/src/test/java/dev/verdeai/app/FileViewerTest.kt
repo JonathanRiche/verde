@@ -105,7 +105,7 @@ class FileViewerTest {
     }
 
     @Test fun fileErrorsKeepTimeoutAndServerFailuresDistinctFromNetwork() {
-        val mapping = mapOf("offline" to FileProblem.Offline, "timeout" to FileProblem.Timeout,
+        val mapping = mapOf("offline" to FileProblem.Offline, "connecting" to FileProblem.Connecting, "timeout" to FileProblem.Timeout,
             "cancelled" to FileProblem.Interrupted, "busy" to FileProblem.Busy,
             "server_unavailable" to FileProblem.ServerUnavailable, "forbidden" to FileProblem.Forbidden,
             "host_file_too_large" to FileProblem.GatewayTooLarge, "too_large" to FileProblem.TooLarge,
@@ -159,6 +159,7 @@ class FileViewerTest {
         assertArrayEquals(intArrayOf(0), lineStarts(""))
         assertEquals("x", decodeText(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte(), 'x'.code.toByte())))
         assertNull(decodeText(byteArrayOf('a'.code.toByte(), 0)))
+        assertNull(decodeText(byteArrayOf(0xFF.toByte(), 0xFE.toByte())))
 
         // The route keeps the whole path in one segment; D-06 ranges survive the trip.
         assertEquals("file/ws%201/10/12/%2Fw%2Fa%20b.md", Routes.file("ws 1", FileCitation("/w/a b.md", 10uL, 12uL)))
