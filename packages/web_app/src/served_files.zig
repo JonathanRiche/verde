@@ -26,6 +26,7 @@ pub const ConfineError = error{
     PathOutsideWorkspace,
     /// The path is lexically inside a root but does not resolve on disk.
     FileNotFound,
+    FileSystemFailure,
     OutOfMemory,
     Canceled,
 };
@@ -53,7 +54,7 @@ pub const Roots = struct {
             const relative = std.mem.trimStart(u8, requested[root.len..], "/");
             const file = try openBeneath(allocator, io, base, if (relative.len == 0) "." else relative);
             errdefer file.close(io);
-            const stat = file.stat(io) catch return error.PathOutsideWorkspace;
+            const stat = file.stat(io) catch |err| return classifyOpenError(err);
             if (stat.kind != .file) return error.PathOutsideWorkspace;
             return file;
         }
@@ -80,12 +81,12 @@ pub const Roots = struct {
 };
 
 fn openRoot(io: std.Io, path: []const u8) ConfineError!std.Io.Dir {
-    var dir = std.Io.Dir.openDirAbsolute(io, "/", .{}) catch return error.PathOutsideWorkspace;
+    var dir = std.Io.Dir.openDirAbsolute(io, "/", .{}) catch |err| return classifyOpenError(err);
     errdefer dir.close(io);
     var parts = std.mem.tokenizeScalar(u8, path, '/');
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, "..")) return error.PathOutsideWorkspace;
-        const next = dir.openDir(io, part, .{ .follow_symlinks = false }) catch return error.PathOutsideWorkspace;
+        const next = dir.openDir(io, part, .{ .follow_symlinks = false }) catch |err| return classifyOpenError(err);
         dir.close(io);
         dir = next;
     }
@@ -108,9 +109,10 @@ fn openBeneath(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, relat
             switch (linux.errno(rc)) {
                 .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = true } },
                 .INTR => continue,
-                .NOENT => return error.FileNotFound,
+                .NOENT, .NOTDIR => return error.FileNotFound,
+                .ACCES, .PERM, .LOOP, .XDEV, .AGAIN => return error.PathOutsideWorkspace,
                 .NOSYS => break, // Old kernels use the conservative walk below.
-                else => return error.PathOutsideWorkspace,
+                else => return error.FileSystemFailure,
             }
         }
     }
@@ -127,10 +129,7 @@ fn openNoFollow(io: std.Io, root: std.Io.Dir, relative: []const u8) ConfineError
         if (std.mem.eql(u8, part, "..")) return error.PathOutsideWorkspace;
         const last = parts.peek() == null;
         const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true, .NOFOLLOW = true, .DIRECTORY = !last };
-        const fd = std.posix.openat(dir.handle, part, flags, 0) catch |err| return switch (err) {
-            error.FileNotFound => error.FileNotFound,
-            else => error.PathOutsideWorkspace,
-        };
+        const fd = std.posix.openat(dir.handle, part, flags, 0) catch |err| return classifyOpenError(err);
         if (last) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
         if (dir.handle != root.handle) dir.close(io);
         dir = .{ .handle = fd };
@@ -150,7 +149,7 @@ pub fn openCacheFile(io: std.Io, path: []const u8) ConfineError!std.Io.File {
     defer parent.close(io);
     const file = try openNoFollow(io, parent, std.fs.path.basename(path));
     errdefer file.close(io);
-    const stat = file.stat(io) catch return error.PathOutsideWorkspace;
+    const stat = file.stat(io) catch |err| return classifyOpenError(err);
     if (stat.kind != .file) return error.PathOutsideWorkspace;
     return file;
 }
@@ -569,4 +568,40 @@ test "root cache serves secondary checkout from workspace list DTO and rejects f
             try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, document));
         }
     }
+}
+
+// Keep denied/confinement errors indistinguishable, but do not misreport I/O
+// failures or exhausted descriptors as missing or unauthorized files.
+fn classifyOpenError(err: anyerror) ConfineError {
+    return switch (err) {
+        error.FileNotFound => error.FileNotFound,
+        error.AccessDenied, error.PermissionDenied, error.SymLinkLoop, error.NotDir => error.PathOutsideWorkspace,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.FileSystemFailure,
+    };
+}
+
+test "file open errors distinguish permission missing and internal failures" {
+    try std.testing.expectEqual(error.PathOutsideWorkspace, classifyOpenError(error.AccessDenied));
+    try std.testing.expectEqual(error.FileNotFound, classifyOpenError(error.FileNotFound));
+    try std.testing.expectEqual(error.FileSystemFailure, classifyOpenError(error.InputOutput));
+}
+
+test "confinement rejects a permission-denied file" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    try tree.writeFile(io, "denied.txt");
+    const file = try tree.tmp.dir.openFile(io, "denied.txt", .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0));
+    defer file.setPermissions(io, .default_file) catch {};
+    const roots = try testRoots(allocator, tree, &.{""});
+    defer roots.deinit(allocator);
+    const requested = try tree.path(allocator, "denied.txt");
+    defer allocator.free(requested);
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
 }

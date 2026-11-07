@@ -8,6 +8,7 @@ const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
 const office_preview = @import("office_preview.zig");
 const served_files = @import("served_files.zig");
+const file_response = @import("file_response.zig");
 const theme_mod = @import("theme.zig");
 const desktop_mod = @import("desktop.zig");
 
@@ -27,7 +28,7 @@ const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const WEB_CHAT_FILE_DIR = "web-chat-files";
 const MAX_CHAT_FILE_BYTES: usize = 100 * 1024 * 1024;
-/// Workspace files opened from chat citations are read into memory.
+/// Office conversion remains bounded; /api/file streams without a size limit.
 const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
 const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";
 /// PDF bytes are not HTML. `default-src 'none'` here blanks Safari's viewer.
@@ -1625,6 +1626,7 @@ fn handleWorkspaceFile(
     const file = roots.open(allocator, io, decoded) catch |err| switch (err) {
         error.PathOutsideWorkspace => return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"path_outside_workspace\"}"),
         error.FileNotFound => return respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}"),
+        error.FileSystemFailure => return respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"file_open_failed\"}"),
         error.OutOfMemory, error.Canceled => return err,
     };
     defer file.close(io);
@@ -1634,8 +1636,7 @@ fn handleWorkspaceFile(
     const path_len = file.realPath(io, &path_buffer) catch
         return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"path_outside_workspace\"}");
     const served_path = path_buffer[0..path_len];
-    const stat = try file.stat(io);
-    if (stat.size > MAX_SERVED_FILE_BYTES) return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
+    const stat = file.stat(io) catch return respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"file_stat_failed\"}");
     // Attachments are never rendered, so SVG/HTML may download; only inline
     // responses refuse documents that would execute in the gateway's origin.
     const download = queryValue(split.query, "download") != null;
@@ -1646,6 +1647,7 @@ fn handleWorkspaceFile(
 
     const preview = std.mem.eql(u8, split.path, "/api/preview");
     if (preview) {
+        if (stat.size > MAX_SERVED_FILE_BYTES) return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
         if (!office_preview.convertible(served_path)) {
             try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
             return;
@@ -1675,25 +1677,19 @@ fn handleWorkspaceFile(
         return;
     }
 
-    const bytes = served_files.readAlloc(allocator, io, file, MAX_SERVED_FILE_BYTES) catch |err| switch (err) {
-        error.StreamTooLong => {
-            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
-            return;
-        },
-        else => {
-            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
-            return;
-        },
+    const disposition = if (download) try attachmentDisposition(allocator, decoded) else try allocator.dupe(u8, "inline");
+    defer allocator.free(disposition);
+    const headers = [_]std.http.Header{
+        .{ .name = "content-security-policy", .value = if (download) CSP else FILE_FRAME_CSP },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+        .{ .name = "referrer-policy", .value = "no-referrer" },
+        .{ .name = "cross-origin-resource-policy", .value = "same-origin" },
+        .{ .name = "content-type", .value = servedFileMime(served_path) },
+        .{ .name = "content-disposition", .value = disposition },
+        .{ .name = "cache-control", .value = "no-store" },
     };
-    defer allocator.free(bytes);
-    if (download) {
-        // The cited name is what the user clicked; the resolved path decides the type.
-        const disposition = try attachmentDisposition(allocator, decoded);
-        defer allocator.free(disposition);
-        try respondDownload(request, servedFileMime(served_path), disposition, bytes);
-        return;
-    }
-    try respondFramedFile(request, servedFileMime(served_path), bytes);
+    const download_headers = headers ++ [_]std.http.Header{.{ .name = "x-frame-options", .value = "DENY" }};
+    try file_response.respond(io, request, file, stat, if (download) &download_headers else &headers);
 }
 
 const WorkspaceRootLister = struct {
@@ -1745,6 +1741,10 @@ fn confineServedFilePath(
             return null;
         },
         error.OutOfMemory, error.Canceled => return err,
+        error.FileSystemFailure => {
+            try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"file_open_failed\"}");
+            return null;
+        },
     };
 }
 
@@ -3304,23 +3304,6 @@ fn respondFramedFile(
     });
 }
 
-fn respondDownload(
-    request: *std.http.Server.Request,
-    content_type: []const u8,
-    disposition: []const u8,
-    body: []const u8,
-) !void {
-    const headers = BASE_SECURITY_HEADERS ++ [_]std.http.Header{
-        .{ .name = "content-type", .value = content_type },
-        .{ .name = "content-disposition", .value = disposition },
-        .{ .name = "cache-control", .value = "no-store" },
-    };
-    try request.respond(body, .{
-        .status = .ok,
-        .extra_headers = &headers,
-    });
-}
-
 fn respondStatic(
     request: *std.http.Server.Request,
     content_type: []const u8,
@@ -3639,6 +3622,13 @@ fn mimeType(path: []const u8) []const u8 {
 }
 
 fn servedFileMime(path: []const u8) []const u8 {
+    if (std.ascii.endsWithIgnoreCase(path, ".mp3")) return "audio/mpeg";
+    if (std.ascii.endsWithIgnoreCase(path, ".m4a")) return "audio/mp4";
+    if (std.ascii.endsWithIgnoreCase(path, ".mp4")) return "video/mp4";
+    if (std.ascii.endsWithIgnoreCase(path, ".wav")) return "audio/wav";
+    if (std.ascii.endsWithIgnoreCase(path, ".ogg") or std.ascii.endsWithIgnoreCase(path, ".opus")) return "audio/ogg";
+    if (std.ascii.endsWithIgnoreCase(path, ".flac")) return "audio/flac";
+    if (std.ascii.endsWithIgnoreCase(path, ".webm")) return "video/webm";
     if (std.ascii.endsWithIgnoreCase(path, ".pdf")) return "application/pdf";
     if (std.ascii.endsWithIgnoreCase(path, ".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     if (std.ascii.endsWithIgnoreCase(path, ".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -4275,4 +4265,69 @@ test "approval pairing is reachable only through Tailscale Serve with a user ide
     const mapped = pairRequestSubmitError("too_many_pairing_requests");
     try std.testing.expectEqual(std.http.Status.too_many_requests, mapped.status);
     try std.testing.expectEqual(std.http.Status.service_unavailable, pairRequestSubmitError("pairing_request_queue_full").status);
+}
+
+test "workspace file route integrates confinement errors metadata and streaming" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.txt", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "active.html", .data = "<script>no</script>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "test-only-gateway-token-01234567890123456789", .flags = .{ .permissions = .fromMode(0o600) } });
+    const token_path = try std.fs.path.join(allocator, &.{ root, "token" });
+    defer allocator.free(token_path);
+    var auth = try auth_mod.Service.initFromTokenFile(allocator, io, token_path, .{}, .{});
+    defer auth.deinit();
+    var daemon = daemon_mod.Daemon.init(allocator, io, .{});
+    defer daemon.deinit();
+    try daemon.workspace_roots.roots.append(allocator, try allocator.dupe(u8, root));
+    daemon.workspace_roots.fetched_at_ms = auth_mod.nowMillis(io);
+    daemon.workspace_roots.ttl_ms = std.math.maxInt(i64);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const large = try tmp.dir.createFile(io, "large.mp3", .{});
+    try large.setLength(io, 33 * 1024 * 1024);
+    large.close(io);
+    const denied = try tmp.dir.createFile(io, "denied.txt", .{});
+    defer denied.close(io);
+    try denied.setPermissions(io, .fromMode(0));
+    defer denied.setPermissions(io, .default_file) catch {};
+    const cases = .{
+        .{ "GET", "small.txt", "", "", "200 OK", "hello", "text/plain" },
+        .{ "GET", "small.txt", "", "Range: bytes=1-3\r\n", "206 Partial Content", "ell", "text/plain" },
+        .{ "GET", "small.txt", "", "Range: bytes=9-\r\n", "416 Range Not Satisfiable", "invalid_range\n", "text/plain" },
+        .{ "HEAD", "large.mp3", "", "", "200 OK", "", "audio/mpeg" },
+        .{ "GET", "missing.txt", "", "", "404 Not Found", "file_not_found", "application/json" },
+        .{ "GET", "../outside.txt", "", "", "400 Bad Request", "invalid_path", "application/json" },
+        .{ "GET", "active.html", "", "", "415 Unsupported Media Type", "unsupported_document_type", "application/json" },
+        .{ "GET", "active.html", "&download=1", "", "200 OK", "<script>no</script>", "application/octet-stream" },
+        .{ "GET", "denied.txt", "", "", "403 Forbidden", "path_outside_workspace", "application/json" },
+    };
+    inline for (cases) |case| {
+        if (!(std.mem.eql(u8, case[1], "denied.txt") and (@import("builtin").os.tag != .linux or std.os.linux.geteuid() == 0))) {
+            const query = try std.fmt.allocPrint(allocator, "path={s}/{s}{s}", .{ root, case[1], case[2] });
+            defer allocator.free(query);
+            const wire = try std.fmt.allocPrint(allocator, "{s} /api/file?{s} HTTP/1.1\r\nHost: localhost\r\n{s}\r\n", .{ case[0], query, case[3] });
+            defer allocator.free(wire);
+            var input = std.Io.Reader.fixed(wire);
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            var server = std.http.Server.init(&input, &output.writer);
+            var request = try server.receiveHead();
+            try handleWorkspaceFile(allocator, io, .{}, &daemon, &auth, &env, .owner_bearer, .{ .path = "/api/file", .query = query }, &request);
+            const response = output.written();
+            try t.expect(std.mem.indexOf(u8, response, case[4]) != null);
+            try t.expect(std.mem.indexOf(u8, response, case[6]) != null);
+            const body_start = (std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.MissingHeaders) + 4;
+            if (std.mem.startsWith(u8, case[4], "2")) {
+                try t.expectEqualStrings(case[5], response[body_start..]);
+            } else {
+                try t.expect(std.mem.indexOf(u8, response[body_start..], case[5]) != null);
+            }
+        }
+    }
 }

@@ -25,7 +25,7 @@ The gateway supports two explicit request envelopes while its listener remains l
 - Every runtime API and the exact `/ws` WebSocket upgrade requires that cookie or an `Authorization: Bearer` credential.
 - `GET /healthz` is the only unauthenticated health route and exposes liveness, not runtime inventory. `GET /login`, `GET /login.js`, and trusted static assets are public; unauthenticated app navigation redirects to `/login`.
 - The gateway talks only to `verde-sessionizer.sock`. It has no Desktop Live or mock fallback.
-- Folder browsing is confined to daemon-authorized roots. Authenticated `/api/file` and `/api/preview` serve workspace documents opened from chat (PDF and office files) after absolute-path validation; HTML/SVG/JS are rejected.
+- Folder browsing is confined to daemon-authorized roots. Authenticated `/api/file` and `/api/preview` serve workspace files after descriptor-based confinement (see [route contract](#workspace-file-route)); HTML/SVG/JS require attachment downloads.
 - Plain loopback requests support local use and SSH forwarding. Optional trusted-proxy mode accepts only the complete, exact forwarded HTTPS envelope for one configured origin, as used by Tailscale Serve; partial, mixed, duplicate, or standard `Forwarded` headers fail closed.
 
 Do not pass secrets through `--token`, `VERDE_WEB_TOKEN`, `?token=...`, or `X-Verde-Token`. Those legacy forms are rejected. Pass only a token-file path through `--token-file` or `VERDE_WEB_TOKEN_FILE`.
@@ -248,3 +248,45 @@ bash scripts/remote-desktop/macos-screen-sharing-test.sh
 Tests use temporary state and synthetic RFB, never the user's desktop or daemon.
 Live Omarchy capture/input and native macOS compatibility still require host
 validation. Do not restart Verde from a Verde-hosted session to deploy this change.
+
+## Workspace file route
+
+`GET|HEAD /api/file?path=<percent-encoded absolute host path>[&download=1]`
+requires the existing browser session or Bearer credential and `repository:read`
+for paired devices. Paths must name regular files under a daemon-registered
+workspace/repository root. Traversal, escaping symlinks and unauthorized roots
+remain forbidden. A live daemon is required to refresh the root cache.
+
+Files have **no size ceiling**. GET streams the authorized open descriptor in
+64 KiB chunks, with fixed memory independent of file size. It sends `200 OK`,
+`Content-Length`, extension-inferred `Content-Type` (unknown/executable types use
+`application/octet-stream`), `Content-Disposition: inline` or a sanitized
+`attachment; filename=...`, `Last-Modified` (HTTP UTC date), `Accept-Ranges: bytes`,
+`Cache-Control: no-store`, and the existing security headers including `nosniff`.
+HTML/SVG/JS/WASM still require `download=1`; inline attempts return 415. Audio
+extensions include MP3, M4A, WAV, OGG/Opus and FLAC. HEAD returns the same full-file
+metadata without reading/sending the body; it ignores Range.
+
+GET accepts one `Range: bytes=start-end`, `bytes=start-`, or `bytes=-suffixLength`.
+Satisfiable ranges return `206 Partial Content`, the selected `Content-Length`,
+and `Content-Range: bytes start-end/total`. End offsets are inclusive and clamped
+to the file's last byte. Oversized suffixes select the whole file. Malformed,
+duplicate, multipart and unsatisfiable ranges return 416, a short text reason,
+and `Content-Range: bytes */total` (including for empty files).
+`If-Range` accepts an exact matching `Last-Modified` date; a different date, an
+entity tag (ETags are not issued), or duplicate validators returns the full 200
+response so clients can safely replace their partial download.
+
+Missing files return 404; denied permissions or confinement return 403; invalid
+path syntax (including explicit `..`) returns 400; unexpected open/stat failures
+return 500. These errors contain short JSON reasons. Authentication failures
+retain the existing 401/403 behavior. If a read or client connection fails after
+headers are sent, the connection closes with a truncated body rather than falsely
+completing the advertised length. Concurrent file edits are not snapshotted.
+Office conversion at `/api/preview` retains its separate 32 MiB limit (413).
+
+Mobile clients should remove their 32 MiB download rejection and use this route
+for binary/external workspace files instead of expecting inline data from
+`workspace.files.read`. Media elements can seek using Range on `/api/file`;
+`download=1` is for saving an attachment. Persisted/resumed downloads should
+check `Last-Modified`/size before appending since workspace files can change.
