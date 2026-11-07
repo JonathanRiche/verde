@@ -18,7 +18,9 @@ struct PreviewLocation {
     var url: URL { var u = URLComponents(); u.scheme = "verde-preview"; u.host = "workspace"; u.path = document; return u.url! }
     init(document: String, root: String?) {
         self.document = previewPath(document) ?? "/invalid"
-        self.root = previewPath(root ?? (document as NSString).deletingLastPathComponent) ?? self.document
+        let candidate = root.flatMap(previewPath)
+        self.root = candidate.flatMap { self.document == $0 || $0 == "/" || self.document.hasPrefix($0 + "/") ? $0 : nil }
+            ?? previewPath((self.document as NSString).deletingLastPathComponent) ?? self.document
     }
     func resolve(_ url: URL) -> String? {
         guard url.scheme == "verde-preview", url.host == "workspace", url.port == nil, url.user == nil, url.password == nil,
@@ -28,7 +30,7 @@ struct PreviewLocation {
 }
 func previewMime(_ path: String, reported: String?) -> String {
     let ext = (path as NSString).pathExtension.lowercased()
-    return ["css":"text/css", "js":"text/javascript", "mjs":"text/javascript", "cjs":"text/javascript", "html":"text/html", "htm":"text/html", "svg":"image/svg+xml", "mp3":"audio/mpeg", "m4a":"audio/mp4", "wav":"audio/wav", "ogg":"audio/ogg", "woff":"font/woff", "woff2":"font/woff2", "ttf":"font/ttf", "otf":"font/otf"][ext]
+    return ["wasm":"application/wasm", "json":"application/json", "css":"text/css", "js":"text/javascript", "mjs":"text/javascript", "cjs":"text/javascript", "html":"text/html", "htm":"text/html", "svg":"image/svg+xml", "mp3":"audio/mpeg", "m4a":"audio/mp4", "wav":"audio/wav", "ogg":"audio/ogg", "woff":"font/woff", "woff2":"font/woff2", "ttf":"font/ttf", "otf":"font/otf"][ext]
         ?? UTType(filenameExtension: ext)?.preferredMIMEType ?? reported ?? "application/octet-stream"
 }
 let previewCSP = "default-src 'none'; script-src verde-preview: https: http: 'unsafe-inline' 'unsafe-eval' blob:; style-src verde-preview: https: http: 'unsafe-inline'; img-src verde-preview: https: http: data: blob:; media-src verde-preview: https: http: data: blob:; font-src verde-preview: https: http: data:; connect-src verde-preview: https: http:; frame-src 'none'; object-src 'none'; base-uri verde-preview:; form-action 'none'"
@@ -40,7 +42,7 @@ private let previewFailureScript = #"""
 
 <script>(()=>{
  const failed=new Set(); let note;
- function render(){if(!document.body)return;if(!note){note=document.createElement('div');note.setAttribute('role','status');note.setAttribute('aria-live','polite');note.tabIndex=0;note.style.cssText='position:fixed!important;bottom:8px!important;left:8px!important;right:8px!important;z-index:2147483647!important;padding:8px!important;background:#fff4d6!important;color:#352800!important;font:13px system-ui!important;user-select:text!important;border-radius:6px!important';document.body.appendChild(note)}note.textContent=failed.size+(failed.size===1?" linked file couldn't load":" linked files couldn't load");}
+ function render(){if(!document.body)return;if(!note){note=document.createElement('div');note.setAttribute('role','status');note.setAttribute('aria-live','polite');note.tabIndex=0;note.style.cssText='position:fixed!important;bottom:8px!important;left:8px!important;right:8px!important;z-index:2147483647!important;padding:8px!important;background:#fff4d6!important;color:#352800!important;font:13px system-ui!important;-webkit-user-select:text!important;user-select:text!important;border-radius:6px!important';document.body.appendChild(note)}note.textContent=failed.size+(failed.size===1?" linked file couldn't load":" linked files couldn't load");}
  addEventListener('error',e=>{const t=e.target;if(t&&t!==window&&/^(IMG|SCRIPT|LINK|AUDIO|VIDEO|SOURCE)$/.test(t.tagName)){failed.add(t.currentSrc||t.src||t.href||t.tagName);render()}},true);
  addEventListener('DOMContentLoaded',()=>{if(failed.size)render();if(document.fonts)document.fonts.addEventListener('loadingerror',e=>{for(const f of e.fontfaces)failed.add('font:'+f.family);render()})});
 })();</script>
@@ -48,6 +50,7 @@ private let previewFailureScript = #"""
 """#
 
 struct HTMLPreview: UIViewRepresentable {
+    @Environment(\.dynamicTypeSize) private var textSize
     let source: String
     let location: PreviewLocation
     let access: PreviewAccess?
@@ -65,6 +68,8 @@ struct HTMLPreview: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: WKWebView, context: Context) {
+        _ = textSize
+        view.pageZoom = UIFont.preferredFont(forTextStyle: .body).pointSize / 17
         let html = isolatedHTML(source)
         if context.coordinator.html != html { context.coordinator.html = html; view.loadHTMLString(html, baseURL: location.url) }
     }
@@ -93,7 +98,7 @@ struct HTMLPreview: UIViewRepresentable {
             let stream = HTTPStream(response: { [weak self, weak job] response in
                 DispatchQueue.main.sync {
                     guard let self, let job, self.jobs[key] === job else { return }
-                    var headers = ["Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Content-Security-Policy":previewCSP]
+                    var headers = ["Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Expose-Headers":"Content-Length, Content-Range, Accept-Ranges, Last-Modified, ETag", "Content-Security-Policy":previewCSP]
                     for name in ["Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"] {
                         if let value = response.value(forHTTPHeaderField: name) { headers[name] = value }
                     }
