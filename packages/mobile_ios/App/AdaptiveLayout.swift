@@ -147,8 +147,8 @@ struct AdaptiveContext: Equatable {
     var slotVisible = false
     /// The content pane's width (0 when unknown); bars move actions into "⋯" when it is narrow.
     var contentWidth: CGFloat = 0
-    /// The Commit button sits in the chat's bar; otherwise its actions are in "⋯", as on phones.
-    var inlineGit: Bool { tier.wide && (contentWidth == 0 || contentWidth >= inlineGitMinWidth) }
+    /// Git actions live in the chat's “⋯” menu at every width.
+    var inlineGit: Bool { false }
 }
 
 /// I12-7: the chat bar keeps the Commit button only where the title still has room.

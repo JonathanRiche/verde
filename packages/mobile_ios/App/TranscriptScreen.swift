@@ -272,7 +272,6 @@ private struct TranscriptList: View {
     @State private var follow = true
     @State private var viewport: CGFloat = 0
     @State private var cardVisible = false
-    @State private var settled = false
     /// "Latest" is shown; follows `wantsLatest` after a short settle so a resize can't flip it
     /// back and forth within one layout pass.
     @State private var showLatest = false
@@ -398,15 +397,14 @@ private struct TranscriptList: View {
                     .scrollPosition(id: $position)
                     .modifier(BottomAnchor())
                     // Lazy rows start at estimated heights, so the initial bottom offset can land
-                    // past the measured content and show blank until a scroll. Re-anchor once
-                    // the rows are measured, then reveal.
-                    .opacity(settled ? 1 : 0)
+                    // past the measured content. Re-anchor after measurement without hiding the
+                    // scroll view: opacity zero can leave UIKit-backed rows unpainted even after
+                    // their accessibility/layout tree has appeared.
                     .task {
                         for _ in 0..<3 {
                             try? await Task.sleep(for: .milliseconds(30))
                             proxy.scrollTo(bottomID, anchor: .bottom)
                         }
-                        settled = true
                     }
                     // A resize reflows every row; keep the reader on the row they were reading.
                     .onChange(of: outer.size.width) {

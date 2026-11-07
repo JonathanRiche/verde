@@ -100,6 +100,7 @@ final class BackgroundTaskRowTests: XCTestCase {
 final class AttachmentFailureTests: XCTestCase {
     func testRefusalsAskForAHostUpdateAndTransientFailuresRetry() {
         XCTAssertEqual(thumbnailPhase(status: "ready", cached: true), .image)
+        XCTAssertEqual(thumbnailPhase(status: "ready", cached: false), .unavailable)
         XCTAssertEqual(thumbnailPhase(status: "loading", cached: false), .loading)
         XCTAssertEqual(thumbnailPhase(status: nil, cached: false), .loading)
         for code in ["forbidden", "insufficient_scope", "method_not_found", "unknown_method", "not_allowed", "unauthorized"] {

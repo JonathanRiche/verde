@@ -122,3 +122,15 @@ final class ComposerTests: XCTestCase {
         chat.stop(); await harness.close()
     }
 }
+
+final class ComposerVerticalBudgetTests: XCTestCase {
+    func testSuggestionsReserveLargeTypeActionsAndSteerHint() {
+        for available: CGFloat in [340, 400, 450, 600] {
+            let plan = composerVerticalPlan(available: available, controls: 92, hint: 60,
+                                            minimumField: 102, suggestions: true)
+            XCTAssertGreaterThanOrEqual(plan.field, 44)
+            XCTAssertLessThanOrEqual(plan.field + plan.suggestions + 92 + 60 + 96, available)
+            XCTAssertLessThanOrEqual(plan.suggestions, 198)
+        }
+    }
+}

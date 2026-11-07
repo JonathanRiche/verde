@@ -402,7 +402,6 @@ private struct DrawerSearchField: View {
     @Binding var text: String
     let identifier: String
     @FocusState private var focused: Bool
-    @State private var bounds: CGRect = .zero
 
     var body: some View {
         HStack(spacing: 10) {
@@ -410,17 +409,13 @@ private struct DrawerSearchField: View {
             TextField(title, text: $text)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .focused($focused)
-                .accessibilityIdentifier(identifier)
-                .accessibilityFrame(bounds)
         }
         .padding(.horizontal, 12).frame(minHeight: 44)
         .background(VerdeTheme.alternate, in: Capsule())
         .contentShape(Capsule())
         .onTapGesture { focused = true }
-        .background(GeometryReader { geometry in
-            Color.clear.onChange(of: geometry.frame(in: .global), initial: true) { _, frame in
-                if bounds != frame { bounds = frame }
-            }
-        })
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
     }
 }

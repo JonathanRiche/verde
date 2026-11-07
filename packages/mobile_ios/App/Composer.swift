@@ -294,19 +294,19 @@ func rankedMentions(_ mentions: [ChatMention], query: String) -> [ChatMention] {
 private struct ComposerSuggestionList: View {
     let items: [ComposerSuggestion]
     let files: Bool
+    var maximumHeight: CGFloat = 234
     let accept: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(files ? "Files" : "Commands").font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.muted)
-                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 2)
-                .accessibilityAddTraits(.isHeader)
-            if items.count > 4 {
-                ScrollView { rows }.frame(height: 44 * 4.5)
-            } else {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(files ? "Files" : "Commands").font(VerdeTheme.ui(13, bold: true)).foregroundStyle(VerdeTheme.muted)
+                    .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 2)
+                    .accessibilityAddTraits(.isHeader)
                 rows
             }
         }
+        .frame(height: min(maximumHeight, CGFloat(items.count) * 44 + 36))
         .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 10))
         .accessibilityIdentifier("composer-suggestions")
     }
@@ -384,6 +384,8 @@ struct ChatComposer: View {
     @State private var dragStart: CGFloat?
     /// The text's own height; the field grows with it (a few lines) unless resized by hand.
     @State private var contentHeight: CGFloat = 0
+    @State private var controlsHeight: CGFloat = 44
+    @State private var hintHeight: CGFloat = 0
     /// The chip glyphs grow with text, 16 up to 24 points (U1: they stayed 12-13 at AX-L).
     @ScaledMetric(relativeTo: .footnote) private var chipIconScaled: CGFloat = 16
     private var chipIcon: CGFloat { composerChipIconSize(chipIconScaled) }
@@ -461,7 +463,7 @@ struct ChatComposer: View {
             }
             if let token = model.token {
                 let items = composerSuggestions(token, mentions: model.view?.mentions ?? [], slash: model.view?.catalogs.slash ?? [])
-                if !items.isEmpty { ComposerSuggestionList(items: items, files: token.marker == "@") { model.accept($0) } }
+                if !items.isEmpty { ComposerSuggestionList(items: items, files: token.marker == "@", maximumHeight: verticalPlan.suggestions) { model.accept($0) } }
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
                 // Up to 16 images: one row that scrolls sideways, never taller than one thumbnail.
@@ -541,8 +543,11 @@ struct ChatComposer: View {
                     if running && !model.canSubmit { stopButton } else { sendButton }
                 }
             }
+            .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { controlsHeight = $0 }
             if let line = composerHintLine(followupKind, text: model.text, followupShown: model.view?.followup.map(visibleFollowup) ?? false) {
                 Text(line).font(VerdeTheme.ui(12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("composer-action-hint")
+                    .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { hintHeight = $0 }
+                    .onDisappear { hintHeight = 0 }
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 12)
@@ -801,9 +806,18 @@ struct ChatComposer: View {
         case .queue: return "text.line.last.and.arrowtriangle.forward"
         }
     }
+    private var verticalPlan: ComposerVerticalPlan {
+        let suggestions = model.token.map {
+            !composerSuggestions($0, mentions: model.view?.mentions ?? [], slash: model.view?.catalogs.slash ?? []).isEmpty
+        } ?? false
+        return composerVerticalPlan(available: availableHeight, controls: controlsHeight, hint: hintHeight,
+                                    minimumField: basePrompt, suggestions: suggestions)
+    }
+
     private var promptHeight: CGFloat {
         let natural = min(max(basePrompt, contentHeight), basePrompt * 3)
-        return composerPromptHeight(resizedHeight ?? natural, available: availableHeight, minimum: basePrompt)
+        let limit = verticalPlan.field
+        return min(limit, max(min(basePrompt, limit), resizedHeight ?? natural))
     }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight, minimum: basePrompt) }
     private func sortedChoices(_ kind: ComposerPicker) -> [ChatChoice] { choices(kind).sorted { $0.favorite && !$1.favorite } }
@@ -1396,4 +1410,22 @@ private struct ComposerGlyph: Shape {
 func composerPromptHeight(_ requested: CGFloat, available: CGFloat, minimum: CGFloat = 56) -> CGFloat {
     let maximum = max(minimum, min(available * 0.4, available - 200))
     return min(maximum, max(minimum, requested))
+}
+
+/// Chips/actions and the hint own their measured height first. The remainder belongs to the
+/// editable field and a scrolling suggestion list, so large type cannot put Send below the keyboard.
+struct ComposerVerticalPlan: Equatable {
+    let field: CGFloat
+    let suggestions: CGFloat
+}
+
+func composerVerticalPlan(available: CGFloat, controls: CGFloat, hint: CGFloat, minimumField: CGFloat,
+                          suggestions: Bool) -> ComposerVerticalPlan {
+    // Card/outer padding, resize handle and stack gaps; none depend on suggestion content.
+    let room = max(44, available - controls - hint - 96)
+    if suggestions {
+        let field = min(max(44, room - 44), max(44, minimumField / 2))
+        return ComposerVerticalPlan(field: field, suggestions: min(198, max(0, room - field)))
+    }
+    return ComposerVerticalPlan(field: min(room, max(minimumField, available * 0.4)), suggestions: 0)
 }

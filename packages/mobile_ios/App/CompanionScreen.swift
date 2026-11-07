@@ -99,19 +99,7 @@ struct CompanionSheet: View {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
-            // S27: a visible Connecting state in the sheet, cancellable, until the call is live.
-            if live.phase == .connecting {
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Connecting…").font(VerdeTheme.ui(14)).frame(maxWidth: .infinity, alignment: .leading)
-                    Button("Cancel") { live.end() }.font(VerdeTheme.ui(14, bold: true)).frame(minHeight: 44)
-                }
-                .padding(.horizontal, 12)
-                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 12).padding(.bottom, 6)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("live-connecting")
-            }
+            // The app-wide Live pill owns Connecting and Cancel; do not duplicate it here.
             if !live.active, live.failure != nil, live.failureNeedsSetup {
                 LiveSetupCard(setup: { live.dismissFailure(); settingsBrain = false; settingsLive = true; settings = true },
                               close: { live.dismissFailure() })

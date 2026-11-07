@@ -115,6 +115,7 @@ func thumbnailPhase(status: String?, errorCode: String? = nil, cached: Bool) -> 
         if attachmentRefusalCodes.contains(code) { return .hostRefused }
         if code == "not_found" || code == "unavailable" { return .unavailable }
         return .retry
+    case "ready"?: return .unavailable
     default: return .loading
     }
 }
@@ -223,6 +224,19 @@ enum AttachmentIntent {
     }
 }
 
+/// A 16-photo envelope can contain megabytes of base64. Decode each store snapshot once,
+/// rather than once per thumbnail on the main actor (which also delays initial painting).
+@MainActor private final class AttachmentSnapshots {
+    static let shared = AttachmentSnapshots()
+    private var data: Data?
+    private var items: [String: AttachmentFetchState] = [:]
+
+    func state(_ key: String, in snapshot: Data?) -> AttachmentFetchState? {
+        if data != snapshot { data = snapshot; items = decodeAttachmentsView(snapshot) }
+        return items[key]
+    }
+}
+
 // MARK: - Views
 
 struct ViewerRequestImage: Identifiable {
@@ -307,9 +321,17 @@ struct AttachmentThumbnail: View {
         }
         // Lazily: only rows on screen fetch.
         .task(id: key) { await load() }
+        .task(id: key) {
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled, image == nil,
+                  thumbnailPhase(status: status, errorCode: errorCode, cached: false) == .loading else { return }
+            AttachmentImageCache.shared.end(key)
+            errorCode = "timeout"
+            status = "failed"
+        }
         .onChange(of: browse.session?.store.snapshots["attachments"]) { _, data in
             guard image == nil, requested else { return }
-            Task { await receive(decodeAttachmentsView(data)[key]) }
+            Task { await receive(AttachmentSnapshots.shared.state(key, in: data)) }
         }
         .fullScreenCover(item: $viewer) { request in AttachmentViewer(url: request.url) }
     }
@@ -331,7 +353,7 @@ struct AttachmentThumbnail: View {
             // A failed fetch has already ended; make sure no stale in-flight mark blocks the retry.
             AttachmentImageCache.shared.end(key)
             errorCode = nil
-        } else if let existing = decodeAttachmentsView(session.store.snapshots["attachments"])[key] {
+        } else if let existing = AttachmentSnapshots.shared.state(key, in: session.store.snapshots["attachments"]) {
             await receive(existing)
             if image != nil || existing.status != "loading" && existing.status != "ready" { return }
         }
@@ -350,18 +372,25 @@ struct AttachmentThumbnail: View {
 
     /// Caches ready bytes, shows them, and lets the core drop its copy.
     private func receive(_ state: AttachmentFetchState?) async {
-        guard let state, image == nil else { return }
-        status = state.status
+        guard image == nil else { return }
+        if let cached = AttachmentImageCache.shared.thumbnail(for: key, maxPixel: maxPixel) { image = cached; return }
+        guard let state else { return }
+        status = state.status == "ready" ? "loading" : state.status
         errorCode = state.error_code
         if state.status == "failed" || state.status == "unavailable" { AttachmentImageCache.shared.end(key); return }
-        guard state.status == "ready", let base64 = state.data_base64, let data = Data(base64Encoded: base64) else { return }
+        guard state.status == "ready" else { return }
+        guard let base64 = state.data_base64, let data = Data(base64Encoded: base64), !data.isEmpty else {
+            AttachmentImageCache.shared.end(key)
+            status = "unavailable"
+            return
+        }
         let key = self.key, mime = state.mime, maxPixel = self.maxPixel
         let decoded = await Task.detached(priority: .userInitiated) { () -> UIImage? in
             AttachmentImageCache.shared.store(data, key: key, mime: mime)
             return AttachmentImageCache.shared.thumbnail(for: key, maxPixel: maxPixel)
         }.value
         AttachmentImageCache.shared.end(key)
-        if let decoded { image = decoded } else { status = "failed" }
+        if let decoded { image = decoded } else { status = "unavailable" }
         if let host = browse.session?.host {
             let (type, fields) = AttachmentIntent.release(intentID: UUID().uuidString, key: key)
             try? await host.sendIntent(type, fields)

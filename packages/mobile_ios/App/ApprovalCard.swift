@@ -197,12 +197,11 @@ private struct ApprovalDetails: View {
                     let (shown, truncated) = all ? (approval.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
                         : leadingLines(approval.body, detailLines)
                     // I14-4: the request wraps at every size; it never hides behind a sideways scroll.
-                    Text(shown).font(VerdeTheme.mono()).textSelection(.enabled)
+                    Text(shown).font(structured ? VerdeTheme.mono() : VerdeTheme.ui(14)).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10).padding(.vertical, 8)
-                    .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityLabel("Approval details")
+                        .padding(.horizontal, structured ? 10 : 0).padding(.vertical, structured ? 8 : 0)
+                    .background(structured ? VerdeTheme.alternate : .clear, in: RoundedRectangle(cornerRadius: 8))
                     HStack(spacing: 16) {
                         if truncated { Button { disclosure.setFlag(key + ":all", true) } label: { TargetText("Show all \(countLines(approval.body)) lines") } }
                     }

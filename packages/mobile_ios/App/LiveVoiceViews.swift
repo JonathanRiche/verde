@@ -45,14 +45,26 @@ struct LivePill: View {
                             .frame(width: 40, height: 40)
                             .background(VerdeTheme.accent.opacity(0.19), in: Circle())
                             .overlay(Circle().stroke(speaking ? VerdeTheme.accent : VerdeTheme.border))
-                        LiveDots(live: live, speaking: speaking)
-                            .frame(maxWidth: .infinity, minHeight: 40, maxHeight: 40)
+                        if live.phase == .connecting {
+                            Text("Connecting…").font(VerdeTheme.ui(14))
+                                .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+                        } else {
+                            LiveDots(live: live, speaking: speaking)
+                                .frame(maxWidth: .infinity, minHeight: 40, maxHeight: 40)
+                        }
                     }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(liveStatus(live, speaking: speaking, name: name))
                 .accessibilityHint("Opens the full Live view.")
+                if live.phase == .connecting {
+                    Button("Cancel") { live.end() }
+                        .font(VerdeTheme.ui(14, bold: true)).foregroundStyle(VerdeTheme.danger)
+                        .padding(.horizontal, 8).frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle()).buttonStyle(.plain)
+                        .accessibilityLabel("Cancel live connection")
+                } else {
                 LivePillButton(systemImage: "gearshape", label: "Voice settings", tone: .plain, action: openSettings)
                 LivePillButton(systemImage: "captions.bubble", label: captionsShown ? "Hide captions" : "Show captions",
                                tone: captionsShown ? .selected : .plain) { captionsShown.toggle() }
@@ -60,12 +72,13 @@ struct LivePill: View {
                                tone: live.muted ? .warning : .plain) { live.setMuted(!live.muted) }
                     .disabled(live.phase != .live)
                 LivePillButton(systemImage: "xmark", label: "End live conversation", tone: .danger) { live.end() }
+                }
             }
             .padding(6)
             .background(VerdeTheme.alternate, in: Capsule())
             .overlay(Capsule().stroke(VerdeTheme.border))
             .shadow(color: .black.opacity(0.25), radius: 8, y: 4)
-            if captionsShown {
+            if captionsShown && live.phase != .connecting {
                 LiveCaptionsCard(live: live, name: name)
                     .contentShape(Rectangle())
                     .onTapGesture(perform: expand)
