@@ -17,10 +17,11 @@ struct PreviewLocation {
     let root: String
     var url: URL { var u = URLComponents(); u.scheme = "verde-preview"; u.host = "workspace"; u.path = document; return u.url! }
     init(document: String, root: String?) {
-        self.document = previewPath(document) ?? "/invalid"
+        let documentPath = previewPath(document) ?? "/invalid"
+        self.document = documentPath
         let candidate = root.flatMap(previewPath)
-        self.root = candidate.flatMap { self.document == $0 || $0 == "/" || self.document.hasPrefix($0 + "/") ? $0 : nil }
-            ?? previewPath((self.document as NSString).deletingLastPathComponent) ?? self.document
+        self.root = candidate.flatMap { documentPath == $0 || $0 == "/" || documentPath.hasPrefix($0 + "/") ? $0 : nil }
+            ?? previewPath((documentPath as NSString).deletingLastPathComponent) ?? documentPath
     }
     func resolve(_ url: URL) -> String? {
         guard url.scheme == "verde-preview", url.host == "workspace", url.port == nil, url.user == nil, url.password == nil,
