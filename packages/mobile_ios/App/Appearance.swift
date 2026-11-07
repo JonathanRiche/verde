@@ -144,6 +144,8 @@ private let bundledLicences: [(String, String)] = [
 /// The Theme choices: the current one checked, in the same column and bar as Settings.
 private struct ThemeChoicePage: View {
     @Bindable var appearance: AppearanceSettings
+    /// Only in the content pane: in the Settings sheet the back chevron is the way out (B5).
+    var embedded = false
     var body: some View {
         List {
             ForEach(AppearanceMode.allCases, id: \.self) { mode in
@@ -161,7 +163,9 @@ private struct ThemeChoicePage: View {
         }
         .scrollContentBackground(.hidden).background(VerdeTheme.background)
         .modifier(ReadableListWidth())
-        .modifier(VerdeNavigation())
+        .modifier(EmbeddedNavigation(enabled: embedded))
+        // iPad with the sidebar hidden: the same companion entry as Settings itself.
+        .modifier(RootCompanionToolbar())
         .navigationTitle("Theme").navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -189,7 +193,7 @@ struct AppSettings: View {
                 Section {
                     // Pass 16: our own page, so it keeps the 720-point column and the sidebar button.
                     NavigationLink {
-                        ThemeChoicePage(appearance: appearance)
+                        ThemeChoicePage(appearance: appearance, embedded: embedded)
                     } label: {
                         LabeledContent("Theme", value: appearance.mode.label)
                     }

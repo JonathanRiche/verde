@@ -92,14 +92,19 @@ struct LiveSetupCard: View {
             Text(liveSetupTitle).font(VerdeTheme.ui(15, bold: true)).accessibilityAddTraits(.isHeader)
             Text(liveSetupBody).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.text)
                 .fixedSize(horizontal: false, vertical: true)
-            // S46: a tonal "Not now" and a filled primary, one height (as on Android).
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                Button("Not now", action: close)
-                    .buttonStyle(TonalButtonStyle(fullWidth: false))
-                Button("Open Companion settings", action: setup)
-                    .buttonStyle(PrimaryButtonStyle(fullWidth: false))
-                    .accessibilityHint("Add a live voice provider key.")
+            // S46: a tonal "Not now" and a filled primary, one height (as on Android). Labels never
+            // wrap (a wrapped primary made the pair two heights on iPad); when the pair doesn't fit on
+            // one line it stacks, each button full width.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    notNow(fullWidth: false)
+                    openSettings(fullWidth: false)
+                }
+                VStack(spacing: 8) {
+                    openSettings(fullWidth: true)
+                    notNow(fullWidth: true)
+                }
             }
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -109,6 +114,17 @@ struct LiveSetupCard: View {
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.warning, lineWidth: 1.5))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("live-setup")
+    }
+
+    private func notNow(fullWidth: Bool) -> some View {
+        Button(action: close) { Text("Not now").lineLimit(1) }
+            .buttonStyle(TonalButtonStyle(fullWidth: fullWidth))
+    }
+
+    private func openSettings(fullWidth: Bool) -> some View {
+        Button(action: setup) { Text("Open Companion settings").lineLimit(1) }
+            .buttonStyle(PrimaryButtonStyle(fullWidth: fullWidth))
+            .accessibilityHint("Add a live voice provider key.")
     }
 }
 

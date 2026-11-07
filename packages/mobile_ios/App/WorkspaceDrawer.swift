@@ -125,8 +125,10 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 4) {
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle)
+                    // S38: the field itself is the 44-point target, not just the capsule around it.
                     TextField("Search", text: $search).textInputAutocapitalization(.never).autocorrectionDisabled()
-                }.padding(.horizontal, 12).frame(minHeight: 40).background(VerdeTheme.alternate, in: Capsule())
+                        .frame(minHeight: 44)
+                }.padding(.horizontal, 12).background(VerdeTheme.alternate, in: Capsule())
                 if !all.isEmpty {
                     Button { open(.newChat(target?.workspace_id)) } label: { Image(systemName: "square.and.pencil").frame(width: 44, height: 44).contentShape(Rectangle()) }
                         .accessibilityLabel("New chat")
@@ -224,8 +226,9 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle)
                 TextField("Search workspaces", text: $workspaceQuery).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .frame(minHeight: 44)
                     .accessibilityIdentifier("workspace-switcher-search")
-            }.padding(12)
+            }.padding(.horizontal, 12).padding(.vertical, 2)
             Divider().overlay(VerdeTheme.border)
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
