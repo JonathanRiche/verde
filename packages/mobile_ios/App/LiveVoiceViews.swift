@@ -53,7 +53,7 @@ struct LivePill: View {
                                 .frame(maxWidth: .infinity, minHeight: 40, maxHeight: 40)
                         }
                     }
-                    .contentShape(Rectangle())
+                    .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(liveStatus(live, speaking: speaking, name: name))
@@ -188,7 +188,7 @@ private struct LiveCaptionsCard: View {
                 Text("\(name): \(live.assistantCaption)").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.text).lineLimit(2)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
         .padding(.horizontal, 14).padding(.vertical, 10)
         .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.border))

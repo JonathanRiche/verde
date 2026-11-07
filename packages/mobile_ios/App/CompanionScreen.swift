@@ -112,7 +112,8 @@ struct CompanionSheet: View {
                     .padding(.horizontal, 12).padding(.bottom, 6)
             }
             CompanionSummary(model: model, open: open, expanded: $panel)
-            Divider().overlay(VerdeTheme.border)
+            // The pinned block ends in a hairline; the transcript fades below this boundary.
+            Divider().overlay(VerdeTheme.border).accessibilityHidden(true)
             // The call bar over the app opens the full view here.
             if live.active && pill.expanded {
                 LiveVoiceFullView(live: live, name: active.name) { pill.expanded = false }
@@ -837,7 +838,11 @@ struct CompanionSettings: View {
                     ForEach(CompanionCharacter.allCases) { option in
                         Button(option.displayName) { Task { await add(option) } }
                     }
-                } label: { Label("Add companion", systemImage: "plus") }
+                } label: {
+                    Label("Add companion", systemImage: "plus")
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).contentShape(Rectangle())
+                }
+                .accessibilityLabel("Add companion")
                 .disabled(model.saving || model.defaultHome == nil)
             }
         } header: { SectionTitle("Companions") } footer: {

@@ -117,8 +117,11 @@ struct StatusPip: View {
     var attention = false
     var failed = false
     var body: some View {
-        Circle().fill(failed ? VerdeTheme.danger : attention ? VerdeTheme.warning : active ? VerdeTheme.accent : VerdeTheme.subtle)
-            .frame(width: 6, height: 6).modifier(Pulse(active: active && !attention && !failed)).accessibilityLabel(failed ? "Failed" : attention ? "Needs attention" : active ? "Working" : "Idle")
+        if active || attention || failed {
+            Circle().fill(failed ? VerdeTheme.danger : attention ? VerdeTheme.warning : VerdeTheme.accent)
+                .frame(width: 6, height: 6).modifier(Pulse(active: active && !attention && !failed))
+                .accessibilityLabel(failed ? "Failed" : attention ? "Needs attention" : "Working")
+        }
     }
 }
 private struct DrawerActionKey: EnvironmentKey { static let defaultValue: () -> Void = {} }

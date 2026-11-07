@@ -117,6 +117,10 @@ final class CompanionModel {
     }
     var badgeCount: Int { needsYouBadge(attention: browse.state.attention, items: needsYou) }
 
+    var accessibilityStatus: String {
+        bubbleAccessibilityValue(count: badgeCount, failed: failedCount, status: presence.status)
+    }
+
     /// Changes when the companion finishes a turn (its chat went quiet with newer activity); the
     /// bubble pops "<Name> replied" for a change it hasn't seen.
     var replyKey: String? {

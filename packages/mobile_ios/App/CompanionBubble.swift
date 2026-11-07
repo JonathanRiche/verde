@@ -78,6 +78,14 @@ func bubbleAccessibilityLabel(name: String, count: Int, failed: Int = 0) -> Stri
     }
 }
 
+/// Attention must agree with the badge rather than the companion's otherwise idle presence.
+func bubbleAccessibilityValue(count: Int, failed: Int, status: String) -> String {
+    var attention: [String] = []
+    if count > 0 { attention.append(needsYouPhrase(count)) }
+    if failed > 0 { attention.append("\(failed) chat\(failed == 1 ? "" : "s") failed") }
+    return attention.isEmpty ? status : attention.joined(separator: ", ")
+}
+
 /// Decides when the collapsed bubble shows its speech-bubble chip: only for needs-you items it
 /// hasn't seen before, or a companion reply newer than the last one seen. The first observation
 /// only primes it, and anything observed while the sheet is open counts as seen.
@@ -289,7 +297,6 @@ struct CompanionBubbleLayer: View {
     }
 
     private func bubble(_ active: RosterEntry, layout: BubbleLayout) -> some View {
-        let presence = model.presence
         let badge = model.badgeCount
         let d = layout.diameter
         let liveOn = live.active
@@ -300,7 +307,7 @@ struct CompanionBubbleLayer: View {
         .contentShape(Circle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge, failed: model.failedCount))
-        .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
+        .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : model.accessibilityStatus)
         .accessibilityHint(liveOn ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { if liveOn { live.end() } else { open() } }

@@ -78,6 +78,14 @@ final class Pass2Tests: XCTestCase {
         XCTAssertEqual(coreChatState(sections.needs.first?.state).label(status: sections.needs.first?.status ?? ""), "Needs input")
         XCTAssertTrue(homeSections(state, limit: 8, hidden: ["r"]).running.isEmpty, "companion chats stay out")
     }
+
+    func testBubbleValueAgreesWithAttentionAndFallsBackToPresence() {
+        XCTAssertEqual(bubbleAccessibilityValue(count: 0, failed: 1, status: "Ready when you are"), "1 chat failed")
+        XCTAssertEqual(bubbleAccessibilityValue(count: 2, failed: 1, status: "Ready when you are"), "2 things need you, 1 chat failed")
+        XCTAssertEqual(bubbleAccessibilityValue(count: 1, failed: 0, status: "Working…"), "1 thing needs you")
+        XCTAssertEqual(bubbleAccessibilityValue(count: 0, failed: 0, status: "2 chats running"), "2 chats running")
+        XCTAssertEqual(bubbleAccessibilityValue(count: 0, failed: 0, status: "Ready when you are"), "Ready when you are")
+    }
 }
 
 /// Round-3 transcript rules: bottom hysteresis and following your own send.

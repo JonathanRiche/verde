@@ -296,7 +296,9 @@ struct AddWorkspaceScreen: View {
                     Section {
                         // Host lists can repeat a folder; a repeated row id can break the list's updates.
                         ForEach(recent, id: \.self) { root in
-                            folderRow(root, systemImage: "clock.arrow.circlepath") { Task { await manage.directory(root) } }
+                            folderRow(workspaceFolderName(root, workspaces: manage.browse.state.workspaces?.items ?? []), systemImage: "clock.arrow.circlepath") {
+                                Task { await manage.directory(root) }
+                            }
                         }
                     } header: { SectionTitle("Recent folders") }
                     .disabled(manage.busy)
@@ -307,11 +309,12 @@ struct AddWorkspaceScreen: View {
                     if !directory.supported { Text("Folder browsing needs a newer host. You can still enter a path.") }
                     else {
                         if !directory.path.isEmpty {
+                            let name = workspaceFolderName(directory.path, workspaces: manage.browse.state.workspaces?.items ?? [])
                             HStack(spacing: 8) {
                                 Image(systemName: "folder.fill").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true)
-                                Text(directory.path).font(VerdeTheme.mono(12)).foregroundStyle(VerdeTheme.text).lineLimit(3).textSelection(.enabled)
+                                Text(name).font(VerdeTheme.ui(14, bold: true)).foregroundStyle(VerdeTheme.text).lineLimit(2).textSelection(.enabled)
                             }
-                            .accessibilityElement(children: .combine).accessibilityLabel("Current folder, \(directory.path)")
+                            .accessibilityElement(children: .combine).accessibilityLabel("Current folder, \(name)")
                             Button("Use this folder") { path = directory.path; manage.notice = nil }
                                 .buttonStyle(TonalButtonStyle())
                                 .listRowBackground(Color.clear)

@@ -254,6 +254,21 @@ private struct BottomOffsetKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
 }
 
+/// Softens the cropped history edge under the Companion's pinned header without moving its tail.
+private struct CompanionTranscriptFade: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled {
+            content.mask {
+                VStack(spacing: 0) {
+                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom).frame(height: 18)
+                    Color.black
+                }
+            }
+        } else { content }
+    }
+}
+
 /// Starts at the newest row; older pages prepend above without moving the reading position,
 /// and new output is followed only while the reader is at the bottom.
 private struct TranscriptList: View {
@@ -375,6 +390,7 @@ private struct TranscriptList: View {
                     // On the list alone, so the bars over it keep their own identifiers.
                     .accessibilityIdentifier("transcript-list")
                     .coordinateSpace(name: "transcript")
+                    .modifier(CompanionTranscriptFade(enabled: compact))
                     // A bar over the bottom edge (I2-1), drawn as an overlay so it never changes the
                     // scroll view's size or insets: resizing the lazy transcript while scrolled up
                     // made its layout loop (I3-1). It only shows away from the newest output.

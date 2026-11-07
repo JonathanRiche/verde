@@ -77,10 +77,13 @@ private struct Dot: View {
     let label: String
     var body: some View {
         // S32: a dot only when there is state; an idle row keeps the space but draws nothing.
-        let idle = label == "Idle"
-        Circle().fill(idle ? Color.clear : color).frame(width: 6, height: 6)
-            .modifier(Pulse(active: ["Working", "Running", "Active"].contains(label))).accessibilityLabel(label)
-            .accessibilityHidden(idle)
+        Group {
+            if label != "Idle" {
+                Circle().fill(color)
+                    .modifier(Pulse(active: ["Working", "Running", "Active"].contains(label)))
+                    .accessibilityLabel(label)
+            }
+        }.frame(width: 6, height: 6)
     }
 }
 

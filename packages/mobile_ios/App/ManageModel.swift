@@ -24,6 +24,16 @@ func normalizedWorkspacePath(_ raw: String) -> String {
     return path
 }
 
+/// Folder chrome uses the workspace's name or the final folder component; editing keeps the path.
+func workspaceFolderName(_ raw: String, workspaces: [Workspace]) -> String {
+    let path = normalizedWorkspacePath(raw)
+    if let workspace = workspaces.first(where: { normalizedWorkspacePath($0.path) == path }), !workspace.label.isEmpty {
+        return workspace.label
+    }
+    if path == "/" { return "Computer" }
+    return path.split(separator: "/").last.map(String.init) ?? "Folders"
+}
+
 /// Why a typed folder can't become a workspace, before asking the host; nil when it may.
 /// The core stores the path as given, so it has to be a clean absolute path.
 func workspacePathProblem(_ raw: String) -> String? {

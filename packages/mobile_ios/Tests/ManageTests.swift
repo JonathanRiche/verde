@@ -56,6 +56,15 @@ final class ManageTests: XCTestCase {
         XCTAssertEqual(uniqued(["/a", "/b", "/a"]), ["/a", "/b"])
     }
 
+    func testFolderChromeUsesNamesWhilePathsStayIntact() {
+        let workspace = Workspace(workspace_id: "w", label: "Demo app", path: "/tmp/review/demo-app", open: true, panes: [], threads: [])
+        XCTAssertEqual(workspaceFolderName("/tmp/review/demo-app/", workspaces: [workspace]), "Demo app")
+        XCTAssertEqual(workspaceFolderName("/tmp/review/demo/", workspaces: [workspace]), "demo")
+        XCTAssertEqual(workspaceFolderName("/", workspaces: []), "Computer")
+        XCTAssertEqual(workspaceFolderName("", workspaces: []), "Folders")
+        XCTAssertEqual(normalizedWorkspacePath("/tmp/review/demo/"), "/tmp/review/demo")
+    }
+
     func testBadWorkspacePathNeverReachesTheCore() async throws {
         let harness = ChatHarness()
         try await harness.launch()

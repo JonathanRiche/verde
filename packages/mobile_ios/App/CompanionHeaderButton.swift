@@ -104,7 +104,7 @@ private struct CompanionHeaderFace: View {
     private var accessibilityValue: String {
         if entry.live.active { return "Live conversation" }
         if entry.voice.listening { return "Listening" }
-        return entry.voice.speaking ? "Speaking" : entry.model.presence.status
+        return entry.voice.speaking ? "Speaking" : entry.model.accessibilityStatus
     }
 
     private var ring: Color {

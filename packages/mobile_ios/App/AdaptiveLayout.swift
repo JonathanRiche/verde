@@ -248,7 +248,7 @@ struct CompanionDock: View {
                 .buttonStyle(.plain)
                 .contextMenu { Button("Settings", action: settings) }
                 .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge, failed: model.failedCount))
-                .accessibilityValue(model.presence.status)
+                .accessibilityValue(live.active ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : model.accessibilityStatus)
                 .accessibilityAddTraits(open ? .isSelected : [])
                 .accessibilityAction(named: "Settings", settings)
                 .accessibilityIdentifier("companion-dock")
@@ -278,7 +278,7 @@ struct CompanionDock: View {
         } else if let notice = voice.notice {
             Text(notice).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.warning).lineLimit(1)
         } else {
-            Text(live.active ? "Live" : model.presence.status).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
+            Text(live.active ? "Live" : model.accessibilityStatus).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.muted).lineLimit(2)
         }
     }
 
