@@ -45,6 +45,7 @@ struct LivePill: View {
                             .frame(width: 40, height: 40)
                             .background(VerdeTheme.accent.opacity(0.19), in: Circle())
                             .overlay(Circle().stroke(speaking ? VerdeTheme.accent : VerdeTheme.border))
+                            .accessibilityHidden(true)
                         if live.phase == .connecting {
                             Text("Connecting…").font(VerdeTheme.ui(14))
                                 .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
