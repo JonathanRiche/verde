@@ -577,7 +577,12 @@ private fun MicButton(voice: CompanionVoice, model: TranscriptModel, name: Strin
     val listening = talk !is TalkState.Idle
     // Recognition problems surface where the user is looking: the composer's notice line.
     var voiceNotice by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(error) { error?.let { model.composer.showNotice(it); voiceNotice = it; voice.clearError() } }
+    LaunchedEffect(error) {
+        error?.let {
+            if (!voice.suppressed) { model.composer.showNotice(it); voiceNotice = it }
+            voice.clearError()
+        }
+    }
     // A8-4: a recognition hiccup clears on the next press and when the sheet closes.
     LaunchedEffect(talk) { if (talk !is TalkState.Idle) voiceNotice?.let { model.composer.clearNotice(it); voiceNotice = null } }
     val noticeNow by rememberUpdatedState(voiceNotice)

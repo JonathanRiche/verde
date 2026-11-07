@@ -187,6 +187,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Real-time voice (phase 2): provider WebSocket from the phone, token minted by the desktop.
     val live: LiveVoice = viewModel(key = "companion-live", factory = viewModelFactory { initializer { LiveVoice(voiceContext, hosts, browse.state, companion) } })
     val liveUi by live.ui.collectAsState()
+    var liveStarting by remember { mutableStateOf(false) }
     // Levels change every 20 ms in a call: only the bubble ring and the call bar read them (via
     // lambdas), so the shell itself doesn't recompose at mic rate.
     val liveLevel by live.outputLevel.collectAsState()
@@ -202,7 +203,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         live.snapshot = { companionSnapshot(companion.state.value, browse.state.value) }
         live.workspaceLabel = { ws -> browse.state.value.workspaces?.items?.find { it.workspace_id == ws }?.label }
     }
-    LaunchedEffect(liveUi.active) { voice.suppressed = liveUi.active }
+    LaunchedEffect(liveUi.phase, liveStarting) { voice.suppressed = liveStarting || liveUi.phase != LivePhase.Off }
     val voiceActive by voice.active.collectAsState()
     LaunchedEffect(voice, companionTranscript, voiceActive, liveUi.active, companionOpen) {
         voice.holdFocus(companionTranscript, voiceActive || liveUi.active, companionOpen)
@@ -216,14 +217,24 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         // A Live call carries on in the background like a phone call (LiveCallService); talk and read-aloud stop.
         if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) voice.pause()
     }
-    var liveStarting by remember { mutableStateOf(false) }
     fun toggleLive() {
+        if (!live.ui.value.active) {
+            // The recognizer can report an error as pause stops it. Retire that notice before
+            // either the permission preview or the real Connecting frame is published.
+            voice.suppressed = true
+            voice.clearError(); companionTranscript?.composer?.clearNotice()
+        }
         when {
             live.ui.value.active -> live.stop()
             // Granting the microphone carries straight on into the call. A7-8: the call bar is set up
             // while the permission dialog is open, so "Connecting…" shows the first frame after it.
-            !mic.granted() -> { liveStarting = true; mic.request { if (!live.ui.value.active) { voice.pause(); live.start() } } }
-            else -> { voice.pause(); live.start() }
+            !mic.granted() -> {
+                voice.clearError(); companionTranscript?.composer?.clearNotice(); live.dismissError()
+                liveStarting = true
+                mic.request(onGranted = { if (liveStarting && !live.ui.value.active) { voice.pause(); live.start() } },
+                    onDismiss = { liveStarting = false })
+            }
+            else -> { voice.clearError(); companionTranscript?.composer?.clearNotice(); voice.pause(); live.start() }
         }
     }
     val talkState by voice.talk.collectAsState()
@@ -238,10 +249,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // S9: the call bar only during a call; a failed call's reason and repair live in the companion
     // sheet, which opens to show them and clears them when it closes.
     val callUp = liveUi.active || liveStarting
-    LaunchedEffect(liveStarting, liveUi.active) {
-        // Started, or the permission was declined: the bar's early host goes once it has no call.
-        if (liveUi.active) liveStarting = false else if (liveStarting) { kotlinx.coroutines.delay(30_000); liveStarting = false }
-    }
+    LaunchedEffect(liveUi.active) { if (liveUi.active) liveStarting = false }
     LaunchedEffect(liveUi.phase) {
         // One message: a speech-recognition hiccup from the same attempt isn't shown beside it.
         if (liveUi.phase == LivePhase.Failed) voice.clearError()
@@ -250,10 +258,11 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     var liveSettings by remember { mutableStateOf(false) }
     val callBarUi: @Composable (Dp) -> Unit = { top ->
         val character = CompanionCharacter.of(companionActive?.character)
-        LiveCallBar(liveUi, { liveInput }, { liveLevel }, character, companionActive?.name?.ifBlank { null } ?: character.label, liveCaptions,
+        LiveCallBar(permissionLiveUi(liveUi, liveStarting), { liveInput }, { liveLevel }, character, companionActive?.name?.ifBlank { null } ?: character.label, liveCaptions,
             onExpand = { liveExpanded = true; companionSettings = false; companionOpen = true },
             onSettings = { liveSettings = true; companionOpen = true },
-            onCaptions = { liveCaptions = !liveCaptions }, onMute = live::toggleMute, onEnd = live::stop,
+            onCaptions = { liveCaptions = !liveCaptions }, onMute = live::toggleMute,
+            onEnd = { liveStarting = false; mic.cancel(); live.stop() },
             onRetry = ::toggleLive, onClose = live::dismissError, statusBarHeight = top)
     }
     val currentCallBar = rememberUpdatedState(callBarUi)

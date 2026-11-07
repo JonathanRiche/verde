@@ -295,29 +295,47 @@ private fun doNotDisturb(context: Context): Boolean {
 // ---- Microphone permission ----
 
 /** [request]'s optional action runs once the permission is granted (Live starts without a second tap). */
-internal class MicPermission(val granted: () -> Boolean, val request: (onGranted: (() -> Unit)?) -> Unit) {
-    fun request() = request(null)
+internal class MicPermission(
+    val granted: () -> Boolean,
+    private val ask: (onGranted: (() -> Unit)?, onDismiss: () -> Unit) -> Unit,
+    val cancel: () -> Unit = {},
+) {
+    fun request(onGranted: (() -> Unit)? = null) = ask(onGranted, {})
+    fun request(onGranted: () -> Unit, onDismiss: () -> Unit) = ask(onGranted, onDismiss)
 }
 
-/** RECORD_AUDIO with a short rationale first; a pending action carries on once it is granted. */
+/** Exactly one completion, including rationale cancellation and OS permission denial. */
+internal class MicPermissionAction {
+    private var granted: (() -> Unit)? = null
+    private var dismissed: (() -> Unit)? = null
+    fun begin(onGranted: (() -> Unit)?, onDismiss: () -> Unit) {
+        finish(false)
+        granted = onGranted; dismissed = onDismiss
+    }
+    fun finish(allowed: Boolean) {
+        val action = if (allowed) granted else dismissed
+        granted = null; dismissed = null
+        action?.invoke()
+    }
+}
+
+/** RECORD_AUDIO with a rationale; a pending Live start is cancelled on every dismissal path. */
 @Composable
 internal fun rememberMicPermission(): MicPermission {
     val context = LocalContext.current
     val rationale = remember { mutableStateOf(false) }
-    val pending = remember { mutableStateOf<(() -> Unit)?>(null) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        val action = pending.value
-        pending.value = null
-        if (granted) action?.invoke()
-    }
-    if (rationale.value) AlertDialog(onDismissRequest = { rationale.value = false },
+    val pending = remember { MicPermissionAction() }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> pending.finish(granted) }
+    fun cancel() { rationale.value = false; pending.finish(false) }
+    if (rationale.value) AlertDialog(onDismissRequest = ::cancel,
         title = { Text("Talk to your companion") },
         text = { Text("verde listens only while you hold the bubble or the mic. Your phone's speech service turns what you say into text (on the device when it can), and verde sends that text as a message. verde doesn't record or keep audio.") },
         confirmButton = { TextButton(onClick = { rationale.value = false; launcher.launch(Manifest.permission.RECORD_AUDIO) }) { Text("Continue") } },
-        dismissButton = { TextButton(onClick = { rationale.value = false; pending.value = null }) { Text("Not now") } })
+        dismissButton = { TextButton(onClick = ::cancel) { Text("Not now") } })
     return remember(context, launcher) {
         MicPermission(granted = { ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED },
-            request = { action -> pending.value = action; rationale.value = true })
+            ask = { action, dismiss -> pending.begin(action, dismiss); rationale.value = true },
+            cancel = { rationale.value = false; pending.finish(false) })
     }
 }
 

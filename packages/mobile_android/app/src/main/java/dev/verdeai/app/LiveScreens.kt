@@ -76,6 +76,10 @@ internal const val LIVE_PILL = "companion-live-pill"
 internal const val LIVE_PILL_CAPTIONS = "companion-live-pill-captions"
 internal const val LIVE_CALL_BAR = "companion-live-call-bar"
 
+/** The bar is already Connecting behind the OS dialog, not an active host rendering Idle. */
+internal fun permissionLiveUi(ui: LiveUi, awaitingPermission: Boolean): LiveUi =
+    if (awaitingPermission && !ui.active) LiveUi(phase = LivePhase.Connecting) else ui
+
 /**
  * What the shell shares while a call is up (or has failed): the call bar, where it ends on screen and
  * the screen's top inset it sits under. Dialogs, sheets and menus use it to keep the bar on top.
