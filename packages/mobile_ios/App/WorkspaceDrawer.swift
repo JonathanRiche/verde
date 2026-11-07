@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 func drawerThreads(_ workspace: Workspace, hidden: Set<String> = []) -> [ThreadSummary] {
     let open = Set(workspace.panes.compactMap(\.thread_id))
@@ -402,20 +403,67 @@ private struct DrawerSearchField: View {
     @Binding var text: String
     let identifier: String
     @FocusState private var focused: Bool
+    @ScaledMetric(relativeTo: .body) private var lineHeight: CGFloat = 22
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass").foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
-            TextField(title, text: $text)
-                .textInputAutocapitalization(.never).autocorrectionDisabled()
-                .focused($focused)
-        }
-        .padding(.horizontal, 12).frame(minHeight: 44)
-        .background(VerdeTheme.alternate, in: Capsule())
-        .contentShape(Capsule())
-        .onTapGesture { focused = true }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(title)
-        .accessibilityIdentifier(identifier)
+        CapsuleSearchInput(title: title, text: $text,
+                           focused: Binding(get: { focused }, set: { focused = $0 }), identifier: identifier)
+            .frame(height: max(44, lineHeight + 20))
+            .background(VerdeTheme.alternate, in: Capsule())
+            .contentShape(Capsule())
+            .onTapGesture { focused = true }
+    }
+}
+
+/// The native field occupies the capsule itself, including its icon and padding. A SwiftUI
+/// TextField inside a 44-point wrapper still exposes only its 20-point text line to VoiceOver.
+private struct CapsuleSearchInput: UIViewRepresentable {
+    let title: String
+    @Binding var text: String
+    @Binding var focused: Bool
+    let identifier: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.edited(_:)), for: .editingChanged)
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.adjustsFontForContentSizeCategory = true
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let icon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
+        icon.contentMode = .center
+        icon.frame = CGRect(x: 0, y: 0, width: 40, height: 44)
+        icon.isAccessibilityElement = false
+        field.leftView = icon
+        field.leftViewMode = .always
+        field.rightView = UIView(frame: CGRect(x: 0, y: 0, width: 12, height: 44))
+        field.rightViewMode = .always
+        return field
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.parent = self
+        if field.text != text { field.text = text }
+        field.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 15) ?? .systemFont(ofSize: 15))
+        field.textColor = UIColor(VerdeTheme.text)
+        field.tintColor = UIColor(VerdeTheme.accent)
+        field.leftView?.tintColor = UIColor(VerdeTheme.subtle)
+        field.attributedPlaceholder = NSAttributedString(string: title, attributes: [.foregroundColor: UIColor(VerdeTheme.subtle)])
+        field.accessibilityLabel = title
+        field.accessibilityIdentifier = identifier
+        if focused && !field.isFirstResponder {
+            DispatchQueue.main.async { if context.coordinator.parent.focused { field.becomeFirstResponder() } }
+        } else if !focused && field.isFirstResponder { field.resignFirstResponder() }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: CapsuleSearchInput
+        init(_ parent: CapsuleSearchInput) { self.parent = parent }
+        @objc func edited(_ field: UITextField) { parent.text = field.text ?? "" }
+        func textFieldDidBeginEditing(_ field: UITextField) { if !parent.focused { parent.focused = true } }
+        func textFieldDidEndEditing(_ field: UITextField) { if parent.focused { parent.focused = false } }
     }
 }
