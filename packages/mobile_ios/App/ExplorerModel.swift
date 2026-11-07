@@ -101,7 +101,7 @@ struct FilePartial: Equatable {
     let shown: UInt64
     let total: UInt64
     var text: String { "Showing the first \(Self.label(shown))" + (total > shown ? " of \(Self.label(total))" : "") }
-    static func label(_ bytes: UInt64) -> String { bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB" }
+    static func label(_ bytes: UInt64) -> String { bytes < 1024 ? "\(bytes) B" : bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB" }
 }
 
 /// Viewer outcome of a failed `workspace_file_read`; nil falls back to the `/api/file` fetch (older hosts).

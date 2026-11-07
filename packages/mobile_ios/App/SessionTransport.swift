@@ -10,7 +10,10 @@ final class SessionTransport: CoreTransport {
     private var operations: [String: SessionOperation] = [:]
     private let files = FileBuffer()
     func takeFile(_ id: String) -> FileBytes? { files.take(id) }
-    func discardFile(_ id: String) { files.discard(id) }
+    func discardFile(_ id: String) {
+        files.discard(id)
+        queue.async { Array(self.operations.values).filter { $0.ownsFile(id) }.forEach { $0.cancel() } }
+    }
 
     func execute(_ effect: Effect, emit: @escaping (Event) -> Void) {
         queue.async {
@@ -462,6 +465,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
             }
         }
     }
+    func ownsFile(_ id: String) -> Bool { fileIntent == id }
     func cancel() { fail(.cancelled, .cancelled) }
     func rejectTLS(_ failure: TransportFailure) { fail(failure.kind, failure.code) }
     func close(code: UInt16) {
