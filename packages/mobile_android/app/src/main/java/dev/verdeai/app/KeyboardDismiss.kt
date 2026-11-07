@@ -30,9 +30,23 @@ internal val LocalDismissKeyboard = compositionLocalOf<(() -> Unit)?> { null }
 internal class ShellFocus(private val scope: CoroutineScope) {
     val requester = androidx.compose.ui.focus.FocusRequester()
     var parked by mutableStateOf(true)
+    var pendingPark by mutableStateOf(false)
+        private set
+    private var parking: kotlinx.coroutines.Job? = null
     fun requestFocus() {
+        parking?.cancel()
         parked = true
-        scope.launch { withFrameNanos { }; runCatching { requester.requestFocus() } }
+        pendingPark = true
+        parking = scope.launch {
+            withFrameNanos { }
+            runCatching { requester.requestFocus() }
+            pendingPark = false
+        }
+    }
+    fun release() {
+        parking?.cancel()
+        pendingPark = false
+        parked = false
     }
 }
 internal val LocalShellFocus = compositionLocalOf<ShellFocus?> { null }

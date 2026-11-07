@@ -373,6 +373,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val shellFocus = remember { ShellFocus(scope) }
     val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val contentFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val bubbleFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
     val hasShellHeader = !pairing && route in TABS
     var shellHolds by remember { mutableStateOf(false) }
     LaunchedEffect(shellFocus) { shellFocus.requestFocus() }
@@ -381,11 +383,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         .onFocusChanged { shellHolds = it.isFocused }
         .onPreviewKeyEvent { event ->
             // A7-3: the first Tab after a touch (the shell holds focus) goes to the first control.
-            if (shellHolds && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
+            if ((shellHolds || shellFocus.pendingPark) && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
                 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
                 // Request a real region, not Enter on the parking target (which can stay empty).
+                inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard)
+                shellFocus.release()
                 runCatching { (if (hasShellHeader) headerFocus else contentFocus).requestFocus() }
-                shellFocus.parked = false
                 return@onPreviewKeyEvent true
             }
             // Enter would otherwise "enter" the shell and land on its first control.
@@ -407,7 +410,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             contentWindowInsets = contentWindowInsets(tier, panes),
             topBar = {
                 if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding().focusRequester(headerFocus)
-                    .keyboardRegion(contentFocus)) {
+                    .keyboardRegion(contentFocus, if (bubbleShown) bubbleFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                     // S28: one logo: beside the full sidebar (which carries it) the content bar has none.
                     VerdeTopBar(title = { if (panes.sidebar != SidebarMode.Full) VerdeWordmark() },
                         navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }, modifier = Modifier.named("Open workspace drawer")) {
@@ -428,7 +431,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             },
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding).focusRequester(contentFocus)
-                .keyboardRegion(if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
+                .keyboardRegion(if (bubbleShown && hasShellHeader) bubbleFocus else if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
                     LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
                     LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {
@@ -440,6 +443,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     }
     if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
         companionNow.pulse.needsYou, companionNow.crewRunning, bubbleTalk, bubbleLive, failed = companionNow.failed,
+        focusModifier = Modifier.focusRequester(bubbleFocus).focusProperties {
+            if (hasShellHeader) { next = headerFocus; previous = contentFocus }
+        },
         onOpen = { companionSettings = false; companionOpen = true })
     // Last, so it floats above every screen, the drawer and the bubble.
     if (callUp) LiveShellBar(liveBar, statusTop)

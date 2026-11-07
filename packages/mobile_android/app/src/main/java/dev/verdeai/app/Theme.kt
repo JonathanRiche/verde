@@ -248,11 +248,14 @@ internal fun KeyboardFocusRing(color: Color, content: @Composable () -> Unit) {
             val target = focused?.takeIf { it.isAttached } ?: return@drawWithContent
             val host = root?.takeIf { it.isAttached } ?: return@drawWithContent
             if (!keyboard) return@drawWithContent
-            val box = host.localBoundingBoxOf(target, clipBounds = false)
+            // Dialogs/popups have a separate layout tree. Focus can be reported here during the
+            // handoff; attached coordinates alone do not guarantee a common ancestor.
+            val box = focusRingBounds(host, target)
+                ?: return@drawWithContent
             if (box.width <= 0f || box.height <= 0f) return@drawWithContent
             // A container that shows its own focus (the composer card) owns whatever focuses inside it.
-            if (owned.areas.values.any { area -> area.isAttached && host.localBoundingBoxOf(area, clipBounds = false).let {
-                    it.left <= box.left + 1f && it.top <= box.top + 1f && it.right >= box.right - 1f && it.bottom >= box.bottom - 1f } }) return@drawWithContent
+            if (owned.areas.values.any { area -> area.isAttached && focusRingBounds(host, area)?.let {
+                    it.left <= box.left + 1f && it.top <= box.top + 1f && it.right >= box.right - 1f && it.bottom >= box.bottom - 1f } == true }) return@drawWithContent
             val stroke = 2.dp.toPx()
             val square = kotlin.math.abs(box.width - box.height) < 4.dp.toPx()
             val radius = if (square) box.width / 2f else 8.dp.toPx()
@@ -260,6 +263,11 @@ internal fun KeyboardFocusRing(color: Color, content: @Composable () -> Unit) {
                 size = Size(box.width - stroke, box.height - stroke), cornerRadius = CornerRadius(radius), style = Stroke(stroke))
         }) { content() }
     }
+}
+
+internal fun focusRingBounds(host: LayoutCoordinates, target: LayoutCoordinates): androidx.compose.ui.geometry.Rect? {
+    if (!host.isAttached || !target.isAttached) return null
+    return runCatching { host.localBoundingBoxOf(target, clipBounds = false) }.getOrNull()
 }
 
 /** Containers that draw their own keyboard focus; the shared ring skips anything inside them. */

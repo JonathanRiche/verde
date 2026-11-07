@@ -315,12 +315,13 @@ internal fun CompanionBubbleLayer(
     talk: BubbleTalk?,
     live: BubbleLive? = null,
     failed: Int = 0,
+    focusModifier: Modifier = Modifier,
     onOpen: () -> Unit,
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { BubblePrefs.of(context) }
     if (!shown) return
-    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live, failed,
+    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live, failed, focusModifier,
         // While Live, a tap ends it; otherwise it opens the sheet.
         onOpen = {
             chip.clear()
@@ -540,7 +541,7 @@ private enum class BubbleGesture { Tap, Drag, Hold }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompanionBubble(prefs: BubblePrefs, name: String, character: CompanionCharacter, pose: CompanionPose, count: Int,
-    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, failed: Int, onOpen: () -> Unit, onHide: () -> Unit) {
+    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, failed: Int, focusModifier: Modifier, onOpen: () -> Unit, onHide: () -> Unit) {
     val context = LocalContext.current
     val reduced = remember(context) { reducedMotion(context) }
     val haptics = LocalHapticFeedback.current
@@ -659,6 +660,14 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                         add(CustomAccessibilityAction("Hide bubble") { onHide(); true })
                     }
                 }
+                .then(focusModifier)
+                .onKeyEvent { event ->
+                    val activate = event.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
+                        event.key in setOf(androidx.compose.ui.input.key.Key.Enter, androidx.compose.ui.input.key.Key.NumPadEnter, androidx.compose.ui.input.key.Key.Spacebar)
+                    if (activate) onOpen()
+                    activate
+                }
+                .focusable()
                 .testTag(COMPANION_BUBBLE)) {
                 val liveOn = live?.active == true
                 if (liveOn) LiveRing(live?.level?.invoke() ?: 0f) else if (running || talking) RunningRing(reduced)
