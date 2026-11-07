@@ -260,6 +260,7 @@ struct AttachmentThumbnail: View {
     @State private var errorCode: String?
     @State private var viewer: ViewerRequestImage?
     @State private var requested = false
+    @State private var retryGeneration = 0
 
     private var key: String { attachmentKey(workspaceID: workspaceID, threadID: threadID, messageID: messageID, index: index) }
     private var maxPixel: CGFloat { longest * displayScale }
@@ -321,7 +322,7 @@ struct AttachmentThumbnail: View {
         }
         // Lazily: only rows on screen fetch.
         .task(id: key) { await load() }
-        .task(id: key) {
+        .task(id: "\(key)#\(retryGeneration)") {
             try? await Task.sleep(for: .seconds(20))
             guard !Task.isCancelled, image == nil,
                   thumbnailPhase(status: status, errorCode: errorCode, cached: false) == .loading else { return }
@@ -350,12 +351,13 @@ struct AttachmentThumbnail: View {
         guard let session = browse.session else { status = "unavailable"; return }
         requested = true
         if force {
+            retryGeneration += 1
             // A failed fetch has already ended; make sure no stale in-flight mark blocks the retry.
             AttachmentImageCache.shared.end(key)
             errorCode = nil
         } else if let existing = AttachmentSnapshots.shared.state(key, in: session.store.snapshots["attachments"]) {
             await receive(existing)
-            if image != nil || existing.status != "loading" && existing.status != "ready" { return }
+            if image != nil || status == "unavailable" || existing.status != "loading" && existing.status != "ready" { return }
         }
         guard AttachmentImageCache.shared.begin(key) else { status = "loading"; return }
         status = "loading"
