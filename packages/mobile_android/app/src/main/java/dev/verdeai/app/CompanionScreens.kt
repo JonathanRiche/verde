@@ -358,7 +358,7 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 }
 
 @Composable
-private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
+internal fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
     liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {},
     onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false, onScheduled: (() -> Unit)? = null, scheduledCount: Int? = null,
@@ -374,15 +374,13 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (onChats != null) 4.dp else 8.dp)) {
         onChats?.let { ChatsButton(it) }
         CompanionAvatar(character, pose, size = 28.dp, description = if (name == character.label) name else "$name, ${character.label}")
-        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            // S28: the name keeps its width ("Sprout", never "S…"); the status after it gives way.
-            Text(name, Modifier.widthIn(max = 160.dp), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (suffix != null) Text("  \u00b7 $suffix",
-                Modifier.weight(1f, fill = false).then(if (onSuffix != null) Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity",
-                    role = Role.Button, onClick = onSuffix).wrapContentHeight(Alignment.CenterVertically).padding(end = 8.dp) else Modifier)
-                    // The clickable node itself is named ("1 needs you"), not an unnamed wrapper.
-                    .then(if (onSuffix != null) Modifier.nameOnly(suffix, selected = suffixExpanded) else Modifier),
-                style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
+            Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            if (suffix != null) Text(suffix,
+                Modifier.fillMaxWidth().then(if (onSuffix != null) Modifier.heightIn(min = 48.dp)
+                    .clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity", role = Role.Button, onClick = onSuffix)
+                    .wrapContentHeight(Alignment.CenterVertically).nameOnly(suffix, selected = suffixExpanded) else Modifier),
+                style = MaterialTheme.typography.bodySmall, color = suffixColor)
         }
         // Tight in a pane; the menu below always has it.
         if (scheduledButton) onScheduled?.let { ScheduledButton(scheduledCount, it) }
@@ -540,7 +538,7 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
     val name = active.name.ifBlank { "your companion" }
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds().topEdgeFade(VerdeColors.Background)) {
+        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds().topEdgeFade(VerdeColors.Background, bottom = true)) {
             when (transcriptPlaceholder(state)) {
                 null -> TranscriptList(items, state, context, CompactTranscriptRenderers, spacing = 4.dp,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp))

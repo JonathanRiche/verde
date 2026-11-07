@@ -21,6 +21,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -253,11 +254,12 @@ private fun MenuRow(
     Box {
         VerdeListRow(
             // S7: 16sp titles that take a second line rather than cut off; 13sp "workspace · state · age".
-            headlineContent = { Text(headline, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_TITLE) },
+            headlineContent = { Text(headline, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_TITLE,
+                fontWeight = if (mark == ChatState.Unread || badge == UNREAD) FontWeight.SemiBold else FontWeight.Normal) },
             supportingContent = (styledSupporting ?: supporting?.let(::AnnotatedString))?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = ROW_SUBTITLE) } },
             leadingContent = leading,
-            trailingContent = mark?.takeIf { it != ChatState.Idle }?.let { { StateMark(it) } }
-                ?: badge?.let { { if (it == UNREAD) UnreadDot() else AttentionBadge(it) } },
+            trailingContent = mark?.takeIf { it in setOf(ChatState.NeedsYou, ChatState.Running, ChatState.Failed) }?.let { { StateMark(it) } }
+                ?: badge?.takeUnless { it == UNREAD }?.let { { AttentionBadge(it) } },
             // S4: one TalkBack stop that reads "title, subtitle".
             modifier = Modifier.fillMaxWidth().combinedClickable(
                 enabled = enabled || menu.isNotEmpty(),
@@ -279,12 +281,6 @@ private fun MenuRow(
 }
 
 internal const val UNREAD = "Unread"
-
-/** S21: an unread finished chat is just a dot (TalkBack: "Unread"), never an amber "needs you". */
-@Composable
-internal fun UnreadDot() {
-    Box(Modifier.size(8.dp).background(VerdeColors.Muted, CircleShape))
-}
 
 @Composable
 private fun AttentionBadge(text: String) {
@@ -337,15 +333,14 @@ internal fun chatStateLabel(state: ChatState, status: String): String? = when (s
     else -> null
 }
 
-/** The state's mark: amber dot (needs you), pulsing 8dp accent dot (running), red ✕ (failed), neutral dot (unread). */
+/** The state's mark: amber dot (needs you), pulsing 8dp accent dot (running), red ✕ (failed). Unread is carried by the title weight. */
 @Composable
 internal fun StateMark(state: ChatState) {
     when (state) {
         ChatState.NeedsYou -> Box(Modifier.size(8.dp).background(VerdeColors.Warning, CircleShape))
         ChatState.Running -> RunningDot(MaterialTheme.colorScheme.primary)
         ChatState.Failed -> Icon(Icons.Filled.Close, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(14.dp))
-        ChatState.Unread -> UnreadDot()
-        ChatState.Idle -> Unit
+        ChatState.Unread, ChatState.Idle -> Unit
     }
 }
 

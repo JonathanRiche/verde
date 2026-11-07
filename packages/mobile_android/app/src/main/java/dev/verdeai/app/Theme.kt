@@ -227,10 +227,12 @@ internal fun Modifier.horizontalEdgeFade(state: ScrollState, color: Color, width
 }
 
 /** A soft viewport edge below pinned sheet chrome; content keeps its existing bottom anchor. */
-internal fun Modifier.topEdgeFade(color: Color, height: Dp = 18.dp) = drawWithContent {
+internal fun Modifier.topEdgeFade(color: Color, height: Dp = 18.dp, bottom: Boolean = false) = drawWithContent {
     drawContent()
     val h = height.toPx().coerceAtMost(size.height)
     drawRect(Brush.verticalGradient(listOf(color, Color.Transparent), startY = 0f, endY = h), size = Size(size.width, h))
+    if (bottom) drawRect(Brush.verticalGradient(listOf(Color.Transparent, color), startY = size.height - h, endY = size.height),
+        topLeft = Offset(0f, size.height - h), size = Size(size.width, h))
 }
 
 /**

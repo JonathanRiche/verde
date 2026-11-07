@@ -751,12 +751,12 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
     val density = LocalDensity.current
     BoxWithConstraints(Modifier.fillMaxWidth().testTag(COMPOSER_CHIPS)) {
         fun textWidth(text: String) = with(density) { measurer.measure(text, labelStyle).size.width.toDp().value }
-        fun width(chip: Chip): Float = textWidth(chip.short) + (if (chip.icon == null && chip.provider == null) CHIP_CHROME.value - 18f else CHIP_CHROME.value)
+        fun width(chip: Chip): Float = kotlin.math.ceil(textWidth(chip.short)) + 4f + (if (chip.icon == null && chip.provider == null) CHIP_CHROME.value - 18f else CHIP_CHROME.value)
         val available = (maxWidth - (if (leading != null) 52.dp else 0.dp)).value
         val modelChip = chips.first { it.picker == ComposerPicker.Model }
         val modelFull = width(modelChip)
         // A model name narrower than this (with its glyph) reads as noise: wrap rather than squeeze it.
-        val modelFloor = minOf(modelFull, 84f)
+        val modelFloor = minOf(modelFull, maxOf(84f, textWidth("Auto") + CHIP_CHROME.value))
         val others = chips.filter { it !== modelChip }.sumOf { width(it).toDouble() }.toFloat() + chips.size * 4f
         val rowWidth = maxWidth
         if (large || available - others < modelFloor) {
@@ -771,12 +771,12 @@ internal fun SettingsControls(view: ChatComposerView, state: TranscriptState, pr
             return@BoxWithConstraints
         }
         val modelRoom = (available - others).coerceIn(modelFloor, modelFull)
-        // S45: the same middle truncation as iOS, "GPT…Sol" (no space beside the ellipsis).
-        val modelShown = middleFit(modelChip.short, modelRoom - (modelFull - textWidth(modelChip.short)), ::textWidth)
+        // Fit only inside the final text slot. Subtracting estimated chrome here loses a fraction
+        // of a pixel at cover-screen densities and can turn a fitting "Auto" into "A…o".
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
             leading?.invoke()
             chips.forEach {
-                SettingChip(it.name, it.value, it.provider, it.icon, it.fill, shown = if (it === modelChip) modelShown else it.short,
+                SettingChip(it.name, it.value, it.provider, it.icon, it.fill, shown = it.short,
                     maxWidth = if (it === modelChip) modelRoom.dp else 220.dp) { open(it.picker) }
             }
         }
@@ -866,10 +866,25 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
         Row(Modifier.heightIn(min = 32.dp).padding(start = if (iconOnly) 12.dp else 7.dp, end = if (iconOnly) 12.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             leading?.invoke()
-            // A8-2: a long model name keeps both ends ("GPT…Sol"), like iOS.
-            if (!iconOnly) Text(shown, style = MaterialTheme.typography.labelMedium, maxLines = 1,
-                overflow = if (name == "Model") TextOverflow.MiddleEllipsis else TextOverflow.Ellipsis)
+            if (!iconOnly) {
+                if (name == "Model") ModelChipLabel(shown)
+                else Text(shown, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
+    }
+}
+
+/** Fit the actual label slot in whole pixels, after the glyph and padding, exactly once.
+ * Short names stay whole; long names keep both ends without a second platform ellipsis pass. */
+@Composable
+internal fun ModelChipLabel(label: String) {
+    val measurer = androidx.compose.ui.text.rememberTextMeasurer()
+    val style = MaterialTheme.typography.labelMedium
+    val density = LocalDensity.current
+    BoxWithConstraints {
+        val room = with(density) { maxWidth.toPx() }
+        val shown = middleFit(label, room) { measurer.measure(it, style).size.width.toFloat() }
+        Text(shown, style = style, maxLines = 1, overflow = TextOverflow.Clip)
     }
 }
 

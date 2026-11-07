@@ -30,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
@@ -212,11 +213,12 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                 val parts = listOfNotNull(labels[thread.workspace_id].takeIf { filter == null },
                     state, "Archived".takeIf { thread.archived },
                     thread.last_activity_at_ms?.let { agoLabel(it, now) })
-                VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    fontWeight = if (chat == ChatState.Unread) FontWeight.SemiBold else FontWeight.Normal) },
                     leadingContent = { ProviderGlyph(thread.provider) },
                     // F2: the state reads as on Home (coloured "Working", amber waiting, red failed).
                     supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(stateLine(it, state, chat.rowState()), maxLines = 1) } },
-                    trailingContent = chat.takeIf { it != ChatState.Idle && it != ChatState.Running }?.let { { StateMark(it) } },
+                    trailingContent = chat.takeIf { it == ChatState.NeedsYou || it == ChatState.Failed }?.let { { StateMark(it) } },
                     modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open") { onOpenThread(thread) }
                         .nameOnly((listOf(thread.title) + parts + listOfNotNull("Unread".takeIf { chat == ChatState.Unread })).joinToString(", ")))
             }

@@ -34,6 +34,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
@@ -309,7 +310,8 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
     val clipboard = LocalClipboardManager.current
     Box {
 
-    VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+    VerdeListRow(headlineContent = { Text(thread.title, maxLines = if (active) 2 else 1, overflow = TextOverflow.Ellipsis,
+        fontWeight = if (chatState(thread.state ?: pane?.state) == ChatState.Unread) FontWeight.SemiBold else FontWeight.Normal) },
         leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             chip?.let { WorkspaceChip(it, 16.dp) }
             ProviderGlyph(thread.provider)
@@ -355,7 +357,7 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
 /** Terminal row: an agent TUI shows its provider glyph and a live status pip, like the desktop/web rail. */
 @Composable
 private fun DrawerTerminal(pane: Pane, active: Boolean, chip: Workspace?, onClick: () -> Unit) {
-    VerdeListRow(headlineContent = { Text(pane.title, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+    VerdeListRow(headlineContent = { Text(pane.title, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, maxLines = if (active) 2 else 1, overflow = TextOverflow.Ellipsis) },
         leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             chip?.let { WorkspaceChip(it, 16.dp) }
             if (pane.provider != null) ProviderGlyph(pane.provider)
@@ -371,7 +373,7 @@ private fun DrawerTerminal(pane: Pane, active: Boolean, chip: Workspace?, onClic
 
 @Composable
 private fun DrawerRow(label: String, active: Boolean, modifier: Modifier = Modifier, chip: Workspace? = null, onClick: () -> Unit) {
-    VerdeListRow(headlineContent = { Text(label, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+    VerdeListRow(headlineContent = { Text(label, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, maxLines = if (active) 2 else 1, overflow = TextOverflow.Ellipsis) },
         leadingContent = chip?.let { { WorkspaceChip(it, 16.dp) } },
         modifier = modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))

@@ -45,26 +45,39 @@ class ComposerChipsLayoutTest {
         ChatSelection(provider = if (codex) "codex" else "claude"), catalogs(codex), emptyList(), provider_ready = true,
         can_send = true, can_stop = true, send_operation = null, followup = null, shell_confirmation = null, error = null)
 
-    private fun check(fontScale: Float, codex: Boolean, steer: Boolean) {
+    private fun check(fontScale: Float, codex: Boolean, steer: Boolean, width: Int = 379, autoModel: Boolean = false) {
         val scale = fontScale
         compose.setContent {
             val base = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(base.density, scale)) {
                 VerdeTheme {
-                    Box(Modifier.requiredWidth(379.dp)) {
-                        SettingsControls(view(codex), state(steer), if (codex) "codex" else "claude") {}
+                    Box(Modifier.requiredWidth(width.dp)) {
+                        SettingsControls(view(codex).let { if (autoModel) it.copy(catalogs = it.catalogs.copy(default_model_label = "Auto")) else it }, state(steer), if (codex) "codex" else "claude") {}
                     }
                 }
             }
         }
-        val labels = if (codex) listOf("GPT-6.1 Sol", "Auto", "Std", "Full") else listOf("Opus 5.5", "Auto", "Full")
+        val labels = if (codex) listOf(if (autoModel) "Auto" else "GPT-6.1 Sol", "Auto", "Std", "Full").distinct() else listOf("Opus 5.5", "Auto", "Full")
         val row = compose.onNodeWithTag(COMPOSER_CHIPS).getUnclippedBoundsInRoot()
         val lefts = labels.map { label ->
-            val node = compose.onNode(hasText(label), useUnmergedTree = true)
+            val node = compose.onAllNodes(hasText(label), useUnmergedTree = true).onFirst()
             node.assertExists("$label at ${fontScale}x (codex=$codex, steer=$steer)")
             val bounds = node.getUnclippedBoundsInRoot()
             assertTrue("$label stays inside the row at ${fontScale}x", bounds.right <= row.right + 1.dp && bounds.left >= row.left - 1.dp)
             bounds
+        }
+        if (autoModel) {
+            // Model and effort both say Auto; finding just one could hide a squeezed model label.
+            compose.onAllNodes(hasText("Auto"), useUnmergedTree = true).assertCountEquals(2)
+            compose.onAllNodes(hasText("Auto"), useUnmergedTree = true).fetchSemanticsNodes().indices.forEach { index ->
+                val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+                compose.onAllNodes(hasText("Auto"), useUnmergedTree = true)[index]
+                    .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+                val layout = layouts.single()
+                assertTrue("Auto must fit its actual slot at $width dp/$scale",
+                    layout.multiParagraph.intrinsics.maxIntrinsicWidth <= layout.layoutInput.constraints.maxWidth)
+                assertFalse(layout.isLineEllipsized(0))
+            }
         }
         // Reading order: model · effort · speed · access (rows wrap, but never reorder).
         lefts.zipWithNext().forEach { (a, b) -> assertTrue("order at ${fontScale}x", b.top > a.top + 1.dp || b.left > a.left) }
@@ -72,6 +85,16 @@ class ComposerChipsLayoutTest {
         listOf("Model", "Effort", "Access").forEach { compose.onNodeWithContentDescription("$it:", substring = true).assertExists() }
         if (codex) compose.onNodeWithContentDescription("Speed: Standard. Change").assertExists()
     }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35], qualifiers = "w360dp-h900dp-420dpi")
+    fun coverAutoModelKeepsTheWholeShortLabel() = check(1f, codex = true, steer = false, width = 328, autoModel = true)
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35], qualifiers = "w360dp-h900dp-420dpi")
+    fun coverSteerAtMaximumFontKeepsLabels() = check(2f, codex = true, steer = true, width = 328, autoModel = true)
 
     @Test fun largeIdleClaude() = check(1.3f, codex = false, steer = false)
     @Test fun largeSteerCodex() = check(1.3f, codex = true, steer = true)
