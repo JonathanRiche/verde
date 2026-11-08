@@ -30,7 +30,7 @@ struct AgentsPanel: View {
             HStack {
                 Text("Agents").font(.headline)
                 Spacer()
-                Button("Close agents", action: close).frame(minWidth: 44, minHeight: 44)
+                BarButton("Close agents", action: close)
                     .keyboardShortcut(.cancelAction)
             }.padding(.horizontal, 12)
             ScrollView {
