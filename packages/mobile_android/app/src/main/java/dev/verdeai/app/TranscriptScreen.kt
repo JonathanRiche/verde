@@ -357,6 +357,7 @@ internal fun TranscriptScreen(
         }
     }
     if (agentsOpen) {
+        val workspaceLabels = state.browse.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
         val openAgent: (ChatLinkedAgent) -> Unit = { agent ->
             agentsOpen = false
             if (onOpenAgent != null) onOpenAgent(agent.workspace_id, agent.local_thread_id) else onOpenThread?.invoke(agent.local_thread_id)
@@ -364,9 +365,9 @@ internal fun TranscriptScreen(
         if (wideAgents) {
             androidx.activity.compose.BackHandler { agentsOpen = false }
             Surface(Modifier.align(Alignment.CenterEnd).width(300.dp).fillMaxHeight(), color = VerdeColors.Panel) {
-                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent)
+                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels)
             }
-        } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent)
+        } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels)
     }
     gitChanges?.let { GitChangesLayer(it) }
     }

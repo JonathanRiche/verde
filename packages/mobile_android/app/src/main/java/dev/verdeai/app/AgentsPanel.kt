@@ -34,7 +34,7 @@ internal fun AgentsWaitingBar(agents: ChatOrchestration, open: () -> Unit) {
 }
 
 @Composable
-internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit) {
+internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap()) {
     val focus = LocalFocusManager.current
     Column(Modifier.fillMaxSize().padding(12.dp).onPreviewKeyEvent { event ->
         if (event.type != KeyEventType.KeyDown) false else when (event.key) {
@@ -63,7 +63,7 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
                         }
                         Text(listOf(agent.provider, agent.model).filter { it.isNotBlank() }.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
-                        Text(agent.workspace_id, style = MaterialTheme.typography.bodySmall)
+                        Text(workspaceLabels[agent.workspace_id] ?: agent.workspace_id, style = MaterialTheme.typography.bodySmall)
                         if (agent.updated_at_ms > 0) Text(agoLabel(agent.updated_at_ms, System.currentTimeMillis()), style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -74,6 +74,6 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AgentsSheet(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit) {
-    ModalBottomSheet(onDismissRequest = close) { Box(Modifier.fillMaxWidth().fillMaxHeight(0.85f)) { AgentsPanel(agents, close, open) } }
+internal fun AgentsSheet(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap()) {
+    ModalBottomSheet(onDismissRequest = close) { Box(Modifier.fillMaxWidth().fillMaxHeight(0.85f)) { AgentsPanel(agents, close, open, workspaceLabels) } }
 }
