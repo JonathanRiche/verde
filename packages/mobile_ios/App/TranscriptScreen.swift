@@ -19,6 +19,8 @@ struct TranscriptScreen: View {
     var onHosts: () -> Void = {}
 
     @State private var model: TranscriptModel?
+    @State private var agentsOpen = false
+    @Environment(\.openRoute) private var openRoute
     @State private var git: GitChangesModel?
     @Environment(\.adaptive) private var adaptive
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -30,10 +32,18 @@ struct TranscriptScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             if let model {
-                TranscriptBody(model: model, browse: browse, onHosts: onHosts)
+                HStack(spacing: 0) {
+                    TranscriptBody(model: model, browse: browse, onHosts: onHosts, onAgents: { agentsOpen = true })
+                    if agentsOpen && adaptive.tier.docked {
+                        agentsPanel.frame(width: 280)
+                    }
+                }
             } else {
                 Spacer()
             }
+        }
+        .accessibleSheet(isPresented: Binding(get: { agentsOpen && !adaptive.tier.docked }, set: { agentsOpen = $0 })) {
+            agentsPanel.presentationDetents([.medium, .large])
         }
         .environment(\.gitChangesModel, git)
         .background {
@@ -48,6 +58,10 @@ struct TranscriptScreen: View {
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Agents", systemImage: "person.2") { agentsOpen.toggle() }
+                    .frame(minWidth: 44, minHeight: 44).accessibilityLabel("Show linked agents")
+            }
             // S10: [back] [drawer] title … [companion] [⋯]. Only wide windows add the Commit button;
             // phones reach Git through ⋯ and keep its sheets mounted in the background.
             if adaptive.inlineGit {
@@ -99,6 +113,13 @@ struct TranscriptScreen: View {
 }
 
 extension TranscriptScreen {
+    private var agentsPanel: some View {
+        AgentsPanel(agents: model?.thread?.orchestration, close: { agentsOpen = false }, open: { agent in
+            agentsOpen = false
+            openRoute(.thread(workspace: agent.workspace_id, thread: agent.local_thread_id))
+        })
+    }
+
     /// "Ask agent" selections (file/diff viewers) and notification replies arrive as prompts;
     /// notification Approve/Deny as an approval hand-off.
     fileprivate func takeHandoffs() {
@@ -144,6 +165,7 @@ struct TranscriptBody: View {
     var accessory: AnyView? = nil
     /// The Companion sheet's single-row composer.
     var compactComposer: CompactComposer? = nil
+    var onAgents: (() -> Void)? = nil
     @Environment(\.adaptive) private var adaptive
 
     var body: some View {
@@ -166,6 +188,9 @@ struct TranscriptBody: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let agents = state.thread?.orchestration, agents.waiting_count > 0, let onAgents {
+                    AgentsWaitingBar(agents: agents, open: onAgents)
+                }
                 if let accessory { accessory }
                 ChatComposer(model: model.input, availableHeight: geometry.size.height, availableWidth: geometry.size.width, compact: compactComposer)
                     // Lines up with the transcript's capped text (the card has 8 points of margin).

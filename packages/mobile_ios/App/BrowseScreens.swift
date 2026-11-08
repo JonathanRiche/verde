@@ -229,7 +229,7 @@ private struct ThreadItem: View {
         // S39: the core's state (C11), never the app's reading of the turn status.
         let core = coreChatState(thread.state)
         let state = RowState(core)
-        let stateText = core.label(status: thread.status)
+        let stateText = thread.orchestration_subtitle.isEmpty ? core.label(status: thread.status) : thread.orchestration_subtitle
         // A live state replaces the age: "Needs approval · 11 h ago" read as stale (I6-9).
         let age = state == nil ? thread.last_activity_at_ms.map { agoLabel($0, now) } : nil
         let elapsed = core == .running ? startedAt.map { elapsedLabel($0, now) } : nil

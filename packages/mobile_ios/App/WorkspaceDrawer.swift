@@ -375,8 +375,14 @@ struct WorkspaceDrawer: View {
             HStack(spacing: 10) {
                 if let chip { WorkspaceChip(workspace: chip, size: chipSize) }
                 ProviderGlyph(provider: thread.provider, size: glyphSize)
-                Text(thread.title.isEmpty ? "New chat" : thread.title)
-                    .font(VerdeTheme.ui(13).weight(state == .unread ? .semibold : .regular)).lineLimit(2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(thread.title.isEmpty ? "New chat" : thread.title)
+                        .font(VerdeTheme.ui(13).weight(state == .unread ? .semibold : .regular)).lineLimit(2)
+                    if !thread.orchestration_subtitle.isEmpty {
+                        Text(thread.orchestration_subtitle).font(VerdeTheme.ui(12))
+                            .foregroundStyle(state == .needs_you ? VerdeTheme.warning : VerdeTheme.accent)
+                    }
+                }
                 Spacer(minLength: 0)
                 GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                 // S32/S40: a dot only with state (the core's, C11), as on Android; never a grey idle dot.
