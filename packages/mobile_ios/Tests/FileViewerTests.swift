@@ -42,6 +42,7 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(readFailure("cancelled"), .problem(.of("cancelled", limit: 0)))
         XCTAssertEqual(ViewerKind.of("a.M4A"), .audio)
         XCTAssertEqual(ViewerKind.fetchKind("a.mp3"), .audio)
+        XCTAssertTrue(isolatedHTML("<body/>", textScale: 200).contains("-webkit-text-size-adjust:200%"))
         let html = isolatedHTML("<script>1</script>")
         XCTAssertTrue(html.contains("default-src 'none'"))
         XCTAssertTrue(html.contains("base-uri verde-preview:; form-action 'none'"))
