@@ -197,7 +197,7 @@ internal fun TranscriptTitle(title: String, provider: String?) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 internal fun TranscriptScreen(
     model: TranscriptModel,
@@ -229,6 +229,8 @@ internal fun TranscriptScreen(
     val openDrawer = LocalWorkspaceMenu.current
     val tier = LocalWindowTier.current
     var agentsOpen by remember(model) { mutableStateOf(false) }
+    var agentsKeyboardEntered by remember(model) { mutableStateOf(false) }
+    val agentsInputMode = androidx.compose.ui.platform.LocalInputModeManager.current
     val wideAgents = tier.wide
     val setAgentsPanelVisible = LocalAgentsPanelVisible.current
     DisposableEffect(agentsOpen, wideAgents) {
@@ -242,10 +244,28 @@ internal fun TranscriptScreen(
     val headerEntry = remember { androidx.compose.ui.focus.FocusRequester() }
     val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val agentsFocus = remember { androidx.compose.ui.focus.FocusRequester() }
-    LaunchedEffect(agentsOpen, wideAgents) { if (agentsOpen && wideAgents) agentsFocus.requestFocus() }
+    LaunchedEffect(agentsOpen, wideAgents) {
+        agentsKeyboardEntered = false
+        if (agentsOpen && wideAgents && agentsInputMode.inputMode == androidx.compose.ui.input.InputMode.Keyboard) {
+            agentsFocus.requestFocus()
+            agentsKeyboardEntered = true
+        }
+    }
     val tabletop = rememberTabletopHinge()
     val columnBounds = remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
-    Box(Modifier.fillMaxSize()) {
+    Box(Modifier.fillMaxSize().onPreviewKeyEvent { event ->
+        if (!agentsOpen || !wideAgents || event.type != androidx.compose.ui.input.key.KeyEventType.KeyDown) false
+        else when (event.key) {
+            androidx.compose.ui.input.key.Key.Escape -> { agentsOpen = false; true }
+            androidx.compose.ui.input.key.Key.Tab -> if (!agentsKeyboardEntered) {
+                agentsInputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard)
+                agentsFocus.requestFocus()
+                agentsKeyboardEntered = true
+                true
+            } else false
+            else -> false
+        }
+    }) {
     Column(Modifier.fillMaxSize().padding(end = if (agentsOpen && wideAgents) 300.dp else 0.dp).then(if (tabletop != null) Modifier.onGloballyPositioned { columnBounds.value = it.boundsInWindow() } else Modifier)) {
         Box(Modifier.focusRequester(headerEntry).keyboardRegion(composerFocus)) {
         VerdeTopBar(
