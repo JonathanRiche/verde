@@ -7,7 +7,6 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 const eq = host.eq;
 pub const Pane = struct {
-    orchestration_subtitle: []const u8 = "",
     id: []const u8,
     workspace_id: []const u8,
     kind: []const u8,
@@ -28,9 +27,9 @@ pub const Pane = struct {
     state: ?[]const u8 = null,
     /// Agent provider of a TUI running in a terminal pane (desktop `agent_provider`).
     provider: ?[]const u8 = null,
+    orchestration_subtitle: []const u8 = "",
 };
 pub const ThreadSummary = struct {
-    orchestration_subtitle: []const u8 = "",
     workspace_id: []const u8,
     thread_id: []const u8,
     title: []const u8,
@@ -47,6 +46,7 @@ pub const ThreadSummary = struct {
     /// attention.zig `ChatState` on Workspaces threads and History items; null elsewhere
     /// (the chat screen's own summary).
     state: ?[]const u8 = null,
+    orchestration_subtitle: []const u8 = "",
 };
 pub const Workspace = struct {
     workspace_id: []const u8,

@@ -1268,7 +1268,6 @@ extension ChatOrchestration {
 }
 
 struct ChatThreadView: Codable {
-    var `orchestration`: ChatOrchestration? = nil
     var `thread`: ThreadSummary
     var `rows`: [ChatRow]
     var `page`: ChatPage
@@ -1278,11 +1277,11 @@ struct ChatThreadView: Codable {
     var `stale`: Bool
     var `error`: LocalError?
     var `background_tasks`: [ChatBackgroundTask] = []
+    var `orchestration`: ChatOrchestration? = nil
 }
 
 extension ChatThreadView {
     private enum CodingKeys: String, CodingKey {
-        case `orchestration`
         case `thread`
         case `rows`
         case `page`
@@ -1292,12 +1291,10 @@ extension ChatThreadView {
         case `stale`
         case `error`
         case `background_tasks`
+        case `orchestration`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if !c.contains(.`orchestration`) { self.`orchestration` = nil } else {
-        self.`orchestration` = try c.decodeIfPresent(ChatOrchestration.self, forKey: .`orchestration`)
-        }
         self.`thread` = try c.decode(ThreadSummary.self, forKey: .`thread`)
         self.`rows` = try c.decode([ChatRow].self, forKey: .`rows`)
         self.`page` = try c.decode(ChatPage.self, forKey: .`page`)
@@ -1309,10 +1306,12 @@ extension ChatThreadView {
         if !c.contains(.`background_tasks`) { self.`background_tasks` = [] } else {
         self.`background_tasks` = try c.decode([ChatBackgroundTask].self, forKey: .`background_tasks`)
         }
+        if !c.contains(.`orchestration`) { self.`orchestration` = nil } else {
+        self.`orchestration` = try c.decodeIfPresent(ChatOrchestration.self, forKey: .`orchestration`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(self.`orchestration`, forKey: .`orchestration`)
         try c.encode(self.`thread`, forKey: .`thread`)
         try c.encode(self.`rows`, forKey: .`rows`)
         try c.encode(self.`page`, forKey: .`page`)
@@ -1322,6 +1321,7 @@ extension ChatThreadView {
         try c.encode(self.`stale`, forKey: .`stale`)
         try c.encode(self.`error`, forKey: .`error`)
         try c.encode(self.`background_tasks`, forKey: .`background_tasks`)
+        try c.encode(self.`orchestration`, forKey: .`orchestration`)
     }
 }
 
@@ -7723,7 +7723,6 @@ extension DiffIndexQuery {
 }
 
 struct Pane: Codable {
-    var `orchestration_subtitle`: String = ""
     var `id`: String
     var `workspace_id`: String
     var `kind`: String
@@ -7738,11 +7737,11 @@ struct Pane: Codable {
     var `needs_you`: Bool = false
     var `state`: String? = nil
     var `provider`: String? = nil
+    var `orchestration_subtitle`: String = ""
 }
 
 extension Pane {
     private enum CodingKeys: String, CodingKey {
-        case `orchestration_subtitle`
         case `id`
         case `workspace_id`
         case `kind`
@@ -7757,12 +7756,10 @@ extension Pane {
         case `needs_you`
         case `state`
         case `provider`
+        case `orchestration_subtitle`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
-        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
-        }
         self.`id` = try c.decode(String.self, forKey: .`id`)
         self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
         self.`kind` = try c.decode(String.self, forKey: .`kind`)
@@ -7797,10 +7794,12 @@ extension Pane {
         if !c.contains(.`provider`) { self.`provider` = nil } else {
         self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
         }
+        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
+        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
         try c.encode(self.`id`, forKey: .`id`)
         try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
         try c.encode(self.`kind`, forKey: .`kind`)
@@ -7815,11 +7814,11 @@ extension Pane {
         try c.encode(self.`needs_you`, forKey: .`needs_you`)
         try c.encode(self.`state`, forKey: .`state`)
         try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
     }
 }
 
 struct ThreadSummary: Codable {
-    var `orchestration_subtitle`: String = ""
     var `workspace_id`: String
     var `thread_id`: String
     var `title`: String
@@ -7833,11 +7832,11 @@ struct ThreadSummary: Codable {
     var `history_bucket`: String
     var `committed`: Bool = true
     var `state`: String? = nil
+    var `orchestration_subtitle`: String = ""
 }
 
 extension ThreadSummary {
     private enum CodingKeys: String, CodingKey {
-        case `orchestration_subtitle`
         case `workspace_id`
         case `thread_id`
         case `title`
@@ -7851,12 +7850,10 @@ extension ThreadSummary {
         case `history_bucket`
         case `committed`
         case `state`
+        case `orchestration_subtitle`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
-        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
-        }
         self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
         self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
         self.`title` = try c.decode(String.self, forKey: .`title`)
@@ -7874,10 +7871,12 @@ extension ThreadSummary {
         if !c.contains(.`state`) { self.`state` = nil } else {
         self.`state` = try c.decodeIfPresent(String.self, forKey: .`state`)
         }
+        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
+        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
         try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
         try c.encode(self.`thread_id`, forKey: .`thread_id`)
         try c.encode(self.`title`, forKey: .`title`)
@@ -7891,6 +7890,7 @@ extension ThreadSummary {
         try c.encode(self.`history_bucket`, forKey: .`history_bucket`)
         try c.encode(self.`committed`, forKey: .`committed`)
         try c.encode(self.`state`, forKey: .`state`)
+        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
     }
 }
 

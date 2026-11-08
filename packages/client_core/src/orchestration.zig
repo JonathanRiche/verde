@@ -62,7 +62,9 @@ pub fn pump(tx: *h.Transaction) h.ApiError!void {
     for (tx.state.auth.credential.?.scopes) |s| allowed = allowed or eq(s, "chat:read");
     if (!allowed) return;
     // Focused threads are registered first, even before their catalog page arrives.
-    for (tx.state.chat.threads) |t| try ensure(tx, t.workspace_id, t.id);
+    for (tx.state.chat.threads) |t| if (t.focused) {
+        try ensure(tx, t.workspace_id, t.id);
+    };
     for (tx.state.sync.catalog) |row| {
         if (p.get(row, "open") == .bool and !p.yes(p.get(row, "open"))) continue;
         try ensure(tx, p.s(row, "workspace_id"), p.s(row, "local_thread_id"));
@@ -74,7 +76,7 @@ pub fn pump(tx: *h.Transaction) h.ApiError!void {
     var next: ?i64 = null;
     const now = tx.state.now_ms orelse 0;
     for (@constCast(tx.state.chat.orchestration)) |*parent| {
-        if (parent.request_id != null) continue;
+        if (parent.request_id != null or !wanted(&tx.state, parent.workspace_id, parent.thread_id)) continue;
         if (parent.refresh_at <= now and in_flight < 4) {
             parent.request_id = try rpc.request(tx, "chat.links.list", .{ .workspace_id = parent.workspace_id, .parent_thread_id = parent.thread_id }, .{ .mutation = false, .intent_id = "@agents" });
             parent.view.loading = !parent.view.loaded;
@@ -90,6 +92,15 @@ pub fn pump(tx: *h.Transaction) h.ApiError!void {
         };
         if (!armed) try tx.setTimer("agents_refresh", @intCast(@min(20000, @max(1, deadline - now))));
     }
+}
+
+fn wanted(state: *const h.State, ws: []const u8, id: []const u8) bool {
+    for (state.chat.threads) |t| if (t.focused and eq(t.workspace_id, ws) and eq(t.id, id)) return true;
+    for (state.sync.catalog) |row| {
+        if (p.get(row, "open") == .bool and !p.yes(p.get(row, "open"))) continue;
+        if (eq(p.s(row, "workspace_id"), ws) and eq(p.s(row, "local_thread_id"), id)) return true;
+    }
+    return false;
 }
 
 fn ensure(tx: *h.Transaction, ws: []const u8, id: []const u8) h.ApiError!void {

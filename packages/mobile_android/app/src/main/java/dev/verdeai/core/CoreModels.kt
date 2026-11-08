@@ -292,7 +292,6 @@ data class ChatOrchestration(
 
 @Serializable
 data class ChatThreadView(
-    val `orchestration`: ChatOrchestration? = null,
     val `thread`: ThreadSummary,
     val `rows`: List<ChatRow>,
     val `page`: ChatPage,
@@ -302,6 +301,7 @@ data class ChatThreadView(
     val `stale`: Boolean,
     val `error`: LocalError?,
     val `background_tasks`: List<ChatBackgroundTask> = emptyList(),
+    val `orchestration`: ChatOrchestration? = null,
 )
 
 @Serializable
@@ -1920,7 +1920,6 @@ data class DiffIndexQuery(
 
 @Serializable
 data class Pane(
-    val `orchestration_subtitle`: String = "",
     val `id`: String,
     val `workspace_id`: String,
     val `kind`: String,
@@ -1935,11 +1934,11 @@ data class Pane(
     val `needs_you`: Boolean = false,
     val `state`: String? = null,
     val `provider`: String? = null,
+    val `orchestration_subtitle`: String = "",
 )
 
 @Serializable
 data class ThreadSummary(
-    val `orchestration_subtitle`: String = "",
     val `workspace_id`: String,
     val `thread_id`: String,
     val `title`: String,
@@ -1953,6 +1952,7 @@ data class ThreadSummary(
     val `history_bucket`: String,
     val `committed`: Boolean = true,
     val `state`: String? = null,
+    val `orchestration_subtitle`: String = "",
 )
 
 @Serializable
