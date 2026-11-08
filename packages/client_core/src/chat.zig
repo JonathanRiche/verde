@@ -64,7 +64,7 @@ pub const Thread = struct {
     retry_at: i64 = 0,
     @"error": ?h.LocalError = null,
 };
-pub const State = struct { threads: []Thread = &.{}, requests: []const Request = &.{}, client_id: ?[]const u8 = null, generation: u64 = 0, instance_id: ?[]const u8 = null, history: wire.HistoryView = .{ .query = "", .items = &.{}, .next_cursor = null, .loading = false, .@"error" = null }, history_epoch: u64 = 0, history_restarts: u8 = 0, history_workspace: []const u8 = "", history_cursors: []const []const u8 = &.{} };
+pub const State = struct { orchestration: []const @import("orchestration.zig").Parent = &.{}, threads: []Thread = &.{}, requests: []const Request = &.{}, client_id: ?[]const u8 = null, generation: u64 = 0, instance_id: ?[]const u8 = null, history: wire.HistoryView = .{ .query = "", .items = &.{}, .next_cursor = null, .loading = false, .@"error" = null }, history_epoch: u64 = 0, history_restarts: u8 = 0, history_workspace: []const u8 = "", history_cursors: []const []const u8 = &.{} };
 fn value(a: A, item: anytype) E!V {
     return h.parseLimit(a, try h.encode(a, item), h.MAX_HTTP_INPUT);
 }
@@ -683,7 +683,7 @@ fn historyPage(tx: *h.Transaction, id: []const u8) E!void {
 }
 /// Storage and retry timer completions are correlated by the host first.
 pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) E!bool {
-    if (pending.kind == .timer and eq(pending.purpose, "chat_retry")) return true;
+    if (pending.kind == .timer and (eq(pending.purpose, "chat_retry") or eq(pending.purpose, "agents_refresh"))) return true;
     if (pending.kind != .store_get and pending.kind != .store_put) return false;
     for (tx.state.chat.threads, 0..) |*t, i| {
         if (t.storage_id == null or !eq(t.storage_id.?, pending.id)) continue;
@@ -1273,6 +1273,7 @@ pub fn pump(tx: *h.Transaction) E!void {
         }
         if (result.@"error") |failure| try failed(tx, request, failure, result.steer_can_fallback) else try receiveResult(tx, request, result.value orelse .null);
     }
+    try @import("orchestration.zig").pump(tx);
     if (!online(tx)) return;
     if (tx.state.rpc.instance_id) |instance| {
         if (s.instance_id != null and !eq(s.instance_id.?, instance)) {
@@ -1412,13 +1413,13 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
         v.elapsed_ms = @intCast(@max(0, @min(std.math.maxInt(i64), @as(i128, state.wall_time_ms) - start)));
     };
     const background = try background_rows.project(a, rows);
-    return try value(a, m.ThreadView{ .thread = try summary(a, t, state.wall_time_ms), .rows = background.rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error", .background_tasks = background.running });
+    return try value(a, m.ThreadView{ .orchestration = @import("orchestration.zig").view(state, t.workspace_id, t.id), .thread = try summary(a, t, state.wall_time_ms), .rows = background.rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error", .background_tasks = background.running });
 }
 /// Include precise chat selectors in the coalesced host notification.
 pub fn scopes(tx: *h.Transaction, before: *const h.State, host_changed: bool) E![]const []const u8 {
     const equal = @import("state_clone.zig").equal;
     const after = &tx.state;
-    const context_changed = host_changed or before.stale != after.stale or
+    const context_changed = @import("orchestration.zig").changed(before, after) or host_changed or before.stale != after.stale or
         before.rpc.phase != after.rpc.phase or (before.rpc.bearer == null) != (after.rpc.bearer == null) or
         !equal(V, p.get(before.sync.snapshot, "config"), p.get(after.sync.snapshot, "config"));
     var out: []const []const u8 = &.{};

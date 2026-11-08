@@ -41,6 +41,8 @@ pub const types = .{
     .{ "ChatUsageStat", chat.UsageStat },
     .{ "ChatUsage", chat.Usage },
     .{ "ChatPage", chat.Page },
+    .{ "ChatLinkedAgent", chat.LinkedAgent },
+    .{ "ChatOrchestration", chat.Orchestration },
     .{ "ChatThreadView", chat.ThreadView },
     .{ "ChatComposerView", chat.ComposerView },
     .{ "ThreadQuery", wire.Query(chat.ThreadView) },

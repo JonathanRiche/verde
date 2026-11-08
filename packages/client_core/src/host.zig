@@ -770,6 +770,7 @@ fn sharedViewsChanged(before: *const State, after: *const State, host_changed: b
     inline for (.{ "config", "sync", "attention", "manage" }) |name| {
         if (!state_clone.equal(@TypeOf(@field(before.*, name)), @field(before.*, name), @field(after.*, name))) return true;
     }
+    if (@import("orchestration.zig").changed(before, after)) return true;
     // Browse age buckets refresh while browsing, and again when chat loses focus.
     var focused = false;
     for (after.chat.threads) |t| focused = focused or t.focused;

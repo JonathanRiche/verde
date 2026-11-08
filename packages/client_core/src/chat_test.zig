@@ -737,3 +737,48 @@ test "the thread view carries background task rows and the running list" {
     try expect(view.data.?.background_tasks.len == 1);
     try eql("bun run dev", view.data.?.background_tasks[0].label);
 }
+
+test "orchestration projects hidden cross-workspace agents and stable activity ordering" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const agents = @import("orchestration.zig");
+    const result = try f.value(.{ .links = .{
+        .{ .link_id = "a", .local_thread_id = "working", .status = "running", .updated_at_ms = 10 },
+        .{ .link_id = "b", .workspace_id = "elsewhere", .local_thread_id = "approval", .status = "waiting_approval", .updated_at_ms = 20 },
+        .{ .link_id = "c", .local_thread_id = "input", .status = "blocked", .updated_at_ms = 20 },
+        .{ .link_id = "d", .local_thread_id = "done", .status = "completed", .updated_at_ms = 5 },
+        .{ .link_id = "hidden", .local_thread_id = "hidden", .status = "running", .hidden = true },
+    } });
+    const v = try agents.project(f.a(), result, ws, &.{});
+    try expect(v.links.len == 4 and v.waiting_count == 3 and v.needs_you);
+    try eql("Waiting on 3 agents", v.title);
+    try eql("1 working · 1 needs approval · 1 needs input", v.summary);
+    try eql("b", v.links[0].link_id);
+    try eql("elsewhere", v.links[0].workspace_id);
+    try eql(ws, v.links[1].workspace_id);
+    try eql("Untitled chat", v.links[0].title);
+    const empty = try agents.project(f.a(), try f.value(.{ .links = .{} }), ws, &.{});
+    try expect(empty.loaded and empty.waiting_count == 0 and empty.title.len == 0);
+}
+
+test "orchestration refresh updates thread and parent C11 classification then settles" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.reply("chat.links.list", .{ .links = .{.{ .link_id = "child", .local_thread_id = "child", .status = "waiting_approval" }} });
+    const attention = @import("attention.zig");
+    try expect(attention.classify(&f.host.state, ws, thread).state == .needs_you);
+    const v = @import("orchestration.zig").view(&f.host.state, ws, thread);
+    try expect(v.needs_you and v.waiting_count == 1);
+    f.now += 2500;
+    var fired = false;
+    for (f.host.state.pending) |pending| if (pending.kind == .timer and h.eq(pending.purpose, "agents_refresh")) {
+        _ = try f.event("timer_fired", .{ .timer_id = pending.id, .generation = try std.fmt.allocPrint(f.a(), "{d}", .{pending.generation}) });
+        fired = true;
+        break;
+    };
+    try expect(fired);
+    try f.reply("chat.links.list", .{ .links = .{.{ .link_id = "child", .local_thread_id = "child", .status = "completed" }} });
+    try expect(!@import("orchestration.zig").view(&f.host.state, ws, thread).needs_you);
+    try expect(@import("orchestration.zig").view(&f.host.state, ws, thread).waiting_count == 0);
+}

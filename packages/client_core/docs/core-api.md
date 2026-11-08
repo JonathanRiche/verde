@@ -674,3 +674,11 @@ match the real scope table; missing/different mappings fail. This does **not**
 claim deployed-daemon compatibility. Git workflows use offline response fixtures;
 the existing loopback contract suite remains unchanged. Real-device Git checks
 must wait for the owner's daemon relaunch and use a scratch workspace only.
+
+Thread views also expose `orchestration`: linked child chats (workspace-qualified IDs, title,
+provider/model, status and label, needs-you flag and last activity), loading/error state, active
+counts, and the shared waiting title/summary. Hidden links are excluded; children sort by newest
+activity then link ID. While foreground and connected, open chats refresh through `chat.links.list`
+at desktop's cadence (2.5 seconds active, 6 seconds settled, 20 seconds empty), with at most four
+reads in flight. Home and workspace thread/pane rows expose `orchestration_subtitle`; a linked
+child awaiting approval or input makes its parent `needs_you` in the C11 classifier.

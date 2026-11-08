@@ -1101,7 +1101,174 @@ extension ChatPage {
     }
 }
 
+struct ChatLinkedAgent: Codable {
+    var `link_id`: String = ""
+    var `workspace_id`: String = ""
+    var `local_thread_id`: String = ""
+    var `title`: String = ""
+    var `provider`: String = ""
+    var `model`: String = ""
+    var `status`: String = "idle"
+    var `status_label`: String = "Idle"
+    var `summary`: String = ""
+    var `updated_at_ms`: Int64 = 0
+    var `hidden`: Bool = false
+    var `needs_you`: Bool = false
+}
+
+extension ChatLinkedAgent {
+    private enum CodingKeys: String, CodingKey {
+        case `link_id`
+        case `workspace_id`
+        case `local_thread_id`
+        case `title`
+        case `provider`
+        case `model`
+        case `status`
+        case `status_label`
+        case `summary`
+        case `updated_at_ms`
+        case `hidden`
+        case `needs_you`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`link_id`) { self.`link_id` = "" } else {
+        self.`link_id` = try c.decode(String.self, forKey: .`link_id`)
+        }
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`local_thread_id`) { self.`local_thread_id` = "" } else {
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        }
+        if !c.contains(.`title`) { self.`title` = "" } else {
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`provider`) { self.`provider` = "" } else {
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`model`) { self.`model` = "" } else {
+        self.`model` = try c.decode(String.self, forKey: .`model`)
+        }
+        if !c.contains(.`status`) { self.`status` = "idle" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`status_label`) { self.`status_label` = "Idle" } else {
+        self.`status_label` = try c.decode(String.self, forKey: .`status_label`)
+        }
+        if !c.contains(.`summary`) { self.`summary` = "" } else {
+        self.`summary` = try c.decode(String.self, forKey: .`summary`)
+        }
+        if !c.contains(.`updated_at_ms`) { self.`updated_at_ms` = 0 } else {
+        self.`updated_at_ms` = try c.decode(Int64.self, forKey: .`updated_at_ms`)
+        }
+        if !c.contains(.`hidden`) { self.`hidden` = false } else {
+        self.`hidden` = try c.decode(Bool.self, forKey: .`hidden`)
+        }
+        if !c.contains(.`needs_you`) { self.`needs_you` = false } else {
+        self.`needs_you` = try c.decode(Bool.self, forKey: .`needs_you`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`link_id`, forKey: .`link_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`status_label`, forKey: .`status_label`)
+        try c.encode(self.`summary`, forKey: .`summary`)
+        try c.encode(self.`updated_at_ms`, forKey: .`updated_at_ms`)
+        try c.encode(self.`hidden`, forKey: .`hidden`)
+        try c.encode(self.`needs_you`, forKey: .`needs_you`)
+    }
+}
+
+struct ChatOrchestration: Codable {
+    var `links`: [ChatLinkedAgent] = []
+    var `loaded`: Bool = false
+    var `loading`: Bool = false
+    var `error`: LocalError? = nil
+    var `waiting_count`: UInt32 = 0
+    var `working_count`: UInt32 = 0
+    var `approval_count`: UInt32 = 0
+    var `input_count`: UInt32 = 0
+    var `needs_you`: Bool = false
+    var `title`: String = ""
+    var `summary`: String = ""
+}
+
+extension ChatOrchestration {
+    private enum CodingKeys: String, CodingKey {
+        case `links`
+        case `loaded`
+        case `loading`
+        case `error`
+        case `waiting_count`
+        case `working_count`
+        case `approval_count`
+        case `input_count`
+        case `needs_you`
+        case `title`
+        case `summary`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`links`) { self.`links` = [] } else {
+        self.`links` = try c.decode([ChatLinkedAgent].self, forKey: .`links`)
+        }
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+        if !c.contains(.`waiting_count`) { self.`waiting_count` = 0 } else {
+        self.`waiting_count` = try c.decode(UInt32.self, forKey: .`waiting_count`)
+        }
+        if !c.contains(.`working_count`) { self.`working_count` = 0 } else {
+        self.`working_count` = try c.decode(UInt32.self, forKey: .`working_count`)
+        }
+        if !c.contains(.`approval_count`) { self.`approval_count` = 0 } else {
+        self.`approval_count` = try c.decode(UInt32.self, forKey: .`approval_count`)
+        }
+        if !c.contains(.`input_count`) { self.`input_count` = 0 } else {
+        self.`input_count` = try c.decode(UInt32.self, forKey: .`input_count`)
+        }
+        if !c.contains(.`needs_you`) { self.`needs_you` = false } else {
+        self.`needs_you` = try c.decode(Bool.self, forKey: .`needs_you`)
+        }
+        if !c.contains(.`title`) { self.`title` = "" } else {
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`summary`) { self.`summary` = "" } else {
+        self.`summary` = try c.decode(String.self, forKey: .`summary`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`links`, forKey: .`links`)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`error`, forKey: .`error`)
+        try c.encode(self.`waiting_count`, forKey: .`waiting_count`)
+        try c.encode(self.`working_count`, forKey: .`working_count`)
+        try c.encode(self.`approval_count`, forKey: .`approval_count`)
+        try c.encode(self.`input_count`, forKey: .`input_count`)
+        try c.encode(self.`needs_you`, forKey: .`needs_you`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`summary`, forKey: .`summary`)
+    }
+}
+
 struct ChatThreadView: Codable {
+    var `orchestration`: ChatOrchestration? = nil
     var `thread`: ThreadSummary
     var `rows`: [ChatRow]
     var `page`: ChatPage
@@ -1115,6 +1282,7 @@ struct ChatThreadView: Codable {
 
 extension ChatThreadView {
     private enum CodingKeys: String, CodingKey {
+        case `orchestration`
         case `thread`
         case `rows`
         case `page`
@@ -1127,6 +1295,9 @@ extension ChatThreadView {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`orchestration`) { self.`orchestration` = nil } else {
+        self.`orchestration` = try c.decodeIfPresent(ChatOrchestration.self, forKey: .`orchestration`)
+        }
         self.`thread` = try c.decode(ThreadSummary.self, forKey: .`thread`)
         self.`rows` = try c.decode([ChatRow].self, forKey: .`rows`)
         self.`page` = try c.decode(ChatPage.self, forKey: .`page`)
@@ -1141,6 +1312,7 @@ extension ChatThreadView {
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`orchestration`, forKey: .`orchestration`)
         try c.encode(self.`thread`, forKey: .`thread`)
         try c.encode(self.`rows`, forKey: .`rows`)
         try c.encode(self.`page`, forKey: .`page`)
@@ -7551,6 +7723,7 @@ extension DiffIndexQuery {
 }
 
 struct Pane: Codable {
+    var `orchestration_subtitle`: String = ""
     var `id`: String
     var `workspace_id`: String
     var `kind`: String
@@ -7569,6 +7742,7 @@ struct Pane: Codable {
 
 extension Pane {
     private enum CodingKeys: String, CodingKey {
+        case `orchestration_subtitle`
         case `id`
         case `workspace_id`
         case `kind`
@@ -7586,6 +7760,9 @@ extension Pane {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
+        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
+        }
         self.`id` = try c.decode(String.self, forKey: .`id`)
         self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
         self.`kind` = try c.decode(String.self, forKey: .`kind`)
@@ -7623,6 +7800,7 @@ extension Pane {
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
         try c.encode(self.`id`, forKey: .`id`)
         try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
         try c.encode(self.`kind`, forKey: .`kind`)
@@ -7641,6 +7819,7 @@ extension Pane {
 }
 
 struct ThreadSummary: Codable {
+    var `orchestration_subtitle`: String = ""
     var `workspace_id`: String
     var `thread_id`: String
     var `title`: String
@@ -7658,6 +7837,7 @@ struct ThreadSummary: Codable {
 
 extension ThreadSummary {
     private enum CodingKeys: String, CodingKey {
+        case `orchestration_subtitle`
         case `workspace_id`
         case `thread_id`
         case `title`
@@ -7674,6 +7854,9 @@ extension ThreadSummary {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`orchestration_subtitle`) { self.`orchestration_subtitle` = "" } else {
+        self.`orchestration_subtitle` = try c.decode(String.self, forKey: .`orchestration_subtitle`)
+        }
         self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
         self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
         self.`title` = try c.decode(String.self, forKey: .`title`)
@@ -7694,6 +7877,7 @@ extension ThreadSummary {
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`orchestration_subtitle`, forKey: .`orchestration_subtitle`)
         try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
         try c.encode(self.`thread_id`, forKey: .`thread_id`)
         try c.encode(self.`title`, forKey: .`title`)

@@ -260,7 +260,39 @@ data class ChatPage(
 )
 
 @Serializable
+data class ChatLinkedAgent(
+    val `link_id`: String = "",
+    val `workspace_id`: String = "",
+    val `local_thread_id`: String = "",
+    val `title`: String = "",
+    val `provider`: String = "",
+    val `model`: String = "",
+    val `status`: String = "idle",
+    val `status_label`: String = "Idle",
+    val `summary`: String = "",
+    val `updated_at_ms`: Long = 0,
+    val `hidden`: Boolean = false,
+    val `needs_you`: Boolean = false,
+)
+
+@Serializable
+data class ChatOrchestration(
+    val `links`: List<ChatLinkedAgent> = emptyList(),
+    val `loaded`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `error`: LocalError? = null,
+    val `waiting_count`: Long = 0,
+    val `working_count`: Long = 0,
+    val `approval_count`: Long = 0,
+    val `input_count`: Long = 0,
+    val `needs_you`: Boolean = false,
+    val `title`: String = "",
+    val `summary`: String = "",
+)
+
+@Serializable
 data class ChatThreadView(
+    val `orchestration`: ChatOrchestration? = null,
     val `thread`: ThreadSummary,
     val `rows`: List<ChatRow>,
     val `page`: ChatPage,
@@ -1888,6 +1920,7 @@ data class DiffIndexQuery(
 
 @Serializable
 data class Pane(
+    val `orchestration_subtitle`: String = "",
     val `id`: String,
     val `workspace_id`: String,
     val `kind`: String,
@@ -1906,6 +1939,7 @@ data class Pane(
 
 @Serializable
 data class ThreadSummary(
+    val `orchestration_subtitle`: String = "",
     val `workspace_id`: String,
     val `thread_id`: String,
     val `title`: String,

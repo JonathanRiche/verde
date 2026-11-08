@@ -394,6 +394,9 @@ pub fn classify(state: *const h.State, ws: []const u8, thread_id: []const u8) st
         if (eq(link.status, "waiting_approval")) return .{ .state = .needs_you, .kind = .needs_approval, .status = turn.status };
         if (eq(link.status, "blocked")) return .{ .state = .needs_you, .kind = .blocked, .status = turn.status };
     }
+    const agents = @import("orchestration.zig").view(state, ws, thread_id);
+    if (agents.needs_you) return .{ .state = .needs_you, .kind = if (agents.approval_count > 0) .needs_approval else .blocked, .status = turn.status };
+    if (agents.waiting_count > 0) return .{ .state = .running, .status = turn.status };
     if (turn.status.len > 0 and activeStatus(turn.status)) return .{ .state = .running, .status = turn.status };
     if (entry == .failed) return .{ .state = .failed, .status = turn.status };
     if (entry == .unread) return .{ .state = .unread, .status = turn.status };
@@ -566,6 +569,7 @@ fn relive(a: A, state: *const h.State, thread: *V) E!void {
     const ws = p.s(thread.*, "workspace_id");
     const id = p.s(thread.*, "thread_id");
     if (liveStatus(state, ws, id)) |status| try thread.object.put(a, "status", .{ .string = status });
+    try thread.object.put(a, "orchestration_subtitle", .{ .string = @import("orchestration.zig").view(state, ws, id).title });
     try thread.object.put(a, "state", .{ .string = @tagName(classify(state, ws, id).state) });
 }
 /// Applies the live turn and the attention entry; true when the pane has an attention kind.
@@ -582,6 +586,7 @@ fn mark(a: A, state: *const h.State, pane: *V) E!bool {
         try pane.object.put(a, "can_stop", .{ .bool = activeStatus(status) });
         try pane.object.put(a, "attention", .{ .bool = eq(status, "waiting_approval") });
     }
+    try pane.object.put(a, "orchestration_subtitle", .{ .string = @import("orchestration.zig").view(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id")).title });
     const c = classify(state, p.s(pane.*, "workspace_id"), p.s(pane.*, "thread_id"));
     try pane.object.put(a, "needs_you", .{ .bool = c.state == .needs_you });
     try pane.object.put(a, "state", .{ .string = @tagName(c.state) });

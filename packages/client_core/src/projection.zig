@@ -7,6 +7,7 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 const eq = host.eq;
 pub const Pane = struct {
+    orchestration_subtitle: []const u8 = "",
     id: []const u8,
     workspace_id: []const u8,
     kind: []const u8,
@@ -29,6 +30,7 @@ pub const Pane = struct {
     provider: ?[]const u8 = null,
 };
 pub const ThreadSummary = struct {
+    orchestration_subtitle: []const u8 = "",
     workspace_id: []const u8,
     thread_id: []const u8,
     title: []const u8,
