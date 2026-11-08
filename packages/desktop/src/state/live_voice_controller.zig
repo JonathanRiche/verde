@@ -18,6 +18,7 @@ const Engine = @import("../live_voice/engine.zig");
 const Transcript = @import("../live_voice/transcript.zig");
 const Machine = @import("../live_voice/session.zig");
 const protocol = @import("../live_voice/protocol.zig");
+const Request = @import("../live_voice/request.zig");
 pub const Settings = @import("live_voice_settings.zig");
 
 const log = std.log.scoped(.live_voice_ui);
@@ -25,7 +26,6 @@ const log = std.log.scoped(.live_voice_ui);
 pub const MAX_CAPTIONS: usize = 3;
 const SESSION_TIMEOUT_MS: u32 = 45_000;
 const SAVE_TIMEOUT_MS: u32 = 15_000;
-const ASK_WAIT_MS: i64 = 30 * 60_000;
 const MAX_RETIRING: usize = 4;
 const MAX_UNSAVED: usize = 4;
 const MAX_SAVE_ATTEMPTS: u8 = 3;
@@ -80,9 +80,6 @@ const MintContext = struct {
 
 const Retiring = struct { engine: *Engine, mint: *MintContext };
 
-/// A pending `ask_companion`: the reply is read aloud when that turn ends.
-const Ask = struct { before_count: usize, started: bool, sent_at_ms: i64 };
-
 const SaveMessage = struct { key: []u8, role: []const u8, author: []u8, body: []u8, created_at_ms: i64 };
 
 const SaveJob = struct {
@@ -131,9 +128,11 @@ unsaved: [MAX_UNSAVED]?*Transcript = @splat(null),
 save_job: ?*SaveJob = null,
 save_attempts: u8 = 0,
 last_save_ms: i64 = 0,
-ask: ?Ask = null,
-/// Spoken requests waiting for a busy companion turn to finish.
-queued_request: ?[]u8 = null,
+requests: std.ArrayList(*Request) = .empty,
+reply_revision: u64 = 0,
+call_epoch: u64 = 0,
+stop_serial: u64 = 0,
+stop_call: ?struct { id: []const u8, batch: u64 } = null,
 muted: bool = false,
 /// Provider and voice choice for the call pill's settings popover.
 settings: Settings = .{},
@@ -157,7 +156,10 @@ pub fn deinit(self: *Self) void {
     };
     for (self.notes.items) |item| item.deinit(self.allocator);
     self.notes.deinit(self.allocator);
-    if (self.queued_request) |text| self.allocator.free(text);
+    for (self.requests.items) |job| job.detach.store(true, .release);
+    for (self.requests.items) |job| job.destroy();
+    self.requests.deinit(self.allocator);
+    if (self.stop_call) |call| self.allocator.free(call.id);
     self.settings.deinit();
     self.* = .{};
 }
@@ -224,7 +226,6 @@ pub fn start(self: *Self, host: anytype) void {
     self.engine = engine;
     self.mint = mint;
     self.transcript = record;
-    self.ask = null;
     self.last_save_ms = nowMs();
     self.status = engine.status();
     requestFrame();
@@ -285,6 +286,7 @@ pub fn dismissError(self: *Self) void {
 pub fn tick(self: *Self, host: anytype) void {
     self.reapRetiring();
     self.collectSave();
+    self.collectRequests();
     switch (self.settings.poll()) {
         .none => {},
         .listed, .failed => requestFrame(),
@@ -319,8 +321,6 @@ pub fn tick(self: *Self, host: anytype) void {
             self.retire();
             self.finishTranscript(host);
             requestFrame();
-        } else {
-            self.followAsk(host, engine, now);
         }
     }
     self.maybeSave(host, now);
@@ -376,49 +376,20 @@ fn runTool(self: *Self, host: anytype, engine: *Engine, call_id: []const u8, nam
     const arena = arena_state.allocator();
     const arguments = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch std.json.Value{ .object = .empty };
     const fields: std.json.ObjectMap = if (arguments == .object) arguments.object else .empty;
+    if (std.mem.eql(u8, name, "ask_companion")) {
+        self.startRequest(host, engine, call_id, fields, now) catch engine.sendToolResult(call_id, name, objectOf(arena, .{ .accepted = false, .@"error" = "failed" }));
+        return;
+    }
+    if (std.mem.eql(u8, name, "stop_companion")) {
+        self.stopRequests(host, engine, call_id) catch engine.sendToolResult(call_id, name, objectOf(arena, .{ .stopped = @as(?bool, null), .@"error" = "delivery_uncertain" }));
+        return;
+    }
     const output = self.toolOutput(host, arena, name, fields, now) catch objectOf(arena, .{ .@"error" = "failed" });
     engine.sendToolResult(call_id, name, output);
 }
 
 fn toolOutput(self: *Self, host: anytype, arena: std.mem.Allocator, name: []const u8, fields: std.json.ObjectMap, now: i64) !std.json.Value {
-    if (std.mem.eql(u8, name, "ask_companion")) {
-        const request = std.mem.trim(u8, protocol.stringOf(fields.get("request")) orelse "", &std.ascii.whitespace);
-        if (request.len == 0) return objectOf(arena, .{ .accepted = false, .@"error" = "empty_request" });
-        if (self.transcript) |record| {
-            const line = try std.fmt.allocPrint(arena, "→ Asked {s}: {s}", .{ companionName(host), request });
-            record.system(line, now) catch {};
-        }
-        // A companion turn is running: steer it with the request (Codex,
-        // Claude, Pi; others queue it as the next turn). Only if that fails,
-        // hold it until the turn ends.
-        if (host.liveCompanionWorking()) {
-            if (self.queued_request == null and host.liveSteerCompanion(request)) {
-                // Its reply arrives when the steered turn finishes.
-                if (self.ask == null) self.ask = .{ .before_count = host.liveCompanionMessageCount(), .started = true, .sent_at_ms = now };
-                return objectOf(arena, .{ .accepted = true, .delivered = "to the running turn" });
-            }
-            try self.queueRequest(request);
-            return objectOf(arena, .{ .accepted = true, .queued = true });
-        }
-        if (self.queued_request != null) {
-            try self.queueRequest(request);
-            return objectOf(arena, .{ .accepted = true, .queued = true });
-        }
-        if (!self.sendRequest(host, request, now)) return objectOf(arena, .{ .accepted = false, .@"error" = "companion_not_ready" });
-        return objectOf(arena, .{ .accepted = true });
-    }
     if (std.mem.eql(u8, name, "companion_status")) return host.liveCompanionStatus(arena);
-    if (std.mem.eql(u8, name, "stop_companion")) {
-        if (self.queued_request) |text| self.allocator.free(text);
-        self.queued_request = null;
-        if (!host.liveStopCompanion()) return objectOf(arena, .{ .stopped = false, .@"error" = "not_running" });
-        self.ask = null;
-        if (self.transcript) |record| {
-            const line = try std.fmt.allocPrint(arena, "■ Stopped {s}", .{companionName(host)});
-            record.system(line, now) catch {};
-        }
-        return objectOf(arena, .{ .stopped = true });
-    }
     if (std.mem.eql(u8, name, "decide_approval")) {
         const approve_value = fields.get("approve") orelse .null;
         if (approve_value != .bool) return objectOf(arena, .{ .@"error" = "missing_decision" });
@@ -441,53 +412,152 @@ fn toolOutput(self: *Self, host: anytype, arena: std.mem.Allocator, name: []cons
     return objectOf(arena, .{ .@"error" = "unknown_tool" });
 }
 
-fn queueRequest(self: *Self, request: []const u8) !void {
-    const next = if (self.queued_request) |earlier| try joinDraft(self.allocator, earlier, request) else try self.allocator.dupe(u8, request);
-    if (self.queued_request) |earlier| self.allocator.free(earlier);
-    self.queued_request = next;
-}
-
-fn sendRequest(self: *Self, host: anytype, request: []const u8, now: i64) bool {
-    const before = host.liveCompanionMessageCount();
-    if (!host.liveAskCompanion(request)) return false;
-    self.ask = .{ .before_count = before, .started = false, .sent_at_ms = now };
-    return true;
-}
-
-/// After `ask_companion`, waits for the companion turn to start and finish,
-/// then has the voice read the reply. Queued requests go out once idle.
-fn followAsk(self: *Self, host: anytype, engine: *Engine, now: i64) void {
-    if (self.queued_request) |text| if (self.ask == null and !host.liveCompanionWorking()) {
-        self.queued_request = null;
-        defer self.allocator.free(text);
-        _ = self.sendRequest(host, text, now);
+fn startRequest(self: *Self, host: anytype, engine: *Engine, call_id: []const u8, fields: std.json.ObjectMap, now: i64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const request = std.mem.trim(u8, protocol.stringOf(fields.get("request")) orelse "", &std.ascii.whitespace);
+    if (request.len == 0 or request.len > 32768) {
+        engine.sendToolResult(call_id, "ask_companion", objectOf(a, .{ .accepted = false, .@"error" = "invalid_request" }));
+        return;
+    }
+    const target = host.livePrepareRequest() orelse {
+        engine.sendToolResult(call_id, "ask_companion", objectOf(a, .{ .accepted = false, .@"error" = "companion_not_ready" }));
+        return;
     };
-    const pending = &(self.ask orelse return);
-    if (now - pending.sent_at_ms > ASK_WAIT_MS) {
-        self.ask = null;
+    if (self.requests.items.len >= 16) {
+        engine.sendToolResult(call_id, "ask_companion", objectOf(a, .{ .accepted = false, .@"error" = "busy" }));
         return;
     }
-    const working = host.liveCompanionWorking();
-    if (working) {
-        pending.started = true;
-        return;
-    }
-    if (!pending.started) return;
-    const before = pending.before_count;
-    self.ask = null;
-    const reply = host.liveCompanionReplySince(before) orelse return;
-    if (self.status.phase != .live) return;
-    const update = protocol.companionUpdateAlloc(self.allocator, reply) catch return;
-    defer self.allocator.free(update);
+    const correction = fields.get("supersedes_previous") orelse .null;
+    if (correction == .bool and correction.bool) self.supersedeRequest(protocol.stringOf(fields.get("supersedes_request_id")));
+    var nonce: [16]u8 = undefined;
+    randomHex(&nonce);
+    const turn = try std.fmt.allocPrint(a, "voice:desktop:{s}", .{nonce});
+    var spoken: []const u8 = "";
     if (self.transcript) |record| {
-        const line = std.fmt.allocPrint(self.allocator, "← {s} replied", .{companionName(host)}) catch null;
-        if (line) |text| {
-            defer self.allocator.free(text);
-            record.system(text, now) catch {};
+        var index = record.lines.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (record.lines.items[index].role == .user) {
+                spoken = record.lines.items[index].body;
+                break;
+            }
         }
     }
-    engine.inject(update);
-    requestFrame();
+    const prompt = if (spoken.len == 0) request else try std.fmt.allocPrint(a, "{s}\n\nLatest voice transcript (may contain transcription errors; the corrected request above takes precedence):\n{s}", .{ request, spoken });
+    try self.requests.ensureUnusedCapacity(self.allocator, 1);
+    const job = try Request.create(self.allocator, host.livePrefPath(), target.workspace_id, target.thread_id, turn, call_id, prompt, self.reply_revision, self.call_epoch, false);
+    self.requests.appendAssumeCapacity(job);
+    if (self.transcript) |record| record.system(std.fmt.allocPrint(a, "→ Asked {s}: {s}", .{ companionName(host), request }) catch "Voice request sent", now) catch {};
+}
+
+fn supersedeRequest(self: *Self, request_id: ?[]const u8) void {
+    var index = self.requests.items.len;
+    while (index > 0) {
+        index -= 1;
+        const job = self.requests.items[index];
+        if (job.epoch != self.call_epoch or job.cancel_only) continue;
+        if (request_id) |id| if (!std.mem.eql(u8, job.call_id, id)) continue;
+        job.superseded = true;
+        return;
+    }
+}
+
+fn stopRequests(self: *Self, host: anytype, engine: *Engine, call_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    if (self.stop_call != null) {
+        engine.sendToolResult(call_id, "stop_companion", objectOf(a, .{ .stopped = @as(?bool, null), .@"error" = "stop_pending" }));
+        return;
+    }
+    const owned_id = try self.allocator.dupe(u8, call_id);
+    errdefer self.allocator.free(owned_id);
+    self.stop_serial +%= 1;
+    self.reply_revision +%= 1;
+    var count: usize = 0;
+    const active_turn = try host.liveCompanionTurnAlloc(a);
+    var covered = false;
+    for (self.requests.items) |job| {
+        if (job.epoch != self.call_epoch or job.done.load(.acquire)) continue;
+        job.stop_batch = self.stop_serial;
+        job.cancel.store(true, .release);
+        count += 1;
+        if (active_turn) |turn| covered = covered or std.mem.eql(u8, job.turn, turn);
+    }
+    if (!covered) if (active_turn) |turn| {
+        const job = try Request.create(self.allocator, host.livePrefPath(), "", "", turn, call_id, "", self.reply_revision, self.call_epoch, true);
+        errdefer job.destroy();
+        job.stop_batch = self.stop_serial;
+        try self.requests.append(self.allocator, job);
+        count += 1;
+    };
+    if (count == 0) {
+        self.allocator.free(owned_id);
+        engine.sendToolResult(call_id, "stop_companion", objectOf(a, .{ .stopped = false, .@"error" = "not_running" }));
+        return;
+    }
+    self.stop_call = .{ .id = owned_id, .batch = self.stop_serial };
+}
+
+fn clipUtf8(text: []const u8, cap: usize) []const u8 {
+    if (text.len <= cap) return text;
+    var end = cap;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+fn collectRequests(self: *Self) void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    if (self.stop_call) |call| {
+        var ready = true;
+        var ok = true;
+        for (self.requests.items) |job| if (job.stop_batch == call.batch) {
+            if (job.cancel_done.load(.acquire)) {
+                ok = ok and job.cancel_ok;
+            } else if (job.done.load(.acquire)) {
+                ok = ok and (job.accepted != null);
+            } else ready = false;
+        };
+        if (ready) {
+            if (self.engine) |engine| engine.sendToolResult(call.id, "stop_companion", objectOf(a, .{ .stopped = if (ok) @as(?bool, true) else null, .@"error" = if (ok) @as(?[]const u8, null) else "delivery_uncertain" }));
+            for (self.requests.items) |job| if (job.stop_batch == call.batch) {
+                job.stop_batch = 0;
+            };
+            self.allocator.free(call.id);
+            self.stop_call = null;
+        }
+    }
+    var i: usize = 0;
+    while (i < self.requests.items.len) {
+        const job = self.requests.items[i];
+        if (job.epoch == self.call_epoch) if (self.engine) |engine| {
+            if (!job.cancel_only and !job.reported and job.accept_ready.load(.acquire)) {
+                engine.sendToolResult(job.call_id, "ask_companion", objectOf(a, .{ .accepted = job.accepted, .request_id = job.call_id, .turn_id = job.turn, .@"error" = job.accept_error }));
+                job.reported = true;
+            }
+            if (job.done.load(.acquire) and job.accepted == true and !job.cancel_only and !job.superseded and job.revision == self.reply_revision) {
+                // Retain finished replies through a provider reconnect.
+                if (engine.status().phase == .reconnecting or engine.status().phase == .connecting) {
+                    i += 1;
+                    continue;
+                }
+                if (engine.status().phase == .live) {
+                    const body = if (job.reply) |reply| if (reply.len > 0) reply else job.status else job.status;
+                    const update = protocol.companionUpdateAlloc(a, body) catch "Request finished.";
+                    const text = std.fmt.allocPrint(a, "Request {s}, turn {s}, task: {s}\n{s}", .{ job.call_id, job.turn, clipUtf8(job.prompt, 2000), update }) catch update;
+                    engine.inject(text);
+                }
+            }
+        };
+        if (job.done.load(.acquire) and job.stop_batch == 0) {
+            _ = self.requests.orderedRemove(i);
+            job.destroy();
+        } else i += 1;
+    }
 }
 
 // ---- saving ------------------------------------------------------------------------
@@ -495,9 +565,13 @@ fn followAsk(self: *Self, host: anytype, engine: *Engine, now: i64) void {
 fn finishTranscript(self: *Self, host: anytype) void {
     const record = self.transcript orelse return;
     self.transcript = null;
-    self.ask = null;
-    if (self.queued_request) |text| self.allocator.free(text);
-    self.queued_request = null;
+    self.call_epoch +%= 1;
+    for (self.requests.items) |job| {
+        job.detach.store(true, .release);
+        job.stop_batch = 0;
+    }
+    if (self.stop_call) |call| self.allocator.free(call.id);
+    self.stop_call = null;
     const count = record.pending(true) catch 0;
     if (count == 0) {
         self.destroyTranscript(record);
@@ -803,12 +877,6 @@ pub fn voiceSpeaker(author: []const u8) ?[]const u8 {
 }
 
 /// Spoken words join an existing draft like the phone apps do.
-pub fn joinDraft(allocator: std.mem.Allocator, draft: []const u8, spoken: []const u8) ![]u8 {
-    const before = std.mem.trimEnd(u8, draft, &std.ascii.whitespace);
-    const words = std.mem.trim(u8, spoken, &std.ascii.whitespace);
-    if (before.len == 0) return allocator.dupe(u8, words);
-    return std.mem.concat(allocator, u8, &.{ before, "\n\n", words });
-}
 
 // ---- tests -------------------------------------------------------------------------
 
@@ -836,28 +904,14 @@ const HostContract = struct {
     pub fn liveSaveTarget(_: *HostContract) ?struct { workspace_id: []const u8, thread_id: []const u8 } {
         return null;
     }
-    pub fn liveAskCompanion(self: *HostContract, text: []const u8) bool {
-        self.asked.appendSlice(testing.allocator, text) catch return false;
-        return true;
+    pub fn livePrepareRequest(_: *HostContract) ?struct { workspace_id: []const u8, thread_id: []const u8 } {
+        return null;
+    }
+    pub fn liveCompanionTurnAlloc(_: *HostContract, _: std.mem.Allocator) !?[]const u8 {
+        return null;
     }
     pub fn liveCompanionWorking(self: *HostContract) bool {
         return self.working;
-    }
-    pub fn liveSteerCompanion(self: *HostContract, text: []const u8) bool {
-        if (!self.working) return false;
-        self.steered.appendSlice(testing.allocator, text) catch return false;
-        return true;
-    }
-    pub fn liveStopCompanion(self: *HostContract) bool {
-        if (!self.working) return false;
-        self.working = false;
-        return true;
-    }
-    pub fn liveCompanionMessageCount(self: *HostContract) usize {
-        return self.message_count;
-    }
-    pub fn liveCompanionReplySince(self: *HostContract, _: usize) ?[]const u8 {
-        return self.reply;
     }
     pub fn liveCompanionStatus(_: *HostContract, arena: std.mem.Allocator) !std.json.Value {
         return objectOf(arena, .{ .crew = &[_]u8{}, .needs_you = &[_]u8{} });
@@ -888,15 +942,6 @@ test "approval matching prefers exact titles and refuses ambiguity" {
     try testing.expectEqualStrings("t2", matchApproval("t2", &candidates).found.thread_id);
 }
 
-test "spoken requests join the draft" {
-    const joined = try joinDraft(testing.allocator, "half typed  \n", " run tests ");
-    defer testing.allocator.free(joined);
-    try testing.expectEqualStrings("half typed\n\nrun tests", joined);
-    const alone = try joinDraft(testing.allocator, "   ", "run tests");
-    defer testing.allocator.free(alone);
-    try testing.expectEqualStrings("run tests", alone);
-}
-
 test "tools route to the companion and approvals" {
     var host: HostContract = .{};
     defer host.asked.deinit(testing.allocator);
@@ -909,17 +954,6 @@ test "tools route to the companion and approvals" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var ask_fields: std.json.ObjectMap = .empty;
-    try ask_fields.put(arena, "request", .{ .string = "run the tests" });
-    const asked = try controller.toolOutput(&host, arena, "ask_companion", ask_fields, 1);
-    try testing.expect(asked.object.get("accepted").?.bool);
-    try testing.expectEqualStrings("run the tests", host.asked.items);
-    try testing.expectEqual(@as(usize, 4), controller.ask.?.before_count);
-    try testing.expectEqualStrings("→ Asked Moss: run the tests", record.lines.items[record.lines.items.len - 1].body);
-
-    const empty = try controller.toolOutput(&host, arena, "ask_companion", .empty, 2);
-    try testing.expectEqualStrings("empty_request", empty.object.get("error").?.string);
 
     host.approvals = &.{.{ .workspace_id = "w", .thread_id = "t", .title = "Deploy" }};
     var decide: std.json.ObjectMap = .empty;
@@ -978,32 +1012,19 @@ test "voice authors name their speaker" {
     try testing.expect(!isVoiceAuthor("Live"));
 }
 
-test "while the companion works, spoken requests steer it and stop_companion interrupts it" {
-    var host: HostContract = .{ .working = true };
-    defer host.asked.deinit(testing.allocator);
-    defer host.steered.deinit(testing.allocator);
+test "voice corrections retire only the identified reply and preserve independent work" {
+    var first: Request = .{ .allocator = testing.allocator, .pref_path = "", .workspace = "ws", .thread = "moss", .turn = "t1", .call_id = "first", .prompt = "one", .revision = 0, .epoch = 0 };
+    var second = first;
+    second.call_id = "second";
     var controller: Self = .{ .allocator = testing.allocator };
-    defer controller.deinit();
-    var record = try Transcript.init(testing.allocator, "Moss", @splat('a'));
-    defer record.deinit();
-    controller.transcript = &record;
-    defer controller.transcript = null;
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var fields: std.json.ObjectMap = .empty;
-    try fields.put(arena, "request", .{ .string = "use the staging branch instead" });
-    const steered = try controller.toolOutput(&host, arena, "ask_companion", fields, 1);
-    try testing.expect(steered.object.get("accepted").?.bool);
-    try testing.expect(steered.object.get("delivered") != null);
-    try testing.expectEqualStrings("use the staging branch instead", host.steered.items);
-    try testing.expectEqual(@as(usize, 0), host.asked.items.len);
-    try testing.expect(controller.ask.?.started);
-
-    const stopped = try controller.toolOutput(&host, arena, "stop_companion", .empty, 2);
-    try testing.expect(stopped.object.get("stopped").?.bool);
-    try testing.expect(controller.ask == null);
-    const idle = try controller.toolOutput(&host, arena, "stop_companion", .empty, 3);
-    try testing.expectEqualStrings("not_running", idle.object.get("error").?.string);
+    defer controller.requests.deinit(testing.allocator);
+    try controller.requests.append(testing.allocator, &first);
+    try controller.requests.append(testing.allocator, &second);
+    controller.supersedeRequest(null);
+    try testing.expect(second.superseded and !first.superseded);
+    second.superseded = false;
+    controller.supersedeRequest("first");
+    try testing.expect(first.superseded and !second.superseded);
+    controller.supersedeRequest("missing");
+    try testing.expect(!second.superseded);
 }

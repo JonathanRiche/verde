@@ -33,6 +33,16 @@ final class LiveProtocolTests: XCTestCase {
 }
 
 final class LiveToolTests: XCTestCase {
+    func testReplyContextPreservesQualificationsAndRequestIdentity() throws {
+        let qualified = "Done. " + String(repeating: "detail ", count: 150) + "However, the second pane could not be closed."
+        XCTAssertTrue(companionUpdateText(qualified).contains("second pane could not be closed"))
+        let raw = #"{"requests":[{"intent_id":"r1","workspace_id":"w","thread_id":"moss","turn_id":"voice:r1","prompt":"close pane","status":"completed","reply":"Done"}]}"#
+        let view = try JSONDecoder().decode(LiveVoiceView.self, from: Data(raw.utf8))
+        XCTAssertEqual(view.requests.first?.turn_id, "voice:r1")
+        XCTAssertEqual(view.requests.first?.finished, true)
+        XCTAssertEqual(LiveToolName.stopCompanion, "stop_companion")
+    }
+
     private let pending = [
         NeedsYouItem(workspaceID: "w1", threadID: "t1", title: "Deploy API", workspaceLabel: "backend", reason: "Needs approval"),
         NeedsYouItem(workspaceID: "w2", threadID: "t2", title: "Deploy web", workspaceLabel: "frontend", reason: "Needs approval"),

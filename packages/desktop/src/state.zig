@@ -14837,53 +14837,24 @@ pub const AppState = struct {
         return .{ .workspace_id = companion.home_workspace_id.slice(), .thread_id = companion.thread_id.slice() };
     }
 
-    /// Sends a spoken request as a normal companion turn, after any typed
-    /// draft (as the phone apps do). False when it could not be sent.
-    pub fn liveAskCompanion(self: *AppState, text: []const u8) bool {
-        const draft = if (self.activeCompanionThread()) |thread| thread.currentDraft() else "";
-        const joined = live_voice_controller_mod.joinDraft(self.allocator, draft, text) catch return false;
-        defer self.allocator.free(joined);
-        self.companion_controller.ui_error = null;
-        submitCompanionPrompt(self, joined);
-        return self.companion_controller.ui_error == null;
+    /// Materialize the companion thread without touching its typed draft.
+    pub fn livePrepareRequest(self: *AppState) ?struct { workspace_id: []const u8, thread_id: []const u8 } {
+        _ = self.ensureActiveCompanionThread() catch return null;
+        const target = self.liveSaveTarget() orelse return null;
+        return .{ .workspace_id = target.workspace_id, .thread_id = target.thread_id };
     }
 
-    /// A spoken request while the companion works: steers its running turn.
-    pub fn liveSteerCompanion(self: *AppState, text: []const u8) bool {
-        return steerCompanionTurn(self, text);
-    }
-
-    /// `stop_companion`: stops the companion's running turn.
-    pub fn liveStopCompanion(self: *AppState) bool {
-        const location = self.activeCompanionThreadLocation() orelse return false;
-        const project = &self.project_controller.projects.items[location.project_index];
-        const thread = &project.threads.items[location.thread_index];
-        if (!thread.isSendPendingForUi()) return false;
-        return self.abortThreadByLocalId(project.id, thread.local_thread_id);
+    pub fn liveCompanionTurnAlloc(self: *AppState, allocator: std.mem.Allocator) !?[]const u8 {
+        const thread = self.activeCompanionThread() orelse return null;
+        thread.send_state.mutex.lock();
+        defer thread.send_state.mutex.unlock();
+        const id = thread.send_state.daemon_turn_id orelse return null;
+        return try allocator.dupe(u8, id);
     }
 
     pub fn liveCompanionWorking(self: *AppState) bool {
         const thread = self.activeCompanionThread() orelse return false;
         return thread.isSendPendingForUi();
-    }
-
-    pub fn liveCompanionMessageCount(self: *AppState) usize {
-        const thread = self.activeCompanionThread() orelse return 0;
-        return thread.messages.items.len;
-    }
-
-    /// The newest assistant message after the first `count` messages.
-    pub fn liveCompanionReplySince(self: *AppState, count: usize) ?[]const u8 {
-        const thread = self.activeCompanionThread() orelse return null;
-        const messages = thread.messages.items;
-        var index = messages.len;
-        while (index > @min(count, messages.len)) {
-            index -= 1;
-            const message = messages[index];
-            if (message.role != .assistant or message.tool_call_id != null) continue;
-            if (std.mem.trim(u8, message.body, &std.ascii.whitespace).len > 0) return message.body;
-        }
-        return null;
     }
 
     /// `companion_status` tool: the crew and what needs the user, by title.
@@ -14894,6 +14865,7 @@ pub const AppState = struct {
         var needs: std.json.Array = .init(arena);
         for (companion.inbox[0..companion.inbox_count]) |*row| try needs.append(try liveChatRowJson(arena, row));
         var root: std.json.ObjectMap = .empty;
+        try root.put(arena, "scope", .{ .string = "linked crew and attention only; not all open or finished chats" });
         try root.put(arena, "companion_working", .{ .bool = self.liveCompanionWorking() });
         try root.put(arena, "crew", .{ .array = crew });
         try root.put(arena, "needs_you", .{ .array = needs });

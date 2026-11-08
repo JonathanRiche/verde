@@ -154,3 +154,131 @@ test "backgrounding drops the session token and an old host is unsupported" {
     try eql("insufficient_scope", (try r.receipt(denied)).@"error".?.code);
     try expect(r.pending("voice.provider.configure") == 0);
 }
+
+const voice_thread = "{\"thread\":{\"provider\":\"muse\",\"harness\":\"local_cli\",\"model_ref\":\"muse:default\",\"repository_id\":\"repo\"}}";
+
+fn acceptVoice(f: *Fixture, queued: bool) ![]const u8 {
+    _ = try f.reply("chat.thread.get", voice_thread);
+    const params = try f.params("chat.turn.start");
+    try eql("voice", p.s(params, "task_owner"));
+    try eql("repo", p.s(params, "repository_id"));
+    const turn = p.s(params, "turn_id");
+    _ = try f.reply("chat.turn.start", try h.encode(f.a(), .{ .turn_id = turn, .queued = queued }));
+    return turn;
+}
+
+test "voice request waits for acceptance, preserves drafts, and relays only its own turn" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    {
+        var tx = try h.Transaction.init(&f.host);
+        defer tx.deinit();
+        tx.state.chat.threads = try tx.allocator().alloc(@import("chat.zig").Thread, 1);
+        tx.state.chat.threads[0] = .{ .workspace_id = "ws", .id = "moss", .cwd = "/fixture", .metadata = .{ .local_thread_id = "moss", .title = "Moss" }, .loaded = true, .saved = .{ .text = "unsent typed draft" } };
+        const output = try tx.commit(&f.host, f.a());
+        _ = output;
+    }
+    const chat_before = try h.encode(f.a(), f.host.state.chat.threads[0].saved);
+    const first = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "first request" });
+    try eql("pending", (try f.receipt(first)).state);
+    const first_turn = try acceptVoice(&f, false);
+    try eql("succeeded", (try f.receipt(first)).state);
+    const first_tail = try f.find("chat.turn.tail");
+    const second = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "corrected request" });
+    const second_turn = try acceptVoice(&f, true);
+    try expect(!h.eq(first_turn, second_turn));
+    var second_tail: ?rpc.Call = null;
+    for (f.host.state.rpc.calls) |call| if (h.eq(call.method, "chat.turn.tail") and call.id != first_tail.id) {
+        second_tail = call;
+    };
+    _ = try f.respond(second_tail.?, try h.encode(f.a(), .{ .jsonrpc = "2.0", .id = second_tail.?.id, .result = .{ .status = "completed", .result_reply_text = "corrected answer" } }));
+    try eql("succeeded", (try f.receipt(second)).state);
+    _ = try f.respond(first_tail, try h.encode(f.a(), .{ .jsonrpc = "2.0", .id = first_tail.id, .result = .{ .status = "completed", .result_reply_text = "older answer" } }));
+    const rows = p.rows(p.get(try f.view(), "requests"));
+    try expect(rows.len == 2);
+    try eql(first, p.s(rows[0], "intent_id"));
+    try eql("older answer", p.s(rows[0], "reply"));
+    try eql(second, p.s(rows[1], "intent_id"));
+    try eql("corrected answer", p.s(rows[1], "reply"));
+    try eql(chat_before, try h.encode(f.a(), f.host.state.chat.threads[0].saved));
+}
+
+test "voice cancellation before acceptance cannot race a later start" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    const submit = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "stop this" });
+    const turn = f.host.state.voice.requests[0].turn_id;
+    const cancel = try f.intent("voice_request_cancel", .{ .turn_id = turn });
+    try eql("succeeded", (try f.receipt(cancel)).state);
+    try eql("failed", (try f.receipt(submit)).state);
+    _ = try f.reply("chat.thread.get", voice_thread);
+    try expect(f.pending("chat.turn.start") == 0);
+
+    _ = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "stop during start" });
+    _ = try f.reply("chat.thread.get", voice_thread);
+    const next_turn = p.s(try f.params("chat.turn.start"), "turn_id");
+    const stop = try f.intent("voice_request_cancel", .{ .turn_id = next_turn });
+    try expect(f.pending("chat.turn.cancel") == 0);
+    _ = try f.reply("chat.turn.start", try h.encode(f.a(), .{ .turn_id = next_turn, .queued = true }));
+    try expect(f.pending("chat.turn.cancel") == 1);
+    try eql(next_turn, p.s(try f.params("chat.turn.cancel"), "turn_id"));
+    try eql("pending", (try f.receipt(stop)).state);
+    _ = try f.reply("chat.turn.cancel", "{\"accepted\":true}");
+    try eql("succeeded", (try f.receipt(stop)).state);
+}
+
+test "voice tails paginate and retry queued turns without retracting acceptance" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    const id = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    _ = try acceptVoice(&f, true);
+    _ = try f.reject("chat.turn.tail", "not_found");
+    try eql("succeeded", (try f.receipt(id)).state);
+    f.now += 1001;
+    _ = try f.event("foreground", .{});
+    _ = try f.reply("chat.turn.tail", "{\"status\":\"completed\",\"events\":[{\"seq\":5}],\"has_more_events\":true}");
+    try expect(p.uint(p.get(try f.params("chat.turn.tail"), "after_seq")) == 5);
+    _ = try f.reply("chat.turn.tail", "{\"status\":\"completed\",\"result_reply_text\":\"full answer\"}");
+    try eql("full answer", p.s(p.rows(p.get(try f.view(), "requests"))[0], "reply"));
+}
+
+test "voice request failures and read-only devices never claim accepted" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    const id = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    _ = try f.reply("chat.thread.get", voice_thread);
+    _ = try f.reject("chat.turn.start", "invalid_state");
+    try eql("failed", (try f.receipt(id)).state);
+    try expect(f.pending("chat.turn.tail") == 0);
+    var r = try Fixture.init(&.{"chat:read"});
+    defer r.deinit();
+    const denied = try r.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    try eql("insufficient_scope", (try r.receipt(denied)).@"error".?.code);
+    try expect(r.pending("chat.thread.get") == 0);
+}
+
+test "voice stop remains available at request capacity and malformed cancel is uncertain" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    for (0..16) |_| _ = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    const busy = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    try eql("busy", (try f.receipt(busy)).@"error".?.code);
+    const stopped = try f.intent("voice_request_cancel", .{ .turn_id = f.host.state.voice.requests[0].turn_id });
+    try eql("succeeded", (try f.receipt(stopped)).state);
+    const other = try f.intent("voice_request_cancel", .{ .turn_id = "externally-started" });
+    _ = try f.reply("chat.turn.cancel", "{\"accepted\":false}");
+    try eql("uncertain", (try f.receipt(other)).state);
+}
+
+test "voice never replays an uncertain start" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    const id = try f.intent("voice_request_submit", .{ .workspace_id = "ws", .thread_id = "moss", .prompt = "request" });
+    _ = try f.reply("chat.thread.get", voice_thread);
+    const call = try f.find("chat.turn.start");
+    _ = try f.event("http_response", .{ .effect_id = call.effect_id, .generation = try std.fmt.allocPrint(f.a(), "{d}", .{f.host.state.generation}), .status = 503, .headers = .{}, .body_base64 = "", .@"error" = @as(?u8, null) });
+    try eql("uncertain", (try f.receipt(id)).state);
+    f.now += 1000;
+    _ = try f.event("foreground", .{});
+    try expect(f.pending("chat.turn.start") == 0);
+}

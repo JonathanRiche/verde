@@ -174,6 +174,7 @@ pub const types = .{
     .{ "VoiceTool", voice.Tool },
     .{ "VoiceSessionCompanion", voice.SessionCompanion },
     .{ "VoiceSession", voice.Session },
+    .{ "VoiceRequest", @import("voice_requests.zig").RequestView },
     .{ "VoiceView", voice.View },
     .{ "VoiceQuery", wire.Query(voice.View) },
     .{ "AttachmentItem", attachments.Item },

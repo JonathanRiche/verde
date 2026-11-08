@@ -124,6 +124,18 @@ struct LiveVoiceSession: Decodable, Equatable {
     }
 }
 
+struct LiveVoiceRequest: Decodable, Equatable {
+    var intent_id: String
+    var workspace_id: String
+    var thread_id: String
+    var turn_id: String
+    var prompt: String
+    var status: String
+    var reply: String
+    var error_code: String?
+    var finished: Bool { ["completed", "failed", "aborted", "interrupted", "uncertain"].contains(status) }
+}
+
 struct LiveVoiceView: Decodable, Equatable {
     var loaded = false
     var loading = false
@@ -131,8 +143,9 @@ struct LiveVoiceView: Decodable, Equatable {
     var default_provider = ""
     var providers: [LiveVoiceProvider] = []
     var session: LiveVoiceSession?
+    var requests: [LiveVoiceRequest] = []
 
-    private enum Keys: String, CodingKey { case loaded, loading, supported, default_provider, providers, session }
+    private enum Keys: String, CodingKey { case loaded, loading, supported, default_provider, providers, session, requests }
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -142,6 +155,7 @@ struct LiveVoiceView: Decodable, Equatable {
         default_provider = try c.decodeIfPresent(String.self, forKey: .default_provider) ?? ""
         providers = try c.decodeIfPresent([LiveVoiceProvider].self, forKey: .providers) ?? []
         session = try c.decodeIfPresent(LiveVoiceSession.self, forKey: .session)
+        requests = try c.decodeIfPresent([LiveVoiceRequest].self, forKey: .requests) ?? []
     }
 }
 
@@ -239,11 +253,35 @@ struct LiveVoiceClient {
             let operation = data.flatMap { try? JSONDecoder().decode(OperationsQuery.self, from: $0) }?
                 .data?.items.first { $0.intent_id == intent }
             if let operation, operation.state != "pending" {
-                return operation.state == "failed" ? (operation.error?.rpc_code ?? operation.error?.code ?? "failed") : nil
+                if operation.state == "succeeded" { return nil }
+                if operation.state == "uncertain" { return "delivery_uncertain" }
+                return operation.error?.rpc_code ?? operation.error?.code ?? operation.state
             }
             try await Task.sleep(for: .milliseconds(100))
         }
-        return "timeout"
+        return "delivery_uncertain"
+    }
+
+    func requests() async -> [LiveVoiceRequest] {
+        guard let host = browse.session?.host else { return [] }
+        return decodeLiveVoiceView(try? await host.query("voice"))?.requests ?? []
+    }
+
+    func request(_ id: String) async -> LiveVoiceRequest? {
+        let current = await requests()
+        return current.first { $0.intent_id == id }
+    }
+
+    func submitRequest(id: String, workspace: String, thread: String, prompt: String) async throws -> LiveVoiceRequest {
+        let (host, intent) = try await send("voice_request_submit", ["intent_id": .string(id), "workspace_id": .string(workspace), "thread_id": .string(thread), "prompt": .string(prompt)])
+        if let code = try await settle(host, intent) { throw LiveVoiceError.failed(code) }
+        guard let accepted = await request(id) else { throw LiveVoiceError.failed("delivery_uncertain") }
+        return accepted
+    }
+
+    func cancelRequest(turn: String) async throws {
+        let (host, intent) = try await send("voice_request_cancel", ["intent_id": .string(UUID().uuidString), "turn_id": .string(turn)])
+        if let code = try await settle(host, intent) { throw LiveVoiceError.failed(code) }
     }
 
     func refresh() async {

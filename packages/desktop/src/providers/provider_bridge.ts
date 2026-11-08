@@ -1134,8 +1134,13 @@ function formatClaudeUsageSummary(usage, contextUsage) {
 }
 
 function claudeRejectedRateLimitMessage(message) {
-  if (message?.type !== "rate_limit_event" || message?.rate_limit_info?.status !== "rejected") return null;
-  switch (message.rate_limit_info.rateLimitType) {
+  const info = message?.type === "rate_limit_event" ? message.rate_limit_info : null;
+  if (info?.status !== "rejected") return null;
+  // A plan window can be exhausted while usage credits keep the turn running;
+  // only an exhausted overage window (or credits unavailable) stops it.
+  const overageCovers = info.overageStatus === "allowed" || info.overageStatus === "allowed_warning" || info.isUsingOverage === true;
+  if (overageCovers && info.rateLimitType !== "overage") return null;
+  switch (info.rateLimitType) {
     case "five_hour":
       return "Claude five_hour usage limit has been reached.";
     case "seven_day":

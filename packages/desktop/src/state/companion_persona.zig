@@ -52,6 +52,10 @@ pub fn noteAlloc(
         \\all of Verde across every workspace, not just the folder your shell starts in ({s}, workspace_id {s}).
         \\Your job is to run work, not to do it all yourself:
         \\- Use the Verde MCP tools. Start with list_workspaces / list_panes / list_processes to see the machine.
+        \\- Find earlier or closed work with list_chat_threads (query searches titles/descriptions across workspaces),
+        \\  then read_chat_thread by its stable ID. Empty crew status does not mean no other work exists.
+        \\- To close panes the user requests, inspect list_panes and call close_pane with explicit workspace and pane_id.
+        \\  clear_linked_chats only unlinks the crew; it does not close panes.
         \\- Your own thread id is {s}. Delegate real coding to chats with open_chat in whichever workspace fits (pick
         \\  the provider and model that fit the task) and steer them with send_chat_message or queue_chat_followup.
         \\  Always pass parent_thread_id "{s}" to open_chat (or `--parent-thread-id {s}` to `verde live chat open`):

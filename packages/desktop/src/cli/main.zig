@@ -3282,13 +3282,35 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             try sendLiveRequest(allocator, out, io, "chat.open", open_params, json);
             return;
         }
-        const response = sendLiveRequestAlloc(allocator, io, "chat.open", open_params, 1) catch |err| {
+        // A GUI-created thread is not necessarily persisted when chat.open
+        // returns. Linking it immediately can reject the child as missing.
+        // Match MCP: validate, create durably, link, then present that identity.
+        const validation = sendLiveRequestAlloc(allocator, io, "chat.open.validate", open_params, 1) catch |err| {
             liveUnavailable(out, err, json);
         };
-        defer allocator.free(response);
-        mcpLinkOpenedChat(allocator, io, response, parent_thread_id) catch |err| {
+        defer allocator.free(validation);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, validation, .{});
+        defer parsed.deinit();
+        if (chatOpenValidationRoute(parsed.value) != .validated) {
+            if (json) try out.stdout("{s}\n", .{validation}) else try printLiveResponse(out, validation);
+            exitIfResponseFailed(validation);
+            return;
+        }
+        const validated = parseChatOpenValidation(parsed.value, workspace_id, provider) orelse return error.InvalidChatOpenResponse;
+        const durable = try chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
+            .workspace_id = validated.workspace_id,
+            .provider = validated.provider,
+            .model = validated.model,
+            .reasoning_effort = validated.reasoning_effort,
+            .reasoning_variant = validated.reasoning_variant,
+            .fast_mode = if (creation_settings.fast_mode != null) validated.fast_mode else null,
+        });
+        defer allocator.free(durable);
+        mcpLinkOpenedChat(allocator, io, durable, parent_thread_id) catch |err| {
             try out.stderr("warning: chat opened but could not link it to parent {s}: {s}\n", .{ parent_thread_id.?, @errorName(err) });
         };
+        const response = try presentDaemonChatOpenAlloc(allocator, io, durable, target_pane_id, open_params.axis, open_params.focus);
+        defer allocator.free(response);
         if (json) {
             try out.stdout("{s}\n", .{response});
             exitIfResponseFailed(response);
@@ -5228,6 +5250,17 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try s.objectField("tools");
     try s.beginArray();
     try writeMcpTypedTool(&s, "list_workspaces", "List durable Verde workspaces and their repository projections from the session daemon.", &.{});
+    try writeMcpTypedTool(&s, "list_chat_threads", "Search durable chat history by title/description, including closed chats. Omit workspace_id to search all workspaces. Returns stable thread IDs and a pagination cursor; use read_chat_thread for contents.", &.{
+        .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace ID; omit for all workspaces." },
+        .{ .name = "query", .type_name = "string", .description = "Case-insensitive title/description search." },
+        .{ .name = "open", .type_name = "boolean", .description = "Omit for open and closed chats; false for closed history." },
+        .{ .name = "limit", .type_name = "integer", .description = "Page size, 1 to 100; defaults to 50." },
+        .{ .name = "cursor", .type_name = "string", .description = "Opaque next_cursor from the same query." },
+    });
+    try writeMcpTypedTool(&s, "close_pane", "Close a specific desktop pane requested by the user. Inspect list_panes first and use its stable pane ID and explicit workspace. Closing a chat pane retains its transcript; closing a terminal may stop its session. Unlinking a crew chat does not close its pane.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Workspace owning the pane.", .required = true },
+        .{ .name = "pane_id", .type_name = "integer", .description = "Stable pane ID from list_panes.", .required = true },
+    });
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace, grouped into workspace tabs (a split tile is one tab).", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
@@ -5475,6 +5508,7 @@ fn mcpToolAnnotations(name: []const u8) McpToolAnnotations {
         std.mem.eql(u8, name, "delete_schedule") or
         std.mem.eql(u8, name, "restart_process") or
         std.mem.eql(u8, name, "stop_chat_turn") or
+        std.mem.eql(u8, name, "close_pane") or
         std.mem.eql(u8, name, "reset_browser");
     const open_world = std.mem.eql(u8, name, "open_browser") or
         std.mem.eql(u8, name, "navigate_browser") or
@@ -6230,6 +6264,7 @@ fn mcpToolsCall(
                         daemon_response,
                         target_pane_id,
                         axis orelse "horizontal",
+                        false,
                     );
                     defer allocator.free(presented);
                     return try mcpToolTextResult(allocator, out, id_value, presented, tool_name);
@@ -6260,6 +6295,29 @@ fn mcpToolsCall(
             ) catch |err| return try mcpDaemonUnavailableError(allocator, out, id_value, err);
             defer allocator.free(daemon_response);
             return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
+        }
+        if (std.mem.eql(u8, tool_name, "list_chat_threads")) {
+            const limit = mcpArgU32(arguments, "limit") orelse 50;
+            if (limit == 0 or limit > 100 or
+                (mcpArgIsNonNull(arguments, "limit") and mcpArgU32(arguments, "limit") == null) or
+                (mcpArgIsNonNull(arguments, "open") and mcpArgBool(arguments, "open") == null))
+                return try mcpError(allocator, out, id_value, -32602, "invalid limit or open filter");
+            const response = try chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_LIST, headless.store.ThreadListRequest{
+                .workspace_id = mcpArgString(arguments, "workspace_id") orelse "",
+                .query = mcpArgString(arguments, "query") orelse "",
+                .open = mcpArgBool(arguments, "open"),
+                .limit = limit,
+                .cursor = mcpArgString(arguments, "cursor"),
+                .recent_first = true,
+            });
+            defer allocator.free(response);
+            return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        }
+        if (std.mem.eql(u8, tool_name, "close_pane")) {
+            const target = mcpArgU32(arguments, "pane_id") orelse return try mcpError(allocator, out, id_value, -32602, "close_pane requires pane_id");
+            const target_workspace = mcpArgString(arguments, "workspace") orelse return try mcpError(allocator, out, id_value, -32602, "close_pane requires workspace");
+            if (std.mem.trim(u8, target_workspace, &std.ascii.whitespace).len == 0) return try mcpError(allocator, out, id_value, -32602, "close_pane requires an explicit workspace");
+            break :blk sendLiveRequestAlloc(allocator, io, "pane.close", .{ .workspace = target_workspace, .pane = target }, 1);
         }
         if (std.mem.eql(u8, tool_name, "list_panes")) {
             break :blk sendLiveRequestAlloc(allocator, io, "panes", .{ .workspace = workspace }, 1);
@@ -7748,6 +7806,7 @@ fn presentDaemonChatOpenAlloc(
     daemon_response: []const u8,
     target_pane_id: ?u32,
     axis: []const u8,
+    focus: bool,
 ) ![]u8 {
     var daemon_parsed = try std.json.parseFromSlice(std.json.Value, allocator, daemon_response, .{});
     defer daemon_parsed.deinit();
@@ -7771,7 +7830,7 @@ fn presentDaemonChatOpenAlloc(
             .store_revision = store_revision,
             .target_pane_id = target_pane_id,
             .axis = axis,
-            .focus = false,
+            .focus = focus,
         }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
             ambiguous = true;
             sleepChatPresentationRetry(io, deadline_ms);
@@ -9817,4 +9876,30 @@ test "schedule add flags build create params and reject strays" {
 
 test {
     _ = lease_run;
+}
+
+test "MCP exposes durable chat search and explicitly addressed pane closure" {
+    const a = std.testing.allocator;
+    var writer: std.Io.Writer.Allocating = .init(a);
+    defer writer.deinit();
+    try mcpToolsList(a, .{ .io = std.testing.io, .stdout_writer = &writer.writer }, .{ .integer = 1 });
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, writer.written(), .{});
+    defer parsed.deinit();
+    var search = false;
+    var close = false;
+    for (parsed.value.object.get("result").?.object.get("tools").?.array.items) |tool| {
+        const name = tool.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "list_chat_threads")) {
+            search = true;
+            try std.testing.expect(tool.object.get("annotations").?.object.get("readOnlyHint").?.bool);
+            try std.testing.expect(tool.object.get("inputSchema").?.object.get("properties").?.object.contains("cursor"));
+        }
+        if (std.mem.eql(u8, name, "close_pane")) {
+            close = true;
+            try std.testing.expect(tool.object.get("annotations").?.object.get("destructiveHint").?.bool);
+            const required = tool.object.get("inputSchema").?.object.get("required").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), required.len);
+        }
+    }
+    try std.testing.expect(search and close);
 }

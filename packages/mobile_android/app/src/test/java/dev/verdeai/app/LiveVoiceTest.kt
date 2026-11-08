@@ -7,6 +7,15 @@ import org.junit.Test
 import java.util.Base64
 
 class LiveVoiceTest {
+    @Test fun replyContextPreservesQualificationsAndDoesNotSplitUnicode() {
+        val qualified = "Done. " + "detail ".repeat(150) + "However, the second pane could not be closed."
+        assertTrue(companionUpdate(qualified).contains("second pane could not be closed"))
+        val long = "x".repeat(COMPANION_UPDATE_CHARS - 2) + "🌿".repeat(100)
+        val clipped = companionUpdate(long)
+        assertTrue(clipped.endsWith("…"))
+        assertFalse(clipped[clipped.length - 2].isHighSurrogate())
+    }
+
     private fun obj(text: String) = Json.parseToJsonElement(text).jsonObject
     private fun JsonObject.o(name: String) = this[name]!!.jsonObject
     private fun JsonObject.s(name: String) = this[name]!!.jsonPrimitive.content

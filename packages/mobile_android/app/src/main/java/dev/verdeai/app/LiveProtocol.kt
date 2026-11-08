@@ -277,12 +277,14 @@ internal fun resamplePcm16(pcm: ByteArray, from: Int, to: Int): ByteArray {
 
 // ---- Tools (pure parts) ----
 
-internal const val COMPANION_UPDATE_CHARS = 600
+internal const val COMPANION_UPDATE_CHARS = 16000
 
 /** The text injected into the live session when the companion's turn finishes. */
 internal fun companionUpdate(reply: String): String {
     val plain = speechText(reply).ifBlank { reply.trim() }
-    val clipped = if (plain.length <= COMPANION_UPDATE_CHARS) plain else plain.substring(0, COMPANION_UPDATE_CHARS - 1).trimEnd() + "…"
+    var end = minOf(plain.length, COMPANION_UPDATE_CHARS - 1)
+    if (end < plain.length && end > 0 && plain[end - 1].isHighSurrogate()) end--
+    val clipped = if (plain.length <= COMPANION_UPDATE_CHARS) plain else plain.substring(0, end).trimEnd() + "…"
     return "companion_update: $clipped"
 }
 
@@ -315,6 +317,7 @@ internal fun approvalCandidates(needs: List<Pane>, crew: List<CompanionLink>): L
 
 /** `companion_status` result: crew and what needs the user, by title and workspace label. */
 internal fun companionStatusJson(crew: List<CompanionLink>, needs: List<Pane>, workspaceLabel: (String) -> String?): JsonObject = buildJsonObject {
+    put("scope", "linked crew and attention only; not all open or finished chats")
     putJsonArray("crew") {
         crew.forEach { link ->
             addJsonObject {

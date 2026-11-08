@@ -82,6 +82,10 @@ final class LiveVoice {
     @ObservationIgnored private var watchers: [Task<Void, Never>] = []
     @ObservationIgnored private var transcript: TranscriptModel?
     @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var replyRevision = 0
+    @ObservationIgnored private var latestRequestID: String?
+    @ObservationIgnored private var supersededRequests = Set<String>()
+    @ObservationIgnored private var callEpoch = 0
     @ObservationIgnored private var reconnects = 0
     @ObservationIgnored private var lastActivity = Date()
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
@@ -222,6 +226,10 @@ final class LiveVoice {
     }
 
     private func teardown() {
+        callEpoch += 1
+        replyRevision += 1
+        latestRequestID = nil
+        supersededRequests.removeAll()
         generation += 1
         receiver?.cancel(); receiver = nil
         watchdog?.cancel(); watchdog = nil
@@ -311,6 +319,9 @@ final class LiveVoice {
     private func reconnect(_ current: Int) async {
         guard current == generation, reconnects < Self.maxReconnects else { return fail("The live connection ended.") }
         reconnects += 1
+        phase = .connecting
+        proto = nil
+        sessionReady = false
         generation += 1
         let next = generation
         receiver?.cancel()
@@ -429,12 +440,44 @@ final class LiveVoice {
         case LiveToolName.askCompanion:
             guard let request = stringArgument(args["request"]) else { return toolError("missing_request") }
             guard let conversation = await companion.ensureConversation(), current == generation else { return toolError("no_companion_chat") }
+            if boolArgument(args["supersedes_previous"]) == true,
+               let prior = stringArgument(args["supersedes_request_id"]) ?? latestRequestID { supersededRequests.insert(prior) }
+            let revision = replyRevision
+            let epoch = callEpoch
+            let id = UUID().uuidString
+            latestRequestID = id
+            let spoken = userCaption
+            let prompt = request + (spoken.isEmpty ? "" : "\n\nLatest voice transcript (may contain transcription errors; the corrected request above takes precedence):\n" + spoken)
+            let client = LiveVoiceClient(browse: companion.browse)
+            do {
+                let accepted = try await client.submitRequest(id: id, workspace: conversation.workspace, thread: conversation.thread, prompt: prompt)
+                note("→ Asked \(companion.active?.name ?? "the companion"): \(request)")
+                watchers.append(Task { [weak self] in
+                    await self?.relayRequest(client, id: id, turn: accepted.turn_id, task: request, epoch: epoch, revision: revision)
+                })
+                return jsonString(["accepted": true, "request_id": id, "turn_id": accepted.turn_id, "status": accepted.status])
+            } catch LiveVoiceError.failed(let code) {
+                if code == "delivery_uncertain" { return jsonString(["accepted": NSNull(), "request_id": id, "error": code]) }
+                return jsonString(["accepted": false, "request_id": id, "error": code])
+            } catch { return jsonString(["accepted": NSNull(), "request_id": id, "error": "delivery_uncertain"]) }
+        case LiveToolName.stopCompanion:
+            guard let conversation = await companion.ensureConversation() else { return toolError("no_companion_chat") }
             let model = companionTranscript(conversation)
-            let baseline = lastAssistant(model)?.id
-            model.input.ask(request, voice: true)
-            note("→ Asked \(companion.active?.name ?? "the companion"): \(request)")
-            watchers.append(Task { [weak self] in await self?.relayReply(model, after: baseline, generation: current) })
-            return jsonString(["accepted": true])
+            let client = LiveVoiceClient(browse: companion.browse)
+            let requests = await client.requests()
+            var turns = Set(requests.filter {
+                $0.workspace_id == conversation.workspace && $0.thread_id == conversation.thread && ["sending", "queued", "running", "waiting_approval", "uncertain"].contains($0.status)
+            }.map { $0.turn_id })
+            if let turn = model.state.turn { turns.insert(turn.turn_id) }
+            guard !turns.isEmpty else { return jsonString(["stopped": false, "error": "not_running"]) }
+            replyRevision += 1
+            var unconfirmed: [String] = []
+            for turn in turns {
+                do { try await client.cancelRequest(turn: turn) }
+                catch { unconfirmed.append(turn) }
+            }
+            if !unconfirmed.isEmpty { return jsonString(["stopped": NSNull(), "error": "delivery_uncertain", "unconfirmed_turns": unconfirmed]) }
+            return jsonString(["stopped": true])
         case LiveToolName.companionStatus:
             let labels = Dictionary((companion.browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
             return companionStatusJSON(name: companion.active?.name ?? "Companion", status: companion.presence.status,
@@ -469,26 +512,18 @@ final class LiveVoice {
         return model
     }
 
-    private func lastAssistant(_ model: TranscriptModel) -> ChatRow? {
-        model.thread?.rows.last { $0.role == "assistant" && $0.kind == "message" }
-    }
-
-    /// When the companion's turn for an `ask_companion` finishes, tells the live model what it said.
-    private func relayReply(_ model: TranscriptModel, after baseline: String?, generation current: Int) async {
+    /// Relay only the accepted turn; corrections and ended calls retire older relays.
+    private func relayRequest(_ client: LiveVoiceClient, id: String, turn: String, task: String, epoch: Int, revision: Int) async {
         let start = ContinuousClock.now
-        var started = false
-        while !Task.isCancelled, current == generation, ContinuousClock.now - start < .seconds(15 * 60) {
-            let running = model.state.turn != nil
-            if running { started = true }
-            let elapsed = ContinuousClock.now - start
-            if !running, let reply = lastAssistant(model), reply.id != baseline, started || elapsed > .seconds(3) {
-                if let proto { proto.inject(companionUpdateText(reply.body)).forEach(send) }
+        while !Task.isCancelled, epoch == callEpoch, revision == replyRevision, !supersededRequests.contains(id), ContinuousClock.now - start < .seconds(30 * 60) {
+            if let result = await client.request(id), result.turn_id == turn, result.finished,
+               epoch == callEpoch, revision == replyRevision, !supersededRequests.contains(id), let proto, phase == .live {
+                let body = result.reply.isEmpty ? "Request ended with status \(result.status)." : result.reply
+                proto.inject("Request \(id), turn \(turn), task: \(String(task.prefix(2000)))\n" + companionUpdateText(body)).forEach(send)
                 note("← \(companion.active?.name ?? "Companion") replied")
                 return
             }
-            // The turn never started (e.g. the send was refused).
-            if !started && elapsed > .seconds(30) { return }
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 }

@@ -34,6 +34,7 @@ pub const IntegrationProvider = enum {
     fx,
     grok,
     antigravity,
+    muse,
 };
 
 pub const RegistrationStatus = enum {
@@ -54,6 +55,7 @@ pub const McpSummary = struct {
     fx: RegistrationStatus = .unavailable,
     grok: RegistrationStatus = .unavailable,
     antigravity: RegistrationStatus = .unavailable,
+    muse: RegistrationStatus = .unavailable,
 
     pub fn forProvider(self: McpSummary, provider: IntegrationProvider) RegistrationStatus {
         return switch (provider) {
@@ -66,6 +68,7 @@ pub const McpSummary = struct {
             .fx => self.fx,
             .grok => self.grok,
             .antigravity => self.antigravity,
+            .muse => self.muse,
         };
     }
 

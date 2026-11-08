@@ -449,10 +449,19 @@ pub fn instructionsAlloc(allocator: std.mem.Allocator, name: []const u8, charact
         \\Talk naturally and briefly, like a sharp colleague on a call. Never read code, paths, or long lists aloud.
         \\You cannot see code or run anything yourself. For any real work, status beyond what the tools return,
         \\or anything you are unsure about, call ask_companion with a clear, complete request; tell the user you're on it,
-        \\and keep chatting while it works. When a companion_update arrives, summarize it in a sentence or two.
-        \\If the user corrects or redirects work in progress, call ask_companion with the change: it reaches the
-        \\running work right away. If they want the companion to stop, call stop_companion.
-        \\Use companion_status for "what's running / what needs me". Only call decide_approval after the user clearly
+        \\and keep chatting while it works. A bounded recent conversation is supplied below when available; older history may be missing.
+        \\For references to earlier work, ask the companion to read that history instead of asking the user to repeat it.
+        \\In Verde, panes are the chat and terminal tiles; spoken "pins" or "pains" may mean panes. Respect explicit spelling.
+        \\Send a self-contained request with the user's intended task, named workspace/chat, and any correction.
+        \\If the user corrects or redirects work, call ask_companion with the full corrected task. Set supersedes_previous=true for a correction, and supersedes_request_id to the earlier request_id when known; otherwise it replaces the latest request. Leave it false for independent tasks. Delivery may steer
+        \\the current turn or queue a follow-up; acceptance does not mean the work has finished. Only accepted=true confirms delivery; accepted=null is uncertain. Check the request before retrying to avoid duplicate work.
+        \\When a companion_update arrives, summarize it briefly only if it answers the current request. An update
+        \\may belong to an earlier request: do not repeat an interpretation the user has already corrected.
+        \\companion_status lists the linked crew and chats needing attention, not every open or finished chat.
+        \\An empty crew does not mean nothing is running or that a chat does not exist. For workspace-wide status,
+        \\finished work, finding threads, commits, pushes, releases, or pane cleanup, call ask_companion to inspect them.
+        \\If asked to stop work, call stop_companion and report its actual outcome.
+        \\Only call decide_approval after the user clearly
         \\says to approve or deny a specific chat, and read back what you approved.{s}{s}
     , .{ name, character_tagline, if (trimmed.len > 0) "\nStanding orders from the user: " else "", trimmed });
 }
@@ -460,9 +469,9 @@ pub fn instructionsAlloc(allocator: std.mem.Allocator, name: []const u8, charact
 /// Tool schemas shared by every provider adapter (JSON Schema parameters).
 pub const TOOLS_JSON =
     \\[
-    \\ {"name":"ask_companion","description":"Hand a request to the user's Verde companion, which can open and steer coding chats in any workspace, run processes, and report back. While it is already working, the request steers that work. Returns once the request is accepted; the companion's reply arrives later as a companion_update message.","parameters":{"type":"object","properties":{"request":{"type":"string","description":"The complete request in plain language."}},"required":["request"]}},
+    \\ {"name":"ask_companion","description":"Ask the companion to inspect history, find open or finished chats, check commits/releases, manage panes, or run work across workspaces. A busy companion may be steered or receive a queued follow-up. Acceptance is not completion; a reply arrives later as companion_update.","parameters":{"type":"object","properties":{"request":{"type":"string","description":"The self-contained task, including the intended workspace/chat and the full corrected request when the user corrects you."},"supersedes_previous":{"type":"boolean","description":"True only when this corrects or replaces an earlier request; retires outdated spoken replies. False for independent work."},"supersedes_request_id":{"type":"string","description":"The earlier request_id being corrected, when known. Omit to supersede only the latest request."}},"required":["request"]}},
     \\ {"name":"stop_companion","description":"Stop the companion's current work right now, when the user asks to stop, cancel, or interrupt it.","parameters":{"type":"object","properties":{}}},
-    \\ {"name":"companion_status","description":"Current orchestration status: chats running in the companion's crew and chats anywhere that need the user's approval or input.","parameters":{"type":"object","properties":{}}},
+    \\ {"name":"companion_status","description":"Limited snapshot of the companion's linked crew and chats needing attention. Not a list of all running, open, or finished chats. An empty result does not establish that no work exists. Use ask_companion to find other chats or inspect previous work.","parameters":{"type":"object","properties":{}}},
     \\ {"name":"decide_approval","description":"Approve or deny a pending approval for a specific chat, only after the user explicitly asked to.","parameters":{"type":"object","properties":{"chat":{"type":"string","description":"Chat title or id from companion_status."},"approve":{"type":"boolean"}},"required":["chat","approve"]}}
     \\]
 ;

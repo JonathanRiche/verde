@@ -1301,6 +1301,28 @@ data class EventVoiceProviderConfigure(
 ) : Event()
 
 @Serializable
+@SerialName("voice_request_submit")
+data class EventVoiceRequestSubmit(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `prompt`: String,
+) : Event()
+
+@Serializable
+@SerialName("voice_request_cancel")
+data class EventVoiceRequestCancel(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `turn_id`: String,
+) : Event()
+
+@Serializable
 @SerialName("voice_session_create")
 data class EventVoiceSessionCreate(
     val `api_version`: Long = 1,
@@ -2776,6 +2798,18 @@ data class VoiceSession(
 )
 
 @Serializable
+data class VoiceRequest(
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `turn_id`: String,
+    val `prompt`: String,
+    val `status`: String,
+    val `reply`: String,
+    val `error_code`: String? = null,
+)
+
+@Serializable
 data class VoiceView(
     val `loaded`: Boolean = false,
     val `loading`: Boolean = false,
@@ -2784,6 +2818,7 @@ data class VoiceView(
     val `default_provider`: String? = null,
     val `providers`: List<VoiceProvider> = emptyList(),
     val `session`: VoiceSession? = null,
+    val `requests`: List<VoiceRequest> = emptyList(),
     val `error`: LocalError? = null,
 )
 

@@ -138,6 +138,10 @@ internal class LiveVoice(
     @OptIn(ExperimentalCoroutinesApi::class)
     private val audio = LiveAudioLane(Dispatchers.IO.limitedParallelism(1), acquire = { route.acquire() }, release = { route.release() })
     private var job: Job? = null
+    private val replyJobs = mutableListOf<Job>()
+    private var replyRevision = 0L
+    private var latestRequestId: String? = null
+    private val supersededRequests = mutableSetOf<String>()
     private val hangUp: () -> Unit = { stop() }
     private var signals: Channel<Signal>? = null
     private var socket: WebSocket? = null
@@ -174,9 +178,9 @@ internal class LiveVoice(
 
     private suspend fun core(): CoreHost? = try { hosts.activeCore() } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
 
-    private suspend fun dispatch(build: (Long, Long, String) -> Event): Pair<CoreHost, String>? {
+    private suspend fun dispatch(intentId: String = UUID.randomUUID().toString(), build: (Long, Long, String) -> Event): Pair<CoreHost, String>? {
         val host = core() ?: return null
-        val id = UUID.randomUUID().toString()
+        val id = intentId
         return try { host.send { n, w -> build(n, w, id) }; host to id }
         catch (e: CancellationException) { throw e } catch (_: Exception) { null }
     }
@@ -207,6 +211,10 @@ internal class LiveVoice(
 
     fun start() {
         if (ui.value.active) return
+        // A new call also retires relays after a natural disconnect or failure.
+        replyRevision++
+        replyJobs.forEach { it.cancel() }; replyJobs.clear()
+        latestRequestId = null; supersededRequests.clear()
         mutableUi.value = LiveUi(phase = LivePhase.Connecting)
         connectingSince = System.currentTimeMillis()
         val name = companion.state.value.active?.name.orEmpty()
@@ -308,6 +316,9 @@ internal class LiveVoice(
 
     /** Ends Live now; cancelling the conversation releases the socket, mic, speaker and audio route. */
     fun stop() {
+        replyRevision++
+        latestRequestId = null; supersededRequests.clear()
+        replyJobs.forEach { it.cancel() }; replyJobs.clear()
         job?.cancel()
         job = null
         mutableUi.value = LiveUi()
@@ -417,6 +428,7 @@ internal class LiveVoice(
                         transcribe(event)
                     }
                     is LiveEvent.ToolCall -> viewModelScope.launch {
+                        if (socket !== ws) return@launch
                         val output = try { runTool(event.name, event.arguments) } catch (e: CancellationException) { throw e }
                             catch (_: Exception) { buildJsonObject { put("error", "failed") } }
                         if (socket === ws) proto.toolResult(event.callId, event.name, output).forEach { ws.send(it) }
@@ -463,7 +475,9 @@ internal class LiveVoice(
     }
 
     private suspend fun runTool(name: String, arguments: JsonObject): JsonObject = when (name) {
-        "ask_companion" -> ask((arguments["request"] as? JsonPrimitive)?.contentOrNull.orEmpty())
+        "ask_companion" -> ask((arguments["request"] as? JsonPrimitive)?.contentOrNull.orEmpty(), (arguments["supersedes_previous"] as? JsonPrimitive)?.booleanOrNull == true,
+            (arguments["supersedes_request_id"] as? JsonPrimitive)?.contentOrNull)
+        "stop_companion" -> stopCompanion()
         "companion_status" -> snapshot()?.let { companionStatusJson(it.crew, it.needs, workspaceLabel) } ?: buildJsonObject { put("error", "not_ready") }
         "decide_approval" -> decide((arguments["chat"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
             (arguments["approve"] as? JsonPrimitive)?.booleanOrNull)
@@ -471,32 +485,76 @@ internal class LiveVoice(
     }
 
     /** Hands [request] to the companion as a spoken turn and reports its reply into the conversation when done. */
-    private fun ask(request: String): JsonObject {
+    private suspend fun ask(request: String, supersedes: Boolean, supersedesId: String?): JsonObject {
         if (request.isBlank()) return buildJsonObject { put("accepted", false); put("error", "empty_request") }
-        val model = companionTranscript
-        if (model == null) {
-            companion.retrySetup()
-            return buildJsonObject { put("accepted", false); put("error", "companion_not_ready") }
+        val target = companion.state.value.active ?: return buildJsonObject { put("accepted", false); put("error", "companion_not_ready") }
+        if (target.thread_id.isEmpty()) return buildJsonObject { put("accepted", false); put("error", "companion_not_ready") }
+        if (supersedes) (supersedesId ?: latestRequestId)?.let { supersededRequests.add(it) }
+        val revision = replyRevision
+        val spoken = ui.value.captions.lastOrNull { it.user }?.text.orEmpty()
+        val prompt = request.trim() + if (spoken.isBlank()) "" else "\n\nLatest voice transcript (may contain transcription errors; the corrected request above takes precedence):\n$spoken"
+        // Assign identity before any suspension so concurrent requests cannot
+        // reverse which one a later correction supersedes.
+        val id = UUID.randomUUID().toString()
+        latestRequestId = id
+        val sent = dispatch(id) { n, w, intent -> EventVoiceRequestSubmit(now_ms=n, wall_time_ms=w, intent_id=intent,
+            workspace_id=target.home_workspace_id, thread_id=target.thread_id, prompt=prompt) }
+            ?: return buildJsonObject { put("accepted", false); put("error", "offline") }
+        val host = sent.first
+        val op = withTimeoutOrNull(APPROVAL_WAIT_MS) { awaitOperation(host, id) }
+        if (op?.state != "succeeded") return buildJsonObject {
+            if (op == null || op.state == "uncertain") put("accepted", JsonNull) else put("accepted", false)
+            put("request_id", id); put("error", op?.error?.code ?: "delivery_uncertain")
+            put("guidance", "Delivery is not confirmed. Check this request before retrying.")
         }
-        val before = model.state.value.thread?.rows.orEmpty().map { it.id }.toSet()
-        val name = companion.state.value.active?.name?.ifBlank { null } ?: "Companion"
-        transcript?.system("\u2192 Asked $name: ${request.trim()}", System.currentTimeMillis())
-        model.composer.sendSpoken(request)
-        viewModelScope.launch {
-            var started = false
+        val accepted = decodeVoice(host.query("voice"))?.requests?.find { it.intent_id == id }
+            ?: return buildJsonObject { put("accepted", JsonNull); put("request_id", id); put("error", "delivery_uncertain") }
+        if (revision != replyRevision) return buildJsonObject {
+            put("accepted", true); put("request_id", id); put("turn_id", accepted.turn_id)
+        }
+        transcript?.system("→ Asked ${target.name}: ${request.trim()}", System.currentTimeMillis())
+        replyJobs.removeAll { it.isCompleted }
+        replyJobs += viewModelScope.launch {
             val finished = withTimeoutOrNull(ASK_WAIT_MS) {
-                model.state.first { state ->
-                    if (state.turn != null) started = true
-                    started && state.turn == null
-                }
+                host.views.mapNotNull { decodeVoice(it["voice"])?.requests?.find { r -> r.intent_id == id && r.turn_id == accepted.turn_id } }
+                    .first { it.status in setOf("completed", "failed", "aborted", "interrupted", "uncertain") }
             } ?: return@launch
-            val reply = finished.thread?.rows.orEmpty().lastOrNull { it.id !in before && it.role == "assistant" && it.kind == "message" }?.body
-            if (!reply.isNullOrBlank() && ui.value.phase == LivePhase.Live) {
-                transcript?.system("\u2190 $name replied", System.currentTimeMillis())
-                inject(companionUpdate(reply))
+            // A completed reply must survive the short provider reconnect.
+            val live = withTimeoutOrNull(SESSION_WAIT_MS) {
+                ui.first { it.phase != LivePhase.Reconnecting && it.phase != LivePhase.Connecting }
+            }
+            if (revision != replyRevision || id in supersededRequests || live?.phase != LivePhase.Live) return@launch
+            transcript?.system("← ${target.name} replied", System.currentTimeMillis())
+            val body = finished.reply.ifBlank { "Request ended with status ${finished.status}." }
+            inject("Request $id, turn ${finished.turn_id}, task: ${request.take(2000)}\n" + companionUpdate(body))
+        }
+        return buildJsonObject { put("accepted", true); put("request_id", id); put("turn_id", accepted.turn_id); put("status", accepted.status) }
+    }
+
+    private suspend fun stopCompanion(): JsonObject {
+        val revision = replyRevision
+        val target = companion.state.value.active ?: return buildJsonObject { put("stopped", false); put("error", "companion_not_ready") }
+        val host = core() ?: return buildJsonObject { put("stopped", false); put("error", "offline") }
+        val pending = decodeVoice(host.query("voice"))?.requests.orEmpty().filter {
+            it.workspace_id == target.home_workspace_id && it.thread_id == target.thread_id && it.status in setOf("sending", "queued", "running", "waiting_approval", "uncertain")
+        }.map { it.turn_id }
+        val ids = (pending + listOfNotNull(companionTranscript?.state?.value?.turn?.turn_id)).distinct()
+        if (revision != replyRevision) return buildJsonObject { put("stopped", false); put("error", "call_ended") }
+        if (ids.isEmpty()) return buildJsonObject { put("stopped", false); put("error", "not_running") }
+        replyRevision++; replyJobs.forEach { it.cancel() }; replyJobs.clear()
+        val unconfirmed = mutableListOf<String>()
+        for (turn in ids) {
+            val sent = dispatch { n, w, id -> EventVoiceRequestCancel(now_ms=n, wall_time_ms=w, intent_id=id, turn_id=turn) }
+            if (sent == null) { unconfirmed.add(turn); continue }
+            val op = withTimeoutOrNull(APPROVAL_WAIT_MS) { awaitOperation(sent.first, sent.second) }
+            if (op?.state != "succeeded") unconfirmed.add(turn)
+        }
+        return buildJsonObject {
+            if (unconfirmed.isEmpty()) put("stopped", true) else {
+                put("stopped", JsonNull); put("error", "delivery_uncertain")
+                put("unconfirmed_turns", JsonArray(unconfirmed.map { JsonPrimitive(it) }))
             }
         }
-        return buildJsonObject { put("accepted", true) }
     }
 
     private suspend fun decide(chat: String, approve: Boolean?): JsonObject {

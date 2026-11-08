@@ -2,6 +2,7 @@
 //! exposed by `muse serve` over newline-delimited JSON-RPC.
 
 const std = @import("std");
+const mcp = @import("mcp.zig");
 const acp = @import("acp.zig");
 const platform_process = @import("../platform/process.zig");
 const process_env = @import("../platform/env.zig");
@@ -314,11 +315,13 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
         defer allocator.free(cwd);
+        var connection: ?mcp.HttpConnection = if (mcp.isInstalled(allocator, .muse)) (try mcp.loadHttpConnection(allocator)) orelse return error.VerdeMcpUnavailable else null;
+        defer if (connection) |*value| value.deinit(allocator);
         const setup_command_id = try uuidV7Alloc(allocator, proc.threaded.io());
         defer allocator.free(setup_command_id);
         const approval_mode = approvalModeForPolicy(request.approval_policy);
         if (request.thread_id) |thread_id| {
-            try proc.writeLine(try makeSessionResumeRequestAlloc(allocator, 2, setup_command_id, thread_id));
+            try proc.writeLine(try makeSessionResumeRequestAlloc(allocator, 2, setup_command_id, thread_id, connection));
         } else {
             // Muse 1.0.3 selects approval on the wire. 1.0.2 sealed it at
             // host start and rejected explicit modes; retry without the field.
@@ -329,6 +332,7 @@ pub const Client = struct {
                 cwd,
                 request.model orelse self.config.model,
                 approval_mode,
+                connection,
             ));
         }
 
@@ -343,6 +347,7 @@ pub const Client = struct {
                 cwd,
                 request.model orelse self.config.model,
                 null,
+                connection,
             ));
             break :blk try waitForSessionSetupAlloc(allocator, &reader, request.thread_id);
         };
@@ -1615,6 +1620,17 @@ fn makeSessionReadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id
     return writer.toOwnedSlice();
 }
 
+fn writeMcpConfig(json: *std.json.Stringify, connection: ?mcp.HttpConnection) !void {
+    const endpoint = connection orelse return;
+    try json.objectField("config");
+    try json.write(.{ .mcpServers = .{ .verde = .{
+        .transport = "streamableHttp",
+        .url = endpoint.url,
+        .headers = .{ .Authorization = endpoint.authorization, .@"X-Verde-MCP-Client" = "muse", .@"X-Verde-MCP-Managed" = "1" },
+        .mode = "required",
+    } } });
+}
+
 fn makeSessionStartRequestAlloc(
     allocator: std.mem.Allocator,
     id: i64,
@@ -1622,6 +1638,7 @@ fn makeSessionStartRequestAlloc(
     cwd: []const u8,
     model: ?[]const u8,
     approval_mode: ?[]const u8,
+    connection: ?mcp.HttpConnection,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -1633,6 +1650,7 @@ fn makeSessionStartRequestAlloc(
     try json.write(command_id);
     try json.objectField("workspaceRoot");
     try json.write(cwd);
+    try writeMcpConfig(&json, connection);
     if (model) |model_id| {
         if (!std.mem.eql(u8, model_id, "default")) {
             try json.objectField("modelId");
@@ -1648,7 +1666,7 @@ fn makeSessionStartRequestAlloc(
     return writer.toOwnedSlice();
 }
 
-fn makeSessionResumeRequestAlloc(allocator: std.mem.Allocator, id: i64, command_id: []const u8, session_id: []const u8) ![]u8 {
+fn makeSessionResumeRequestAlloc(allocator: std.mem.Allocator, id: i64, command_id: []const u8, session_id: []const u8, connection: ?mcp.HttpConnection) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -1659,6 +1677,7 @@ fn makeSessionResumeRequestAlloc(allocator: std.mem.Allocator, id: i64, command_
     try json.write(command_id);
     try json.objectField("sessionId");
     try json.write(session_id);
+    try writeMcpConfig(&json, connection);
     try json.objectField("excludeItems");
     try json.write(true);
     try json.endObject();
@@ -2157,4 +2176,27 @@ test "Muse failure reconciliation selects only the exact session and turn" {
     , .{});
     defer success.deinit();
     try std.testing.expect(recoveredTerminal(success.value, "session", "active") == null);
+}
+
+test "Muse session start and resume carry enabled Verde MCP configuration" {
+    const a = std.testing.allocator;
+    const endpoint: mcp.HttpConnection = .{ .url = @constCast("http://127.0.0.1:4321/mcp"), .authorization = @constCast("Bearer fixture") };
+    const start = try makeSessionStartRequestAlloc(a, 1, "cmd", "/tmp/fixture", null, null, endpoint);
+    defer a.free(start);
+    const resumed = try makeSessionResumeRequestAlloc(a, 2, "cmd", "session", endpoint);
+    defer a.free(resumed);
+    for ([_][]const u8{ start, resumed }) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        const server = parsed.value.object.get("params").?.object.get("config").?.object.get("mcpServers").?.object.get("verde").?.object;
+        try std.testing.expectEqualStrings("streamableHttp", server.get("transport").?.string);
+        try std.testing.expectEqualStrings(endpoint.url, server.get("url").?.string);
+        try std.testing.expectEqualStrings(endpoint.authorization, server.get("headers").?.object.get("Authorization").?.string);
+        try std.testing.expectEqualStrings("required", server.get("mode").?.string);
+    }
+    const disabled = try makeSessionResumeRequestAlloc(a, 3, "cmd", "session", null);
+    defer a.free(disabled);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, disabled, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("params").?.object.get("config") == null);
 }

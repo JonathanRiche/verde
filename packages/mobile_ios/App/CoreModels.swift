@@ -1665,6 +1665,8 @@ enum Event: Codable {
     case `companion_save`(EventCompanionSave)
     case `voice_providers_refresh`(EventVoiceProvidersRefresh)
     case `voice_provider_configure`(EventVoiceProviderConfigure)
+    case `voice_request_submit`(EventVoiceRequestSubmit)
+    case `voice_request_cancel`(EventVoiceRequestCancel)
     case `voice_session_create`(EventVoiceSessionCreate)
     case `companion_transcript_save`(EventCompanionTranscriptSave)
     case `companion_brain_switch`(EventCompanionBrainSwitch)
@@ -1758,6 +1760,8 @@ enum Event: Codable {
         case "companion_save": self = .`companion_save`(try EventCompanionSave(from: decoder))
         case "voice_providers_refresh": self = .`voice_providers_refresh`(try EventVoiceProvidersRefresh(from: decoder))
         case "voice_provider_configure": self = .`voice_provider_configure`(try EventVoiceProviderConfigure(from: decoder))
+        case "voice_request_submit": self = .`voice_request_submit`(try EventVoiceRequestSubmit(from: decoder))
+        case "voice_request_cancel": self = .`voice_request_cancel`(try EventVoiceRequestCancel(from: decoder))
         case "voice_session_create": self = .`voice_session_create`(try EventVoiceSessionCreate(from: decoder))
         case "companion_transcript_save": self = .`companion_transcript_save`(try EventCompanionTranscriptSave(from: decoder))
         case "companion_brain_switch": self = .`companion_brain_switch`(try EventCompanionBrainSwitch(from: decoder))
@@ -1852,6 +1856,8 @@ enum Event: Codable {
         case .`companion_save`(let value): try value.encode(to: encoder)
         case .`voice_providers_refresh`(let value): try value.encode(to: encoder)
         case .`voice_provider_configure`(let value): try value.encode(to: encoder)
+        case .`voice_request_submit`(let value): try value.encode(to: encoder)
+        case .`voice_request_cancel`(let value): try value.encode(to: encoder)
         case .`voice_session_create`(let value): try value.encode(to: encoder)
         case .`companion_transcript_save`(let value): try value.encode(to: encoder)
         case .`companion_brain_switch`(let value): try value.encode(to: encoder)
@@ -5257,6 +5263,90 @@ extension EventVoiceProviderConfigure {
         try c.encode(self.`make_default`, forKey: .`make_default`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("voice_provider_configure", forKey: .type)
+    }
+}
+
+struct EventVoiceRequestSubmit: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `prompt`: String
+}
+
+extension EventVoiceRequestSubmit {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+        case `prompt`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`prompt` = try c.decode(String.self, forKey: .`prompt`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`prompt`, forKey: .`prompt`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("voice_request_submit", forKey: .type)
+    }
+}
+
+struct EventVoiceRequestCancel: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `turn_id`: String
+}
+
+extension EventVoiceRequestCancel {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `turn_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("voice_request_cancel", forKey: .type)
     }
 }
 
@@ -11446,6 +11536,54 @@ extension VoiceSession {
     }
 }
 
+struct VoiceRequest: Codable {
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `turn_id`: String
+    var `prompt`: String
+    var `status`: String
+    var `reply`: String
+    var `error_code`: String? = nil
+}
+
+extension VoiceRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+        case `turn_id`
+        case `prompt`
+        case `status`
+        case `reply`
+        case `error_code`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+        self.`prompt` = try c.decode(String.self, forKey: .`prompt`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        self.`reply` = try c.decode(String.self, forKey: .`reply`)
+        if !c.contains(.`error_code`) { self.`error_code` = nil } else {
+        self.`error_code` = try c.decodeIfPresent(String.self, forKey: .`error_code`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`prompt`, forKey: .`prompt`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`reply`, forKey: .`reply`)
+        try c.encode(self.`error_code`, forKey: .`error_code`)
+    }
+}
+
 struct VoiceView: Codable {
     var `loaded`: Bool = false
     var `loading`: Bool = false
@@ -11454,6 +11592,7 @@ struct VoiceView: Codable {
     var `default_provider`: String? = nil
     var `providers`: [VoiceProvider] = []
     var `session`: VoiceSession? = nil
+    var `requests`: [VoiceRequest] = []
     var `error`: LocalError? = nil
 }
 
@@ -11466,6 +11605,7 @@ extension VoiceView {
         case `default_provider`
         case `providers`
         case `session`
+        case `requests`
         case `error`
     }
     init(from decoder: Decoder) throws {
@@ -11491,6 +11631,9 @@ extension VoiceView {
         if !c.contains(.`session`) { self.`session` = nil } else {
         self.`session` = try c.decodeIfPresent(VoiceSession.self, forKey: .`session`)
         }
+        if !c.contains(.`requests`) { self.`requests` = [] } else {
+        self.`requests` = try c.decode([VoiceRequest].self, forKey: .`requests`)
+        }
         if !c.contains(.`error`) { self.`error` = nil } else {
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
         }
@@ -11504,6 +11647,7 @@ extension VoiceView {
         try c.encode(self.`default_provider`, forKey: .`default_provider`)
         try c.encode(self.`providers`, forKey: .`providers`)
         try c.encode(self.`session`, forKey: .`session`)
+        try c.encode(self.`requests`, forKey: .`requests`)
         try c.encode(self.`error`, forKey: .`error`)
     }
 }

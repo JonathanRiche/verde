@@ -297,7 +297,7 @@ pub const ProviderReadinessSnapshot = struct {
 };
 
 /// Providers `provider.mcp.set` can register Verde with (see `McpSummary`).
-const MCP_CAPABLE_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity };
+const MCP_CAPABLE_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .antigravity, .muse };
 
 fn mcpIntegrationProvider(provider: Provider) ?headless.providers_protocol.IntegrationProvider {
     return std.meta.stringToEnum(headless.providers_protocol.IntegrationProvider, @tagName(provider));

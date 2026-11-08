@@ -121,6 +121,27 @@ pub fn handoffContextAlloc(conn: zqlite.Conn, allocator: std.mem.Allocator, work
     return try out.toOwnedSlice();
 }
 
+/// A bounded read-only snapshot for the voice front. Tool output is excluded;
+/// JSON quoting keeps transcript content distinct from system instructions.
+pub fn voiceContextAlloc(conn: zqlite.Conn, allocator: std.mem.Allocator, workspace_id: []const u8, thread_id: []const u8) ![]u8 {
+    const Line = struct { role: []const u8, body: []const u8 };
+    var lines: std.ArrayList(Line) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line.body);
+        lines.deinit(allocator);
+    }
+    var rows = try conn.rows(
+        "select m.role,m.body from messages m join threads t on t.id=m.thread_id join workspaces w on w.id=t.workspace_id " ++
+            "where w.workspace_id=? and t.local_thread_id=? and m.role in (0,1) and m.tool_call_id is null order by m.sort_index desc limit 8",
+        .{ workspace_id, thread_id },
+    );
+    defer rows.deinit();
+    while (rows.next()) |row| try lines.append(allocator, .{ .role = if (row.int(0) == 0) "user" else "assistant", .body = try allocator.dupe(u8, clip(row.text(1), 2000)) });
+    if (rows.err) |err| return err;
+    std.mem.reverse(Line, lines.items);
+    return std.json.Stringify.valueAlloc(allocator, .{ .workspace_id = workspace_id, .thread_id = thread_id, .recent_conversation = lines.items }, .{});
+}
+
 fn clip(text: []const u8, cap: usize) []const u8 {
     if (text.len <= cap) return text;
     var end = cap;
@@ -226,4 +247,34 @@ test "roster starts empty, versions every put, and rejects stale writers" {
     const snapshot = try get(conn, allocator);
     defer allocator.free(snapshot.json);
     try std.testing.expectEqual(@as(i64, 2), snapshot.revision);
+}
+
+test "voice context is bounded chronological scoped and excludes tool output" {
+    const a = std.testing.allocator;
+    var conn = try testConn();
+    defer conn.close();
+    try conn.execNoArgs("insert into workspaces values(1,'ws','Workspace'); insert into threads values(1,1,'moss',null); insert into threads values(2,1,'other',null)");
+    for (0..12) |i| {
+        const body = try std.fmt.allocPrint(a, "line-{d}", .{i});
+        defer a.free(body);
+        try conn.exec("insert into messages(thread_id,sort_index,role,body) values(1,?,?,?)", .{ @as(i64, @intCast(i)), @as(i64, @intCast(i % 2)), body });
+    }
+    try conn.execNoArgs("insert into messages(thread_id,sort_index,role,body) values(2,99,1,'other chat'); insert into messages(thread_id,sort_index,role,body,tool_call_id) values(1,99,1,'tool output','tool')");
+    const raw = try voiceContextAlloc(conn, a, "ws", "moss");
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const lines = parsed.value.object.get("recent_conversation").?.array.items;
+    try std.testing.expectEqual(@as(usize, 8), lines.len);
+    try std.testing.expectEqualStrings("line-4", lines[0].object.get("body").?.string);
+    try std.testing.expectEqualStrings("line-11", lines[7].object.get("body").?.string);
+    try std.testing.expectEqualStrings("user", lines[0].object.get("role").?.string);
+    try conn.exec("insert into messages(thread_id,sort_index,role,body) values(1,100,1,?)", .{"é" ** 2000});
+    const clipped = try voiceContextAlloc(conn, a, "ws", "moss");
+    defer a.free(clipped);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
+    const bounded = try std.json.parseFromSlice(std.json.Value, a, clipped, .{});
+    defer bounded.deinit();
+    const last = bounded.value.object.get("recent_conversation").?.array.items[7].object.get("body").?.string;
+    try std.testing.expect(last.len <= 2000);
 }

@@ -91,6 +91,8 @@ pub const Event = union(enum) {
     companion_save: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, roster: @import("companion.zig").Roster, expected_revision: []const u8 },
     voice_providers_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8 },
     voice_provider_configure: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, provider: []const u8, api_key: ?[]const u8 = null, model: ?[]const u8 = null, voice: ?[]const u8 = null, make_default: ?bool = null },
+    voice_request_submit: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, prompt: []const u8 },
+    voice_request_cancel: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, turn_id: []const u8 },
     voice_session_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, provider: ?[]const u8 = null, model: ?[]const u8 = null, voice: ?[]const u8 = null, companion_id: ?[]const u8 = null },
     companion_transcript_save: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, session_id: []const u8, messages: []const @import("companion.zig").TranscriptMessage },
     companion_brain_switch: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, companion_id: ?[]const u8 = null, provider: []const u8, model: ?[]const u8 = null, brief: ?bool = null },

@@ -404,7 +404,7 @@ fn boolOf(value: ?std.json.Value) bool {
 
 // ---- companion update text -----------------------------------------------------
 
-pub const COMPANION_UPDATE_CHARS: usize = 600;
+pub const COMPANION_UPDATE_CHARS: usize = 16000;
 
 /// The text injected into the live session when the companion's turn
 /// finishes: markdown punctuation dropped, clipped on a UTF-8 boundary.
@@ -578,7 +578,7 @@ test "companion update strips markdown and clips on a character boundary" {
     const short = try companionUpdateAlloc(allocator, "## Done\n\n- **Tests** pass\n```\ncode\n```\n");
     defer allocator.free(short);
     try testing.expectEqualStrings("companion_update: Done Tests pass", short);
-    const long_text = "é" ** 400;
+    const long_text = "é" ** 10000;
     const long = try companionUpdateAlloc(allocator, long_text);
     defer allocator.free(long);
     try testing.expect(std.unicode.utf8ValidateSlice(long));

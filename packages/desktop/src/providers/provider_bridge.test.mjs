@@ -324,3 +324,16 @@ for (const [label, info, expected] of [
     assert.equal(closed, true);
   });
 }
+
+test('plan rate limit covered by usage credits does not fail the turn', () => {
+  const { context } = bridge();
+  const event = info => ({ type: 'rate_limit_event', rate_limit_info: info });
+  const check = context.claudeRejectedRateLimitMessage;
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'seven_day', overageStatus: 'allowed' })), null);
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'five_hour', overageStatus: 'allowed_warning' })), null);
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'seven_day', isUsingOverage: true })), null);
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'seven_day', overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' })), 'Claude seven_day usage limit has been reached.');
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'seven_day' })), 'Claude seven_day usage limit has been reached.');
+  assert.equal(check(event({ status: 'rejected', rateLimitType: 'overage', overageStatus: 'allowed' })), 'Claude overage usage limit has been reached.');
+  assert.equal(check(event({ status: 'allowed_warning', rateLimitType: 'seven_day' })), null);
+});

@@ -18,6 +18,7 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 const E = h.ApiError;
 const eq = h.eq;
+const requests = @import("voice_requests.zig");
 
 pub const MAX_KEY_BYTES = 4096;
 pub const MAX_PROVIDERS = 16;
@@ -67,11 +68,13 @@ pub const View = struct {
     default_provider: ?[]const u8 = null,
     providers: []const Provider = &.{},
     session: ?Session = null,
+    requests: []const requests.RequestView = &.{},
     @"error": ?h.LocalError = null,
 };
 
 pub const State = struct {
     view: View = .{},
+    requests: []const requests.Request = &.{},
     list_id: ?u64 = null,
     list_intent: []const u8 = "",
     configure_id: ?u64 = null,
@@ -79,7 +82,7 @@ pub const State = struct {
     session_id: ?u64 = null,
 };
 
-const tags = [_][]const u8{ "voice_providers_refresh", "voice_provider_configure", "voice_session_create" };
+const tags = [_][]const u8{ "voice_providers_refresh", "voice_provider_configure", "voice_session_create", "voice_request_submit", "voice_request_cancel" };
 
 pub fn owns(tag: []const u8) bool {
     for (tags) |t| if (eq(t, tag)) return true;
@@ -88,6 +91,8 @@ pub fn owns(tag: []const u8) bool {
 
 /// `api_key` is deliberately absent: receipts never hash or retain it.
 pub fn receiptFields(context: []const u8) ?[]const u8 {
+    if (eq(context, "voice_request_submit")) return "workspace_id thread_id prompt";
+    if (eq(context, "voice_request_cancel")) return "turn_id";
     if (eq(context, "voice_providers_refresh")) return "";
     if (eq(context, "voice_provider_configure")) return "provider model voice make_default";
     if (eq(context, "voice_session_create")) return "provider model voice companion_id";
@@ -98,7 +103,11 @@ const Configure = struct { provider: []const u8, api_key: ?[]const u8 = null, mo
 const Create = struct { provider: ?[]const u8 = null, model: ?[]const u8 = null, voice: ?[]const u8 = null, companion_id: ?[]const u8 = null };
 
 pub fn validate(a: A, tag: []const u8, event: V) E!void {
-    if (eq(tag, "voice_provider_configure")) {
+    if (eq(tag, "voice_request_submit")) {
+        _ = try h.decode(requests.Submit, a, event);
+    } else if (eq(tag, "voice_request_cancel")) {
+        _ = try h.decode(requests.Cancel, a, event);
+    } else if (eq(tag, "voice_provider_configure")) {
         _ = try h.decode(Configure, a, event);
     } else if (eq(tag, "voice_session_create")) {
         _ = try h.decode(Create, a, event);
@@ -127,6 +136,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
         return receipt(tx, id, "pending", null);
     }
     if (!scoped(&tx.state, "chat:write")) return fail(tx, id, tag, failure("insufficient_scope", "This phone can't use voice on this host."));
+    if (eq(tag, "voice_request_submit") or eq(tag, "voice_request_cancel")) return requests.intent(tx, tag, event);
     if (!s.view.supported) return fail(tx, id, tag, failure("unsupported", "Update verde on the computer to use live voice."));
     if (eq(tag, "voice_provider_configure")) {
         if (s.configure_id != null) return receipt(tx, id, "failed", failure("busy", "Still saving the last voice change."));
@@ -158,6 +168,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
 
 /// Drains `@voice` RPC outcomes.
 pub fn pump(tx: *h.Transaction) E!void {
+    try requests.pump(tx);
     const s = &tx.state.voice;
     const count = tx.state.rpc.results.len;
     for (0..count) |_| {
@@ -190,12 +201,13 @@ pub fn pump(tx: *h.Transaction) E!void {
 pub fn observe(tx: *h.Transaction) void {
     const s = &tx.state.voice;
     if (tx.state.auth.credential == null) {
-        if (s.view.loaded or s.view.session != null or s.list_id != null or s.configure_id != null or s.session_id != null) {
+        if (s.view.loaded or s.view.session != null or s.list_id != null or s.configure_id != null or s.session_id != null or s.requests.len > 0) {
             tx.state.voice = .{};
             tx.changed = true;
         }
         return;
     }
+    requests.observe(tx) catch {};
     if (tx.state.lifecycle != .foreground and (s.view.session != null or s.session_id != null)) {
         s.view.session = null;
         s.session_id = null;
@@ -205,11 +217,22 @@ pub fn observe(tx: *h.Transaction) void {
 
 pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
     if (!eq(selector, "voice")) return null;
-    return try h.parseLimit(a, try h.encode(a, state.voice.view), h.MAX_HTTP_INPUT);
+    var view = state.voice.view;
+    for (state.voice.requests) |r| try add(requests.RequestView, a, &view.requests, .{
+        .intent_id = r.intent_id,
+        .workspace_id = r.workspace_id,
+        .thread_id = r.thread_id,
+        .turn_id = r.turn_id,
+        .prompt = r.prompt,
+        .status = r.status,
+        .reply = r.reply,
+        .error_code = r.error_code,
+    });
+    return try h.parseLimit(a, try h.encode(a, view), h.MAX_HTTP_INPUT);
 }
 
 pub fn scopes(before: *const h.State, after: *const h.State) []const []const u8 {
-    if (!clone.equal(View, before.voice.view, after.voice.view)) return &.{"voice"};
+    if (!clone.equal(View, before.voice.view, after.voice.view) or !clone.equal([]const requests.Request, before.voice.requests, after.voice.requests)) return &.{"voice"};
     return &.{};
 }
 

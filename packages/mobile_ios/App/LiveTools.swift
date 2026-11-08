@@ -6,6 +6,7 @@ import Foundation
  */
 
 enum LiveToolName {
+    static let stopCompanion = "stop_companion"
     static let askCompanion = "ask_companion"
     static let companionStatus = "companion_status"
     static let decideApproval = "decide_approval"
@@ -64,11 +65,11 @@ func companionStatusJSON(name: String, status: String, needsYou: [NeedsYouItem],
         ["chat": link.displayTitle, "workspace": workspaceLabels[link.workspace_id] ?? "", "status": link.attention.label,
          "summary": link.detail ?? ""]
     }
-    return jsonString(["companion": name, "status": status, "needs_you": needs, "crew": members])
+    return jsonString(["companion": name, "status": status, "needs_you": needs, "crew": members, "scope": "linked crew and attention only; not all open or finished chats"])
 }
 
-/// The companion's finished reply for the live model: plain text, at most ~600 characters.
-func companionUpdateText(_ body: String, limit: Int = 600) -> String {
+/// The companion's finished reply for the live model: plain text, bounded context for a short spoken summary.
+func companionUpdateText(_ body: String, limit: Int = 16000) -> String {
     let plain = speechLines(body).joined(separator: " ")
     let clipped = plain.count > limit ? String(plain.prefix(limit)) + "…" : plain
     return "companion_update: " + (clipped.isEmpty ? "(no text reply)" : clipped)

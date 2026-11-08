@@ -58,7 +58,7 @@ pub fn loadHttpConnection(allocator: std.mem.Allocator) !?HttpConnection {
     };
 }
 
-const ALL_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .amp, .pi, .fx, .grok, .antigravity };
+const ALL_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .amp, .pi, .fx, .grok, .antigravity, .muse };
 
 pub const RegistrationStatus = providers_protocol.RegistrationStatus;
 pub const Summary = providers_protocol.McpSummary;
@@ -114,6 +114,16 @@ const ANTIGRAVITY_SPEC: JsonSpec = .{
     .relative_path = ".gemini/config/mcp_config.json",
     .section_key = "mcpServers",
     .environment_key = "env",
+};
+
+// Muse accepts MCP servers on session/start and session/resume rather than
+// through a global native config. This Verde-owned registration is the opt-in
+// marker; the adapter loads the current endpoint at each session construction.
+const MUSE_SPEC: JsonSpec = .{
+    .relative_path = ".local/share/verde/muse-mcp.json",
+    .section_key = "mcpServers",
+    .environment_key = "env",
+    .remote_type = "http",
 };
 
 /// Returns the current registration state for every provider installed on PATH.
@@ -175,6 +185,7 @@ fn detectedProvidersAtHome(allocator: std.mem.Allocator, home: []const u8) [ALL_
         process_env.commandExists("fx"),
         process_env.commandExists("grok"),
         process_env.commandExists("agy"),
+        process_env.commandExists("muse"),
     };
     for (ALL_PROVIDERS, 0..) |provider, index| {
         detected[index] = detected[index] or providerConfigExistsAtHome(allocator, home, provider);
@@ -203,6 +214,7 @@ fn providerConfigExistsAtHome(allocator: std.mem.Allocator, home: []const u8, pr
         .fx => FX_SPEC.relative_path,
         .grok => ".grok/config.toml",
         .antigravity => ANTIGRAVITY_SPEC.relative_path,
+        .muse => MUSE_SPEC.relative_path,
     };
     const path = configPathAlloc(allocator, home, relative_path) catch return false;
     defer allocator.free(path);
@@ -255,6 +267,7 @@ fn setSummaryStatus(summary: *Summary, provider: Provider, status: RegistrationS
         .fx => summary.fx = status,
         .grok => summary.grok = status,
         .antigravity => summary.antigravity = status,
+        .muse => summary.muse = status,
     }
 }
 
@@ -269,6 +282,7 @@ fn installProviderAtHome(allocator: std.mem.Allocator, home: []const u8, endpoin
         .fx => installFxAtHome(allocator, home, endpoint),
         .grok => installGrokAtHome(allocator, home, endpoint),
         .antigravity => installJsonAtHome(allocator, home, endpoint, .antigravity, ANTIGRAVITY_SPEC),
+        .muse => installJsonAtHome(allocator, home, endpoint, .muse, MUSE_SPEC),
     };
 }
 
@@ -283,6 +297,7 @@ fn removeProviderAtHome(allocator: std.mem.Allocator, home: []const u8, provider
         .fx => removeFxAtHome(allocator, home),
         .grok => removeGrokAtHome(allocator, home),
         .antigravity => removeJsonAtHome(allocator, home, ANTIGRAVITY_SPEC),
+        .muse => removeJsonAtHome(allocator, home, MUSE_SPEC),
     };
 }
 
@@ -297,6 +312,7 @@ fn inspectProviderAtHome(allocator: std.mem.Allocator, home: []const u8, provide
         .fx => inspectJsonAtHome(allocator, home, FX_SPEC),
         .grok => inspectGrokAtHome(allocator, home),
         .antigravity => inspectJsonAtHome(allocator, home, ANTIGRAVITY_SPEC),
+        .muse => inspectJsonAtHome(allocator, home, MUSE_SPEC),
     };
 }
 
@@ -781,13 +797,16 @@ test "managed JSON registration preserves user servers and uninstalls only Verde
         \\{"mcp":{"user-server":{"type":"local","command":["user-command"]}}}
     );
     const endpoint = testEndpoint(47_371);
-    const detected = [ALL_PROVIDERS.len]bool{ false, true, true, true, true, false, true, false, false };
+    const detected = [ALL_PROVIDERS.len]bool{ false, true, true, true, true, false, true, false, false, true };
     const installed = try installAtHome(std.testing.allocator, home, &endpoint, detected);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.claude);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.cursor);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.opencode);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.amp);
     try std.testing.expectEqual(RegistrationStatus.installed, installed.fx);
+    try std.testing.expectEqual(RegistrationStatus.installed, installed.muse);
+    try removeProviderAtHome(std.testing.allocator, home, .muse);
+    try std.testing.expectEqual(RegistrationStatus.not_installed, inspectProviderAtHome(std.testing.allocator, home, .muse));
 
     const fx_installed = (try readFileIfPresent(std.testing.allocator, threaded.io(), fx_path)).?;
     defer std.testing.allocator.free(fx_installed);
