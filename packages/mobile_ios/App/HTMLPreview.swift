@@ -35,8 +35,8 @@ func previewMime(_ path: String, reported: String?) -> String {
         ?? UTType(filenameExtension: ext)?.preferredMIMEType ?? reported ?? "application/octet-stream"
 }
 let previewCSP = "default-src 'none'; script-src verde-preview: https: http: 'unsafe-inline' 'unsafe-eval' blob:; style-src verde-preview: https: http: 'unsafe-inline'; img-src verde-preview: https: http: data: blob:; media-src verde-preview: https: http: data: blob:; font-src verde-preview: https: http: data:; connect-src verde-preview: https: http:; frame-src 'none'; object-src 'none'; base-uri verde-preview:; form-action 'none'"
-func isolatedHTML(_ source: String) -> String {
-    #"<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content=""# + previewCSP + #""><meta name="viewport" content="width=device-width, initial-scale=1">"# + previewFailureScript + source
+func isolatedHTML(_ source: String, textScale: Int = 100) -> String {
+    #"<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content=""# + previewCSP + #""><meta name="viewport" content="width=device-width, initial-scale=1">"# + "<style>:root{-webkit-text-size-adjust:\(textScale)%!important}</style>" + previewFailureScript + source
 }
 
 private let previewFailureScript = #"""
@@ -70,8 +70,8 @@ struct HTMLPreview: UIViewRepresentable {
     }
     func updateUIView(_ view: WKWebView, context: Context) {
         _ = textSize
-        view.pageZoom = UIFont.preferredFont(forTextStyle: .body).pointSize / 17
-        let html = isolatedHTML(source)
+        let textScale = Int((UIFont.preferredFont(forTextStyle: .body).pointSize / 17 * 100).rounded())
+        let html = isolatedHTML(source, textScale: textScale)
         if context.coordinator.html != html { context.coordinator.html = html; view.loadHTMLString(html, baseURL: location.url) }
     }
     static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) { view.stopLoading(); view.navigationDelegate = nil; coordinator.cancelAll() }
