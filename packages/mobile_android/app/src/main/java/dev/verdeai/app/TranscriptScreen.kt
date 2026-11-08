@@ -151,7 +151,7 @@ internal fun transcriptPlaceholder(state: TranscriptState): TranscriptPlaceholde
 @Composable
 internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageModel, workspaceId: String, threadId: String, onHosts: () -> Unit,
                          onCitation: (FileCitation) -> Unit = {}, onThreadAction: (ThreadSummary, String) -> Unit,
-                         onOpenThread: ((String) -> Unit)? = null, onBack: () -> Unit) {
+                         onOpenThread: ((String) -> Unit)? = null, onOpenAgent: ((String, String) -> Unit)? = null, onBack: () -> Unit) {
     val model: TranscriptModel = viewModel(key = "transcript:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
@@ -170,7 +170,7 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     LaunchedEffect(model) { PromptHandoff.take(browseState.hostId, workspaceId, threadId)?.let(model.composer::ask) }
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
         canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction,
-        gitChanges = git, threads = knownThreads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
+        gitChanges = git, threads = knownThreads, onOpenThread = onOpenThread, onOpenAgent = onOpenAgent, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 /** One flexible title slot: subtitles never cost the title its second line. */
@@ -211,6 +211,7 @@ internal fun TranscriptScreen(
     onThreadAction: ((ThreadSummary, String) -> Unit)? = null,
     threads: List<ThreadSummary> = emptyList(),
     onOpenThread: ((String) -> Unit)? = null,
+    onOpenAgent: ((String, String) -> Unit)? = null,
     gitChanges: GitChangesModel? = null,
     /** D-08 swaps in the composer; the default is the stop bar. */
     bottomBar: @Composable (TranscriptModel, TranscriptState) -> Unit = { m, s -> StopBar(m, s) },
@@ -227,6 +228,8 @@ internal fun TranscriptScreen(
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread, gitChanges)
     val openDrawer = LocalWorkspaceMenu.current
     val tier = LocalWindowTier.current
+    var agentsOpen by remember(model) { mutableStateOf(false) }
+    val wideAgents = tier.wide
     var chatMenu by remember { mutableStateOf(false) }
     val jump = remember { TranscriptJump() }
     // A8-6: where Shift+Tab lands when it leaves the top of the transcript (the header's last control).
@@ -236,7 +239,7 @@ internal fun TranscriptScreen(
     val tabletop = rememberTabletopHinge()
     val columnBounds = remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Box(Modifier.fillMaxSize()) {
-    Column(Modifier.fillMaxSize().then(if (tabletop != null) Modifier.onGloballyPositioned { columnBounds.value = it.boundsInWindow() } else Modifier)) {
+    Column(Modifier.fillMaxSize().padding(end = if (agentsOpen && wideAgents) 300.dp else 0.dp).then(if (tabletop != null) Modifier.onGloballyPositioned { columnBounds.value = it.boundsInWindow() } else Modifier)) {
         Box(Modifier.focusRequester(headerEntry).keyboardRegion(composerFocus)) {
         VerdeTopBar(
             title = {
@@ -253,6 +256,7 @@ internal fun TranscriptScreen(
                 }
             },
             actions = {
+                TextButton(onClick = { agentsOpen = !agentsOpen }, modifier = Modifier.heightIn(min = 48.dp).named("Show linked agents")) { Text("Agents") }
                 // Git actions never sit between the companion and ⋯: they get the row under the header.
                 if (onThreadAction != null) Box(Modifier.focusRequester(headerFocus)) {
                     val thread = state.thread?.thread
@@ -344,12 +348,25 @@ internal fun TranscriptScreen(
         }
         if (lower != null) Spacer(Modifier.height(lower.first))
         Column(if (lower != null) Modifier.fillMaxWidth().height(lower.second) else Modifier.fillMaxWidth()) {
+        state.thread?.orchestration?.let { AgentsWaitingBar(it) { agentsOpen = true } }
         // U1: running background commands stay in view above the composer.
         state.thread?.background_tasks?.takeIf { it.isNotEmpty() }?.let { tasks -> RunningTasksBar(tasks) { jump.target = it } }
         Box(Modifier.fillMaxWidth().keyboardRegion(headerEntry, newestFocus)) {
             CompositionLocalProvider(LocalComposerFocus provides composerFocus) { bottomBar(model, state) }
         }
         }
+    }
+    if (agentsOpen) {
+        val openAgent: (ChatLinkedAgent) -> Unit = { agent ->
+            agentsOpen = false
+            if (onOpenAgent != null) onOpenAgent(agent.workspace_id, agent.local_thread_id) else onOpenThread?.invoke(agent.local_thread_id)
+        }
+        if (wideAgents) {
+            androidx.activity.compose.BackHandler { agentsOpen = false }
+            Surface(Modifier.align(Alignment.CenterEnd).width(300.dp).fillMaxHeight(), color = VerdeColors.Panel) {
+                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent)
+            }
+        } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent)
     }
     gitChanges?.let { GitChangesLayer(it) }
     }

@@ -312,6 +312,7 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
 
     VerdeListRow(headlineContent = { Text(thread.title, maxLines = if (active) 2 else 1, overflow = TextOverflow.Ellipsis,
         fontWeight = if (chatState(thread.state ?: pane?.state) == ChatState.Unread) FontWeight.SemiBold else FontWeight.Normal) },
+        supportingContent = thread.orchestration_subtitle.takeIf { it.isNotBlank() }?.let { subtitle -> { Text(subtitle, color = if (chatState(thread.state) == ChatState.NeedsYou) VerdeColors.Warning else VerdeColors.Accent) } },
         leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             chip?.let { WorkspaceChip(it, 16.dp) }
             ProviderGlyph(thread.provider)

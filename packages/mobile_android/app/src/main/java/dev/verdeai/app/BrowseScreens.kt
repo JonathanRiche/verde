@@ -400,7 +400,7 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     // C11: the core's state decides the words, the colour and the mark.
     val kind = chat.rowState()
-    val state = chatStateLabel(chat, thread.status)
+    val state = thread.orchestration_subtitle.takeIf { it.isNotBlank() } ?: chatStateLabel(chat, thread.status)
     val parts = listOf(workspaceLabel, state, thread.last_activity_at_ms?.let { agoLabel(it, now) })
     MenuRow(thread.title, parts.filterNotNull().joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),

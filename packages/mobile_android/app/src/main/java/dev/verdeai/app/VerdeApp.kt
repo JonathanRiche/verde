@@ -523,7 +523,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
             val args = entry.arguments
             val ws = args?.getString("ws").orEmpty()
             ThreadRoute(hosts, browse, manage, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }, onThreadAction = onThreadAction,
-                onOpenThread = { nav.navigate(Routes.thread(ws, it)) }) { nav.popBackStack() }
+                onOpenThread = { nav.navigate(Routes.thread(ws, it)) }, onOpenAgent = { childWs, child -> nav.navigate(Routes.thread(childWs, child)) }) { nav.popBackStack() }
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments
