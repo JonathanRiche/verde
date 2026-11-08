@@ -160,7 +160,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val tier = LocalWindowTier.current
     // The user's choice, kept while the window narrows and widens again.
     var sidebarCollapsed by rememberSaveable { mutableStateOf(false) }
-    val panes = shellPanes(tier, sidebarCollapsed, companionOpen && companionState.available, pairing)
+    var agentsPanelVisible by remember { mutableStateOf(false) }
+    val panes = shellPanes(tier, sidebarCollapsed || agentsPanelVisible, companionOpen && companionState.available, pairing)
     // The modal drawer is unused while docked; a saved open state must not scrim the new layout.
     LaunchedEffect(tier.docked) { if (tier.docked) drawer.snapTo(DrawerValue.Closed) }
     val companionNow = companionSnapshot(companionState, browseState)
@@ -439,7 +440,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             Box(Modifier.padding(padding).consumeWindowInsets(padding)
                 .then(if (hasShellHeader) Modifier.dismissKeyboardOnTouch(parkTouch) else Modifier).focusRequester(contentFocus)
                 .keyboardRegion(if (hasShellHeader) headerFocus else androidx.compose.ui.focus.FocusRequester.Default)) {
-                CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
+                CompositionLocalProvider(LocalAgentsPanelVisible provides { agentsPanelVisible = it }, LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit })),
                     LocalCompanionHeader provides headerState, LocalShellFocus provides shellFocus,
                     LocalBubbleReserve provides (if (bubbleShown) BUBBLE_RESERVE else 0.dp)) {
                     Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }

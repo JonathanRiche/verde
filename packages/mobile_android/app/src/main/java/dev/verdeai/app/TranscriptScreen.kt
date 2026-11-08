@@ -230,6 +230,11 @@ internal fun TranscriptScreen(
     val tier = LocalWindowTier.current
     var agentsOpen by remember(model) { mutableStateOf(false) }
     val wideAgents = tier.wide
+    val setAgentsPanelVisible = LocalAgentsPanelVisible.current
+    DisposableEffect(agentsOpen, wideAgents) {
+        setAgentsPanelVisible(agentsOpen && wideAgents)
+        onDispose { setAgentsPanelVisible(false) }
+    }
     var chatMenu by remember { mutableStateOf(false) }
     val jump = remember { TranscriptJump() }
     // A8-6: where Shift+Tab lands when it leaves the top of the transcript (the header's last control).

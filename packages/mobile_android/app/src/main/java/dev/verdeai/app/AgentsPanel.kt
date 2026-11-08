@@ -20,15 +20,15 @@ import dev.verdeai.core.ChatLinkedAgent
 @Composable
 internal fun AgentsWaitingBar(agents: ChatOrchestration, open: () -> Unit) {
     if (agents.waiting_count == 0L) return
-    Surface(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+    Surface(onClick = open, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
         color = VerdeColors.Panel, shape = MaterialTheme.shapes.small) {
-        TextButton(onClick = open, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(12.dp)
             .semantics { liveRegion = LiveRegionMode.Polite }) {
             Column(Modifier.weight(1f)) {
                 Text(agents.title, color = if (agents.needs_you) VerdeColors.Warning else VerdeColors.Accent)
                 Text(agents.summary, style = MaterialTheme.typography.bodySmall)
             }
-            Text(if (agents.needs_you) "Review agents" else "View agents")
+            Text(if (agents.needs_you) "Review agents" else "View agents", color = VerdeColors.Accent)
         }
     }
 }
@@ -50,13 +50,14 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
         }
         if (agents?.error != null) SelectionContainer { Text("Couldn't refresh agents. Reconnect to try again.") }
         if (agents?.links.isNullOrEmpty()) SelectionContainer {
-            Text(if (agents?.loading == true) "Loading agents…" else "No linked agents yet. Delegated chats will appear here.")
+            Text(if (agents == null || !agents.loaded) "Loading agents…" else "No linked agents yet. Delegated chats will appear here.")
         }
         LazyColumn(Modifier.weight(1f)) {
             items(agents?.links.orEmpty(), key = { it.link_id }) { agent ->
-                TextButton(onClick = { open(agent) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    .named("${agent.title}, ${agent.status_label}, ${agent.provider}. Open child chat")) {
-                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Surface(onClick = { open(agent) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    .named("${agent.title}, ${agent.status_label}, ${agent.provider}. Open child chat"),
+                    shape = MaterialTheme.shapes.small, color = VerdeColors.Panel) {
+                    Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(agent.title, style = MaterialTheme.typography.titleSmall)
                         Surface(shape = MaterialTheme.shapes.small, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                             Text(agent.status_label, color = when { agent.needs_you -> VerdeColors.Warning; agent.status == "failed" -> VerdeColors.Danger; agent.status in listOf("aborted", "interrupted", "idle") -> VerdeColors.Muted; else -> VerdeColors.Accent },
@@ -77,3 +78,5 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
 internal fun AgentsSheet(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap()) {
     ModalBottomSheet(onDismissRequest = close) { Box(Modifier.fillMaxWidth().fillMaxHeight(0.85f)) { AgentsPanel(agents, close, open, workspaceLabels) } }
 }
+
+internal val LocalAgentsPanelVisible = androidx.compose.runtime.staticCompositionLocalOf<(Boolean) -> Unit> { {} }
