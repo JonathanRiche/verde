@@ -1893,6 +1893,9 @@ const ChatTurn = struct {
     // Durable completion may precede parent delivery. GC must not join a
     // worker under the daemon lock until it has finished using that lock.
     worker_exited: bool = false,
+    /// Unlocked steering RPCs still reference this turn after its worker exits.
+    /// Guarded by the turn mutex; consume/GC must wait for every request.
+    steering_requests: usize = 0,
     /// True from turn acceptance (when the store is open) until the store
     /// receipt returns, so consume cannot race a pre-commit terminal status.
     durability_pending: bool = false,
@@ -1915,6 +1918,8 @@ const ChatTurn = struct {
     provider_invocation_count: ?*usize = null,
     /// Unit-test-only capture of the exact provider steering identity.
     steer_invocation_capture: ?*SteerInvocationCapture = null,
+    /// Deterministic completion/consume interleaving during stub steering.
+    steer_test_hook: ?*const fn (*Daemon, *ChatTurn) anyerror!void = null,
     /// Last durable-commit error name (diagnostic; dual-write-unread only).
     durability_error: ?[]u8 = null,
     provider_thread_id: ?[]u8 = null,
@@ -2698,7 +2703,7 @@ pub const Daemon = struct {
         }
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
-            const keep_alive = chatTurnKeepsDaemonAlive(
+            const keep_alive = turn.steering_requests != 0 or chatTurnKeepsDaemonAlive(
                 turn.status,
                 turn.consumed,
                 turn.worker_done,
@@ -2745,7 +2750,7 @@ pub const Daemon = struct {
         var count: usize = 0;
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
-            const keep_alive = chatTurnKeepsDaemonAlive(
+            const keep_alive = turn.steering_requests != 0 or chatTurnKeepsDaemonAlive(
                 turn.status,
                 turn.consumed,
                 turn.worker_done,
@@ -8330,6 +8335,12 @@ pub const Daemon = struct {
         const use_stub = turn.use_stub;
         const provider_invocation_count = turn.provider_invocation_count;
         const steer_invocation_capture = turn.steer_invocation_capture;
+        turn.steering_requests += 1;
+        defer {
+            lockTurn(turn);
+            turn.steering_requests -= 1;
+            turn.mutex.unlock();
+        }
         turn.mutex.unlock();
         self.mutex.unlock();
         defer self.allocator.free(owned_provider_thread_id);
@@ -8347,6 +8358,7 @@ pub const Daemon = struct {
         // safely fall back to a queued next turn instead of staying uncertain.
         var definitely_not_delivered = false;
         const provider_accepted = if (use_stub) blk: {
+            if (turn.steer_test_hook) |hook| try hook(self, turn);
             if (provider_invocation_count) |count| count.* += 1;
             if (steer_invocation_capture) |capture| capture.record(steer_provider, owned_provider_thread_id, owned_provider_turn_id);
             break :blk std.mem.indexOf(u8, prompt, "reject steer") == null;
@@ -20068,7 +20080,7 @@ fn markChatTurnWorkerExited(turn: *ChatTurn) void {
 
 // Caller holds the turn mutex. Synthetic/restored turns have no worker.
 fn chatTurnCanReclaim(turn: *const ChatTurn) bool {
-    return turn.worker_done and !turn.durability_pending and
+    return turn.worker_done and !turn.durability_pending and turn.steering_requests == 0 and
         (turn.worker_thread == null or turn.worker_exited);
 }
 
@@ -21894,6 +21906,73 @@ test "queued agent prompt start refusals retry only transient errors" {
         try std.testing.expectEqual(100 + queuedAgentPromptBackoffMs(attempt), daemon.queued_agent_prompts.items[0].retry_at_ms);
     }
     try std.testing.expect(noteQueuedAgentPromptTransientFailure(&daemon, "retry-turn", 100));
+}
+
+test "steering retains completed consumed turns until the RPC returns" {
+    const allocator = std.testing.allocator;
+    const Interleave = struct {
+        fn completeAndConsume(daemon: *Daemon, turn: *ChatTurn) !void {
+            {
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                turn.status = .completed;
+                turn.worker_done = true;
+                turn.worker_exited = true;
+                // Fail before dereferencing freed memory if the lifetime guard regresses.
+                try std.testing.expect(!chatTurnCanReclaim(turn));
+            }
+            const response = try daemon.handleRequest(
+                \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.consume","params":{"turn_id":"steer-race"}}
+            );
+            defer daemon.allocator.free(response);
+            var parsed = try std.json.parseFromSlice(std.json.Value, daemon.allocator, response, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("result").?.object.get("accepted").?.bool);
+            lockDaemon(daemon);
+            defer daemon.mutex.unlock();
+            daemon.removeFinishedConsumedChatTurns();
+            try std.testing.expect(daemon.findChatTurn("steer-race") == turn);
+            try std.testing.expect(turn.consumed);
+            try std.testing.expectEqual(@as(usize, 1), daemon.countKeepAliveTurns());
+        }
+
+        fn completeConsumeAndFail(daemon: *Daemon, turn: *ChatTurn) !void {
+            try completeAndConsume(daemon, turn);
+            return error.TestSteerFailure;
+        }
+    };
+    // Accepted and ambiguous provider replies both touch the turn after the RPC.
+    // A thrown error must also release its lifetime pin.
+    for ([_][]const u8{ "accept steer", "reject steer", "throw" }) |prompt| {
+        var daemon = Daemon.init(allocator);
+        defer daemon.deinit();
+        const turn = try appendTestChatTurn(&daemon, allocator, "steer-race", "w", "/tmp", "Race", "original", .running, 1);
+        turn.request.provider = .codex;
+        turn.use_stub = true;
+        turn.active_turn_id = try allocator.dupe(u8, "provider-turn");
+        const throws = std.mem.eql(u8, prompt, "throw");
+        turn.steer_test_hook = if (throws) Interleave.completeConsumeAndFail else Interleave.completeAndConsume;
+        const raw = try std.json.Stringify.valueAlloc(allocator, .{ .turn_id = "steer-race", .steer_id = "race", .prompt = prompt }, .{});
+        defer allocator.free(raw);
+        var params = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer params.deinit();
+        if (throws) {
+            try std.testing.expectError(error.TestSteerFailure, daemon.chatTurnSteerResponse(.{ .integer = 1 }, params.value));
+        } else {
+            const response = try daemon.chatTurnSteerResponse(.{ .integer = 1 }, params.value);
+            defer allocator.free(response);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.contains(if (std.mem.eql(u8, prompt, "accept steer")) "result" else "error"));
+        }
+        try std.testing.expectEqual(@as(usize, 0), turn.steering_requests);
+        try std.testing.expect(chatTurnCanReclaim(turn));
+        try std.testing.expectEqual(@as(usize, 0), daemon.countKeepAliveTurns());
+        lockDaemon(&daemon);
+        defer daemon.mutex.unlock();
+        daemon.removeFinishedConsumedChatTurns();
+        try std.testing.expect(daemon.findChatTurn("steer-race") == null);
+    }
 }
 
 test "Codex daemon steering uses provider identities and deduplicates ambiguous retry" {
