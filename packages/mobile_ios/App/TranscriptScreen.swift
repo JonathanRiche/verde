@@ -117,7 +117,7 @@ extension TranscriptScreen {
         AgentsPanel(agents: model?.thread?.orchestration, close: { agentsOpen = false }, open: { agent in
             agentsOpen = false
             openRoute(.thread(workspace: agent.workspace_id, thread: agent.local_thread_id))
-        })
+        }, workspaces: browse.state.workspaces?.items ?? [])
     }
 
     /// "Ask agent" selections (file/diff viewers) and notification replies arrive as prompts;

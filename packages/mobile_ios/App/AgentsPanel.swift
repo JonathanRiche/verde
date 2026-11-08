@@ -24,6 +24,7 @@ struct AgentsPanel: View {
     let agents: ChatOrchestration?
     let close: () -> Void
     let open: (ChatLinkedAgent) -> Void
+    var workspaces: [Workspace] = []
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -50,7 +51,7 @@ struct AgentsPanel: View {
                                     .padding(.horizontal, 8).padding(.vertical, 4)
                                     .background(VerdeTheme.alternate, in: Capsule())
                                 Text([agent.provider, agent.model].filter { !$0.isEmpty }.joined(separator: " · "))
-                                Text(agent.workspace_id)
+                                Text(workspaces.first { $0.workspace_id == agent.workspace_id }?.label ?? agent.workspace_id)
                                 if agent.updated_at_ms > 0 {
                                     Text(agoLabel(agent.updated_at_ms, Int64(Date().timeIntervalSince1970 * 1000)))
                                 }
