@@ -9,6 +9,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -34,7 +36,7 @@ internal fun AgentsWaitingBar(agents: ChatOrchestration, open: () -> Unit) {
 }
 
 @Composable
-internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap()) {
+internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap(), entryFocus: FocusRequester? = null) {
     val focus = LocalFocusManager.current
     Column(Modifier.fillMaxSize().padding(12.dp).onPreviewKeyEvent { event ->
         if (event.type != KeyEventType.KeyDown) false else when (event.key) {
@@ -46,7 +48,7 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
     }) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("Agents", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f).padding(vertical = 12.dp))
-            TextButton(onClick = close, modifier = Modifier.heightIn(min = 48.dp)) { Text("Close agents") }
+            TextButton(onClick = close, modifier = Modifier.heightIn(min = 48.dp).then(entryFocus?.let { Modifier.focusRequester(it) } ?: Modifier)) { Text("Close agents") }
         }
         if (agents?.error != null) SelectionContainer { Text("Couldn't refresh agents. Reconnect to try again.") }
         if (agents?.links.isNullOrEmpty()) SelectionContainer {

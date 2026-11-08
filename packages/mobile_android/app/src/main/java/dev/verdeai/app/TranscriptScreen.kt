@@ -241,6 +241,8 @@ internal fun TranscriptScreen(
     val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val headerEntry = remember { androidx.compose.ui.focus.FocusRequester() }
     val composerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val agentsFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(agentsOpen, wideAgents) { if (agentsOpen && wideAgents) agentsFocus.requestFocus() }
     val tabletop = rememberTabletopHinge()
     val columnBounds = remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Box(Modifier.fillMaxSize()) {
@@ -370,7 +372,7 @@ internal fun TranscriptScreen(
         if (wideAgents) {
             androidx.activity.compose.BackHandler { agentsOpen = false }
             Surface(Modifier.align(Alignment.CenterEnd).width(300.dp).fillMaxHeight(), color = VerdeColors.Panel) {
-                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels)
+                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels, entryFocus = agentsFocus)
             }
         } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels)
     }
