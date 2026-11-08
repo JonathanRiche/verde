@@ -80,6 +80,7 @@ struct RootView: View {
     /// The width the shell has; drives the layout from outside its geometry reader too.
     @State private var windowWidth: CGFloat = 0
     /// The user hid the permanent sidebar (for a full-width diff or terminal).
+    @State private var agentsPanelVisible = false
     @AppStorage("layout.sidebar.collapsed") private var sidebarCollapsed = false
     /// The chat list is showing over Moss in the sidebar slot; Moss stays open behind it.
     @State private var chatsPeek = false
@@ -176,6 +177,7 @@ struct RootView: View {
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: sidebarCollapsed)
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: chatsPeek)
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: companionSheet)
+            .environment(\.agentsPanelVisibility, { agentsPanelVisible = $0 })
             .environment(\.openWorkspaceDrawer, {
                 if currentPanes.tier.docked {
                     sidebarCollapsed = false
@@ -231,7 +233,7 @@ struct RootView: View {
     }
 
     private func panesFor(width: CGFloat) -> AdaptivePanes {
-        AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek,
+        AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed || agentsPanelVisible, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek,
                       sidebarWidth: adaptiveSidebarWidth(dynamicTypeSize, window: width),
                       // Moss's header and chips need more room at the accessibility sizes.
                       mossPaneWidth: dynamicTypeSize.isAccessibilitySize ? 400 : AdaptivePanes.mossPaneWidth)

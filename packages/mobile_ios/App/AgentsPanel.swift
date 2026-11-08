@@ -39,7 +39,7 @@ struct AgentsPanel: View {
                         Text("Couldn't refresh agents. Reconnect to try again.").textSelection(.enabled)
                     }
                     if agents?.links.isEmpty != false {
-                        Text(agents?.loading == true ? "Loading agents…" : "No linked agents yet. Delegated chats will appear here.")
+                        Text(agents?.loaded != true ? "Loading agents…" : "No linked agents yet. Delegated chats will appear here.")
                             .textSelection(.enabled).padding(12)
                     }
                     ForEach(agents?.links ?? [], id: \.link_id) { agent in
@@ -64,5 +64,15 @@ struct AgentsPanel: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
         }.background(VerdeTheme.panel)
+    }
+}
+
+private struct AgentsPanelVisibilityKey: EnvironmentKey {
+    static let defaultValue: (Bool) -> Void = { _ in }
+}
+extension EnvironmentValues {
+    var agentsPanelVisibility: (Bool) -> Void {
+        get { self[AgentsPanelVisibilityKey.self] }
+        set { self[AgentsPanelVisibilityKey.self] = newValue }
     }
 }

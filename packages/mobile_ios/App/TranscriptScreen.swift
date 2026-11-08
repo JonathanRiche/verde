@@ -20,6 +20,7 @@ struct TranscriptScreen: View {
 
     @State private var model: TranscriptModel?
     @State private var agentsOpen = false
+    @Environment(\.agentsPanelVisibility) private var setAgentsPanelVisible
     @Environment(\.openRoute) private var openRoute
     @State private var git: GitChangesModel?
     @Environment(\.adaptive) private var adaptive
@@ -108,7 +109,9 @@ struct TranscriptScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .verdeChatHandoff)) { _ in takeHandoffs() }
         // Focus is released after a short delay (or by the model's owner check once it is gone),
         // so a quick return to this chat doesn't churn the core's focus slot.
-        .onDisappear { model?.setVisible(false) }
+        .onChange(of: agentsOpen) { _, open in setAgentsPanelVisible(open && adaptive.tier.docked) }
+        .onChange(of: adaptive.tier) { _, tier in setAgentsPanelVisible(agentsOpen && tier.docked) }
+        .onDisappear { model?.setVisible(false); setAgentsPanelVisible(false) }
     }
 }
 
