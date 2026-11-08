@@ -375,6 +375,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val headerFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val contentFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val bubbleFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val agentsBackDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
     val inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
     val hasShellHeader = !pairing && route in TABS
     var shellHolds by remember { mutableStateOf(false) }
@@ -388,6 +389,11 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         .focusProperties { canFocus = shellFocus.parked }
         .onFocusChanged { shellHolds = it.isFocused; shellHasFocus = it.hasFocus }
         .onPreviewKeyEvent { event ->
+            // Touch parks focus on the shell; Escape must still close the visible agents panel.
+            if (agentsPanelVisible && event.key == Key.Escape && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
+                agentsBackDispatcher?.onBackPressed()
+                return@onPreviewKeyEvent true
+            }
             // A7-3: the first Tab after a touch (the shell holds focus) goes to the first control.
             if ((shellHolds || shellFocus.pendingPark || !shellHasFocus) && event.key == Key.Tab && event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) {
                 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
