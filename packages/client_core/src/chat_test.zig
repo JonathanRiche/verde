@@ -782,3 +782,34 @@ test "orchestration refresh updates thread and parent C11 classification then se
     try expect(!@import("orchestration.zig").view(&f.host.state, ws, thread).needs_you);
     try expect(@import("orchestration.zig").view(&f.host.state, ws, thread).waiting_count == 0);
 }
+
+test "Fable 5.2 fallback selection preserves Opus default and full effort range" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const out = try @import("chat_catalogs.zig").catalogs(arena.allocator(), .{ .provider = "claude", .model = "claude-fable-5-2" }, .null, .null);
+    try eql("default", out.models[0].id);
+    try eql("Opus 5.5", out.default_model_label.?);
+    var found = false;
+    for (out.models) |model| if (h.eq(model.id, "claude-fable-5-2")) {
+        try eql("Fable 5.2", model.label);
+        found = true;
+    };
+    try expect(found);
+    const efforts = [_][]const u8{ "", "low", "medium", "high", "xhigh", "max" };
+    try expect(out.efforts.len == efforts.len);
+    for (out.efforts, efforts) |effort, expected| try eql(expected, effort.id);
+}
+
+test "Muse Ember fallback preserves Wonder default and existing model choices" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const cat = @import("chat_catalogs.zig");
+    const out = try cat.catalogs(arena.allocator(), .{ .provider = "muse", .model = "muse-ember-1.0" }, .null, .null);
+    try eql("muse-wonder-1.0", out.models[0].id);
+    const expected = [_][]const u8{ "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-ember-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
+    try expect(out.models.len == expected.len);
+    for (expected) |id| try expect(cat.contains(out.models, id));
+    const efforts = [_][]const u8{ "", "minimal", "low", "medium", "high", "xhigh", "max" };
+    try expect(out.efforts.len == efforts.len);
+    for (out.efforts, efforts) |effort, expected_effort| try eql(expected_effort, effort.id);
+}

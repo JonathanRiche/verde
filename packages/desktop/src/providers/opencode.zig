@@ -2907,7 +2907,7 @@ fn mimeTypeForPath(path: []const u8) []const u8 {
 
 fn reasoningVariantName(value: ?provider_types.ReasoningEffort) ?[]const u8 {
     return switch (value orelse return null) {
-        .low => "low",
+        .minimal, .low => "low",
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",

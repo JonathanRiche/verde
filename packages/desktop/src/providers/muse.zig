@@ -262,6 +262,9 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
         return sendPromptResuming(self, allocator, request) catch |err| {
+            if (err == error.MuseSessionMcpCapabilityRequired) {
+                if (request.on_failure) |callback| callback(request.stream_context, "Muse rejected session setup because the sessionMcp capability was not negotiated.");
+            }
             if (err != error.MuseOpaqueHistory or request.thread_id == null) return err;
             if (request.on_failure) |callback| callback(request.stream_context, OPAQUE_HISTORY_NOTICE);
             var retry = request;
@@ -372,7 +375,7 @@ pub const Client = struct {
         }
         const turn_command_id = try uuidV7Alloc(allocator, proc.threaded.io());
         defer allocator.free(turn_command_id);
-        try proc.writeLine(try makeTurnStartRequestAlloc(allocator, 5, turn_command_id, session_id, request));
+        try proc.writeLine(try makeTurnStartRequestAlloc(allocator, 5, turn_command_id, session_id, request, self.config.model));
 
         var reply: std.ArrayList(u8) = .empty;
         errdefer reply.deinit(allocator);
@@ -885,6 +888,11 @@ fn failIfRpcError(value: std.json.Value) !void {
     const error_value = acp.getObjectField(value, "error") orelse return;
     const message = acp.getOptionalObjectString(error_value, "message") orelse "";
     if (isSessionInUse(error_value)) return error.MuseSessionInUse;
+    if (acp.getObjectField(error_value, "data")) |data| {
+        if (std.mem.eql(u8, acp.getOptionalObjectString(data, "kind") orelse "", "capabilityRequired") and
+            std.mem.eql(u8, acp.getOptionalObjectString(data, "capability") orelse "", "sessionMcp"))
+            return error.MuseSessionMcpCapabilityRequired;
+    }
     if (containsAuthHint(message)) return error.MuseSignedOut;
     if (isApprovalModeRejected(message)) return error.MuseApprovalModeRejected;
     if (isOpaqueReasoningHistory(message)) return error.MuseOpaqueHistory;
@@ -984,8 +992,20 @@ fn parseModelListAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]p
             });
         }
     }
+    // Older Muse Code catalogs may omit Ember. Preserve the explicit option
+    // when live discovery replaces the clients' fallback catalogs.
+    if (models.items.len > 0 and !hasModelId(entries.array.items, EMBER_MODEL_ID)) {
+        try models.append(allocator, .{
+            .provider_id = try allocator.dupe(u8, "muse"),
+            .provider_name = try allocator.dupe(u8, "Muse"),
+            .model_id = try allocator.dupe(u8, EMBER_MODEL_ID),
+            .model_name = try allocator.dupe(u8, EMBER_MODEL_ID),
+        });
+    }
     return models.toOwnedSlice(allocator);
 }
+
+const EMBER_MODEL_ID = "muse-ember-1.0";
 
 // Muse 1.4.6 `model/list` omits Wonder Full even for entitled accounts, yet
 // the backend serves it, so list it beside Wonder.
@@ -1531,8 +1551,10 @@ fn cancelUserInput(allocator: std.mem.Allocator, proc: *acp.Process, params: std
     try proc.writeLine(try makeUserInputCancelRequestAlloc(allocator, 81, command_id, session_id, request_id));
 }
 
-fn reasoningEffortName(effort: provider_types.ReasoningEffort) []const u8 {
+fn reasoningEffortName(model: ?[]const u8, effort: provider_types.ReasoningEffort) []const u8 {
+    if (model) |id| if (std.mem.eql(u8, id, EMBER_MODEL_ID)) return @tagName(effort);
     return switch (effort) {
+        .minimal => "low",
         .low => "low",
         .medium => "medium",
         .high => "high",
@@ -1555,6 +1577,10 @@ fn makeInitializeRequestAlloc(allocator: std.mem.Allocator, id: i64) ![]u8 {
     try json.objectField("version");
     try json.write("0.1");
     try json.endObject();
+    // Inline MCP configuration on session/start and session/resume requires
+    // this negotiated MSP capability before Muse accepts either request.
+    try json.objectField("capabilities");
+    try json.write(.{ .requestedCapabilities = &[_][]const u8{"sessionMcp"} });
     try json.endObject();
     try json.endObject();
     return writer.toOwnedSlice();
@@ -1718,6 +1744,7 @@ fn makeTurnStartRequestAlloc(
     command_id: []const u8,
     session_id: []const u8,
     request: provider_types.SendPromptRequest,
+    configured_model: ?[]const u8,
 ) ![]u8 {
     const images = try collectImagesAlloc(allocator, request);
     defer allocator.free(images);
@@ -1748,7 +1775,7 @@ fn makeTurnStartRequestAlloc(
     try json.write("replace");
     if (request.reasoning_effort) |effort| {
         try json.objectField("reasoningEffort");
-        try json.write(reasoningEffortName(effort));
+        try json.write(reasoningEffortName(request.model orelse configured_model, effort));
     }
     try json.endObject();
     try json.endObject();
@@ -2199,4 +2226,79 @@ test "Muse session start and resume carry enabled Verde MCP configuration" {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, disabled, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("params").?.object.get("config") == null);
+}
+
+test "Muse Ember discovery preserves existing models and avoids duplicates" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"result":{"models":[{"modelId":"muse-wonder-1.0"},{"modelId":"muse-spark-1.3-contributor"}]}}
+        ,
+        \\{"result":{"models":[{"modelId":"muse-wonder-1.0"},{"modelId":"muse-spark-1.3-contributor"},{"modelId":"muse-ember-1.0","displayLabel":"Ember 1.0"}]}}
+        ,
+    }) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture, .{});
+        defer parsed.deinit();
+        const models = try parseModelListAlloc(allocator, parsed.value);
+        defer provider_types.freeModelInfos(allocator, models);
+        try std.testing.expectEqual(@as(usize, 4), models.len);
+        try std.testing.expectEqualStrings(WONDER_MODEL_ID, models[0].model_id);
+        try std.testing.expectEqualStrings(WONDER_FULL_MODEL_ID, models[1].model_id);
+        try std.testing.expectEqualStrings("muse-spark-1.3-contributor", models[2].model_id);
+        try std.testing.expectEqualStrings(EMBER_MODEL_ID, models[3].model_id);
+    }
+    const empty = try std.json.parseFromSlice(std.json.Value, allocator, "{\"result\":{\"models\":[]}}", .{});
+    defer empty.deinit();
+    const models = try parseModelListAlloc(allocator, empty.value);
+    defer provider_types.freeModelInfos(allocator, models);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+}
+
+test "Muse Ember sends exact effort tiers while older models keep ultra" {
+    const a = std.testing.allocator;
+    const efforts = [_]provider_types.ReasoningEffort{ .minimal, .low, .medium, .high, .xhigh, .max };
+    for (efforts) |effort| {
+        const raw = try makeTurnStartRequestAlloc(a, 1, "cmd", "session", .{ .prompt = "fixture", .model = EMBER_MODEL_ID, .reasoning_effort = effort }, null);
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(effort), parsed.value.object.get("params").?.object.get("reasoningEffort").?.string);
+    }
+    try std.testing.expectEqualStrings("ultra", reasoningEffortName(WONDER_MODEL_ID, .max));
+    try std.testing.expectEqualStrings("ultra", reasoningEffortName("muse-spark-1.3", .max));
+    const raw = try makeTurnStartRequestAlloc(a, 1, "cmd", "session", .{ .prompt = "fixture", .model = EMBER_MODEL_ID }, null);
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("params").?.object.get("reasoningEffort") == null);
+}
+
+test "Muse Ember configured model controls effort on resumed turns" {
+    const a = std.testing.allocator;
+    const raw = try makeTurnStartRequestAlloc(a, 1, "cmd", "session", .{ .prompt = "fixture", .thread_id = "session", .reasoning_effort = .max }, EMBER_MODEL_ID);
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("max", parsed.value.object.get("params").?.object.get("reasoningEffort").?.string);
+}
+
+test "Muse initialize requests session MCP before configuring sessions" {
+    const a = std.testing.allocator;
+    const raw = try makeInitializeRequestAlloc(a, 1);
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?.object;
+    const requested = params.get("capabilities").?.object.get("requestedCapabilities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), requested.len);
+    try std.testing.expectEqualStrings("sessionMcp", requested[0].string);
+    try std.testing.expectEqualStrings("verde", params.get("clientInfo").?.object.get("name").?.string);
+}
+
+test "Muse session MCP rejection retains a specific failure reason" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32010,"message":"session MCP configuration requires the sessionMcp capability","data":{"capability":"sessionMcp","kind":"capabilityRequired","retryable":false}}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.MuseSessionMcpCapabilityRequired, failIfRpcError(parsed.value));
 }

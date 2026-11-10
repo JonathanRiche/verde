@@ -4389,6 +4389,7 @@ fn runReasoningStepLabel(state: *const AppState, index: usize) []const u8 {
 fn reasoningEffortStepDescription(effort: ?ReasoningEffort) []const u8 {
     const value = effort orelse return "Provider default reasoning";
     return switch (value) {
+        .minimal => "Minimal reasoning for quick responses",
         .low => "Fastest, lightest reasoning",
         .medium => "Balanced depth and speed",
         .high => "Deeper reasoning for harder tasks",
@@ -10572,10 +10573,9 @@ pub const AppState = struct {
             }
         }
         if (thread.provider == .muse) {
-            // Muse's top MSP tier is `ultra`; picker rows say Ultra while the
-            // persisted effort tag remains `max`.
+            // Ember uses Max; older Muse models keep their Ultra label.
             if (thread.reasoning_effort) |effort| {
-                for (MUSE_REASONING_OPTIONS) |option| {
+                for (provider_models.museReasoningOptions(thread.model_ref)) |option| {
                     if (option.value) |value| {
                         if (value == effort) return option.label;
                     }
@@ -10684,8 +10684,8 @@ pub const AppState = struct {
                 return .{ .index = gauge.index, .count = gauge.count };
             },
             .muse => return .{
-                .index = composerReasoningIndexForOptions(MUSE_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
-                .count = MUSE_REASONING_OPTIONS.len,
+                .index = composerReasoningIndexForOptions(provider_models.museReasoningOptions(thread.model_ref), thread.reasoning_effort) orelse 0,
+                .count = provider_models.museReasoningOptions(thread.model_ref).len,
             },
         }
     }
@@ -14028,7 +14028,7 @@ pub const AppState = struct {
         switch (thread.provider) {
             .codex => for (codexReasoningOptions(thread.model_ref)) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
             .pi => for (PI_REASONING_OPTIONS) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
-            .muse => for (MUSE_REASONING_OPTIONS) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
+            .muse => for (provider_models.museReasoningOptions(thread.model_ref)) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
             .grok => {
                 const values: ?[]const [:0]const u8 = if (self.grokModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
                 for (GROK_REASONING_OPTIONS) |option| {

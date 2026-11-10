@@ -706,7 +706,7 @@ const chatSchema = closedObject(
     default_model: { type: 'string' },
     default_reasoning: {
       type: 'string',
-      enum: ['default', 'low', 'medium', 'high', 'xhigh', 'max'],
+      enum: ['default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     },
     favorite_models: {
       type: 'array',

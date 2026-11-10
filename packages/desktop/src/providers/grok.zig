@@ -110,6 +110,7 @@ fn cachedModelEfforts(model_id: ?[]const u8) ?EffortSet {
 /// supported tier below it, else the lowest supported one. Unknown models
 /// keep the request (`max` still becomes xhigh in reasoningEffortArg).
 fn clampEffortForModel(efforts: ?EffortSet, requested: ReasoningEffort) ReasoningEffort {
+    if (requested == .minimal) return clampEffortForModel(efforts, .low);
     const set = efforts orelse return requested;
     if (set.count() == 0 or set.contains(requested)) return requested;
     const tiers = [_]ReasoningEffort{ .low, .medium, .high, .xhigh, .max };
@@ -662,7 +663,7 @@ fn buildArgv(storage: *[8][]const u8, executable: []const u8, model_arg: ?[]cons
 /// rather than rejected so an over-ambitious persisted thread still sends.
 fn reasoningEffortArg(effort: provider_types.ReasoningEffort) []const u8 {
     return switch (effort) {
-        .low => "low",
+        .minimal, .low => "low",
         .medium => "medium",
         .high => "high",
         .xhigh, .max => "xhigh",
@@ -947,6 +948,7 @@ test "parseAvailableModelsAlloc keeps per-model reasoning efforts and clamps req
     try std.testing.expectEqual(ReasoningEffort.high, clampEffortForModel(cachedModelEfforts("grok-4.5"), .max));
     try std.testing.expectEqual(ReasoningEffort.xhigh, clampEffortForModel(cachedModelEfforts("grok-4.6"), .max));
     try std.testing.expectEqual(ReasoningEffort.low, clampEffortForModel(cachedModelEfforts("grok-4.6"), .low));
+    try std.testing.expectEqual(ReasoningEffort.low, clampEffortForModel(cachedModelEfforts("grok-4.6"), .minimal));
     // Unknown models keep the request.
     try std.testing.expectEqual(ReasoningEffort.xhigh, clampEffortForModel(cachedModelEfforts("grok-mini"), .xhigh));
     var high_only: EffortSet = .initEmpty();

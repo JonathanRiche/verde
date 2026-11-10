@@ -64,7 +64,7 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     } else if (effort_values.len > 0) {
         out.efforts = try choices(a, effort_values);
     } else if ((eq(provider, "codex") or eq(provider, "claude") or eq(provider, "pi") or eq(provider, "grok") or eq(provider, "muse")) and !(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) {
-        out.efforts = try choices(a, if (eq(provider, "grok") or eq(model, "gpt-5.5")) &.{ "", "low", "medium", "high", "xhigh" } else &.{ "", "low", "medium", "high", "xhigh", "max" });
+        out.efforts = try choices(a, if (eq(provider, "muse") and eq(model, "muse-ember-1.0")) &.{ "", "minimal", "low", "medium", "high", "xhigh", "max" } else if (eq(provider, "grok") or eq(model, "gpt-5.5")) &.{ "", "low", "medium", "high", "xhigh" } else &.{ "", "low", "medium", "high", "xhigh", "max" });
     }
     if (eq(provider, "cursor") and selected == .null) {
         const variants: []const []const u8 = if (eq(model, "grok-4.7-medium")) &.{ "low", "medium", "high", "xhigh" } else if (eq(model, "cursor-grok-4.5-high")) &.{ "low", "medium", "high" } else if (eq(model, "gpt-5.5-medium")) &.{ "none", "low", "medium", "high", "extra-high" } else if (eq(model, "gpt-5.4-medium")) &.{ "low", "medium", "high", "xhigh" } else if (std.mem.startsWith(u8, model, "gpt-5.6-")) &.{ "none", "low", "medium", "high", "xhigh", "max" } else if (std.mem.startsWith(u8, model, "claude-")) &.{ "low", "medium", "high", "xhigh", "max" } else &.{};
@@ -139,11 +139,11 @@ fn namesModel(text: []const u8) bool {
 }
 fn fallback(provider: []const u8) []const []const u8 {
     if (eq(provider, "codex")) return &.{ "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
-    if (eq(provider, "claude")) return &.{ "default", "opus[1m]", "fable[1m]", "sonnet", "haiku" };
+    if (eq(provider, "claude")) return &.{ "default", "opus[1m]", "claude-fable-5-2", "fable[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
     if (eq(provider, "antigravity")) return &.{ "default", "gemini-3.8-flash" };
-    if (eq(provider, "muse")) return &.{ "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
+    if (eq(provider, "muse")) return &.{ "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-ember-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
     if (eq(provider, "pi")) return &.{"default"};
     if (eq(provider, "fx")) return &.{ "default", "openai/gpt-5.2", "openai/gpt-5.4-mini", "openai/gpt-5.1-codex", "anthropic/claude-sonnet-5" };
     if (eq(provider, "cursor")) return &.{ "auto", "grok-4.7-medium", "composer-2.5", "cursor-grok-4.5-high", "claude-opus-4-8-thinking-high", "gpt-5.6-sol-medium", "gpt-5.5-medium", "claude-fable-5-thinking-high", "claude-sonnet-5-thinking-high", "gpt-5.6-terra-medium", "gpt-5.6-luna-medium", "gpt-5.4-medium", "gemini-3.1-pro", "gemini-3.5-flash", "kimi-k3", "glm-5.2-high" };
@@ -197,6 +197,7 @@ pub fn usage(a: A, author: []const u8, body: []const u8) h.ApiError!?m.Usage {
 }
 
 fn choiceLabel(id: []const u8) []const u8 {
+    if (eq(id, "minimal")) return "Minimal";
     if (eq(id, "low")) return "Low";
     if (eq(id, "medium")) return "Medium";
     if (eq(id, "high")) return "High";
@@ -209,6 +210,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "gpt-5.5")) return "GPT-5.5";
     if (eq(id, "gpt-5.6-terra")) return "GPT-5.6 Terra";
     if (eq(id, "gpt-5.6-luna")) return "GPT-5.6 Luna";
+    if (eq(id, "claude-fable-5-2")) return "Fable 5.2";
     if (eq(id, "fable[1m]")) return "Fable 5.1";
     if (eq(id, "opus[1m]")) return "Opus 5.5 (1M context)";
     if (eq(id, "sonnet")) return "Sonnet 5.5";

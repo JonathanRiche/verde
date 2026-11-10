@@ -1244,15 +1244,23 @@ async function handleClaudeListModels(sdk, request) {
   } finally {
     close();
   }
-  write({
-    type: "result",
-    models: (models ?? []).map((model) => ({
-      id: model.value ?? model.id ?? model.name ?? String(model),
-      name: claudeModelDisplayName(model),
-      reasoning_supported: model.supportsEffort ?? false,
-      supported_effort_levels: Array.isArray(model.supportedEffortLevels) ? model.supportedEffortLevels : null,
-    })),
-  });
+  const options = (models ?? []).map((model) => ({
+    id: model.value ?? model.id ?? model.name ?? String(model),
+    name: claudeModelDisplayName(model),
+    reasoning_supported: model.supportsEffort ?? false,
+    supported_effort_levels: Array.isArray(model.supportedEffortLevels) ? model.supportedEffortLevels : null,
+  }));
+  // The SDK may list only the rolling Fable alias. Keep the explicit version
+  // selectable after live discovery replaces the clients' fallback catalogs.
+  if (options.length > 0 && !options.some((model) => model.id === "claude-fable-5-2")) {
+    options.push({
+      id: "claude-fable-5-2",
+      name: "Fable 5.2",
+      reasoning_supported: true,
+      supported_effort_levels: ["low", "medium", "high", "xhigh", "max"],
+    });
+  }
+  write({ type: "result", models: options });
 }
 
 async function handleClaudeListThreads(sdk, request) {

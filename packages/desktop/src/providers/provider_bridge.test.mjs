@@ -337,3 +337,39 @@ test('plan rate limit covered by usage credits does not fail the turn', () => {
   assert.equal(check(event({ status: 'rejected', rateLimitType: 'overage', overageStatus: 'allowed' })), 'Claude overage usage limit has been reached.');
   assert.equal(check(event({ status: 'allowed_warning', rateLimitType: 'seven_day' })), null);
 });
+
+for (const explicit of [false, true]) {
+  test(`Fable 5.2 remains selectable after model discovery (explicit=${explicit})`, async () => {
+    const { context, events } = bridge();
+    const efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+    const models = [
+      { value: 'default', displayName: 'Default (Opus 5.5)', supportsEffort: true },
+      { value: 'fable[1m]', displayName: 'Fable 5.1', supportsEffort: true },
+      ...(explicit ? [{ value: 'claude-fable-5-2', displayName: 'Fable 5.2', supportsEffort: true, supportedEffortLevels: efforts }] : []),
+    ];
+    let closed = false;
+    await context.handleClaudeListModels({ query() {
+      return { supportedModels: async () => models, close: () => { closed = true; } };
+    } }, {});
+    const listed = events.at(-1).models;
+    assert.equal(closed, true);
+    assert.equal(listed[0].id, 'default');
+    assert.equal(listed[0].name, 'Default (Opus 5.5)');
+    assert.equal(listed.filter(model => model.id === 'claude-fable-5-2').length, 1);
+    assert.deepEqual(listed.find(model => model.id === 'claude-fable-5-2'), {
+      id: 'claude-fable-5-2', name: 'Fable 5.2', reasoning_supported: true, supported_effort_levels: efforts,
+    });
+    assert.ok(listed.some(model => model.id === 'fable[1m]'));
+    assert.equal(context.buildClaudeOptions({ model: 'claude-fable-5-2', reasoning_effort: 'max' }).model, 'claude-fable-5-2');
+  });
+}
+
+for (const models of [[], null]) {
+  test(`empty Claude discovery preserves client fallback (${JSON.stringify(models)})`, async () => {
+    const { context, events } = bridge();
+    await context.handleClaudeListModels({ query() {
+      return { supportedModels: async () => models, close() {} };
+    } }, {});
+    assert.deepEqual(events.at(-1).models, []);
+  });
+}

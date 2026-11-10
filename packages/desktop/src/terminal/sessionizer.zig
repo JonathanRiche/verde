@@ -12527,9 +12527,14 @@ fn toolCallStatusNameFromCode(code: i64) []const u8 {
 }
 
 fn reasoningEffortNameFromCode(code: i64) []const u8 {
-    const names = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
+    const names = [_][]const u8{ "low", "medium", "high", "xhigh", "max", "minimal" };
     if (code < 0 or code >= names.len) return "medium";
     return names[@intCast(code)];
+}
+
+test "minimal reasoning effort survives stored thread projection" {
+    try std.testing.expectEqualStrings("minimal", reasoningEffortNameFromCode(5));
+    try std.testing.expectEqualStrings("max", reasoningEffortNameFromCode(4));
 }
 
 fn fastModeNameFromCode(code: i64) []const u8 {

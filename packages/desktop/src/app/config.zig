@@ -56,6 +56,7 @@ pub const ChatReasoning = enum {
     high,
     xhigh,
     max,
+    minimal,
 
     pub fn parse(value: []const u8) ?ChatReasoning {
         if (std.mem.eql(u8, value, "default")) return .provider_default;
@@ -1271,7 +1272,7 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
             if (ChatReasoning.parse(reasoning_value.string)) |reasoning| {
                 config.new_chat_reasoning = reasoning;
             } else {
-                log.warn("chat.default_reasoning must be default, low, medium, high, xhigh, or max", .{});
+                log.warn("chat.default_reasoning must be default, minimal, low, medium, high, xhigh, or max", .{});
             }
         } else {
             log.warn("chat.default_reasoning must be a string when provided", .{});

@@ -2143,7 +2143,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
                 break :blk false;
             },
             // Pi accepts every Verde effort tag as a thinking level.
-            .pi => true,
+            .pi => effort != .minimal,
             .opencode, .cursor => false,
             // fx tiers follow the probed catalog for the model.
             .fx => provider_models.fxEffortSupported(self.modelOptionForProvider(.fx, model_ref), effort),
@@ -2157,7 +2157,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
                 const values: ?[]const [:0]const u8 = if (self.modelOptionForProvider(.grok, model_ref)) |option| option.grok_effort_values else null;
                 break :blk grokEffortSupported(values, effort);
             },
-            .muse => true,
+            .muse => provider_models.museEffortSupported(model_ref, effort),
             .custom_acp => false,
         };
         if (!supported) return error.UnsupportedReasoningEffort;

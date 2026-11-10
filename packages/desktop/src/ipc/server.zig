@@ -1283,7 +1283,7 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     }
     const creation_settings = parseChatOpenSettings(params) catch |err| switch (err) {
         error.InvalidReasoningEffortType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_effort must be a string"),
-        error.InvalidReasoningEffortValue => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_effort must be one of: low, medium, high, xhigh, max"),
+        error.InvalidReasoningEffortValue => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_effort must be one of: minimal, low, medium, high, xhigh, max"),
         error.InvalidReasoningVariantType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_variant must be a string"),
         error.InvalidFastModeType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open fast_mode must be a boolean"),
     };

@@ -2027,7 +2027,7 @@ pub fn refreshOpencodeReasoningMenu(self: anytype, thread: *const ChatThread) !v
     if (thread.provider == .grok) return self.refreshGrokReasoningMenu(thread);
     if (thread.provider == .antigravity) return self.refreshAntigravityReasoningMenu(thread);
     if (thread.provider == .fx) return self.refreshFxReasoningMenu(thread);
-    if (thread.provider == .muse) return self.refreshMuseReasoningMenu();
+    if (thread.provider == .muse) return self.refreshMuseReasoningMenu(thread);
     if (thread.provider != .opencode) return;
     const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
     if (!opt.reasoning_supported) return;
@@ -2120,8 +2120,8 @@ pub fn refreshFxReasoningMenu(self: anytype, thread: *const ChatThread) !void {
     }
 }
 
-pub fn refreshMuseReasoningMenu(self: anytype) !void {
-    for (provider_models.MUSE_REASONING_OPTIONS) |option| {
+pub fn refreshMuseReasoningMenu(self: anytype, thread: *const ChatThread) !void {
+    for (provider_models.museReasoningOptions(thread.model_ref)) |option| {
         const label = try self.allocator.dupeZ(u8, option.label);
         errdefer self.allocator.free(label);
         const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;

@@ -5844,7 +5844,18 @@ fn reasoningEffortCode(value: []const u8) !i64 {
     if (std.mem.eql(u8, value, "high")) return 2;
     if (std.mem.eql(u8, value, "xhigh")) return 3;
     if (std.mem.eql(u8, value, "max")) return 4;
+    if (std.mem.eql(u8, value, "minimal")) return 5;
     return error.InvalidParams;
+}
+
+test "reasoning effort persistence preserves existing ordinals and adds minimal" {
+    const ReasoningEffort = db_types.ReasoningEffort;
+    for ([_][]const u8{ "low", "medium", "high", "xhigh", "max", "minimal" }, 0..) |name, code| {
+        const stored = try reasoningEffortCode(name);
+        try std.testing.expectEqual(@as(i64, @intCast(code)), stored);
+        const decoded = std.enums.fromInt(ReasoningEffort, stored).?;
+        try std.testing.expectEqualStrings(name, @tagName(decoded));
+    }
 }
 
 fn fastModeCode(value: []const u8) !i64 {

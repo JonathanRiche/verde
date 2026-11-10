@@ -3258,7 +3258,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         const creation_settings = liveChatOpenSettings(argv) catch |err| {
             switch (err) {
                 error.MissingReasoningEffort => try out.stderr("--reasoning requires a value\n", .{}),
-                error.InvalidReasoningEffort => try out.stderr("invalid --reasoning value; expected one of: low, medium, high, xhigh, max\n", .{}),
+                error.InvalidReasoningEffort => try out.stderr("invalid --reasoning value; expected one of: minimal, low, medium, high, xhigh, max\n", .{}),
                 error.MissingReasoningVariant => try out.stderr("--reasoning-variant requires a value\n", .{}),
                 error.ConflictingFastMode => try out.stderr("--fast and --no-fast cannot be used together\n", .{}),
             }

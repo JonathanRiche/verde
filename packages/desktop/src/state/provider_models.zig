@@ -90,6 +90,7 @@ pub fn cursorReasoningValueLabel(value: []const u8) []const u8 {
 }
 
 pub fn parseReasoningEffort(value: []const u8) ?ReasoningEffort {
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
     if (std.mem.eql(u8, value, "low")) return .low;
     if (std.mem.eql(u8, value, "medium")) return .medium;
     if (std.mem.eql(u8, value, "high")) return .high;
@@ -106,6 +107,7 @@ pub fn claudeEffortValueLabel(value: []const u8) []const u8 {
 
 pub fn reasoningEffortDisplayLabel(value: ReasoningEffort) []const u8 {
     return switch (value) {
+        .minimal => "Minimal",
         .low => "Low",
         .medium => "Medium",
         .high => "High",
@@ -187,6 +189,7 @@ pub const CLAUDE_FULL_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", 
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Default (Opus 5.5)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Opus 5.5 (1M context)", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Fable 5.2", .value = "claude-fable-5-2", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Fable 5.1", .value = "fable[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet 5.5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 5.5", .value = "haiku", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
@@ -236,6 +239,7 @@ pub const FX_REASONING_OPTIONS = [_]ReasoningOption{
 /// row (null for unknown refs): a probed catalog lists the model's tiers, an
 /// unprobed row offers every tier, and models without reasoning offer none.
 pub fn fxEffortSupported(option: ?ModelOption, effort: ReasoningEffort) bool {
+    if (effort == .minimal) return false;
     const row = option orelse return true;
     if (!row.reasoning_supported) return false;
     const list = row.grok_effort_values orelse return true;
@@ -314,6 +318,7 @@ test "antigravityBaseModelRef strips agy's folded thinking tier" {
 /// True when an agy model row offers `effort`: its catalog tiers, else agy's
 /// usual low/medium/high.
 pub fn antigravityEffortSupported(values: ?[]const [:0]const u8, effort: ReasoningEffort) bool {
+    if (effort == .minimal) return false;
     const list = values orelse ANTIGRAVITY_DEFAULT_EFFORT_VALUES[0..];
     for (list) |value| {
         if (parseReasoningEffort(value) == effort) return true;
@@ -358,6 +363,7 @@ pub const MUSE_MODEL_OPTIONS = [_]ModelOption{
         .description = MUSE_SUBSCRIPTION_DESCRIPTION,
         .reasoning_supported = true,
     },
+    .{ .label = "muse-ember-1.0", .value = "muse-ember-1.0", .reasoning_supported = true },
     .{ .label = "muse-spark-1.3", .value = "muse-spark-1.3", .reasoning_supported = true },
     .{
         .label = "muse-spark-1.3-contributor",
@@ -396,6 +402,7 @@ pub const GROK_REASONING_OPTIONS = [_]ReasoningOption{
 /// True when a grok model accepts `effort`: the catalog list when the model
 /// reported one, otherwise every tier up to xhigh (grok has no max tier).
 pub fn grokEffortSupported(values: ?[]const [:0]const u8, effort: ReasoningEffort) bool {
+    if (effort == .minimal) return false;
     const list = values orelse return effort != .max;
     for (list) |value| {
         if (parseReasoningEffort(value) == effort) return true;
@@ -428,6 +435,26 @@ pub const MUSE_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Xhigh", .value = .xhigh },
     .{ .label = "Ultra", .value = .max },
 };
+
+pub const MUSE_EMBER_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Minimal", .value = .minimal },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
+    .{ .label = "Max", .value = .max },
+};
+
+pub fn museReasoningOptions(model: ?[]const u8) []const ReasoningOption {
+    if (model) |id| if (std.mem.eql(u8, id, "muse-ember-1.0")) return &MUSE_EMBER_REASONING_OPTIONS;
+    return &MUSE_REASONING_OPTIONS;
+}
+
+pub fn museEffortSupported(model: ?[]const u8, effort: ReasoningEffort) bool {
+    for (museReasoningOptions(model)) |option| if (option.value == effort) return true;
+    return false;
+}
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Default", .value = null },
@@ -467,3 +494,16 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Full access", .value = .full_access },
     .{ .label = "Supervised", .value = .supervised },
 };
+
+test "Muse Ember effort choices preserve older models and default" {
+    try std.testing.expectEqualStrings("muse-wonder-1.0", DEFAULT_MUSE_MODEL);
+    const ember = museReasoningOptions("muse-ember-1.0");
+    try std.testing.expectEqual(@as(usize, 7), ember.len);
+    try std.testing.expectEqual(ReasoningEffort.minimal, ember[1].value.?);
+    try std.testing.expectEqualStrings("Max", ember[6].label);
+    const wonder = museReasoningOptions(DEFAULT_MUSE_MODEL);
+    try std.testing.expectEqual(@as(usize, 6), wonder.len);
+    try std.testing.expectEqualStrings("Ultra", wonder[5].label);
+    try std.testing.expect(!museEffortSupported(DEFAULT_MUSE_MODEL, .minimal));
+    try std.testing.expect(museEffortSupported("muse-ember-1.0", .minimal));
+}

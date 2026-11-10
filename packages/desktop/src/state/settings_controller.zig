@@ -31,7 +31,7 @@ const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .
 /// Settings > Providers rows, in display order: the "Connect an AI provider"
 /// dialog's order (`onboarding_modal.PROVIDERS`), so both list providers alike.
 pub const PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .antigravity, .muse };
-const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
+const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .minimal, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -1209,6 +1209,7 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
     if (reasoning == .provider_default) return true;
     const provider = self.settings_controller.draft.new_chat_provider;
     const option = selectedNewChatModelOption(self) orelse return false;
+    if (reasoning == .minimal and (provider != .muse or option.value == null or !std.mem.eql(u8, option.value.?, "muse-ember-1.0"))) return false;
     return switch (provider) {
         .codex => blk: {
             const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
@@ -1246,7 +1247,10 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
             const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
             break :blk provider_models.grokEffortSupported(option.grok_effort_values, effort);
         },
-        .muse => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
+        .muse => blk: {
+            const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
+            break :blk provider_models.museEffortSupported(option.value, effort);
+        },
         .custom_acp => false,
         .opencode => blk: {
             if (!option.reasoning_supported) break :blk false;
@@ -1279,6 +1283,7 @@ pub fn settingsNewChatReasoningLabel(self: anytype, option_index: usize) []const
     const reasoning = settingsNewChatReasoningOptionAt(self, option_index) orelse return "Unknown";
     return switch (reasoning) {
         .provider_default => "Default",
+        .minimal => "Minimal",
         .low => "Low",
         .medium => "Medium",
         .high => "High",

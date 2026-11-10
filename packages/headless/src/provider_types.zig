@@ -151,6 +151,8 @@ pub const ReasoningEffort = enum(u8) {
     high,
     xhigh,
     max,
+    // Append new tiers to preserve persisted enum values.
+    minimal,
 };
 
 pub const ApprovalPolicy = enum(u8) {

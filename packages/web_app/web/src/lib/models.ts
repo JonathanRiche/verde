@@ -119,7 +119,7 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
         label,
         value: row.model_id,
         ...(row.description ? { description: row.description } : {}),
-        efforts: MUSE_EFFORTS,
+        efforts: row.model_id === 'muse-ember-1.0' ? MUSE_EMBER_EFFORTS : MUSE_EFFORTS,
       })
     } else {
       options.push({ label, value: row.model_id })
@@ -170,6 +170,7 @@ const CODEX_MODELS: ModelOption[] = [
 const CLAUDE_MODELS: ModelOption[] = [
   { label: 'Default (Opus 5.5)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Opus 5.5 (1M context)', value: 'opus[1m]', efforts: CLAUDE_FULL_EFFORTS },
+  { label: 'Fable 5.2', value: 'claude-fable-5-2', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Fable 5.1', value: 'fable[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Sonnet 5.5', value: 'sonnet', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Haiku 5.5', value: 'haiku', efforts: CLAUDE_FULL_EFFORTS },
@@ -248,6 +249,13 @@ const MUSE_EFFORTS: EffortOption[] = [
   { label: 'Ultra', value: 'max' },
 ]
 
+const MUSE_EMBER_EFFORTS: EffortOption[] = [
+  DEFAULT_EFFORT,
+  { label: 'Minimal', value: 'minimal' },
+  ...MUSE_EFFORTS.slice(1, -1),
+  { label: 'Max', value: 'max' },
+]
+
 const MUSE_CONTRIBUTOR_DESCRIPTION =
   'Your content, including inter-session messages, may be used for product improvement.'
 
@@ -259,6 +267,7 @@ const MUSE_MODELS: ModelOption[] = [
     description: 'Requires a Muse Code Power or Maximum subscription.',
     efforts: MUSE_EFFORTS,
   },
+  { label: 'muse-ember-1.0', value: 'muse-ember-1.0', efforts: MUSE_EMBER_EFFORTS },
   { label: 'muse-spark-1.3', value: 'muse-spark-1.3', efforts: MUSE_EFFORTS },
   {
     label: 'muse-spark-1.3-contributor',
@@ -358,6 +367,7 @@ export function effortOptionsFor(
 
 export function effortLabel(value: string | null | undefined): string {
   if (!value) return 'Default'
+  if (value === 'minimal') return 'Minimal'
   const known = CLAUDE_FULL_EFFORTS.find((option) => option.value === value)
   return known?.label ?? value
 }
