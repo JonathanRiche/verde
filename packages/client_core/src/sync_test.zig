@@ -556,3 +556,25 @@ test "workspace projection carries the repository manifest and primary group key
     const json = try std.json.Stringify.valueAlloc(a, models.workspaces[3], .{});
     try std.testing.expect(std.mem.indexOf(u8, json, "\"repositories\":[],\"group_key\":null") != null);
 }
+
+test "sync workspace projection may exceed the network input budget" {
+    var h = try init();
+    defer h.deinit();
+    var tx = try host.Transaction.init(&h);
+    defer tx.deinit();
+    try fixture(&tx);
+    const a = tx.allocator();
+    const label = try a.alloc(u8, host.MAX_INPUT + 1);
+    @memset(label, 'x');
+    const ws = &p.get(p.get(tx.state.sync.snapshot, "snapshot"), "workspaces").array.items[0];
+    try ws.object.put(a, "label", .{ .string = label });
+    const view = try sync.query(a, &tx.state, "workspaces");
+    const encoded = try std.json.Stringify.valueAlloc(a, view, .{});
+    try expect(encoded.len > host.MAX_INPUT);
+    try std.testing.expectError(error.ResourceLimit, host.parse(a, encoded));
+    // The separate paginated history override must use its larger view budget too.
+    h.state.chat.history_epoch = 1;
+    h.state.chat.history.query = label;
+    const history_view = try h.query("workspaces", a);
+    try expect(history_view.len > host.MAX_INPUT);
+}

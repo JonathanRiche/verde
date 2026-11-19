@@ -181,7 +181,7 @@ pub const Host = struct {
             if (data == .null) failure = .{ .code = "not_found", .message = "Unknown terminal." };
         } else if (eq(selector, "home") or eq(selector, "workspaces")) {
             data = try sync.query(a, s, selector);
-            if (eq(selector, "workspaces") and s.chat.history_epoch > 0) try data.object.put(a, "history", try valueOf(a, s.chat.history));
+            if (eq(selector, "workspaces") and s.chat.history_epoch > 0) try data.object.put(a, "history", try parseLimit(a, try encode(a, s.chat.history), MAX_HTTP_INPUT));
             try attention.annotate(a, s, selector, &data);
         } else if (try git.query(a, s, selector)) |git_view| {
             data = git_view;

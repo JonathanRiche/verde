@@ -396,5 +396,7 @@ pub fn query(a: std.mem.Allocator, state: *const host.State, selector: []const u
     };
     const models = try p.projectFocused(a, s.snapshot, s.catalog, s.has_catalog, state.wall_time_ms, s.focus, activity.items);
     const bytes = if (eq(selector, "home")) try std.json.Stringify.valueAlloc(a, .{ .items = models.active, .loading = s.loading, .stale = state.stale, .incomplete_scopes = if (p.get(s.snapshot, "incomplete_scopes") == .array) p.get(s.snapshot, "incomplete_scopes") else V{ .array = std.array_list.Managed(V).init(a) }, .@"error" = s.@"error" }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .items = models.workspaces, .loading = s.loading, .stale = state.stale, .@"error" = s.@"error", .history = .{ .query = "", .items = models.history, .next_cursor = @as(?[]const u8, null), .loading = s.loading, .@"error" = s.@"error" } }, .{});
-    return host.parse(a, bytes);
+    // This is an internal projection of already validated, paginated state,
+    // not a network input. Its aggregate size may exceed MAX_INPUT.
+    return host.parseLimit(a, bytes, bytes.len);
 }
