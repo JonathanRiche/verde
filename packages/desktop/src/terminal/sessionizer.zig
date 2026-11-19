@@ -2470,8 +2470,14 @@ const CHAT_ATTACHMENT_SWEEP_INTERVAL_MS: i64 = 60 * std.time.ms_per_s;
 const StagedChatAttachment = struct {
     /// Opaque daemon-generated 32-hex identity; the only client handle.
     id: []u8,
-    /// Canonical MIME from the shared allowlist (static slice; never freed).
+    /// Canonical MIME from the shared allowlist (static slice; never freed),
+    /// or `owned_mime` for a file that is not an image.
     mime: []const u8,
+    /// Set for a file that is not an image; backs `mime`.
+    owned_mime: ?[]u8 = null,
+    /// Client display name of a file that is not an image (validated, one
+    /// line). Null marks an image, which providers take as an image input.
+    file_name: ?[]u8 = null,
     declared_bytes: usize,
     received_bytes: usize = 0,
     state: enum { staging, committed, consumed } = .staging,
@@ -2490,6 +2496,8 @@ const StagedChatAttachment = struct {
         const io = threaded.io();
         if (self.file) |file| file.close(io);
         std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
+        if (self.owned_mime) |value| allocator.free(value);
+        if (self.file_name) |value| allocator.free(value);
         allocator.free(self.id);
         allocator.free(self.path);
         allocator.destroy(self);
@@ -2503,6 +2511,9 @@ const ClaimedAttachmentsError = error{ InvalidParams, ResourceNotFound, InvalidS
 const ClaimedAttachments = struct {
     image_paths: []const []const u8 = &.{},
     images: []store_protocol.Attachment = &.{},
+    /// Prompt lines ("- name: /staged/path") for claimed files that are not
+    /// images; the agent reads those with its own tools.
+    file_lines: []const []const u8 = &.{},
     /// Consumed staged-record ids, retained so a turn-start failure after the
     /// claim can restore the records for a client retry.
     ids: []const []const u8 = &.{},
@@ -2510,6 +2521,7 @@ const ClaimedAttachments = struct {
     fn deinit(self: *ClaimedAttachments, allocator: std.mem.Allocator) void {
         freeStringArray(allocator, self.image_paths);
         freeAttachmentArray(allocator, self.images);
+        freeStringArray(allocator, self.file_lines);
         freeStringArray(allocator, self.ids);
     }
 };
@@ -7846,8 +7858,11 @@ pub const Daemon = struct {
         // Staging is scratch space wiped at daemon start; keep claimed images
         // so phones and the web can still preview them later.
         if (claimed_ptr) |claim| {
-            for (claim.ids, 0..) |id, index| {
-                if (index < claim.image_paths.len) attachment_store.persistClaimed(self.allocator, self.pref_path, id, claim.image_paths[index]);
+            // Images only: `images` and `image_paths` are parallel, and each
+            // image row's reference ends in its attachment id.
+            for (claim.images, claim.image_paths) |image, staged_path| {
+                const id = image.path[headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX.len..];
+                attachment_store.persistClaimed(self.allocator, self.pref_path, id, staged_path);
             }
         }
         const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
@@ -8602,8 +8617,18 @@ pub const Daemon = struct {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const mime_raw = jsonString(params.object.get("mime") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing mime");
-        const mime = headless.attachment_protocol.supportedImageMime(mime_raw) orelse
+        // An image keeps the strict allowlist and becomes a provider image
+        // input. Anything else is staged as a file under its display name.
+        const image_mime = headless.attachment_protocol.supportedImageMime(mime_raw);
+        const is_image = image_mime != null;
+        if (!is_image and !headless.attachment_protocol.isValidFileMime(mime_raw))
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unsupported attachment mime type");
+        const file_name_raw: []const u8 = if (is_image) "" else blk: {
+            const name = jsonString(params.object.get("name") orelse .null) orelse "file";
+            if (!headless.attachment_protocol.isValidAttachmentName(name))
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid attachment name");
+            break :blk name;
+        };
         const declared: usize = blk: {
             const value = params.object.get("byte_size") orelse .null;
             if (value != .integer) break :blk 0;
@@ -8614,7 +8639,8 @@ pub const Daemon = struct {
         // provider harness ingests; accepting more would defer a
         // deterministic provider failure past acceptance.
         const max_declared = @min(limits.max_attachment_bytes, headless.attachment_protocol.MAX_PORTABLE_ATTACHMENT_BYTES);
-        if (declared < STAGED_ATTACHMENT_MIN_BYTES or declared > max_declared)
+        const min_declared: usize = if (is_image) STAGED_ATTACHMENT_MIN_BYTES else 1;
+        if (declared < min_declared or declared > max_declared)
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment byte_size out of range");
 
         const pinned_service = self.beginStagedAttachmentRequest() catch
@@ -8634,12 +8660,23 @@ pub const Daemon = struct {
         ensureChatAttachmentStagingDirectory(io, dir_path) catch
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging directory is unavailable");
 
+        const owned_mime: ?[]u8 = if (is_image) null else try std.ascii.allocLowerString(self.allocator, mime_raw);
+        errdefer if (owned_mime) |value| self.allocator.free(value);
+        const file_name: ?[]u8 = if (is_image) null else try self.allocator.dupe(u8, file_name_raw);
+        errdefer if (file_name) |value| self.allocator.free(value);
+        const mime: []const u8 = image_mime orelse owned_mime.?;
+
         const id = randomEphemeralHexId(self.allocator);
-        // Suffix from the validated MIME (never client input): provider CLIs
-        // and bridges may infer image type from the extension, so a correct
-        // canonical suffix keeps every shared harness working while the
-        // random server-generated id preserves traversal/isolation guarantees.
-        const extension = headless.attachment_protocol.imageExtension(mime);
+        // Suffix from the validated MIME for images: provider CLIs and bridges
+        // may infer image type from the extension, so a correct canonical
+        // suffix keeps every shared harness working. A file keeps only the
+        // alphanumeric extension of its name. Either way the random
+        // server-generated id preserves traversal/isolation guarantees.
+        var extension_buffer: [headless.attachment_protocol.MAX_FILE_EXTENSION_BYTES]u8 = undefined;
+        const extension = if (is_image)
+            headless.attachment_protocol.imageExtension(mime)
+        else
+            headless.attachment_protocol.fileExtension(file_name_raw, &extension_buffer);
         const file_path = std.fmt.allocPrint(self.allocator, "{s}{c}{s}.{s}", .{ dir_path, std.fs.path.sep, id, extension }) catch |err| {
             self.allocator.free(id);
             return err;
@@ -8647,6 +8684,8 @@ pub const Daemon = struct {
         var file = std.Io.Dir.createFileAbsolute(io, file_path, .{ .exclusive = true }) catch {
             self.allocator.free(id);
             self.allocator.free(file_path);
+            if (owned_mime) |value| self.allocator.free(value);
+            if (file_name) |value| self.allocator.free(value);
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging is unavailable");
         };
         const record = self.allocator.create(StagedChatAttachment) catch |err| {
@@ -8659,6 +8698,8 @@ pub const Daemon = struct {
         record.* = .{
             .id = id,
             .mime = mime,
+            .owned_mime = owned_mime,
+            .file_name = file_name,
             .declared_bytes = declared,
             .updated_at_ms = nowMs(),
             .path = file_path,
@@ -8756,7 +8797,9 @@ pub const Daemon = struct {
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment data exceeds declared byte_size");
         }
-        if (record.received_bytes == 0 and
+        // Only images are checked against their MIME: providers decode them.
+        // A file's type is a label, and the agent reads its bytes as data.
+        if (record.received_bytes == 0 and record.file_name == null and
             (decoded.len < STAGED_ATTACHMENT_MIN_BYTES or
                 !headless.attachment_protocol.imageBytesMatchMime(record.mime, decoded)))
         {
@@ -8940,6 +8983,11 @@ pub const Daemon = struct {
             for (ids.items) |id| self.allocator.free(id);
             ids.deinit(self.allocator);
         }
+        var file_lines: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (file_lines.items) |line| self.allocator.free(line);
+            file_lines.deinit(self.allocator);
+        }
 
         // Pure memory work only under this lock (no file/SQLite I/O), and no
         // record state changes until every fallible step has succeeded — an
@@ -8959,15 +9007,23 @@ pub const Daemon = struct {
         }
         for (array.items) |item| {
             const record = self.findStagedChatAttachment(jsonString(item).?).?;
-            const owned_path = try self.allocator.dupe(u8, record.path);
-            {
-                errdefer self.allocator.free(owned_path);
-                try paths.append(self.allocator, owned_path);
-            }
             const owned_id = try self.allocator.dupe(u8, record.id);
             {
                 errdefer self.allocator.free(owned_id);
                 try ids.append(self.allocator, owned_id);
+            }
+            if (record.file_name) |name| {
+                // Not an image: no provider image input and no image row. The
+                // prompt names the staged file for the agent to read.
+                const line = try std.fmt.allocPrint(self.allocator, "- {s}: {s}", .{ name, record.path });
+                errdefer self.allocator.free(line);
+                try file_lines.append(self.allocator, line);
+                continue;
+            }
+            const owned_path = try self.allocator.dupe(u8, record.path);
+            {
+                errdefer self.allocator.free(owned_path);
+                try paths.append(self.allocator, owned_path);
             }
             // Durable projection: the message row persists a stable opaque
             // reference, never the daemon's absolute staging path (which is
@@ -8997,6 +9053,8 @@ pub const Daemon = struct {
         errdefer freeStringArray(self.allocator, owned_paths);
         const owned_images = try images.toOwnedSlice(self.allocator);
         errdefer freeAttachmentArray(self.allocator, owned_images);
+        const owned_lines = try file_lines.toOwnedSlice(self.allocator);
+        errdefer freeStringArray(self.allocator, owned_lines);
         const owned_ids = try ids.toOwnedSlice(self.allocator);
         // Infallible from here: consumption is atomic with the validation
         // above because the daemon lock was never released.
@@ -9005,7 +9063,7 @@ pub const Daemon = struct {
             record.state = .consumed;
             record.updated_at_ms = nowMs();
         }
-        return .{ .image_paths = owned_paths, .images = owned_images, .ids = owned_ids };
+        return .{ .image_paths = owned_paths, .images = owned_images, .file_lines = owned_lines, .ids = owned_ids };
     }
 
     /// Undo a successful claim after a later turn-start failure (duplicate
@@ -18986,8 +19044,10 @@ test "staged chat attachments reject invalid input at every stage" {
     defer detachTestStoreService(&daemon);
 
     const cases: []const struct { method: TestAttachmentMethod, params: []const u8, code: []const u8 } = &.{
-        // Unsupported MIME and out-of-range declarations never allocate state.
-        .{ .method = .create, .params = "{\"mime\":\"text/plain\",\"byte_size\":4096}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // Malformed MIME, unsafe names and out-of-range declarations never allocate state.
+        .{ .method = .create, .params = "{\"mime\":\"plain\",\"byte_size\":4096}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"text/plain\",\"name\":\"../../etc/passwd\",\"byte_size\":4096}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"text/plain\",\"name\":\"a.txt\",\"byte_size\":0}", .code = headless.protocol.ERR_INVALID_PARAMS },
         .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":8}", .code = headless.protocol.ERR_INVALID_PARAMS },
         .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":53687091200}", .code = headless.protocol.ERR_INVALID_PARAMS },
         // Just past the portable per-image cap (16 MiB): accepted staging
@@ -19002,6 +19062,42 @@ test "staged chat attachments reject invalid input at every stage" {
         var response = try testAttachmentRpc(&daemon, case.method, case.params);
         defer response.deinit();
         try std.testing.expectEqualStrings(case.code, testRpcErrorCode(response.value).?);
+    }
+
+    // A file that is not an image stages under its own extension with no
+    // magic-byte check, and is claimed as a prompt line, never as an image.
+    {
+        var file_create = try testAttachmentRpc(&daemon, .create,
+            \\{"mime":"Text/Plain","name":"Notes v2.TXT","byte_size":5}
+        );
+        defer file_create.deinit();
+        const file_id = testRpcResultField(file_create.value, "attachment_id").?.string;
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, file_id, 0, "hello");
+        defer allocator.free(chunk_json);
+        var appended = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer appended.deinit();
+        try std.testing.expect(testRpcResultField(appended.value, "received_bytes") != null);
+        const id_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{file_id});
+        defer allocator.free(id_json);
+        var committed = try testAttachmentRpc(&daemon, .commit, id_json);
+        defer committed.deinit();
+        try std.testing.expect(testRpcResultField(committed.value, "attachment_id") != null);
+        const file_claim_json = try std.fmt.allocPrint(allocator, "{{\"attachments\":[\"{s}\"]}}", .{file_id});
+        defer allocator.free(file_claim_json);
+        var file_claim_params = try std.json.parseFromSlice(std.json.Value, allocator, file_claim_json, .{});
+        defer file_claim_params.deinit();
+        var file_claim = (try daemon.claimStagedChatAttachments(file_claim_params.value, true)).?;
+        defer file_claim.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), file_claim.images.len);
+        try std.testing.expectEqual(@as(usize, 0), file_claim.image_paths.len);
+        try std.testing.expectEqual(@as(usize, 1), file_claim.ids.len);
+        try std.testing.expectEqual(@as(usize, 1), file_claim.file_lines.len);
+        const line = file_claim.file_lines[0];
+        try std.testing.expect(std.mem.startsWith(u8, line, "- Notes v2.TXT: /"));
+        try std.testing.expect(std.mem.endsWith(u8, line, ".txt"));
+        const staged = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, line["- Notes v2.TXT: ".len..], allocator, .limited(64));
+        defer allocator.free(staged);
+        try std.testing.expectEqualStrings("hello", staged);
     }
 
     // Stage one attachment and probe the byte-level guards against it.
@@ -19348,6 +19444,38 @@ test "model-less remote turns take the desktop's new-chat defaults" {
     try std.testing.expect(!isRemoteNewChatTurn("mobile:abc:2", bare));
 }
 
+/// The user's prompt followed by the staged files that are not images, one
+/// "- name: path" line each. Every provider takes text, so naming the
+/// runtime-local path lets any agent read the file with its own tools.
+fn promptWithAttachedFilesAlloc(allocator: std.mem.Allocator, prompt: []const u8, file_lines: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const text = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
+    try out.appendSlice(allocator, text);
+    if (text.len > 0) try out.appendSlice(allocator, "\n\n");
+    try out.appendSlice(allocator, "Attached file(s):\n");
+    for (file_lines) |line| {
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    try out.appendSlice(allocator, "\nRead the attached file(s) as context for this request.");
+    return try out.toOwnedSlice(allocator);
+}
+
+test "attached files are named in the prompt, after the user's text" {
+    const allocator = std.testing.allocator;
+    const lines = [_][]const u8{ "- notes.pdf: /staging/aa.pdf", "- data.csv: /staging/bb.csv" };
+    const with_text = try promptWithAttachedFilesAlloc(allocator, "Summarize these\n", &lines);
+    defer allocator.free(with_text);
+    try std.testing.expectEqualStrings(
+        "Summarize these\n\nAttached file(s):\n- notes.pdf: /staging/aa.pdf\n- data.csv: /staging/bb.csv\n\nRead the attached file(s) as context for this request.",
+        with_text,
+    );
+    const alone = try promptWithAttachedFilesAlloc(allocator, "", lines[0..1]);
+    defer allocator.free(alone);
+    try std.testing.expect(std.mem.startsWith(u8, alone, "Attached file(s):\n- notes.pdf"));
+}
+
 fn createChatTurnFromParams(
     allocator: std.mem.Allocator,
     params: std.json.Value,
@@ -19375,7 +19503,10 @@ fn createChatTurnFromParams(
     else
         try requiredDupe(allocator, params, "project_path");
     errdefer allocator.free(project_path);
-    const prompt = try requiredDupe(allocator, params, "prompt");
+    const prompt = if (claimed_attachments != null and claimed_attachments.?.file_lines.len > 0)
+        try promptWithAttachedFilesAlloc(allocator, jsonString(params.object.get("prompt") orelse .null) orelse return error.InvalidParams, claimed_attachments.?.file_lines)
+    else
+        try requiredDupe(allocator, params, "prompt");
     errdefer allocator.free(prompt);
     const provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id");
     errdefer if (provider_thread_id) |value| allocator.free(value);

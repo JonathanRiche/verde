@@ -396,6 +396,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
         "repositories.manifest.v1",
         "chat.repository_route.v1",
         attachment_protocol.CHAT_ATTACHMENT_CAPABILITY,
+        attachment_protocol.CHAT_ATTACHMENT_FILES_CAPABILITY,
         access_protocol.PAIR_RUNTIME_CAPABILITY,
         WORKSPACE_DIRECTORY_CAPABILITY,
         DEVICE_PUSH_CAPABILITY,

@@ -291,13 +291,29 @@ fn beginSend(tx: *h.Transaction, i: usize, intent_id: []const u8, followup: bool
     try add(m.Row, a, &t.overlay, .{ .id = message_id, .role = "user", .body = t.send.?.text, .delivery = "optimistic", .created_at_ms = tx.state.wall_time_ms, .attachments = try attachments(a, t.send.?.inputs) });
     try upsert(tx, i);
 }
+/// Largest attached file. Its base64 has to fit one `draft_set` event (`h.MAX_HTTP_INPUT`).
+pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest draft, all attachments together.
+pub const MAX_DRAFT_ATTACHMENT_BYTES: usize = 12 * 1024 * 1024;
+fn isImage(mime: []const u8) bool {
+    return std.mem.startsWith(u8, mime, "image/");
+}
+/// Whether the host stages files that are not images (`chat.attachments.files.v1`).
+fn filesSupported(state: *const h.State) bool {
+    for (state.rpc.runtime_capabilities) |name| if (eq(name, "chat.attachments.files.v1")) return true;
+    return false;
+}
 fn uploadNext(tx: *h.Transaction, i: usize) E!void {
     const t = &tx.state.chat.threads[i];
     const send = &t.send.?;
     if (send.index < send.inputs.len) {
         const input = send.inputs[send.index];
         const size = std.fmt.parseInt(u64, input.byte_size, 10) catch return error.InvalidArgument;
-        try call(tx, i, .create, "chat.attachment.create", .{ .mime = input.mime, .byte_size = size }, true, send.intent);
+        // A file that is not an image is staged under its name; the host hands its path to the agent.
+        if (isImage(input.mime))
+            try call(tx, i, .create, "chat.attachment.create", .{ .mime = input.mime, .byte_size = size }, true, send.intent)
+        else
+            try call(tx, i, .create, "chat.attachment.create", .{ .mime = input.mime, .byte_size = size, .name = input.name }, true, send.intent);
     } else {
         var ids: []const []const u8 = &.{};
         for (send.attachments) |item| try add([]const u8, tx.allocator(), &ids, item.attachment_id.?);
@@ -443,16 +459,27 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     const t = &tx.state.chat.threads[i];
     if (eq(tag, "draft_set")) {
         const inputs = try tx.allocator().dupe(wire.AttachmentInput, try h.decode([]const wire.AttachmentInput, tx.allocator(), p.get(event, "attachments")));
+        var draft_bytes: usize = 0;
+        var has_file = false;
         for (inputs, 0..) |*input, n| {
             // Empty bytes keep this draft's attachment with the same ID and size, so the platform
             // never has to hold or resend bytes it cannot read back (restored or pulled-back drafts).
             if (input.bytes_base64.len == 0) for (t.saved.inputs) |old| {
                 if (eq(old.local_id, input.local_id) and eq(old.byte_size, input.byte_size)) input.* = old;
             };
-            const bytes = try @import("auth.zig").decode64Limit(tx.allocator(), input.bytes_base64, tx.state.rpc.limits.max_attachment_bytes);
+            const bytes = try @import("auth.zig").decode64Limit(tx.allocator(), input.bytes_base64, @min(tx.state.rpc.limits.max_attachment_bytes, MAX_FILE_BYTES));
             const size = std.fmt.parseInt(u64, input.byte_size, 10) catch return error.InvalidArgument;
-            if (size != bytes.len or size > tx.state.rpc.limits.max_attachment_bytes or size == 0 or input.local_id.len == 0 or !std.mem.startsWith(u8, input.mime, "image/")) return error.InvalidArgument;
+            if (size != bytes.len or size > tx.state.rpc.limits.max_attachment_bytes or size == 0 or input.local_id.len == 0 or std.mem.indexOfScalar(u8, input.mime, '/') == null) return error.InvalidArgument;
             for (inputs[0..n]) |previous| if (eq(previous.local_id, input.local_id)) return error.InvalidArgument;
+            draft_bytes += bytes.len;
+            if (!isImage(input.mime)) has_file = true;
+        }
+        // Every event copies the draft, so its attachments stay bounded together as well as each.
+        if (draft_bytes > MAX_DRAFT_ATTACHMENT_BYTES) return error.ResourceLimit;
+        if (has_file and !filesSupported(&tx.state)) {
+            // An older host stages images only and would refuse the upload at send.
+            operation(tx, id, "failed", .{ .code = "unsupported", .message = "Update verde on the computer to attach files that aren't images." });
+            return true;
         }
         if (t.saved.revision == std.math.maxInt(u64)) return error.ResourceLimit;
         t.saved.revision += 1;

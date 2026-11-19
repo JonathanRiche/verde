@@ -136,7 +136,8 @@ pub const Host = struct {
         var tx = try Transaction.init(self);
         defer tx.deinit();
         const event = try parseLimit(tx.allocator(), input, MAX_HTTP_INPUT);
-        if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response") and !eq(try string(event, "type"), "ws_message")) return error.ResourceLimit;
+        // A draft carries one attached file's bytes per event (chat.MAX_FILE_BYTES).
+        if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response") and !eq(try string(event, "type"), "ws_message") and !eq(try string(event, "type"), "draft_set")) return error.ResourceLimit;
         try tx.apply(event);
         try sync.pump(&tx);
         try terminal.pump(&tx);

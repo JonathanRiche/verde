@@ -238,7 +238,7 @@ private fun AttachmentChip(row: ChatRow, a: ChatAttachment, ctx: TranscriptConte
                 else -> Unit
             }
             Text(label, style = MaterialTheme.typography.labelMedium)
-            if (status == ImageStatus.Unavailable || status == ImageStatus.Failed) {
+            if (image && (status == ImageStatus.Unavailable || status == ImageStatus.Failed)) {
                 // Why there's no preview: an older host refusing the read, an image that's gone, or a
                 // hiccup worth retrying.
                 val problem = imageProblem(status, target?.let { images.errors[it.key] })

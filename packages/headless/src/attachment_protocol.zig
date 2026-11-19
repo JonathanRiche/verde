@@ -98,6 +98,76 @@ pub fn imageExtension(mime: []const u8) []const u8 {
     return "gif";
 }
 
+/// Capability advertised by daemons that also stage files that are not
+/// images. Such a file never becomes a provider image input: the turn's
+/// prompt names its runtime-local path so the agent reads it with its tools.
+pub const CHAT_ATTACHMENT_FILES_CAPABILITY = "chat.attachments.files.v1";
+
+/// Longest client-supplied display name kept for a staged file.
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 120;
+/// Longest extension carried from a file's name onto its staged path.
+pub const MAX_FILE_EXTENSION_BYTES: usize = 10;
+
+/// A well-formed `type/subtype` media type for a staged file. The value is
+/// only a label; file bytes are never interpreted through it.
+pub fn isValidFileMime(value: []const u8) bool {
+    if (value.len == 0 or value.len > 127) return false;
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return false;
+    if (slash == 0 or slash + 1 == value.len) return false;
+    for (value, 0..) |byte, index| {
+        if (index == slash) continue;
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "!#$&^_.+-", byte) == null) return false;
+    }
+    return true;
+}
+
+/// A display name safe to echo into a prompt and a transcript: one line of
+/// valid UTF-8 with no path separators or control bytes.
+pub fn isValidAttachmentName(name: []const u8) bool {
+    if (name.len == 0 or name.len > MAX_ATTACHMENT_NAME_BYTES) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    for (name) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\') return false;
+    }
+    return true;
+}
+
+/// Lowercase alphanumeric extension of `name` written into `buffer`, or
+/// "bin". The staged path keeps it so agents and tools recognize the type;
+/// nothing else of the client's name reaches the filesystem.
+pub fn fileExtension(name: []const u8, buffer: *[MAX_FILE_EXTENSION_BYTES]u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "bin";
+    const raw = name[dot + 1 ..];
+    if (dot == 0 or raw.len == 0 or raw.len > MAX_FILE_EXTENSION_BYTES) return "bin";
+    for (raw, 0..) |byte, index| {
+        if (!std.ascii.isAlphanumeric(byte)) return "bin";
+        buffer[index] = std.ascii.toLower(byte);
+    }
+    return buffer[0..raw.len];
+}
+
+test "file attachments validate their mime, name and extension" {
+    try std.testing.expect(isValidFileMime("application/pdf"));
+    try std.testing.expect(isValidFileMime("application/vnd.ms-excel.sheet+xml"));
+    try std.testing.expect(!isValidFileMime("pdf"));
+    try std.testing.expect(!isValidFileMime("text/"));
+    try std.testing.expect(!isValidFileMime("text/plain; charset=utf-8"));
+    try std.testing.expect(!isValidFileMime("a/b/c"));
+    try std.testing.expect(isValidAttachmentName("Q3 report (final).pdf"));
+    try std.testing.expect(!isValidAttachmentName("../etc/passwd"));
+    try std.testing.expect(!isValidAttachmentName("two\nlines.txt"));
+    try std.testing.expect(!isValidAttachmentName(".."));
+    try std.testing.expect(!isValidAttachmentName(""));
+    var buffer: [MAX_FILE_EXTENSION_BYTES]u8 = undefined;
+    try std.testing.expectEqualStrings("pdf", fileExtension("Report.PDF", &buffer));
+    try std.testing.expectEqualStrings("gz", fileExtension("logs.tar.gz", &buffer));
+    try std.testing.expectEqualStrings("bin", fileExtension("Makefile", &buffer));
+    try std.testing.expectEqualStrings("bin", fileExtension(".env", &buffer));
+    try std.testing.expectEqualStrings("bin", fileExtension("odd.na me", &buffer));
+    try std.testing.expectEqualStrings("bin", fileExtension("long.abcdefghijklm", &buffer));
+}
+
 test "attachment id validation accepts only 32 lowercase hex chars" {
     try std.testing.expect(isValidAttachmentId("0123456789abcdef0123456789abcdef"));
     try std.testing.expect(!isValidAttachmentId(""));

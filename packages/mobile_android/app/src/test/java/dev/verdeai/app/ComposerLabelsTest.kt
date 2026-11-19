@@ -96,6 +96,31 @@ class ComposerLabelsTest {
         assertEquals("16 photos", draftImageCount(16))
     }
 
+    /** Any file attaches: files keep their names beside numbered photos, and the count stops saying "photos". */
+    @Test fun draftFilesKeepTheirNames() {
+        assertEquals(listOf("Photo 1 of 2", "report.pdf", "Photo 2 of 2"),
+            draftAttachmentNames(listOf("1000001.jpg" to "image/jpeg", "report.pdf" to "application/pdf", "b.jpg" to "image/jpeg")))
+        assertEquals(listOf("notes.txt"), draftAttachmentNames(listOf("notes.txt" to "text/plain")))
+        assertEquals("16 photos", draftAttachmentCount(List(16) { "image/jpeg" }))
+        assertEquals("1 image", draftAttachmentCount(listOf("image/jpeg"), "image"))
+        assertEquals("3 attachments", draftAttachmentCount(listOf("image/jpeg", "application/pdf", "text/plain")))
+        assertEquals("1 attachment", draftAttachmentCount(listOf("application/pdf")))
+    }
+
+    /** The host takes a one-line name of at most 120 bytes and a plain type; an image type is kept for real images. */
+    @Test fun pickedFilesGetSafeNamesAndTypes() {
+        assertEquals("Q3 report.pdf", ImageAttachments.fileName(" Q3 report.pdf "))
+        assertEquals("a_b_c.txt", ImageAttachments.fileName("a/b\\c.txt"))
+        assertEquals("file", ImageAttachments.fileName(null))
+        assertEquals("file", ImageAttachments.fileName(".."))
+        val long = ImageAttachments.fileName("é".repeat(200) + ".pdf")
+        assertTrue(long.toByteArray().size <= 120 && long.endsWith(".pdf"))
+        assertEquals("application/pdf", ImageAttachments.fileMime("Application/PDF", "a.pdf"))
+        assertEquals("application/octet-stream", ImageAttachments.fileMime("image/svg+xml", "a.svg"))
+        assertEquals("application/octet-stream", ImageAttachments.fileMime("text/plain; charset=utf-8", "a.txt"))
+        assertTrue(ComposerModel.MAX_FILE_BYTES.toLong() * 4 / 3 < 12L * 1024 * 1024)
+    }
+
     /** S45: the model chip keeps both ends with no space beside the ellipsis ("GPT…Sol"). */
     @Test fun modelNameMiddleTruncatesWithoutSpaces() {
         val width = { t: String -> t.length.toFloat() }

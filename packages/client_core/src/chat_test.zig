@@ -404,6 +404,29 @@ test "photos too large for the draft record stay in memory and upload" {
     _ = try f.find("chat.attachment.create");
 }
 
+test "files that are not images attach only on a host that stages them, and upload by name" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const pdf = .{ .local_id = "file", .name = "notes.pdf", .mime = "application/pdf", .byte_size = "6", .bytes_base64 = "YWJjZGVm" };
+    // An older host: the draft is refused up front, with words for the user.
+    _ = try f.intent("draft_set", .{ .text = "read this", .attachments = .{pdf} });
+    const receipts = f.host.state.receipts;
+    try eql("unsupported", receipts[receipts.len - 1].operation.@"error".?.code);
+    try expect(f.host.state.chat.threads[0].saved.inputs.len == 0);
+    f.host.state.rpc.runtime_capabilities = &.{"chat.attachments.files.v1"};
+    _ = try f.intent("draft_set", .{ .text = "read this", .attachments = .{pdf} });
+    _ = try f.storage(null, false);
+    try expect(f.host.state.chat.threads[0].saved.inputs.len == 1);
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("send", .{ .draft_revision = revision });
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    const create = try f.params("chat.attachment.create");
+    try eql("application/pdf", p.s(create, "mime"));
+    try eql("notes.pdf", p.s(create, "name"));
+}
+
 test "chat discovers externally started turn after a completed turn without replaying stale snapshot" {
     var f = try Fixture.init();
     defer f.deinit();

@@ -152,15 +152,15 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
         onDispose { lifecycle.lifecycle.removeObserver(observer) }
     }
 
-    fun add(uris: List<Uri>, camera: Boolean = false) = scope.launch {
-        // Never decode more than a message can carry (the file picker has no count limit).
+    fun add(uris: List<Uri>, camera: Boolean = false, anyFile: Boolean = false) = scope.launch {
+        // Never read more than a message can carry (the file picker has no count limit).
         val picked = uris.take(ComposerModel.MAX_IMAGES)
-        val prepared = ImageAttachments.prepare(context, picked)
+        val prepared = ImageAttachments.prepare(context, picked, anyFile)
         if (camera) ImageAttachments.clearCamera(context)
-        composer.attach(prepared.images, prepared.rejected, overflow = uris.size - picked.size)
+        composer.attach(prepared.images, prepared.rejected, overflow = uris.size - picked.size, tooLarge = prepared.tooLarge)
     }
     val photos = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(ComposerModel.MAX_IMAGES)) { if (it.isNotEmpty()) add(it) }
-    val files = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { if (it.isNotEmpty()) add(it) }
+    val files = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { if (it.isNotEmpty()) add(it, anyFile = true) }
     var cameraUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val uri = cameraUri
@@ -277,7 +277,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 if (context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
                 else permission.launch(Manifest.permission.CAMERA)
             }
-            val onFiles = { files.launch(arrayOf("image/*")) }
+            val onFiles = { files.launch(arrayOf("*/*")) }
             if (dense) {
                 // The input gets the full width; controls sit on one compact row below it.
                 BasicTextField(
@@ -422,7 +422,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
                     onClick = { menu = false; onPicker(ComposerPicker.Access) })
                 DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() })
                 DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
-                DropdownMenuItem(text = { Text("Image files") }, enabled = attach, onClick = { menu = false; onFiles() })
+                DropdownMenuItem(text = { Text("Attach files") }, enabled = attach, onClick = { menu = false; onFiles() })
             }
         }
         // r5: the brain reads in full ("Codex · GPT-6.1 Sol") wherever the row has room, the foldable's
@@ -461,7 +461,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() },
                 modifier = Modifier.testTag(COMPOSER_ATTACH))
             DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
-            DropdownMenuItem(text = { Text("Image files") }, enabled = attach, onClick = { menu = false; onFiles() })
+            DropdownMenuItem(text = { Text("Attach files") }, enabled = attach, onClick = { menu = false; onFiles() })
         }
     }
 }
@@ -470,14 +470,14 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
 private fun AttachButton(enabled: Boolean, onPhotos: () -> Unit, onCamera: () -> Unit, onFiles: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     Box {
-        IconButton(onClick = { menu = true }, enabled = enabled, modifier = Modifier.testTag(COMPOSER_ATTACH).named("Attach image")) {
+        IconButton(onClick = { menu = true }, enabled = enabled, modifier = Modifier.testTag(COMPOSER_ATTACH).named("Attach file")) {
             Icon(painterResource(R.drawable.composer_attach), contentDescription = null, modifier = Modifier.size(18.dp))
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             LiveOverMenu()
             DropdownMenuItem(text = { Text("Photos") }, onClick = { menu = false; onPhotos() })
             DropdownMenuItem(text = { Text("Camera") }, onClick = { menu = false; onCamera() })
-            DropdownMenuItem(text = { Text("Image files") }, onClick = { menu = false; onFiles() })
+            DropdownMenuItem(text = { Text("Files") }, onClick = { menu = false; onFiles() })
         }
     }
 }
@@ -494,7 +494,7 @@ private fun FollowupCard(f: ChatFollowup, composer: ComposerModel, kind: EventFo
                 Text(DELIVERY_LABELS[f.delivery] ?: f.delivery, style = MaterialTheme.typography.labelMedium)
             }
             if (f.text.isNotEmpty()) Text(f.text, maxLines = 4, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-            if (f.attachments.isNotEmpty()) Text(if (f.attachments.size == 1) "1 image" else "${f.attachments.size} images", style = MaterialTheme.typography.labelMedium)
+            if (f.attachments.isNotEmpty()) Text(draftAttachmentCount(f.attachments.map { it.mime }, "image"), style = MaterialTheme.typography.labelMedium)
             Text(followupHint(f, kind), style = MaterialTheme.typography.bodySmall, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
             if (f.delivery == "uncertain" || f.delivery == "accepted") {
                 Text("This follow-up cannot be recalled while delivery is unconfirmed or already accepted.", style = MaterialTheme.typography.bodySmall)
@@ -562,15 +562,15 @@ private fun Suggestions(composer: ComposerModel, view: ChatComposerView?) {
 
 @Composable
 private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: ComposerModel) {
-    // Up to 16 images (the host's limit): one horizontally scrolling strip of thumbnails, each with
-    // its own remove button and upload progress, so the composer never grows a row per image.
+    // Up to 16 attachments (the host's limit): one horizontally scrolling strip of tiles, each with
+    // its own remove button and upload progress, so the composer never grows a row per attachment.
     val scroll = rememberScrollState()
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        if (items.size > 1) Text(draftImageCount(items.size), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted)
+        if (items.size > 1) Text(draftAttachmentCount(items.map { it.mime }), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted)
         Row(Modifier.fillMaxWidth().horizontalEdgeFade(scroll, VerdeColors.Panel).horizontalScroll(scroll).testTag(COMPOSER_ATTACHMENTS),
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             // A11-3: names that tell the images apart; generic ones become "Photo 1…16".
-            val names = draftImageNames(items.map { it.name })
+            val names = draftAttachmentNames(items.map { it.name to it.mime })
             for ((index, a) in items.withIndex()) key(a.local_id) {
                 val name = names[index]
                 val size = a.byte_size.toLongOrNull() ?: 0L
@@ -595,6 +595,9 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
                             }
                         }
                     }
+                    // A file has no thumbnail, so its name is on screen.
+                    if (!a.mime.startsWith("image/")) Text(name, Modifier.width(64.dp), style = MaterialTheme.typography.labelSmall,
+                        color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.MiddleEllipsis)
                     if (a.status == "uploading" || (locked && uploaded in 1 until size)) {
                         LinearProgressIndicator(progress = { if (size > 0) (uploaded.toFloat() / size).coerceIn(0f, 1f) else 0f },
                             modifier = Modifier.width(64.dp).semantics { contentDescription = "Uploading $name" })
@@ -613,6 +616,19 @@ internal const val COMPOSER_ATTACHMENTS = "composer-attachments"
 /** S44: each draft image's indexed name, "Photo 3 of 16"; a lone image keeps its own name. */
 internal fun draftImageNames(raw: List<String>): List<String> =
     if (raw.size <= 1) raw.map(::attachmentDisplayName) else raw.indices.map { "Photo ${it + 1} of ${raw.size}" }
+
+/** Draft names: photos are numbered among themselves as [draftImageNames] does; a file keeps its own name. */
+internal fun draftAttachmentNames(items: List<Pair<String, String>>): List<String> {
+    val photos = draftImageNames(items.filter { it.second.startsWith("image/") }.map { it.first }).iterator()
+    return items.map { (name, mime) -> if (mime.startsWith("image/")) photos.next() else attachmentDisplayName(name) }
+}
+
+/** "16 photos" (or "2 images" for a follow-up), and "3 attachments" once any of them is not an image. */
+internal fun draftAttachmentCount(mimes: List<String>, noun: String = "photo"): String = when {
+    mimes.all { it.startsWith("image/") } -> if (mimes.size == 1) "1 $noun" else "${mimes.size} ${noun}s"
+    mimes.size == 1 -> "1 attachment"
+    else -> "${mimes.size} attachments"
+}
 
 /** S44: the strip's count, "16 photos". */
 internal fun draftImageCount(count: Int): String = if (count == 1) "1 photo" else "$count photos"

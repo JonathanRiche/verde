@@ -13,24 +13,75 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
- * Turns picked or captured images into JPEGs no larger than providers keep (2048 px edge).
- * Everything stays in memory or the app's private cache; nothing about the image is logged.
+ * Turns picked or captured images into JPEGs no larger than providers keep (2048 px edge), and
+ * reads any other picked file as it is. Everything stays in memory or the app's private cache;
+ * nothing about a file is logged.
  */
 internal object ImageAttachments {
     private const val MAX_EDGE = 2048
 
-    class Prepared(val images: List<PickedImage>, val rejected: Int)
+    class Prepared(val images: List<PickedImage>, val rejected: Int, val tooLarge: Int = 0)
 
-    suspend fun prepare(context: Context, uris: List<Uri>, maxBytes: Int = ComposerModel.MAX_IMAGE_BYTES): Prepared =
+    /**
+     * [anyFile]: the document picker, where a file that isn't an image (or is one this phone can't
+     * decode) attaches as it is. Photos and the camera only ever give images.
+     */
+    suspend fun prepare(context: Context, uris: List<Uri>, anyFile: Boolean = false, maxBytes: Int = ComposerModel.MAX_IMAGE_BYTES): Prepared =
         withContext(Dispatchers.IO) {
             var rejected = 0
-            val images = uris.mapNotNull { uri ->
-                val picked = try { one(context.contentResolver, uri, maxBytes) } catch (_: Exception) { null }
-                if (picked == null) rejected++
-                picked
+            var tooLarge = 0
+            val resolver = context.contentResolver
+            val picked = uris.mapNotNull { uri ->
+                // From the document picker only a stated image is decoded; anything else is read once, as a file.
+                val tryImage = !anyFile || try { resolver.getType(uri) } catch (_: Exception) { null }?.startsWith("image/") == true
+                val image = if (tryImage) try { one(resolver, uri, maxBytes) } catch (_: Exception) { null } else null
+                if (image != null) return@mapNotNull image
+                if (!anyFile) { rejected++; return@mapNotNull null }
+                when (val file = try { file(resolver, uri) } catch (_: Exception) { null }) {
+                    null -> { rejected++; null }
+                    TOO_LARGE -> { tooLarge++; null }
+                    else -> file
+                }
             }
-            Prepared(images, rejected)
+            Prepared(picked, rejected, tooLarge)
         }
+
+    private val TOO_LARGE = PickedImage("", "", ByteArray(0))
+
+    /** A picked file read whole; [TOO_LARGE] past the per-file limit, null when unreadable or empty. */
+    private fun file(resolver: ContentResolver, uri: Uri): PickedImage? {
+        val stated = statedSize(resolver, uri)
+        if (stated != null && stated > ComposerModel.MAX_FILE_BYTES) return TOO_LARGE
+        val stream = resolver.openInputStream(uri) ?: return null
+        val bytes = stream.use { readFully(it, ComposerModel.MAX_FILE_BYTES) } ?: return TOO_LARGE
+        if (bytes.isEmpty()) return null
+        val name = fileName(rawName(resolver, uri))
+        return PickedImage(name, fileMime(resolver.getType(uri), name), bytes)
+    }
+
+    private val MIME = Regex("^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+
+    /**
+     * The type a file is sent under. An `image/` type is reserved for images the host can show
+     * (re-encoded JPEGs); any other image, such as an SVG, goes as a plain file.
+     */
+    internal fun fileMime(reported: String?, name: String): String {
+        val type = reported?.takeIf { it != "*/*" }
+            ?: android.webkit.MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
+        val clean = type?.lowercase()?.takeIf { it.length <= 127 && MIME.matches(it) && !it.startsWith("image/") }
+        return clean ?: "application/octet-stream"
+    }
+
+    /** A one-line name the host accepts: no path separators or control characters, at most 120 bytes. */
+    internal fun fileName(raw: String?): String {
+        var name = raw.orEmpty().map { if (it == '/' || it == '\\' || it.isISOControl()) '_' else it }.joinToString("").trim()
+        if (name.isEmpty() || name == "." || name == "..") return "file"
+        val extension = name.substringAfterLast('.', "").takeIf { it.isNotEmpty() && it.length <= 10 && name.contains('.') }?.let { ".$it" }.orEmpty()
+        var stem = name.removeSuffix(extension)
+        while ((stem + extension).toByteArray().size > 120 && stem.isNotEmpty()) stem = stem.dropLast(1)
+        name = (stem + extension).trim()
+        return name.ifEmpty { "file" }
+    }
 
     /**
      * A5-2: a picker or document URI is an image when its content decodes as one. Its reported type
@@ -117,12 +168,14 @@ internal object ImageAttachments {
         return null
     }
 
+    private fun rawName(resolver: ContentResolver, uri: Uri): String? = try {
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+    } catch (_: Exception) { null }
+
     private fun displayName(resolver: ContentResolver, uri: Uri): String {
-        val name = try {
-            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
-            }
-        } catch (_: Exception) { null }
+        val name = rawName(resolver, uri)
         // The photo picker names files by a numeric id: the host gets "photo.jpg" instead (A6-3).
         val base = name?.substringBeforeLast('.')?.takeIf { it.isNotBlank() && !it.all(Char::isDigit) }?.take(80) ?: "photo"
         return "$base.jpg"

@@ -112,7 +112,10 @@ internal enum class ComposerPicker { Provider, Model, Effort, Access, Speed }
 internal val PROVIDERS = listOf("codex" to "Codex", "claude" to "Claude", "cursor" to "Cursor", "opencode" to "OpenCode",
     "pi" to "Pi", "fx" to "FX", "grok" to "Grok", "antigravity" to "Antigravity", "muse" to "Muse")
 
-/** One image ready for the core: already downscaled and re-encoded by [ImageAttachments]. */
+/**
+ * One attachment ready for the core: an image already downscaled and re-encoded by
+ * [ImageAttachments] (`image/jpeg`), or any other file as it was picked.
+ */
 internal class PickedImage(val name: String, val mime: String, val bytes: ByteArray)
 
 /** User-facing text for a failed composer operation; codes and daemon messages only, never draft content. */
@@ -128,8 +131,8 @@ internal fun composerError(error: LocalError?): String? {
         "unknown_command" -> "That command isn't available for this provider."
         "provider_thread_required" -> "Send a message first. This command needs an existing conversation."
         "invalid_selection" -> "That option isn't available for this model."
-        "resource_limit" -> "That's too large to keep on the phone. Remove an image or shorten the message."
-        "invalid_input" -> "The phone couldn't use that. Try a smaller image or a shorter message."
+        "resource_limit" -> "That's too large to keep on the phone. Remove an attachment or shorten the message."
+        "invalid_input" -> "The phone couldn't use that. Try a smaller file or a shorter message."
         "stale_confirmation" -> "The command confirmation expired. Send it again."
         "thread_unavailable" -> "This chat isn't available right now."
         "offline", "unavailable" -> "The host is offline. Your draft is kept."
@@ -505,24 +508,28 @@ internal class ComposerModel(
      * New images go to the core with bytes; the draft's existing ones by reference. One `draft_set`
      * per image keeps each event's base64 inside the core's 1 MiB input.
      */
-    fun attach(images: List<PickedImage>, rejected: Int = 0, overflow: Int = 0) = action {
+    fun attach(images: List<PickedImage>, rejected: Int = 0, overflow: Int = 0, tooLarge: Int = 0) = action {
         if (!flush()) return@action
         var existing = references()
         val room = MAX_IMAGES - existing.size
         val accepted = images.take(room.coerceAtLeast(0))
-        if (accepted.isEmpty() && images.isNotEmpty()) { notice = "Up to $MAX_IMAGES images per message."; return@action }
+        if (accepted.isEmpty() && images.isNotEmpty()) { notice = "Up to $MAX_IMAGES attachments per message."; return@action }
         for (image in accepted) {
-            if (image.bytes.size > MAX_IMAGE_BYTES) { notice = "This image is too large to attach."; return@action }
-            val added = AttachmentInput(local_id="img-" + UUID.randomUUID(), name=image.name, mime=image.mime,
+            val isImage = image.mime.startsWith("image/")
+            if (isImage && image.bytes.size > MAX_IMAGE_BYTES) { notice = "This image is too large to attach."; return@action }
+            if (image.bytes.size > MAX_FILE_BYTES) { notice = FILE_TOO_LARGE; return@action }
+            val added = AttachmentInput(local_id=(if (isImage) "img-" else "file-") + UUID.randomUUID(), name=image.name, mime=image.mime,
                 byte_size=image.bytes.size.toString(), bytes_base64=Base64.getEncoder().encodeToString(image.bytes))
             val op = setDraft(field.text, existing + added)
             if (op == null || op.state == "failed") return@action fail(op)
-            imagePreviews = imagePreviews + (added.local_id to image.bytes)
+            // Only images are previewed; a file's bytes stay with the core alone.
+            if (isImage) imagePreviews = imagePreviews + (added.local_id to image.bytes)
             existing = existing + added.copy(bytes_base64="")
         }
         notice = when {
-            rejected > 0 -> if (accepted.isEmpty()) "Couldn't attach that file. Pick a photo or an image file." else "Some files weren't images, so they weren't attached."
-            accepted.size < images.size || overflow > 0 -> "Up to $MAX_IMAGES images per message."
+            tooLarge > 0 -> FILE_TOO_LARGE
+            rejected > 0 -> if (accepted.isEmpty()) "Couldn't attach that file." else "Some files couldn't be attached."
+            accepted.size < images.size || overflow > 0 -> "Up to $MAX_IMAGES attachments per message."
             else -> null
         }
     }
@@ -570,6 +577,12 @@ internal class ComposerModel(
          * text; the core also enforces the daemon's own attachment limit.
          */
         const val MAX_IMAGE_BYTES = 700 * 1024
+        /**
+         * Per file that isn't an image: the core's `MAX_FILE_BYTES` (packages/client_core/src/chat.zig),
+         * whose base64 fits one `draft_set` event. The core also bounds a draft's attachments together.
+         */
+        const val MAX_FILE_BYTES = 8 * 1024 * 1024
+        const val FILE_TOO_LARGE = "Files up to 8 MB can be attached."
         private val detached = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     }
 }
