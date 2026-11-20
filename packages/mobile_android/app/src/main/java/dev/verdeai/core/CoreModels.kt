@@ -141,6 +141,7 @@ data class ChatRow(
     val `tool`: ChatTool? = null,
     val `message_id`: String? = null,
     val `background`: ChatBackground? = null,
+    val `updated_at_ms`: Long? = null,
 )
 
 @Serializable
@@ -276,6 +277,16 @@ data class ChatLinkedAgent(
 )
 
 @Serializable
+data class ChatSubagent(
+    val `row_id`: String = "",
+    val `tool_call_id`: String? = null,
+    val `title`: String = "Subagent",
+    val `status`: String = "unknown",
+    val `status_label`: String = "Unknown",
+    val `updated_at_ms`: Long? = null,
+)
+
+@Serializable
 data class ChatOrchestration(
     val `links`: List<ChatLinkedAgent> = emptyList(),
     val `loaded`: Boolean = false,
@@ -288,6 +299,7 @@ data class ChatOrchestration(
     val `needs_you`: Boolean = false,
     val `title`: String = "",
     val `summary`: String = "",
+    val `subagents`: List<ChatSubagent> = emptyList(),
 )
 
 @Serializable

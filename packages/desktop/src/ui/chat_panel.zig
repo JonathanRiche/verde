@@ -2824,6 +2824,7 @@ fn transcriptSelectableBodyRect(
         return transcriptSelectableBodyRect(column, y, height, .assistant, "Child chat", childNotification(role, body).?.body);
     }
     if (parentSteerBody(role, body)) |inner| return transcriptSelectableBodyRect(column, y, height, role, author, inner);
+    if (scheduledRun(role, body)) |run| return transcriptSelectableBodyRect(column, y, height, role, author, run.prompt);
     if (role == .system and isSlashCommandResultMessage(author, body)) {
         const pad = theme.scaledUi(16.0);
         const body_y = y + pad + theme.scaledUi(46.0) + theme.scaledUi(12.0);
@@ -7496,6 +7497,7 @@ fn expandedOrchestrationHeaderUpdates(state: *app_state.AppState, messages: []co
 /// (several cards share one message index), so they keep the stored body.
 fn transcriptDisplayBody(role: app_state.ChatRole, body: []const u8) []const u8 {
     if (childNotification(role, body)) |notification| return notification.body;
+    if (scheduledRun(role, body)) |run| return run.prompt;
     return parentSteerBody(role, body) orelse body;
 }
 
@@ -7518,6 +7520,29 @@ fn parentSteerBody(role: app_state.ChatRole, body: []const u8) ?[]const u8 {
     const inner_end = std.mem.lastIndexOf(u8, body, close) orelse return null;
     if (inner_end < inner_start) return "";
     return body[inner_start..inner_end];
+}
+
+const ScheduledRun = struct {
+    name: []const u8,
+    prompt: []const u8,
+};
+
+/// Scheduled turns arrive fenced for the provider (see daemon/schedules.zig
+/// runPromptAlloc); show only the task prompt, labelled with the schedule.
+fn scheduledRun(role: app_state.ChatRole, body: []const u8) ?ScheduledRun {
+    if (role != .user) return null;
+    const open = "<verde_schedule id=\"";
+    const name_attr = "\" name=\"";
+    const close = "</verde_schedule>";
+    if (!std.mem.startsWith(u8, body, open)) return null;
+    const header_end = std.mem.indexOfPos(u8, body, open.len, "\">") orelse return null;
+    const name_start = (std.mem.indexOfPos(u8, body, open.len, name_attr) orelse return null) + name_attr.len;
+    if (name_start > header_end) return null;
+    const close_at = std.mem.indexOfPos(u8, body, header_end, close) orelse return null;
+    return .{
+        .name = body[name_start..header_end],
+        .prompt = std.mem.trimStart(u8, body[close_at + close.len ..], "\r\n"),
+    };
 }
 
 const ChildNotificationIdentity = struct {
@@ -7618,6 +7643,7 @@ fn transcriptMessageHeightStream(
         return childNotificationBatchHeight(state, message_index, batch, column_width, streaming);
     }
     if (parentSteerBody(role, body_raw)) |inner| return transcriptMessageHeightStream(state, message_index, inner, role, column_width, message_author, assistant_plain_layout, streaming);
+    if (scheduledRun(role, body_raw)) |run| return transcriptMessageHeightStream(state, message_index, run.prompt, role, column_width, message_author, assistant_plain_layout, streaming);
     if (isTranscriptStatusNotice(role, message_author)) return theme.scaledUi(TRANSCRIPT_NOTICE_H_CSS);
     if (role == .system and isSlashCommandResultMessage(message_author, body_raw)) {
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
@@ -8055,10 +8081,15 @@ fn renderTranscriptImagesFromParts(
             }
         } else {
             queueRoundedShellClipped(state, frame, paletteColor(frame_fill), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(9.0), clip);
-            queueText(state, .{ .x = frame.x + pad, .y = frame.y + pad, .w = frame.w - pad * 2.0, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+            queueText(state, .{ .x = frame.x + pad, .y = frame.y + pad, .w = frame.w - pad * 2.0, .h = theme.scaledUi(20.0) }, attachmentDisplayName(image.file_name), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
         }
         image_y += thumb_h + gap;
     }
+}
+
+/// Never show an internal `verde-attachment:<id>` reference as a file name.
+pub fn attachmentDisplayName(name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, @import("headless").attachment_protocol.ATTACHMENT_REFERENCE_PREFIX)) "Image" else name;
 }
 
 // ----- Provider usage summary card -----
@@ -10484,6 +10515,11 @@ fn renderTranscriptBubbleFromParts(
     if (parentSteerBody(role, body_raw)) |inner| {
         return renderTranscriptBubbleFromParts(state, column, y, height, role, if (role == .system) "Parent agent \u{00B7} steering" else "Parent agent", inner, muted_body, assistant_plain_layout, clip, message_index, streaming, active);
     }
+    if (scheduledRun(role, body_raw)) |run| {
+        var label_buf: [256]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "Scheduled \u{00B7} {s}", .{run.name}) catch "Scheduled";
+        return renderTranscriptBubbleFromParts(state, column, y, height, role, label, run.prompt, muted_body, assistant_plain_layout, clip, message_index, streaming, active);
+    }
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
@@ -10513,7 +10549,9 @@ fn renderTranscriptBubbleFromParts(
     else
         theme.borderMuted();
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border_color), rr, clip);
-    const display_label = if (steering) "Steering" else role_label;
+    var label_buf: [256]u8 = undefined;
+    const label_max_w = bubble.w - theme.scaledUi(28.0) - (if (active) theme.scaledUi(18.0) else 0.0);
+    const display_label = truncateRoleLabel(&label_buf, if (steering) "Steering" else role_label, label_max_w, theme.scaledUi(13.0), .prose_bold);
 
     var label_x = bubble.x + theme.scaledUi(14.0);
     if (active) {
@@ -13185,6 +13223,16 @@ test "pointer hits skip layout rows that outlived their messages" {
     const group: chat_types.TranscriptLayoutItem = .{ .message_index = 0, .group_end = 3, .top = -80.0, .height = 80.0 };
     try std.testing.expect(!layoutItemInRange(group, 2));
     try std.testing.expect(layoutItemInRange(group, 3));
+}
+
+test "scheduled turns show the schedule name and only the task prompt" {
+    const body = "<verde_schedule id=\"sch-1\" name=\"Monitor release\">This turn was started by a Verde scheduled task. Do the task and report the result briefly.</verde_schedule>\n\nCheck CI.";
+    const run = scheduledRun(.user, body).?;
+    try std.testing.expectEqualStrings("Monitor release", run.name);
+    try std.testing.expectEqualStrings("Check CI.", run.prompt);
+    try std.testing.expectEqualStrings("Check CI.", transcriptDisplayBody(.user, body));
+    try std.testing.expect(scheduledRun(.assistant, body) == null);
+    try std.testing.expect(scheduledRun(.user, "Check CI.") == null);
 }
 
 test "steering notes render as user turns, other system notes stay neutral" {

@@ -19,8 +19,9 @@ pub const Background = struct { label: []const u8, status: []const u8, task_id: 
 /// A running background task for the bar above the composer; `row_id` is its transcript row.
 pub const BackgroundTask = struct { row_id: []const u8, task_id: ?[]const u8 = null, label: []const u8, status: []const u8, started_at_ms: ?i64 = null };
 /// `message_id` is the stored message's ID (null for optimistic rows or legacy rows without one).
+/// `updated_at_ms` is the stored message's last update (null for live turn rows).
 /// `kind` "background_task" rows carry `background`; their `body` is the command alone.
-pub const Row = struct { id: []const u8, role: []const u8, kind: []const u8 = "message", author: []const u8 = "", body: []const u8, created_at_ms: ?i64 = null, delivery: []const u8 = "committed", attachments: []const Attachment = &.{}, tool: ?Tool = null, message_id: ?[]const u8 = null, background: ?Background = null };
+pub const Row = struct { id: []const u8, role: []const u8, kind: []const u8 = "message", author: []const u8 = "", body: []const u8, created_at_ms: ?i64 = null, delivery: []const u8 = "committed", attachments: []const Attachment = &.{}, tool: ?Tool = null, message_id: ?[]const u8 = null, background: ?Background = null, updated_at_ms: ?i64 = null };
 pub const Turn = struct { turn_id: []const u8, status: []const u8, after_seq: []const u8 = "0", started_at_ms: ?i64 = null, elapsed_ms: i64 = 0, stop_pending: bool = false };
 pub const Approval = struct { turn_id: []const u8, call_id: []const u8, title: []const u8, body: []const u8, resolution: []const u8 = "idle", @"error": ?h.LocalError = null };
 pub const Followup = struct { id: []const u8, kind: []const u8, state: []const u8 = "pending", delivery: []const u8 = "unsent", turn_id: []const u8, steer_id: []const u8, next_turn_id: []const u8, text: []const u8, attachments: []const Attachment = &.{}, voice: bool = false, paused: bool = false, can_retry: bool = false, can_pull_back: bool = true, @"error": ?h.LocalError = null };
@@ -41,6 +42,13 @@ pub const Usage = struct { provider: []const u8, limits: []const UsageLimit = &.
 pub const Page = struct { has_older: bool, cursor: ?[]const u8, loading: bool };
 /// `background_tasks`: the thread's running background tasks, oldest first, for the bar above the composer.
 pub const LinkedAgent = struct { link_id: []const u8 = "", workspace_id: []const u8 = "", local_thread_id: []const u8 = "", title: []const u8 = "", provider: []const u8 = "", model: []const u8 = "", status: []const u8 = "idle", status_label: []const u8 = "Idle", summary: []const u8 = "", updated_at_ms: i64 = 0, hidden: bool = false, needs_you: bool = false };
-pub const Orchestration = struct { links: []const LinkedAgent = &.{}, loaded: bool = false, loading: bool = false, @"error": ?h.LocalError = null, waiting_count: u32 = 0, working_count: u32 = 0, approval_count: u32 = 0, input_count: u32 = 0, needs_you: bool = false, title: []const u8 = "", summary: []const u8 = "" };
+/// A provider subagent (e.g. a child of Claude's Agent tool) in the thread's transcript, as desktop's
+/// Agents panel lists them. `row_id`: its transcript row. `tool_call_id`: null for older saved rows
+/// stored without one. `status`: running, completed, failed, aborted or unknown. `updated_at_ms`:
+/// the stored row's last update, else its creation; null for live turn rows.
+pub const Subagent = struct { row_id: []const u8 = "", tool_call_id: ?[]const u8 = null, title: []const u8 = "Subagent", status: []const u8 = "unknown", status_label: []const u8 = "Unknown", updated_at_ms: ?i64 = null };
+/// `links`: linked child chats from the host (`chat.links.list`). `subagents`: provider subagents
+/// from the transcript, newest first; filled only in the thread view, never counted as waiting.
+pub const Orchestration = struct { links: []const LinkedAgent = &.{}, loaded: bool = false, loading: bool = false, @"error": ?h.LocalError = null, waiting_count: u32 = 0, working_count: u32 = 0, approval_count: u32 = 0, input_count: u32 = 0, needs_you: bool = false, title: []const u8 = "", summary: []const u8 = "", subagents: []const Subagent = &.{} };
 pub const ThreadView = struct { thread: p.ThreadSummary, rows: []const Row, page: Page, turn: ?Turn, approval: ?Approval, usage: ?Usage, stale: bool, @"error": ?h.LocalError, background_tasks: []const BackgroundTask = &.{}, orchestration: ?Orchestration = null };
 pub const ComposerView = struct { draft: Draft, selection: Selection, catalogs: Catalogs, mentions: []const Mention, provider_ready: bool, can_send: bool, can_stop: bool, send_operation: ?h.Operation, followup: ?Followup, shell_confirmation: ?ShellConfirmation, @"error": ?h.LocalError };

@@ -25,6 +25,19 @@ pub const ATTACHMENT_ID_LENGTH: usize = 32;
 /// expire with the runtime-side TTL and are not downloadable afterwards.
 pub const ATTACHMENT_REFERENCE_PREFIX = "verde-attachment:";
 
+/// Directory under the daemon's data path holding the durable copy of each
+/// claimed image, one file per attachment id. A desktop sharing that data
+/// path (the local runtime) previews references straight from here.
+pub const ATTACHMENT_STORE_DIR_NAME = "attachment-store";
+
+/// The attachment id of a `verde-attachment:<id>` reference, or null for
+/// anything else (a plain file path, a malformed id).
+pub fn referenceAttachmentId(reference: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, reference, ATTACHMENT_REFERENCE_PREFIX)) return null;
+    const id = reference[ATTACHMENT_REFERENCE_PREFIX.len..];
+    return if (isValidAttachmentId(id)) id else null;
+}
+
 /// One turn references at most this many staged attachments. Shared between
 /// the desktop composer gate (visible pre-staging rejection) and the daemon
 /// claim path so a client can never stage a set it cannot send.
@@ -198,4 +211,10 @@ test "append chunk sizing keeps the encoded fit contract for every limit" {
     try std.testing.expectEqual(@as(usize, 0), maxAppendChunkBytes(APPEND_ENVELOPE_RESERVE_BYTES));
     try std.testing.expectEqual(@as(usize, 3), maxAppendChunkBytes(APPEND_ENVELOPE_RESERVE_BYTES + 4));
     try std.testing.expectEqual(@as(usize, 3072), maxAppendChunkBytes(8 * 1024));
+}
+
+test "attachment references yield their id, plain paths do not" {
+    try std.testing.expectEqualStrings("5287f0e1c59db3473133cc770cbc8382", referenceAttachmentId("verde-attachment:5287f0e1c59db3473133cc770cbc8382").?);
+    try std.testing.expect(referenceAttachmentId("/home/me/pic.png") == null);
+    try std.testing.expect(referenceAttachmentId("verde-attachment:../../etc/passwd") == null);
 }

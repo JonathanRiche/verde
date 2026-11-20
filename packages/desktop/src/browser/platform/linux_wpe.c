@@ -1559,7 +1559,9 @@ static gboolean verde_browser_linux_platform_render_buffer(void *user, WPEView *
                 ? verde_browser_linux_publish_pixels(browser, pixels, stride, width, height, now_us)
                 : VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
         } else {
-            /* A dma-buf the GUI cannot take (socket gone or format refused): slow readback. */
+            /* A dma-buf the GUI cannot take (socket gone or format refused): slow readback.
+             * The GBytes is owned by the buffer (transfer none) and WebKit reuses buffers:
+             * unreffing it here frees it under the buffer and the next readback crashes. */
             GError *error = NULL;
             GBytes *bytes = wpe_buffer_import_to_pixels(buffer, &error);
             if (bytes != NULL) {
@@ -1568,7 +1570,6 @@ static gboolean verde_browser_linux_platform_render_buffer(void *user, WPEView *
                 result = height > 0 && size >= (gsize)width * 4u * height
                     ? verde_browser_linux_publish_pixels(browser, pixels, size / height, width, height, now_us)
                     : VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
-                g_bytes_unref(bytes);
             } else {
                 result = VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
                 g_clear_error(&error);

@@ -4410,8 +4410,8 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
         .w = @min(zoom_label_text_w, zoom_label_rect.w),
         .h = zoom_font_size * 1.25,
     }, zoom_label, paletteColor(theme.COLOR_TEXT_MUTED), zoom_font_size, modal);
-    queuePaletteText(state, .{ .x = content.x, .y = content.y, .w = header_text_width, .h = theme.scaledUi(22.0) }, std.fs.path.basename(modal_path), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), modal);
-    queuePaletteText(state, .{ .x = content.x, .y = content.y + theme.scaledUi(24.0), .w = header_text_width, .h = theme.scaledUi(20.0) }, modal_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
+    queuePaletteText(state, .{ .x = content.x, .y = content.y, .w = header_text_width, .h = theme.scaledUi(22.0) }, chat_panel.attachmentDisplayName(std.fs.path.basename(modal_path)), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), modal);
+    queuePaletteText(state, .{ .x = content.x, .y = content.y + theme.scaledUi(24.0), .w = header_text_width, .h = theme.scaledUi(20.0) }, if (chat_panel.attachmentDisplayName(modal_path).ptr == modal_path.ptr) modal_path else "Sent from another device", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
 
     const canvas = imageModalCanvasRect(width, height);
     queuePaletteRoundedRect(state, canvas, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));

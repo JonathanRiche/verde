@@ -10225,7 +10225,21 @@ pub const AppState = struct {
         const owned_key = self.allocator.dupe(u8, path) catch return null;
         errdefer self.allocator.free(owned_key);
 
-        const loaded = stb_image.load(path) catch |err| {
+        // Images sent from a phone or the web are referenced by attachment
+        // id; the local runtime keeps their bytes in the shared data path.
+        var store_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const load_path: [:0]const u8 = if (headless.attachment_protocol.referenceAttachmentId(path)) |id|
+            std.fmt.bufPrintZ(&store_path_buf, "{s}{c}{s}{c}{s}", .{
+                std.mem.trimEnd(u8, self.storage.pref_path, "/\\"),
+                std.fs.path.sep,
+                headless.attachment_protocol.ATTACHMENT_STORE_DIR_NAME,
+                std.fs.path.sep,
+                id,
+            }) catch path
+        else
+            path;
+
+        const loaded = stb_image.load(load_path) catch |err| {
             log.err("failed to decode attachment preview {s}: {s}", .{ path, @errorName(err) });
             self.image_texture_cache.put(owned_key, .{
                 .texture_id = 0,

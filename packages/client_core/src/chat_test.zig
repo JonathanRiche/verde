@@ -761,6 +761,57 @@ test "the thread view carries background task rows and the running list" {
     try eql("bun run dev", view.data.?.background_tasks[0].label);
 }
 
+test "the thread view lists transcript subagents from saved and live rows, newest first" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage(null, false);
+    // An older saved Claude card stored as a generic tool without a call ID, a saved Agent call the
+    // live turn later updates, a cancelled one, and a plain command that is not a subagent.
+    try f.recorded("chat.message.list",
+        \\{"messages":[
+        \\{"sort_index":1,"message_id":"old-agent","role":"system","author":"Cursor tool","body":"Tool:\ntask\n\nInput:\n{\"description\":\"read_readme\",\"subagent_type\":\"Explore\",\"prompt\":\"Read README.md\"}\n\nOutput:\nVerde","images":[],"image":null,"tool_call_id":null,"tool_call_kind":null,"tool_call_status":null,"created_at_ms":900,"updated_at_ms":1000},
+        \\{"sort_index":2,"message_id":"saved-agent-0","role":"system","author":"Subagent","body":"Input:\n{\"description\":\"Audit deps\"}","images":[],"image":null,"tool_call_id":"agent-0","tool_call_kind":"subagent","tool_call_status":"cancelled","created_at_ms":1500,"updated_at_ms":3000},
+        \\{"sort_index":3,"message_id":"saved-agent-1","role":"system","author":"Subagent","body":"Input:\n{\"prompt\":\"Fix the bug\"}","images":[],"image":null,"tool_call_id":"agent-1","tool_call_kind":"subagent","tool_call_status":"in_progress","created_at_ms":2000,"updated_at_ms":2000},
+        \\{"sort_index":4,"message_id":"cmd","role":"system","author":"Ran command","body":"Input:\nls\n\nOutput:\nok","images":[],"image":null,"tool_call_id":"cmd-1","tool_call_kind":"execute","tool_call_status":"completed","created_at_ms":4000,"updated_at_ms":4000}
+        \\],"next_cursor":null,"store_revision":2}
+    );
+    try f.seedTurn();
+    try f.tail(.{ .status = "running", .events = .{
+        .{ .seq = 1, .kind = "tool_call", .payload_json = "{\"call_id\":\"agent-1\",\"title\":\"Agent\",\"kind\":\"subagent\",\"status\":\"completed\",\"input\":\"{\\\"prompt\\\":\\\"Fix the bug\\\\nthen test\\\"}\",\"output\":\"fixed\"}" },
+        .{ .seq = 2, .kind = "tool_call", .payload_json = "{\"call_id\":\"agent-2\",\"title\":\"Explore the repo\",\"kind\":\"subagent\",\"status\":\"in_progress\",\"input\":\"{\\\"description\\\":\\\"Explore the repo\\\",\\\"prompt\\\":\\\"Look around\\\"}\"}" },
+    } });
+    const view = try std.json.parseFromValueLeaky(wire.Query(m.ThreadView), f.a(), try f.query("thread"), .{ .ignore_unknown_fields = true });
+    const agents = view.data.?.orchestration.?;
+    try expect(agents.links.len == 0 and agents.waiting_count == 0);
+    const list = agents.subagents;
+    try expect(list.len == 4);
+    // Live rows are newest; the live update of agent-1 replaces its saved row.
+    try eql("agent-2", list[0].tool_call_id.?);
+    try eql("Explore the repo", list[0].title);
+    try eql("running", list[0].status);
+    try eql("Working", list[0].status_label);
+    try expect(list[0].updated_at_ms == null);
+    try eql("agent-1", list[1].tool_call_id.?);
+    try eql("completed", list[1].status);
+    try eql("Done", list[1].status_label);
+    try eql("Fix the bug", list[1].title);
+    try expect(std.mem.startsWith(u8, list[1].row_id, "turn:fixture-turn:msg:"));
+    var row_found = false;
+    for (view.data.?.rows) |row| row_found = row_found or h.eq(row.id, list[1].row_id);
+    try expect(row_found);
+    try eql("saved-agent-0", list[2].row_id);
+    try eql("aborted", list[2].status);
+    try eql("Stopped", list[2].status_label);
+    try eql("Audit deps", list[2].title);
+    try expect(list[2].updated_at_ms.? == 3000);
+    try eql("old-agent", list[3].row_id);
+    try expect(list[3].tool_call_id == null);
+    try eql("read_readme", list[3].title);
+    try eql("unknown", list[3].status);
+    try expect(list[3].updated_at_ms.? == 1000);
+}
+
 test "orchestration projects hidden cross-workspace agents and stable activity ordering" {
     var f = try Fixture.init();
     defer f.deinit();

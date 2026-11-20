@@ -142,6 +142,8 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-6.1 Sol", .value = DEFAULT_CODEX_MODEL },
+    .{ .label = "GPT-6.2 Sol", .value = "gpt-6.2-sol" },
+    .{ .label = "GPT-6.2 Astra", .value = "gpt-6.2-astra" },
     .{ .label = "GPT-6 Astra", .value = "gpt-6-astra" },
     .{ .label = "GPT-6.1 Terra", .value = "gpt-6.1-terra" },
     .{ .label = "GPT-6 Sol", .value = "gpt-6-sol" },
@@ -471,7 +473,9 @@ pub const CODEX_MAX_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningO
 /// Returns the reasoning efforts supported by the selected Codex model.
 pub fn codexReasoningOptions(model_ref: ?[]const u8) []const ReasoningOption {
     const model = model_ref orelse DEFAULT_CODEX_MODEL;
-    if (std.mem.eql(u8, model, "gpt-6-astra") or
+    if (std.mem.eql(u8, model, "gpt-6.2-sol") or
+        std.mem.eql(u8, model, "gpt-6.2-astra") or
+        std.mem.eql(u8, model, "gpt-6-astra") or
         std.mem.eql(u8, model, "gpt-6.1-sol") or
         std.mem.eql(u8, model, "gpt-6.1-terra") or
         std.mem.eql(u8, model, "gpt-6-sol") or
@@ -506,4 +510,19 @@ test "Muse Ember effort choices preserve older models and default" {
     try std.testing.expectEqualStrings("Ultra", wonder[5].label);
     try std.testing.expect(!museEffortSupported(DEFAULT_MUSE_MODEL, .minimal));
     try std.testing.expect(museEffortSupported("muse-ember-1.0", .minimal));
+}
+
+test "GPT-6.2 Codex models are selectable with Max effort without changing the default" {
+    try std.testing.expectEqualStrings("gpt-6.1-sol", DEFAULT_CODEX_MODEL);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value);
+    for ([_][]const u8{ "gpt-6.2-sol", "gpt-6.2-astra" }) |model| {
+        var listed = false;
+        for (CODEX_MODEL_OPTIONS) |option| {
+            if (std.mem.eql(u8, option.value, model)) listed = true;
+        }
+        try std.testing.expect(listed);
+        const efforts = codexReasoningOptions(model);
+        try std.testing.expectEqual(CODEX_MAX_REASONING_OPTIONS.len, efforts.len);
+        try std.testing.expectEqualStrings("Max", efforts[efforts.len - 1].label);
+    }
 }

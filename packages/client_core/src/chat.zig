@@ -809,7 +809,7 @@ fn messageRow(a: A, message: store.Message, fallback: []const u8, delivery: []co
     if (message.image) |image| if (images.len == 0) {
         try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = baseName(image.path), .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = 0 });
     };
-    return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| try toolView(a, id, message) else null };
+    return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .updated_at_ms = message.updated_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| try toolView(a, id, message) else null };
 }
 /// The file name of a host path (POSIX or Windows separators); the full path stays in `reference`.
 fn baseName(path: []const u8) []const u8 {
@@ -1440,7 +1440,102 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
         v.elapsed_ms = @intCast(@max(0, @min(std.math.maxInt(i64), @as(i128, state.wall_time_ms) - start)));
     };
     const background = try background_rows.project(a, rows);
-    return try value(a, m.ThreadView{ .orchestration = @import("orchestration.zig").view(state, t.workspace_id, t.id), .thread = try summary(a, t, state.wall_time_ms), .rows = background.rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error", .background_tasks = background.running });
+    // Saved rows and live turn rows meet only here, so transcript subagents join the host's links here.
+    var agents = @import("orchestration.zig").view(state, t.workspace_id, t.id);
+    agents.subagents = try subagents(a, background.rows);
+    return try value(a, m.ThreadView{ .orchestration = agents, .thread = try summary(a, t, state.wall_time_ms), .rows = background.rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error", .background_tasks = background.running });
+}
+/// Provider subagents in the transcript, as desktop's Agents panel collects them
+/// (`linkedChatsLayoutFor`): one per tool call (or OpenCode child session) where the latest row
+/// wins, newest first. Live turn rows carry no timestamp and sort as the newest.
+fn subagents(a: A, rows: []const m.Row) E![]const m.Subagent {
+    const Entry = struct { item: m.Subagent, identity: ?[]const u8, at: i64, index: usize };
+    var out: std.ArrayList(Entry) = .empty;
+    next: for (rows, 0..) |row, index| {
+        if (!isSubagentRow(row)) continue;
+        const status = subagentStatus(if (row.tool) |tool| tool.status else "unknown");
+        const updated = row.updated_at_ms orelse row.created_at_ms;
+        const entry: Entry = .{
+            .item = .{ .row_id = row.id, .tool_call_id = if (row.tool) |tool| tool.id else null, .title = try subagentTitle(a, row.body), .status = status, .status_label = @import("orchestration.zig").label(status), .updated_at_ms = updated },
+            .identity = if (row.tool) |tool| tool.id else childSessionId(tool_body.section(row.body, "Output:\n") orelse tool_body.section(row.body, "Input:\n") orelse ""),
+            .at = updated orelse if (eq(row.delivery, "streaming")) std.math.maxInt(i64) else 0,
+            .index = index,
+        };
+        if (entry.identity) |id| for (out.items) |*existing| if (existing.identity != null and eq(existing.identity.?, id)) {
+            existing.* = entry;
+            continue :next;
+        };
+        try out.append(a, entry);
+    }
+    std.mem.sort(Entry, out.items, {}, struct {
+        fn newer(_: void, l: Entry, r: Entry) bool {
+            return if (l.at != r.at) l.at > r.at else l.index > r.index;
+        }
+    }.newer);
+    const items = try a.alloc(m.Subagent, out.items.len);
+    for (out.items, items) |entry, *item| item.* = entry.item;
+    return items;
+}
+/// Desktop `isSubagentTimelineEntry`: a row with a tool call trusts its kind and author; an older
+/// saved row stored without one is recognized from its body (`looksLikeSubagentCard`).
+fn isSubagentRow(row: m.Row) bool {
+    if (!eq(row.role, "system")) return false;
+    const author = std.ascii.eqlIgnoreCase(std.mem.trim(u8, row.author, " \n\r\t"), "Subagent");
+    if (row.tool) |tool| return author or eq(tool.kind, "subagent");
+    if (author) return true;
+    if (@import("headless").provider_types.isSubagentToolName(tool_body.section(row.body, "Tool:\n") orelse "")) return true;
+    if (std.mem.indexOf(u8, tool_body.section(row.body, "Input:\n") orelse "", "\"subagent_type\"") != null) return true;
+    return std.mem.indexOf(u8, tool_body.section(row.body, "Output:\n") orelse "", "<task id=\"") != null;
+}
+/// Desktop `subagentEntryStatus`.
+fn subagentStatus(tool_status: []const u8) []const u8 {
+    if (eq(tool_status, "pending") or eq(tool_status, "in_progress")) return "running";
+    if (eq(tool_status, "completed")) return "completed";
+    if (eq(tool_status, "failed")) return "failed";
+    if (eq(tool_status, "cancelled")) return "aborted";
+    return "unknown";
+}
+/// Desktop `parseSubagentConversation` title: the input's description, else a tool title that is
+/// not just the tool's name, else the prompt's (or body's) first line.
+fn subagentTitle(a: A, body: []const u8) E![]const u8 {
+    const tool = tool_body.section(body, "Tool:\n") orelse "";
+    const input = tool_body.section(body, "Input:\n") orelse "";
+    var prompt: []const u8 = if (input.len > 0) input else tool;
+    var title: []const u8 = "";
+    if (std.mem.startsWith(u8, input, "{")) {
+        const parsed = std.json.parseFromSliceLeaky(V, a, input, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => V.null,
+        };
+        if (p.get(parsed, "prompt") == .string and p.s(parsed, "prompt").len > 0) prompt = p.s(parsed, "prompt");
+        title = p.s(parsed, "description");
+    }
+    if (title.len == 0 and tool.len > 0 and !@import("headless").provider_types.isSubagentToolName(tool)) title = tool;
+    if (title.len == 0) title = firstLine(if (prompt.len > 0) prompt else body);
+    title = firstLine(title);
+    if (title.len == 0) return "Subagent";
+    // One line for a list row; cut on a UTF-8 boundary.
+    var end = @min(title.len, 200);
+    while (end < title.len and end > 0 and (title[end] & 0xC0) == 0x80) end -= 1;
+    return title[0..end];
+}
+fn firstLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len > 0) return line;
+    }
+    return "";
+}
+/// Desktop `openCodeChildSessionId`: an OpenCode child session (`ses_…`) named in a tool section.
+fn childSessionId(text: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "<task id=\"", "\"sessionID\":\"", "\"sessionId\":\"" }) |prefix| {
+        const start = std.mem.indexOf(u8, text, prefix) orelse continue;
+        const rest = text[start + prefix.len ..];
+        const end = std.mem.indexOfAny(u8, rest, "\"<") orelse continue;
+        if (std.mem.startsWith(u8, rest[0..end], "ses_")) return rest[0..end];
+    }
+    return null;
 }
 /// Include precise chat selectors in the coalesced host notification.
 pub fn scopes(tx: *h.Transaction, before: *const h.State, host_changed: bool) E![]const []const u8 {

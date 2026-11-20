@@ -42,6 +42,7 @@ pub const types = .{
     .{ "ChatUsage", chat.Usage },
     .{ "ChatPage", chat.Page },
     .{ "ChatLinkedAgent", chat.LinkedAgent },
+    .{ "ChatSubagent", chat.Subagent },
     .{ "ChatOrchestration", chat.Orchestration },
     .{ "ChatThreadView", chat.ThreadView },
     .{ "ChatComposerView", chat.ComposerView },

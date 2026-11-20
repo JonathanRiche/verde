@@ -11,11 +11,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zqlite = @import("zqlite");
+const attachment_protocol = @import("headless").attachment_protocol;
 
 const log = std.log.scoped(.attachment_store);
 
 pub const METHOD_READ = "chat.attachment.read";
-pub const DIR_NAME = "attachment-store";
+pub const DIR_NAME = attachment_protocol.ATTACHMENT_STORE_DIR_NAME;
 pub const REFERENCE_PREFIX = "verde-attachment:";
 /// Largest chunk returned per read (raw bytes, before base64).
 pub const MAX_CHUNK_BYTES: usize = 512 * 1024;

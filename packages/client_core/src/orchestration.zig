@@ -144,7 +144,8 @@ fn newer(_: void, l: m.LinkedAgent, r: m.LinkedAgent) bool {
     if (l.updated_at_ms != r.updated_at_ms) return l.updated_at_ms > r.updated_at_ms;
     return std.mem.lessThan(u8, l.link_id, r.link_id);
 }
-fn label(status: []const u8) []const u8 {
+/// Display label for a linked chat or subagent status.
+pub fn label(status: []const u8) []const u8 {
     if (eq(status, "running")) return "Working";
     if (eq(status, "waiting_approval")) return "Needs approval";
     if (eq(status, "blocked")) return "Needs input";
@@ -153,5 +154,6 @@ fn label(status: []const u8) []const u8 {
     if (eq(status, "aborted")) return "Stopped";
     if (eq(status, "interrupted")) return "Interrupted";
     if (eq(status, "idle")) return "Idle";
+    if (eq(status, "unknown")) return "Unknown";
     return status;
 }

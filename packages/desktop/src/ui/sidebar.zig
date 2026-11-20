@@ -1912,19 +1912,12 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     // One ordered list drives measuring, focus reveal, and rendering, so the
     // three passes cannot disagree about row positions.
     const open_units = collectOpenUnits(state, all_scope);
-    // A standalone pane already listed in ACTIVE is not repeated in OPEN
-    // (docs/workspace-switcher-sidebar.md: OPEN is "every other open pane"),
-    // so a chat never shows twice. Keyboard ordinals keep using the full
-    // `open_units` list, so Ctrl+N numbering is unchanged.
-    var open_unit_shown: []const bool = &.{};
-    if (state.palette_frame_text_arena.allocator().alloc(bool, open_units.len)) |shown| {
-        for (open_units, shown) |unit, *flag| flag.* = !openUnitShownInActive(state, unit);
-        open_unit_shown = shown;
-    } else |_| {}
+    // OPEN lists every tab, including ones also shown in ACTIVE: a new chat
+    // must appear as a tab right away, not only once it leaves ACTIVE. The
+    // selected fill stays on the ACTIVE row (see `renderOpenPaneRow`).
     var content_y = open_top + caption_h;
     var focused_row: ?palette.Rect = null;
-    for (open_units, 0..) |unit, unit_index| {
-        if (unit_index < open_unit_shown.len and !open_unit_shown[unit_index]) continue;
+    for (open_units) |unit| {
         const unit_h = openUnitHeight(&projects[unit.project_index].workspace_layout, unit.pane_index);
         if (unit.project_index == selected_index and focused_pane_id != null and
             openUnitContainsPane(&projects[unit.project_index].workspace_layout, unit.pane_index, focused_pane_id.?))
@@ -1954,13 +1947,11 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     } else &.{};
     const row_ordinals = allWorkspacesOrderActive(state);
     for (open_units, 0..) |unit, ordinal| {
-        if (ordinal < open_unit_shown.len and !open_unit_shown[ordinal]) continue;
         y = renderOpenPaneUnit(state, unit, selected_tabs, if (row_ordinals) ordinal else null, x, rail_w, rows_clip, rows_clip, y);
     }
     if (open_units.len > 0) y += theme.scaledUi(4.0);
     if (y == rows_top) {
-        const empty_label = if (open_units.len > 0) "Every open pane is active" else "No open panes";
-        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, empty_label, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), rows_clip);
+        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), rows_clip);
     }
 
     // Scrollbar clips to the OPEN band so the thumb never extends behind the
@@ -2491,17 +2482,6 @@ fn paneShownInActive(project_index: usize, pane_id: native_state.WorkspacePaneId
     return false;
 }
 
-/// True for a standalone OPEN unit whose pane is already an ACTIVE row.
-/// Split tiles stay in OPEN (their miniature is the only view of the tile);
-/// their ACTIVE member just loses the duplicate selected fill.
-fn openUnitShownInActive(state: *const runtime.AppState, unit: OpenUnit) bool {
-    const layout = &state.project_controller.projects.items[unit.project_index].workspace_layout;
-    const pane = layout.panes.items[unit.pane_index];
-    const group_id = layout.scrollGroupIdForPane(pane.id) orelse return false;
-    if (layout.scrollGroupPaneCount(group_id) > 1) return false;
-    return paneShownInActive(unit.project_index, pane.id);
-}
-
 /// Focuses the ACTIVE row at the same sorted position used by the sidebar.
 pub fn focusAttentionClusterRowAtIndex(state: *runtime.AppState, row_index: usize) bool {
     var rows: [palette_hits.len]AttentionClusterRow = undefined;
@@ -2903,8 +2883,8 @@ fn renderOpenPaneRow(
         if (value.pane_id == pane.id) value else null
     else
         null;
-    // One selected treatment per pane: a split-tile member that is also an
-    // ACTIVE row keeps its selected fill on the ACTIVE row only.
+    // One selected treatment per pane: a pane that is also an ACTIVE row
+    // keeps its selected fill on the ACTIVE row only.
     const focused = state.project_controller.selected_index == project_index and layout.focused_pane_id == pane.id and
         (show_workspace_tag or !paneShownInActive(project_index, pane.id));
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);

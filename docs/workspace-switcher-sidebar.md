@@ -18,7 +18,8 @@ per-workspace identity so a workspace looks identical everywhere.
    chevrons:
    - **Active** – panes/chats that are working, waiting, failed, or have an
      unread completion.
-   - **Open** (inactive) – every other open pane/chat.
+   - **Open** – every open pane/chat (tab), including ones currently in
+     Active, so a new chat is listed as a tab as soon as it opens.
    **Active is global**: it always spans every open workspace, whatever the
    scope, and every Active row carries the small workspace identity chip
    (icon on tinted square) — you always want to see what is working.

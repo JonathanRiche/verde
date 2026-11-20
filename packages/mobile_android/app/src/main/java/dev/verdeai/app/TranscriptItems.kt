@@ -46,6 +46,14 @@ internal sealed interface TranscriptItem {
     data class Approval(val approval: ChatApproval) : TranscriptItem { override val key get() = "approval:${approval.turn_id}:${approval.call_id}" }
 }
 
+/** Whether this item shows transcript row [id]: the target of a jump from the running-tasks bar or the Agents panel. */
+internal fun TranscriptItem.showsRow(id: String): Boolean = when (this) {
+    is TranscriptItem.Background -> rows.any { it.id == id }
+    is TranscriptItem.ToolGroup -> rows.any { it.id == id }
+    is TranscriptItem.Tool -> row.id == id
+    else -> false
+}
+
 internal const val DIFF_MARKER = "VERDE_DIFF_V2\n"
 private const val HIDDEN_AUTHOR = "__verde_codex_background_snapshot"
 

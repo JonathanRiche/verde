@@ -389,12 +389,19 @@ internal fun TranscriptScreen(
             agentsOpen = false
             if (onOpenAgent != null) onOpenAgent(agent.workspace_id, agent.local_thread_id) else onOpenThread?.invoke(agent.local_thread_id)
         }
+        // A subagent lives in this transcript: close the panel and scroll to its row, as the running-tasks bar does.
+        val showSubagent: (ChatSubagent) -> Unit = { agent ->
+            agentsOpen = false
+            jump.target = agent.row_id
+        }
+        val provider = state.thread?.thread?.provider
         if (wideAgents) {
             androidx.activity.compose.BackHandler { agentsOpen = false }
             Surface(Modifier.align(Alignment.CenterEnd).width(300.dp).fillMaxHeight(), color = VerdeColors.Panel) {
-                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels, entryFocus = agentsFocus)
+                AgentsPanel(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels, entryFocus = agentsFocus,
+                    provider = provider, showSubagent = showSubagent)
             }
-        } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels)
+        } else AgentsSheet(state.thread?.orchestration, { agentsOpen = false }, openAgent, workspaceLabels, provider, showSubagent)
     }
     gitChanges?.let { GitChangesLayer(it) }
     }
@@ -499,10 +506,10 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
             anchored = true
         }
     }
-    // U1: the running-tasks bar scrolls to a task's row.
+    // U1: the running-tasks bar (and the Agents panel's subagents) scroll to a row.
     LaunchedEffect(jump?.target) {
         val id = jump?.target ?: return@LaunchedEffect
-        val index = reversed.indexOfFirst { item -> item is TranscriptItem.Background && item.rows.any { it.id == id } }
+        val index = reversed.indexOfFirst { it.showsRow(id) }
         if (index >= 0) {
             follow = false
             // (a) / A7-9: outline the task for a moment so the eye finds it, as on iOS: first, so it

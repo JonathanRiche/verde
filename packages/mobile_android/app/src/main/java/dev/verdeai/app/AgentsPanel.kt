@@ -13,11 +13,14 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.verdeai.core.ChatOrchestration
 import dev.verdeai.core.ChatLinkedAgent
+import dev.verdeai.core.ChatSubagent
 
 @Composable
 internal fun AgentsWaitingBar(agents: ChatOrchestration, open: () -> Unit) {
@@ -36,7 +39,8 @@ internal fun AgentsWaitingBar(agents: ChatOrchestration, open: () -> Unit) {
 }
 
 @Composable
-internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap(), entryFocus: FocusRequester? = null) {
+internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap(), entryFocus: FocusRequester? = null,
+    provider: String? = null, showSubagent: (ChatSubagent) -> Unit = {}) {
     val focus = LocalFocusManager.current
     Column(Modifier.fillMaxSize().padding(12.dp).onPreviewKeyEvent { event ->
         if (event.type != KeyEventType.KeyDown) false else when (event.key) {
@@ -51,8 +55,9 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
             TextButton(onClick = close, modifier = Modifier.heightIn(min = 48.dp).then(entryFocus?.let { Modifier.focusRequester(it) } ?: Modifier)) { Text("Close agents") }
         }
         if (agents?.error != null) SelectionContainer { Text("Couldn't refresh agents. Reconnect to try again.") }
-        if (agents?.links.isNullOrEmpty()) SelectionContainer {
-            Text(if (agents == null || !agents.loaded) "Loading agents…" else "No linked agents yet. Delegated chats will appear here.")
+        val subagents = agents?.subagents.orEmpty()
+        if (agents?.links.isNullOrEmpty() && subagents.isEmpty()) SelectionContainer {
+            Text(if (agents == null || !agents.loaded) "Loading agents…" else "No agents yet. Linked chats and subagents will appear here.")
         }
         LazyColumn(Modifier.weight(1f)) {
             items(agents?.links.orEmpty(), key = { it.link_id }) { agent ->
@@ -71,14 +76,40 @@ internal fun AgentsPanel(agents: ChatOrchestration?, close: () -> Unit, open: (C
                     }
                 }
             }
+            // Provider subagents (desktop's "{provider} subagents"): they live in this chat's transcript.
+            if (subagents.isNotEmpty()) item(key = "subagents") {
+                Text(subagentsHeading(provider), style = MaterialTheme.typography.labelLarge, color = VerdeColors.Muted,
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 8.dp).semantics { heading() })
+            }
+            items(subagents, key = { "subagent:" + it.row_id }) { agent ->
+                Surface(onClick = { showSubagent(agent) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    .named("${agent.title}, ${agent.status_label}. Show in transcript"),
+                    shape = MaterialTheme.shapes.small, color = VerdeColors.Panel) {
+                    Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(agent.title, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Surface(shape = MaterialTheme.shapes.small, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                            Text(agent.status_label, color = when (agent.status) { "failed" -> VerdeColors.Danger; "aborted", "unknown" -> VerdeColors.Muted; else -> VerdeColors.Accent },
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                        }
+                        agent.updated_at_ms?.takeIf { it > 0 }?.let { Text(agoLabel(it, System.currentTimeMillis()), style = MaterialTheme.typography.bodySmall) }
+                    }
+                }
+            }
         }
     }
 }
 
+/** "Claude subagents", as the desktop panel names the section; "Subagents" without a provider. */
+internal fun subagentsHeading(provider: String?): String {
+    val id = provider?.takeIf { it.isNotBlank() } ?: return "Subagents"
+    return "${PROVIDERS.find { it.first == id }?.second ?: id.replaceFirstChar { it.uppercase() }} subagents"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AgentsSheet(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap()) {
-    ModalBottomSheet(onDismissRequest = close) { Box(Modifier.fillMaxWidth().fillMaxHeight(0.85f)) { AgentsPanel(agents, close, open, workspaceLabels) } }
+internal fun AgentsSheet(agents: ChatOrchestration?, close: () -> Unit, open: (ChatLinkedAgent) -> Unit, workspaceLabels: Map<String, String> = emptyMap(),
+    provider: String? = null, showSubagent: (ChatSubagent) -> Unit = {}) {
+    ModalBottomSheet(onDismissRequest = close) { Box(Modifier.fillMaxWidth().fillMaxHeight(0.85f)) { AgentsPanel(agents, close, open, workspaceLabels, provider = provider, showSubagent = showSubagent) } }
 }
 
 internal val LocalAgentsPanelVisible = androidx.compose.runtime.staticCompositionLocalOf<(Boolean) -> Unit> { {} }

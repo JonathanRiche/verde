@@ -424,7 +424,10 @@ internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContex
     val summary = toolGroupSummary(item.rows, item.subagent, elapsed)
     val kinds = remember(item.rows) { item.rows.map(::toolKind).distinct().take(3) }
     val shape = RoundedCornerShape(10.dp)
-    Column(Modifier.fillMaxWidth().border(1.dp, colors.outlineVariant, shape).background(colors.surfaceContainerLow, shape).then(tabbing)) {
+    // Reached from the Agents panel: outlined for a moment, like a background task from its bar.
+    val highlighted = LocalTranscriptJump.current?.highlight?.let { id -> item.rows.any { it.id == id } } == true
+    Column(Modifier.fillMaxWidth().border(if (highlighted) 2.dp else 1.dp, if (highlighted) colors.primary else colors.outlineVariant, shape)
+        .background(colors.surfaceContainerLow, shape).then(tabbing)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).then(disclosure.track)
             .clickable(role = Role.Button, onClickLabel = if (disclosure.expanded) "Collapse" else "Expand") { disclosure.toggle() }
             .clearAndSetSemantics {

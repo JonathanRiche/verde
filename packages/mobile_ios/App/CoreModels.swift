@@ -537,6 +537,7 @@ struct ChatRow: Codable {
     var `tool`: ChatTool? = nil
     var `message_id`: String? = nil
     var `background`: ChatBackground? = nil
+    var `updated_at_ms`: Int64? = nil
 }
 
 extension ChatRow {
@@ -552,6 +553,7 @@ extension ChatRow {
         case `tool`
         case `message_id`
         case `background`
+        case `updated_at_ms`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -582,6 +584,9 @@ extension ChatRow {
         if !c.contains(.`background`) { self.`background` = nil } else {
         self.`background` = try c.decodeIfPresent(ChatBackground.self, forKey: .`background`)
         }
+        if !c.contains(.`updated_at_ms`) { self.`updated_at_ms` = nil } else {
+        self.`updated_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`updated_at_ms`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -596,6 +601,7 @@ extension ChatRow {
         try c.encode(self.`tool`, forKey: .`tool`)
         try c.encode(self.`message_id`, forKey: .`message_id`)
         try c.encode(self.`background`, forKey: .`background`)
+        try c.encode(self.`updated_at_ms`, forKey: .`updated_at_ms`)
     }
 }
 
@@ -1187,6 +1193,56 @@ extension ChatLinkedAgent {
     }
 }
 
+struct ChatSubagent: Codable {
+    var `row_id`: String = ""
+    var `tool_call_id`: String? = nil
+    var `title`: String = "Subagent"
+    var `status`: String = "unknown"
+    var `status_label`: String = "Unknown"
+    var `updated_at_ms`: Int64? = nil
+}
+
+extension ChatSubagent {
+    private enum CodingKeys: String, CodingKey {
+        case `row_id`
+        case `tool_call_id`
+        case `title`
+        case `status`
+        case `status_label`
+        case `updated_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`row_id`) { self.`row_id` = "" } else {
+        self.`row_id` = try c.decode(String.self, forKey: .`row_id`)
+        }
+        if !c.contains(.`tool_call_id`) { self.`tool_call_id` = nil } else {
+        self.`tool_call_id` = try c.decodeIfPresent(String.self, forKey: .`tool_call_id`)
+        }
+        if !c.contains(.`title`) { self.`title` = "Subagent" } else {
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`status`) { self.`status` = "unknown" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`status_label`) { self.`status_label` = "Unknown" } else {
+        self.`status_label` = try c.decode(String.self, forKey: .`status_label`)
+        }
+        if !c.contains(.`updated_at_ms`) { self.`updated_at_ms` = nil } else {
+        self.`updated_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`updated_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`row_id`, forKey: .`row_id`)
+        try c.encode(self.`tool_call_id`, forKey: .`tool_call_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`status_label`, forKey: .`status_label`)
+        try c.encode(self.`updated_at_ms`, forKey: .`updated_at_ms`)
+    }
+}
+
 struct ChatOrchestration: Codable {
     var `links`: [ChatLinkedAgent] = []
     var `loaded`: Bool = false
@@ -1199,6 +1255,7 @@ struct ChatOrchestration: Codable {
     var `needs_you`: Bool = false
     var `title`: String = ""
     var `summary`: String = ""
+    var `subagents`: [ChatSubagent] = []
 }
 
 extension ChatOrchestration {
@@ -1214,6 +1271,7 @@ extension ChatOrchestration {
         case `needs_you`
         case `title`
         case `summary`
+        case `subagents`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1250,6 +1308,9 @@ extension ChatOrchestration {
         if !c.contains(.`summary`) { self.`summary` = "" } else {
         self.`summary` = try c.decode(String.self, forKey: .`summary`)
         }
+        if !c.contains(.`subagents`) { self.`subagents` = [] } else {
+        self.`subagents` = try c.decode([ChatSubagent].self, forKey: .`subagents`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -1264,6 +1325,7 @@ extension ChatOrchestration {
         try c.encode(self.`needs_you`, forKey: .`needs_you`)
         try c.encode(self.`title`, forKey: .`title`)
         try c.encode(self.`summary`, forKey: .`summary`)
+        try c.encode(self.`subagents`, forKey: .`subagents`)
     }
 }
 

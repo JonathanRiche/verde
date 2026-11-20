@@ -138,7 +138,7 @@ fn namesModel(text: []const u8) bool {
     return false;
 }
 fn fallback(provider: []const u8) []const []const u8 {
-    if (eq(provider, "codex")) return &.{ "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
+    if (eq(provider, "codex")) return &.{ "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
     if (eq(provider, "claude")) return &.{ "default", "opus[1m]", "claude-fable-5-2", "fable[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
@@ -201,6 +201,8 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "low")) return "Low";
     if (eq(id, "medium")) return "Medium";
     if (eq(id, "high")) return "High";
+    if (eq(id, "gpt-6.2-sol")) return "GPT-6.2 Sol";
+    if (eq(id, "gpt-6.2-astra")) return "GPT-6.2 Astra";
     if (eq(id, "gpt-6-astra")) return "GPT-6 Astra";
     if (eq(id, "gpt-6.1-sol")) return "GPT-6.1 Sol";
     if (eq(id, "gpt-6.1-terra")) return "GPT-6.1 Terra";
