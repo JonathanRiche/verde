@@ -514,11 +514,13 @@ test "Muse Ember effort choices preserve older models and default" {
 
 test "GPT-6.2 Codex models are selectable with Max effort without changing the default" {
     try std.testing.expectEqualStrings("gpt-6.1-sol", DEFAULT_CODEX_MODEL);
-    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value.?);
     for ([_][]const u8{ "gpt-6.2-sol", "gpt-6.2-astra" }) |model| {
         var listed = false;
         for (CODEX_MODEL_OPTIONS) |option| {
-            if (std.mem.eql(u8, option.value, model)) listed = true;
+            if (option.value) |value| {
+                if (std.mem.eql(u8, value, model)) listed = true;
+            }
         }
         try std.testing.expect(listed);
         const efforts = codexReasoningOptions(model);
