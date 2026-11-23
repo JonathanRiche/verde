@@ -449,6 +449,24 @@ fields. A disappearing terminal command remains observable as `stopping`
 during a short finalization grace period so waiters do not receive a premature
 `gone`.
 
+## Agent skill
+
+Verde publishes an agent skill that teaches coding agents (Claude Code, Codex,
+Cursor, OpenCode, and others) to use the MCP tools and `verde` CLI above:
+delegating to other chats, leased builds, tracked processes, terminals, the
+built-in browser, and schedules, along with Verde's focus and shared-resource
+rules. Install it with the [`skills` CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add JonathanRiche/verde --skill verde        # current project
+npx skills add JonathanRiche/verde --skill verde -g     # all projects
+```
+
+The source is
+[`skills/verde/SKILL.md`](https://github.com/JonathanRiche/verde/blob/master/skills/verde/SKILL.md).
+Agents without a skill system can read that file as plain instructions. The
+MCP tools need **Settings → Agents → Enable Verde MCP**.
+
 ## Provider integrations
 
 Provider hooks are optional add-ons that let agent CLIs drive Verde's sidebar
