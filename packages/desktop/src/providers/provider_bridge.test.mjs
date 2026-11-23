@@ -239,6 +239,22 @@ test('Claude is asked to report session state', () => {
   assert.equal(context.buildClaudeOptions({}).env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1');
 });
 
+test('Claude runs under the verde entrypoint, never an inherited sdk label', () => {
+  const { context } = bridge();
+  const env = context.claudeProcessEnv({ PATH: '/bin', CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' });
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, 'verde');
+  assert.equal(env.CLAUDE_CODE_ARTIFACT, '0');
+  assert.equal(env.PATH, '/bin');
+  assert.equal(context.buildClaudeOptions({}).env.CLAUDE_CODE_ENTRYPOINT, 'verde');
+});
+
+test('the entrypoint label and artifact tools can be overridden from the environment', () => {
+  const { context } = bridge();
+  const env = context.claudeProcessEnv({ VERDE_CLAUDE_CODE_ENTRYPOINT: 'custom', CLAUDE_CODE_ARTIFACT: '1' });
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, 'custom');
+  assert.equal(env.CLAUDE_CODE_ARTIFACT, '1');
+});
+
 test('workspace roots reach Claude on resumed turns without widening permission mode', () => {
   const { context } = bridge();
   const options = context.buildClaudeOptions({

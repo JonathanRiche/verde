@@ -899,6 +899,29 @@ function pathToClaudeCodeExecutable(request) {
     "claude";
 }
 
+// Environment for the Claude Code process the SDK spawns.
+//
+// The SDK labels its sessions `sdk-ts` when no entrypoint is set, and
+// subscription 5-hour limits were measured to drain ~1.6x faster under the
+// `sdk-*` labels than in interactive Claude Code for the same tokens. Verde
+// is an interactive client, so it names itself. The value overwrites any
+// inherited one: an `sdk-*` label leaking in from a host session would undo
+// this. `cli` is not usable (Claude Code rewrites it to `sdk-cli` here).
+// VERDE_CLAUDE_CODE_ENTRYPOINT overrides the label if this ever needs changing
+// without a release.
+//
+// Claude Code turns its Artifact tools off only for `sdk-*` entrypoints, so
+// relabelling would add them (several thousand tokens) to every request.
+// Keep them off unless the user opted in.
+function claudeProcessEnv(hostEnv) {
+  return {
+    ...hostEnv,
+    CLAUDE_CODE_ARTIFACT: hostEnv.CLAUDE_CODE_ARTIFACT ?? "0",
+    CLAUDE_CODE_ENTRYPOINT: hostEnv.VERDE_CLAUDE_CODE_ENTRYPOINT || "verde",
+    CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+  };
+}
+
 function buildClaudeOptions(request) {
   const options = {
     cwd: request.cwd ?? undefined,
@@ -918,7 +941,7 @@ function buildClaudeOptions(request) {
     // consumes it). A `result` is not the end of the run: Claude Code can
     // keep working until it reports `idle`, and closing input earlier makes
     // every steer in that window fail.
-    env: { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
+    env: claudeProcessEnv(process.env),
   };
 
   const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
