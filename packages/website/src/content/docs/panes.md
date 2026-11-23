@@ -43,7 +43,7 @@ configured in `verde.json`, the first custom launch profile also appears in
 the terminal context menu.
 
 Use `Ctrl+Alt+T` for a new shell tab. Launch Codex, Claude, OpenCode, Cursor,
-Pi, FX, Grok, or Amp TUIs from the command palette, or open a running GUI
+Pi, FX, Grok, Antigravity, Muse, or Amp TUIs from the command palette, or open a running GUI
 thread in TUI; the built-in agent launchers are not entries in the terminal
 right-click menu.
 
@@ -281,8 +281,8 @@ the same list. Manage them from the terminal with
 `Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
 workspaces, and app commands. `Ctrl+Enter` on a thread result opens it in a
 fresh pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
-OpenCode, Cursor, Grok, and Amp, and **Open Current Thread in TUI** entries that
-promote a GUI chat thread — including Pi, FX, and Grok — into that provider's
+OpenCode, Cursor, Grok, Antigravity, Muse, and Amp, and **Open Current Thread in TUI** entries that
+promote a GUI chat thread — including Pi, FX, Grok, Antigravity, and Muse — into that provider's
 terminal TUI.
 
 The sidebar's **History · N** row opens the same palette scoped to one

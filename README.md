@@ -6,7 +6,8 @@
 
 <p align="center">
   <strong>Every coding agent. One tiling window.</strong><br />
-  Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more side by side.<br />
+  Run Codex, Claude Code, Cursor, OpenCode, Antigravity, Grok Build and more side by side,<br />
+  or plug in any ACP agent.<br />
   Native. Local-first. Free and open source.
 </p>
 
@@ -72,7 +73,7 @@ https://github.com/user-attachments/assets/eeb122f2-b175-47f1-8c99-f2553eb651ba
 
 You already pay for Claude, ChatGPT, or Cursor. Verde puts every agent you run into one fast, keyboard-driven workspace. No new subscription, no API keys, and no hosted relay sitting between you and your code.
 
-- **Every agent, side by side.** Codex, Claude Code, OpenCode, Cursor, Pi, FX and Grok Build run as native GUI chats *or* their own TUIs. Amp runs as a TUI.
+- **Every agent, side by side.** Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok Build, Antigravity and Muse Code run as native GUI chats *or* their own TUIs. Amp runs as a TUI. Add any other [Agent Client Protocol](https://agentclientprotocol.com) agent as a GUI chat, and run any other CLI in a terminal pane.
 - **Uses the plans you already have.** Verde drives the provider CLIs on your machine. It does not host models or proxy prompts, and it has no telemetry sink.
 - **Approve and steer in place.** Allow a command, redirect a running turn, or queue a follow-up without breaking the agent's flow.
 - **A real tiling workspace.** Tile chats, terminals and a browser together, or scroll them as a Niri-style strip. Layouts persist.
@@ -128,9 +129,14 @@ The iOS and Android apps are in beta. A browser-based web client is also availab
 | **Pi** | ✓ | ✓ | Local `pi` CLI in RPC mode (`pi --mode rpc`) + embedded TUI |
 | **FX** | ✓ | ✓ | Local `fx` CLI ACP (`fx acp`) + embedded TUI |
 | **Grok Build** | ✓ | ✓ | Local `grok` CLI ACP (`grok agent stdio`) + embedded TUI |
+| **Antigravity** | ✓ | ✓ | Google's local `agy` CLI ACP (`agy acp`) + embedded TUI (`agy`) |
+| **Muse Code** | ✓ | ✓ | Local `muse` CLI over the Muse Session Protocol (`muse serve`) + embedded TUI |
 | **Amp** | – | ✓ | Local `amp` CLI in an embedded [Ghostty](https://ghostty.org) pane |
+| **Custom ACP agents** | ✓ | – | Any command that speaks ACP over stdio, added in **Settings → Providers** |
 
-→ Setup notes: [Provider docs](https://verdeai.dev/docs/providers)
+Custom ACP agents are saved under `chat.custom_acp_agents` in `verde.json` (up to 32) and appear in the model picker under **Custom ACP**. Any other agent CLI runs as-is in a terminal pane.
+
+→ Setup notes: [Provider docs](https://verdeai.dev/docs/providers) · [Custom ACP agents](https://verdeai.dev/docs/providers#custom-acp-agents)
 
 ---
 
@@ -189,7 +195,10 @@ Verde does **not** ship a model. Install and sign in to at least one provider CL
 | **Pi** | [pi](https://pi.dev) on `PATH` |
 | **FX** | [fx](https://fx.sh) → `fx login` |
 | **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok login` |
+| **Antigravity** | [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli) → `agy acp --login` |
+| **Muse Code** | [Muse Code](https://dev.meta.ai) (`curl -fsSL https://dev.meta.ai/install.sh \| sh`) → `muse login` (or `META_API_KEY`) |
 | **Amp** | [Amp](https://ampcode.com) on `PATH` (terminal TUI) |
+| **Custom ACP agent** | **Settings → Providers → Add custom agent**, then enter the command that starts its ACP server |
 
 Then run `verde`:
 

@@ -118,6 +118,7 @@ export const CHAT_KEYS = [
   'default_reasoning',
   'favorite_models',
   'new_pane_behavior',
+  'custom_acp_agents',
 ] as const
 
 export const UPDATES_KEYS = ['check_automatically'] as const
@@ -313,6 +314,8 @@ export const CHAT_PROVIDERS = [
   'fx',
   'grok',
   'antigravity',
+  'muse',
+  'custom_acp',
 ] as const
 
 export const CHAT_TITLE_PROVIDERS = ['codex', 'claude', 'cursor', 'opencode'] as const
@@ -722,6 +725,39 @@ const chatSchema = closedObject(
     new_pane_behavior: {
       type: 'string',
       enum: ['new_pane', 'replace_pane'],
+    },
+    custom_acp_agents: {
+      type: 'array',
+      maxItems: 32,
+      description:
+        'User-defined agents that speak the Agent Client Protocol over stdio. Also editable in Settings > Providers. Threads select one with the model ref `<agent-id>` or `<agent-id>/<model>`.',
+      items: {
+        ...closedObject(
+          {
+            id: {
+              type: 'string',
+              pattern: '^[a-z0-9_-]{1,48}$',
+              description:
+                'Stable id used in model refs. Derived from `name` when missing, invalid, or duplicated.',
+            },
+            name: { type: 'string', minLength: 1, description: 'Name shown in the model picker.' },
+            command: {
+              type: 'string',
+              minLength: 1,
+              description: 'Executable that starts the ACP server, looked up on PATH or given as a path.',
+            },
+            args: { type: 'array', items: { type: 'string' } },
+            env: {
+              type: 'object',
+              additionalProperties: { type: 'string' },
+              description: 'Extra environment variables for the agent process.',
+            },
+          },
+          undefined,
+          ['command'],
+        ),
+        anyOf: [{ required: ['name'] }, { required: ['id'] }],
+      },
     },
   },
   'New-chat defaults, titles, and favorite models.',

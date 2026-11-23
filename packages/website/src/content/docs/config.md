@@ -211,9 +211,12 @@ generation failure leaves Verde's prompt-derived fallback title unchanged.
 
 New GUI chats start with `chat.default_provider`, `chat.default_model`, and
 `chat.default_reasoning`. Providers accept `codex`, `claude`, `cursor`,
-`opencode`, `pi`, `fx`, `grok`, or `antigravity`; reasoning accepts `default`, `low`,
+`opencode`, `pi`, `fx`, `grok`, `antigravity`, `muse`, or `custom_acp`; reasoning accepts `default`, `low`,
 `medium`, `high`, `xhigh`, or `max` when the chosen model supports it. These
-values are also available under **Settings → Chat → New chat defaults**.
+values are also available under **Settings → Chat → New chat defaults**. For
+`custom_acp`, the model is `<agent-id>` or `<agent-id>/<model>`, naming an entry
+in `chat.custom_acp_agents`; see [Custom ACP agents](/docs/providers#custom-acp-agents)
+for that list's fields.
 
 The model picker’s star tab shows only `chat.favorite_models`. Use the star on
 any provider/model row to add or remove it; provider tabs continue to show the
@@ -263,7 +266,7 @@ last-expanded state for the next group. See [Chat, models & runs](/docs/chat).
 Project stack config is loaded from `verde.toml` in the workspace
 root. `[processes.<name>]` and `[agents.<name>]` entries both run in terminal docks; agent
 entries may also declare `provider` (`codex`, `claude`, `opencode`, `cursor`,
-`grok`, `antigravity`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
+`grok`, `antigravity`, `muse`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
 metadata defaults to disabled unless explicitly set.
 
 ```toml

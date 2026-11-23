@@ -9,7 +9,7 @@ slug: chat
 ## Connect a provider
 
 Verde checks the GUI-chat providers—Codex, Claude Code, OpenCode, Cursor, Pi,
-FX, Grok Build, and Antigravity—when the app opens. If none is ready, the **Connect an AI
+FX, Grok Build, Antigravity, and Muse Code—when the app opens. If none is ready, the **Connect an AI
 provider** screen reports one of these states for each provider:
 
 - **Ready** — the CLI is installed and authenticated.
@@ -20,7 +20,9 @@ provider** screen reports one of these states for each provider:
 
 After installing or signing in, choose **Check again**. **Not now** dismisses
 the screen without changing provider configuration. Amp is not listed because
-it runs as a terminal TUI rather than a native chat provider.
+it runs as a terminal TUI rather than a native chat provider. Custom ACP agents
+are not listed either; add them under **Settings → Providers** (see
+[Custom ACP agents](/docs/providers#custom-acp-agents)).
 See [Provider setup](/docs/providers) for the exact install and login commands.
 
 ## Choose a provider and model
@@ -36,7 +38,8 @@ locked so the transcript and provider session stay consistent; create another
 thread to use a different provider.
 
 Verde loads the available models from OpenCode, Claude Code, Cursor, Pi, FX,
-Grok, and Antigravity at runtime. Codex models come from Verde's supported model list. A
+Grok, Antigravity, and Muse at runtime. Codex models come from Verde's supported model list,
+and each configured custom ACP agent appears as one entry under **Custom ACP**. A
 provider that is missing or signed out remains visible with a readiness hint
 instead of silently accepting a prompt it cannot send.
 
@@ -58,8 +61,8 @@ switch models because not every provider exposes equivalent controls.
 
 Press `Enter` to send the composer. While an agent is working, type another
 message and press `Tab`: Codex, Claude Code, Pi, and FX (0.0.13 or later, text only)
-try to steer the active turn, while OpenCode, Cursor, Grok, and Antigravity queue the
-message as the next turn.
+try to steer the active turn, while OpenCode, Cursor, Grok, Antigravity, Muse, and custom
+ACP agents queue the message as the next turn.
 The pending message stays pinned above the composer. Double-click that pin to pull it back
 into an empty composer for editing, then press `Tab` to queue it again.
 
@@ -87,8 +90,8 @@ attachments are persisted with the thread's draft, so they survive switching
 threads or restarting the app, and sent images remain viewable in the saved
 transcript.
 
-Codex, Claude Code, OpenCode, Pi, Grok, and Antigravity accept local image attachments.
-Cursor and FX accept them when their ACP session advertises image support.
+Codex, Claude Code, OpenCode, Pi, Grok, Antigravity, and Muse accept local image attachments.
+Cursor, FX, and custom ACP agents accept them when their ACP session advertises image support.
 
 To reference a workspace file, type `@` followed by part of its name or path.
 Verde searches the imported workspace, shows up to eight matching files, and
@@ -105,8 +108,8 @@ new pane. Press `Tab` on a result for thread actions.
 
 Right-click a workspace—or use `Ctrl+Shift+P`—to import an existing Codex,
 OpenCode, Claude Code, or Pi provider thread. The import dialog lists recent
-provider sessions and also accepts a provider thread ID. Cursor, FX, Grok, and
-Antigravity thread import is not supported yet.
+provider sessions and also accepts a provider thread ID. Cursor, FX, Grok,
+Antigravity, Muse, and custom ACP thread import is not supported yet.
 
 Imported and Verde-created provider threads can be refreshed with **Sync
 thread** when they have a provider thread ID and no request is running. The

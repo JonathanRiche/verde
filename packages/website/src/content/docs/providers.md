@@ -1,6 +1,6 @@
 ---
 title: Provider setup
-description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok, Antigravity, and Amp.
+description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok, Antigravity, Muse Code, Amp, and custom ACP agents.
 section: Get started
 order: 2
 slug: providers
@@ -27,10 +27,13 @@ machine, and supports each agent in one or both of two modes:
 | FX          | ✓        | ✓            | Speaks ACP to the `fx` CLI (`fx acp`), one process per turn     |
 | Grok Build  | ✓        | ✓            | Speaks ACP to the `grok` CLI (`grok agent stdio`), one process per turn |
 | Antigravity | ✓        | ✓            | Speaks ACP to Google's Antigravity CLI (`agy acp`), one process per turn |
+| Muse Code   | ✓        | ✓            | Speaks the Muse Session Protocol to `muse serve`, one process per turn |
 | Amp         | –        | ✓            | TUI-only — launches the `amp` CLI in a terminal pane            |
+| Custom ACP  | ✓        | –            | Runs any command you configure that speaks ACP over stdio, one process per turn |
 
 All of them run against the project directory you imported into Verde. Tokens,
-transcripts, and project files stay on your machine.
+transcripts, and project files stay on your machine. Any other agent CLI can
+still run as-is in a terminal pane; it just has no native chat integration.
 
 ## Readiness check
 
@@ -41,7 +44,8 @@ authentication. Install or sign in using the instructions below, then choose
 **Check again**. **Open setup guide** returns to this page and **Not now**
 dismisses the screen.
 
-Amp is excluded from this check because it is TUI-only. A GUI
+Amp is excluded from this check because it is TUI-only, and custom ACP agents
+are managed in Settings instead (see [Custom ACP agents](#custom-acp-agents)). A GUI
 provider can also become unavailable later—for example, after credentials
 expire—in which case sending shows an explicit error instead of dropping the
 prompt.
@@ -266,6 +270,40 @@ merged next to your own named hooks. It runs only when agy inherited a Verde
 terminal identity, and reports working (`PreInvocation`), done (`Stop`), and
 error (a `Stop` with an `ERROR` reason) to the pane and sidebar.
 
+## Muse Code
+
+Install Muse Code with its installer and sign in once:
+
+```bash
+curl -fsSL https://dev.meta.ai/install.sh | sh
+muse login
+```
+
+Setting `META_API_KEY` also counts as signed in. Verify `muse` is on `PATH`
+from a normal shell; Verde also looks for `~/.local/bin/muse`. The readiness
+check reports **Sign-in needed** until `muse login` has saved a Meta
+credential or `META_API_KEY` is set.
+
+Verde drives Muse through the Muse Session Protocol that `muse serve` exposes
+(newline-delimited JSON-RPC over stdio), starting
+`muse serve --trust-workspace` once per turn and resuming the same Muse
+session for follow-up turns. **Full access** threads add `--disable-sandbox`;
+supervised threads route each Muse approval request to Verde's approval card.
+
+The model picker lists the models Muse reports (for example `muse-wonder-1.0`,
+the default, and `muse-ember-1.0`); some require a Muse Code Power or Maximum
+subscription. Reasoning levels map onto Muse's reasoning efforts. Muse has no
+speed tier, so the **Speed** row is hidden. Image attachments are forwarded.
+Muse cannot be steered mid-turn: `Tab` queues the message as the next turn.
+Muse does not use Verde's slash-command surface yet. When Verde MCP is on,
+Verde passes its MCP server to each Muse session.
+
+To use the interactive TUI, run **Start New Muse TUI** from `Ctrl+Shift+P`, or
+**Open Current Thread in TUI**, which runs `muse resume <id>` on the same
+session. Muse does not expose third-party hooks yet, so Verde reads Muse's own
+local session events to drive the pane and sidebar status; there is nothing to
+install.
+
 ## Amp
 
 Install [Amp](https://ampcode.com) and make sure `amp` is on your `PATH`. Amp
@@ -286,12 +324,82 @@ agent runs (only when Amp is running inside a Verde pane). You can also toggle
 it from the settings modal under **Status pip hooks**, and remove it with
 `verde integrations remove amp --global`.
 
+## Custom ACP agents
+
+Any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com)
+(ACP) over stdio can run in Verde's native chat panes — the same kind of
+command you would register as a custom agent server in Zed. Install and sign
+in to the agent with its own tooling first; Verde only launches it.
+
+Open **Settings → Providers**, find the **Custom ACP agents** card, and choose
+**Add custom agent**. The form asks for:
+
+- **Name** — shown in the model picker.
+- **Command** — the full command line that starts the agent's ACP server.
+  Words split on whitespace with shell-style quoting (`'…'`, `"…"`, `\`), but
+  nothing is expanded: no `~`, variables, globs, or pipes.
+- **Environment** — optional `KEY=VALUE` pairs added to the agent's
+  environment.
+
+Saving writes the list to `chat.custom_acp_agents` in `verde.json` right away,
+and the daemon reads it on every turn, so edits apply to the next message
+without a restart. You can also edit the list by hand:
+
+```json
+{
+  "chat": {
+    "custom_acp_agents": [
+      {
+        "id": "my-agent",
+        "name": "My Agent",
+        "command": "my-agent",
+        "args": ["acp"],
+        "env": { "MY_AGENT_LOG": "debug" }
+      }
+    ]
+  }
+}
+```
+
+| Field     | Required | Meaning |
+| --------- | -------- | ------- |
+| `name`    | Yes      | Display name. If it is missing, `id` is used instead. |
+| `command` | Yes      | Executable name looked up on `PATH`, or a path to the executable. |
+| `args`    | No       | Array of string arguments. |
+| `env`     | No       | Object of extra environment variables; every value must be a string. |
+| `id`      | No       | Stable slug of lowercase letters, digits, `-`, and `_` (up to 48 characters). When it is missing, invalid, or already used, Verde derives one from `name` (`My Agent` → `my-agent`, then `my-agent-2`). |
+
+Verde keeps up to 32 agents. An invalid entry (no name, no command, or a
+wrongly typed field) is skipped with a warning in the log instead of hiding
+the others. Editing an agent in Settings keeps its `id`, so existing threads
+stay bound to it.
+
+Each agent appears in the model picker under **Custom ACP**. A thread stores
+the agent as its model ref, `<agent-id>` or `<agent-id>/<model>`; Verde sends
+the part after the first `/` to the agent through ACP
+`session/set_config_option` (`model`), and a bare `<agent-id>` keeps the
+agent's own default. For example, set `chat.default_provider` to `custom_acp`
+and `chat.default_model` to `my-agent` to start new chats with that agent.
+
+Custom agents run one process per turn. Follow-up turns resume the ACP session,
+so the agent must support ACP session loading or resuming; otherwise only the
+first turn of a thread works. Image attachments are forwarded when the agent
+advertises image support, the agent's own slash commands are forwarded as
+typed, and Verde MCP is offered to agents that accept HTTP MCP servers. Custom
+agents cannot be steered mid-turn (`Tab` queues the next turn), have no
+terminal TUI profile or **Open Current Thread in TUI** action, and do not
+appear on the **Connect an AI provider** screen. Verde reports the provider
+ready when at least one configured command resolves; it does not launch the
+agent to check sign-in, so authentication problems show up as the turn's
+error.
+
 ## Models and run settings
 
 The searchable model picker groups models by provider, marks defaults, and
 supports `Ctrl+1` through `Ctrl+9` for its visible results. OpenCode, Claude
-Code, Cursor, Pi, FX, Grok, and Antigravity model lists are loaded from the installed provider; Codex
-uses Verde's supported model list.
+Code, Cursor, Pi, FX, Grok, Antigravity, and Muse model lists are loaded from the installed provider; Codex
+uses Verde's supported model list. The **Custom ACP** group lists one entry
+per configured custom agent.
 
 Before a new thread sends its first message, choosing a model can also switch
 the provider. Once the transcript has started, the provider is locked to keep
@@ -309,10 +417,11 @@ provider, model, and transcript; the layout is shared.
 You can also launch any provider's TUI directly inside a terminal pane — useful
 when you want the agent's native UI rather than Verde's chat surface. The
 command palette (`Ctrl+Shift+P`) has a **Start New … TUI** entry for each of
-Codex, Claude, OpenCode, Cursor, Grok, Antigravity, and Amp, plus **Open Current Thread in TUI**
-entries that promote a running GUI chat thread — including Pi, FX, Grok, and Antigravity —
+Codex, Claude, OpenCode, Cursor, Grok, Antigravity, Muse, and Amp, plus **Open Current Thread in TUI**
+entries that promote a running GUI chat thread — including Pi, FX, Grok, Antigravity, and Muse —
 into that provider's terminal TUI. Launch `pi` in a terminal pane for a fresh
-Pi TUI. Right-clicking inside a terminal offers configured custom launch profiles
+Pi TUI, or run any other agent CLI the same way in a plain terminal pane.
+Custom ACP agents have no TUI action. Right-clicking inside a terminal offers configured custom launch profiles
 and pane actions; use the palette or CLI for built-in provider TUI actions.
 
 From the CLI:
@@ -334,8 +443,8 @@ stack schema and the [CLI reference](/docs/cli) for the full command surface.
 
 If prompt sending fails, check in this order:
 
-1. **Is the provider installed?** `which codex`, `which opencode`, `which agent`, `which pi`, `which fx`, `which grok`, `which agy`, etc., from the shell Verde was launched in. GUI launches on some platforms inherit a different `PATH` than a terminal — relaunch Verde from a terminal if you suspect this.
-2. **Is the provider authenticated?** Re-run the provider's login command (`codex login`, `agent login`, `fx login`, `grok login`, `agy acp --login`, `pi login`, etc.) and confirm credentials are still valid.
+1. **Is the provider installed?** `which codex`, `which opencode`, `which agent`, `which pi`, `which fx`, `which grok`, `which agy`, `which muse`, etc. (for a custom ACP agent, its configured `command`), from the shell Verde was launched in. GUI launches on some platforms inherit a different `PATH` than a terminal — relaunch Verde from a terminal if you suspect this.
+2. **Is the provider authenticated?** Re-run the provider's login command (`codex login`, `agent login`, `fx login`, `grok login`, `agy acp --login`, `muse login`, `pi login`, etc.) and confirm credentials are still valid.
 3. **Is the project imported?** Verde runs the provider against the imported project directory. A provider CLI in a different working directory will not see the same files.
 4. **Check the logs.** Provider helper stderr is written to the runtime log alongside Zig panics. On Linux:
    ```bash

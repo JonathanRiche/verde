@@ -62,9 +62,11 @@ function About() {
           Built for multi-agent development.
         </h2>
         <p class="band-body">
-          Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build can run
-          in Verde's native chat interface. Codex, Claude Code, OpenCode,
-          Cursor, Pi, FX, Grok Build, and Amp also run as terminal TUIs. Beside them,
+          Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok Build,
+          Antigravity, and Muse Code can run in Verde's native chat interface,
+          along with any Agent Client Protocol agent you add in Settings.
+          Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok Build,
+          Antigravity, Muse Code, and Amp also run as terminal TUIs. Beside them,
           you can tile shell terminals and a native embedded browser, persist
           the layout, and control the running app through its local CLI.
         </p>

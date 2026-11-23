@@ -55,7 +55,9 @@ terminal-only provider before launching the app:
 | FX          | Install [fx](https://fx.sh) with its setup script, then run `fx login`. FX drives Verde's native chat panes (`fx acp`) and can also launch as a terminal TUI. |
 | Grok Build  | Install [Grok Build](https://docs.x.ai/build/overview#install); ensure `grok` is on `PATH`, then run `grok login`. Grok drives Verde's native chat panes and can also launch as a terminal TUI from the command palette. |
 | Antigravity | Install the [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli) (`curl -fsSL https://antigravity.google/cli/install.sh \| bash`); ensure `agy` is on `PATH`, then run `agy acp --login`. Antigravity drives native chat panes over ACP and launches as a terminal TUI from the command palette. |
+| Muse Code   | Install Muse Code (`curl -fsSL https://dev.meta.ai/install.sh \| sh`); ensure `muse` is on `PATH`, then run `muse login` (or set `META_API_KEY`). Muse drives native chat panes through `muse serve` and launches as a terminal TUI from the command palette. |
 | Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |
+| Custom ACP agent | Install and sign in to any agent that speaks ACP over stdio, then add its command under **Settings → Providers → Custom ACP agents**. It runs in native chat panes only. See [Custom ACP agents](/docs/providers#custom-acp-agents). |
 
 See [Provider setup](/docs/providers) for the full per-provider notes.
 

@@ -21,6 +21,8 @@ import piLogo from '../../../desktop/src/assets/pi-logo.png'
 import fxLogo from '../../../desktop/src/assets/fx-logo.png'
 import ampLogo from '../../../desktop/src/assets/amp-logo.png'
 import grokLogo from '../../../desktop/src/assets/grok-logo.png'
+import antigravityLogo from '../../../desktop/src/assets/antigravity-logo.png'
+import museLogo from '../../../desktop/src/assets/muse-logo.png'
 import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
 import CopyButton from '../components/CopyButton'
 
@@ -114,6 +116,16 @@ const providers = [
   {
     name: 'Grok Build',
     logo: grokLogo,
+    modes: ['gui', 'tui'],
+  },
+  {
+    name: 'Antigravity',
+    logo: antigravityLogo,
+    modes: ['gui', 'tui'],
+  },
+  {
+    name: 'Muse Code',
+    logo: museLogo,
     modes: ['gui', 'tui'],
   },
   {
@@ -407,7 +419,7 @@ const faqs = [
   {
     question: 'What do I need first?',
     answer:
-      'At least one AI coding tool installed and signed in, such as Claude Code, Codex, Cursor, OpenCode, Pi, FX, Grok Build or Amp.',
+      'At least one AI coding tool installed and signed in, such as Claude Code, Codex, Cursor, OpenCode, Pi, FX, Grok Build, Antigravity, Muse Code or Amp. Any other agent that speaks the Agent Client Protocol (ACP) can be added in Settings.',
   },
   {
     question: 'Does Verde see my prompts or code?',
@@ -630,8 +642,10 @@ function App() {
           </div>
           <p class="providers-note">
             Use each one in Verde's chat window or in its own terminal app.
-            Verde doesn't host any AI: it runs the tools and logins already on
-            your computer.
+            Add any other agent that speaks the Agent Client Protocol (ACP) to
+            the chat window from Settings, or run any other coding tool in a
+            terminal pane. Verde doesn't host any AI: it runs the tools and
+            logins already on your computer.
           </p>
         </div>
       </section>

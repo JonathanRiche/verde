@@ -57,6 +57,8 @@ or failed probe appears as **Could not verify** and should be checked against
 the runtime log.
 
 Amp never appears on this screen because it is a terminal-only provider.
+Custom ACP agents do not appear either; check their command under
+**Settings → Providers → Custom ACP agents**.
 
 ## Linux browser runtime missing
 
