@@ -20,7 +20,10 @@
 //! read-only: rows expand, paths open in the file viewer, and dragging over
 //! diff lines selects them (`state.workspace_changes.selection`). An "Ask
 //! agent" chip beside the selection, or Enter, opens `agent_prompt_popover`
-//! for those lines; Escape or a click on empty space clears it.
+//! for those lines; Escape or a click on empty space clears it. A "Comment"
+//! chip beside it, Shift+Enter, or the "Comment" button on each hunk's
+//! header/gap row instead starts a draft in the composer of the chat that
+//! made the change (`commentOnWorkspaceChangesSelection`), quoting the lines.
 
 const std = @import("std");
 const palette = @import("palette");
@@ -54,6 +57,7 @@ const BAR_BLOCKS: usize = 5;
 
 const NF_REFRESH = "\u{eb37}";
 const NF_COD_HUBOT = "\u{EB08}";
+const NF_COD_COMMENT = "\u{EA6B}";
 const NF_CHEVRON_RIGHT = "\u{eab6}";
 const NF_CHEVRON_DOWN = "\u{eab4}";
 
@@ -85,6 +89,18 @@ const HitKind = union(enum) {
     open_file: FileRef,
     expand_all,
     ask_agent,
+    comment_selection,
+    comment_hunk: HunkRef,
+};
+
+/// One change block of a drawn diff (view indices, see
+/// `diff_render.ChangeBlock`) in the layout and collapse it was drawn with.
+const HunkRef = struct {
+    file: FileRef,
+    layout: diff_render.Layout,
+    context_lines: u32,
+    first: u32,
+    last: u32,
 };
 
 const Hit = struct { rect: palette.Rect, kind: HitKind };
@@ -153,6 +169,9 @@ const AskSpan = struct { top: f32, bottom: f32, left: f32, right: f32 };
 var ask_span: ?AskSpan = null;
 /// "Ask agent" chip drawn last frame; anchors the popover.
 var ask_rect: ?palette.Rect = null;
+
+const HUNK_BUTTON_FONT_UI: f32 = 10.5;
+const MAX_FILE_HUNKS: usize = 64;
 
 pub fn resetHitCache() void {
     hit_count = 0;
@@ -772,6 +791,7 @@ fn renderBlock(state: *AppState, rect: palette.Rect, block: Block, ref: FileRef,
         .selection = selected,
     });
     row_used += sink.len;
+    renderHunkButtons(state, patch_rect, patch, block, ref, line_h, clip);
     if (selected) |range| {
         if (!dragging and state.workspace_changes.selection != null) ask_span = .{
             .top = patch_rect.y + @as(f32, @floatFromInt(range.first)) * line_h,
@@ -794,8 +814,44 @@ fn renderBlock(state: *AppState, rect: palette.Rect, block: Block, ref: FileRef,
     }
 }
 
-/// "Ask agent" chip at the diff's right edge, just below the selection
-/// (above it when there is no room), kept inside the list.
+/// Per-hunk "Comment" buttons at the right end of the separator row above
+/// each change block (hunk header or context gap). Every block of a drawn
+/// diff gets a Tab stop, even rows scrolled out of the list.
+fn renderHunkButtons(state: *AppState, patch_rect: palette.Rect, patch: []const u8, block: Block, ref: FileRef, line_h: f32, clip: palette.Rect) void {
+    var blocks: [MAX_FILE_HUNKS]diff_render.ChangeBlock = undefined;
+    const count = diff_render.changeBlocks(state, patch, block.layout, block.context_lines, &blocks);
+    const font = theme.scaledUi(HUNK_BUTTON_FONT_UI);
+    const label = "Comment";
+    const inset = theme.scaledUi(2.0);
+    const button_w = text_measure.textWidth(.ui, font, label) + theme.scaledUi(14.0);
+    const max_index: usize = std.math.maxInt(u32);
+    for (blocks[0..count]) |change| {
+        if (change.last > max_index) break;
+        const row_y = patch_rect.y + @as(f32, @floatFromInt(change.anchor)) * line_h;
+        const rect: palette.Rect = .{
+            .x = patch_rect.x + patch_rect.w - button_w - theme.scaledUi(6.0),
+            .y = row_y + inset,
+            .w = button_w,
+            .h = @max(line_h - inset * 2.0, 1.0),
+        };
+        pushClippedHit(rect, .{ .comment_hunk = .{
+            .file = ref,
+            .layout = block.layout,
+            .context_lines = @intCast(@min(block.context_lines, max_index)),
+            .first = @intCast(change.first),
+            .last = @intCast(change.last),
+        } }, clip);
+        if (rect.y > clip.y + clip.h or rect.y + rect.h < clip.y) continue;
+        const hovered = pointIn(rect);
+        queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, if (hovered) 255 else 210)), theme.scaledUi(4.0), clip);
+        queueCenteredLabel(state, rect, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font, clip);
+        if (hovered) tooltip.queue(state, rect, "Comment on this hunk in its chat's composer");
+    }
+}
+
+/// "Comment" and "Ask agent" chips at the diff's right edge, just below the
+/// selection (above it when there is no room), kept inside the list.
+/// Comment sits left of Ask agent and is dropped when both do not fit.
 fn renderAskChip(state: *AppState, list: palette.Rect, span: AskSpan) void {
     const font = theme.scaledUi(ASK_CHIP_FONT_UI);
     const chip_h = theme.scaledUi(ASK_CHIP_H_UI);
@@ -810,6 +866,7 @@ fn renderAskChip(state: *AppState, list: palette.Rect, span: AskSpan) void {
     const rect: palette.Rect = .{ .x = span.right - chip_w - theme.scaledUi(10.0), .y = y, .w = chip_w, .h = chip_h };
     if (rect.x < span.left) return;
     ask_rect = rect;
+    renderCommentChip(state, list, rect, span.left);
     pushHit(rect, .ask_agent);
     const fill = if (pointIn(rect)) theme.raise(theme.accent(), 0.08) else theme.accent();
     queueRounded(state, rect, paletteColor(fill), chip_h * 0.5, list);
@@ -822,6 +879,46 @@ fn renderAskChip(state: *AppState, list: palette.Rect, span: AskSpan) void {
         .w = chip_w,
         .h = text_h,
     }), label, on_accent, font, .ui_bold, null, list) catch {};
+}
+
+/// Secondary (outlined) "Comment" chip just left of the Ask agent chip.
+fn renderCommentChip(state: *AppState, list: palette.Rect, ask: palette.Rect, left: f32) void {
+    const font = theme.scaledUi(ASK_CHIP_FONT_UI);
+    const label = "Comment";
+    const icon_w = theme.scaledUi(16.0);
+    const pad_x = theme.scaledUi(10.0);
+    const chip_w = pad_x * 2.0 + icon_w + theme.scaledUi(4.0) + text_measure.textWidth(.ui_bold, font, label);
+    const rect: palette.Rect = .{ .x = ask.x - theme.scaledUi(6.0) - chip_w, .y = ask.y, .w = chip_w, .h = ask.h };
+    if (rect.x < left) return;
+    pushHit(rect, .comment_selection);
+    const hovered = pointIn(rect);
+    queueShell(state, rect, paletteColor(if (hovered) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), paletteColor(theme.withAlpha(theme.accent(), 170)), rect.h * 0.5, list);
+    const text_color = paletteColor(if (hovered) theme.COLOR_WHITE else theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.2));
+    queueIcon(state, .{ .x = rect.x + pad_x, .y = rect.y, .w = icon_w, .h = rect.h }, NF_COD_COMMENT, text_color, theme.scaledUi(13.0), list);
+    const text_h = font * 1.4;
+    state.palette_overlay_batch.roleText(state.allocator, snapRect(.{
+        .x = rect.x + pad_x + icon_w + theme.scaledUi(4.0),
+        .y = rect.y + (rect.h - text_h) * 0.5,
+        .w = chip_w,
+        .h = text_h,
+    }), label, text_color, font, .ui_bold, null, list) catch {};
+    if (hovered) tooltip.queue(state, rect, "Comment on these lines in the composer of the chat that made the change");
+}
+
+/// Starts a comment on one change block: selects its rows (so the quoted
+/// lines stay highlighted) and hands them to the owning chat's composer.
+fn commentOnHunk(state: *AppState, hunk: HunkRef) void {
+    selection = .{
+        .file = hunk.file,
+        .layout = hunk.layout,
+        .context_lines = hunk.context_lines,
+        .anchor = hunk.first,
+        .focus = hunk.last,
+    };
+    dragging = false;
+    publishSelection(state);
+    if (state.workspace_changes.selection == null) return;
+    state.commentOnWorkspaceChangesSelection();
 }
 
 /// Opens the shared ask-agent popover for the published diff selection,
@@ -983,6 +1080,8 @@ fn activate(state: *AppState, kind: HitKind) void {
             state.openChangedFileInViewer(found.repo.root, found.file.path);
         },
         .ask_agent => openAskAgent(state),
+        .comment_selection => state.commentOnWorkspaceChangesSelection(),
+        .comment_hunk => |hunk| commentOnHunk(state, hunk),
     }
 }
 
@@ -1043,7 +1142,7 @@ fn renderKeyboardFocus(state: *AppState, rect: palette.Rect) void {
         if (!std.meta.eql(stop.kind, focused)) continue;
         const clip = switch (stop.kind) {
             .chip => chip_viewport,
-            .toggle_file, .open_file => list_rect,
+            .toggle_file, .open_file, .comment_hunk => list_rect,
             else => rect,
         };
         state.palette_overlay_batch.rectBorderClipped(state.allocator, snapRect(stop.rect), paletteColor(theme.accent()), theme.scaledUi(5), @max(@round(theme.scaledUi(1)), 1), clip) catch {};
@@ -1059,7 +1158,7 @@ fn revealControl(state: *AppState, hit: Hit) void {
             const x = hit.rect.x + painted_chip_scroll_x - chip_scroll_x;
             if (x < chip_viewport.x) scrollChips(state, x - chip_viewport.x) else if (x + hit.rect.w > chip_viewport.x + chip_viewport.w) scrollChips(state, x + hit.rect.w - chip_viewport.x - chip_viewport.w);
         },
-        .toggle_file, .open_file => {
+        .toggle_file, .open_file, .comment_hunk => {
             const y = hit.rect.y + painted_list_scroll_y - state.workspace_changes.scroll_y;
             if (y < list_rect.y) scrollBy(state, y - list_rect.y) else if (y + hit.rect.h > list_rect.y + list_rect.h) scrollBy(state, y + hit.rect.h - list_rect.y - list_rect.h);
         },
@@ -1135,7 +1234,7 @@ pub fn handleKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
         },
         .@"return", .kp_enter => {
             if (primary or selection == null or state.workspace_changes.selection == null) return false;
-            openAskAgent(state);
+            if (mods.shift) state.commentOnWorkspaceChangesSelection() else openAskAgent(state);
             return true;
         },
         .c => {

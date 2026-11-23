@@ -883,6 +883,63 @@ pub fn openWorkspaceChangesCommit(self: anytype) void {
     self.setSidebarNotice("Open a chat in this workspace to commit its changes.");
 }
 
+/// Chat a comment on `file` belongs to: the chat the view is filtered to,
+/// else the file's one confident claimant. Null when attribution is
+/// ambiguous (unassigned, shared, or a guessed claim); the caller then uses
+/// the focused chat.
+pub fn commentTargetThreadId(active: Filter, file: ?WorkspaceFile) ?[]const u8 {
+    if (active.kind == .thread and active.thread_id.len > 0) return active.thread_id;
+    const found = file orelse return null;
+    if (found.owners.len != 1 or found.owners[0].unclear) return null;
+    const id = found.owners[0].local_thread_id;
+    return if (id.len > 0) id else null;
+}
+
+/// "Comment" on the picked diff lines: selects the chat that made the
+/// change (see `commentTargetThreadId`; else the side panel's chat, else the
+/// workspace's current chat), focuses its composer, and appends a draft that
+/// names the file and range and quotes the lines. Never touches another
+/// chat's draft and never sends.
+pub fn commentOnWorkspaceChangesSelection(self: anytype) void {
+    const state = &self.workspace_changes;
+    const selection = state.selection orelse return;
+    const lines = selection.promptLines() orelse return;
+    const projects = self.project_controller.projects.items;
+    if (projects.len == 0) return;
+    const project_index = self.project_controller.selected_index;
+    if (project_index >= projects.len) return;
+    const project = &projects[project_index];
+    if (project.threads.items.len == 0) {
+        self.setSidebarNotice("Open a chat in this workspace to comment on changes.");
+        return;
+    }
+    const file = if (state.result()) |listing| fileInResult(listing, selection.root, selection.path) else null;
+    var thread_index: ?usize = null;
+    if (commentTargetThreadId(state.filter(), file)) |thread_id| {
+        for (project.threads.items, 0..) |*thread, index| {
+            if (std.mem.eql(u8, thread.local_thread_id, thread_id)) {
+                thread_index = index;
+                break;
+            }
+        }
+    }
+    if (thread_index == null) {
+        if (self.sidePanelChatPaneId()) |pane_id| thread_index = self.workspaceChatThreadIndexByPane(pane_id);
+    }
+    const target = @min(thread_index orelse project.selected_thread_index, project.threads.items.len - 1);
+    // Copy first: selecting a chat can repaint and replace the selection.
+    const abs_path = std.fs.path.join(page, &.{ selection.root, selection.path }) catch return;
+    defer page.free(abs_path);
+    const snippet = page.dupe(u8, selection.text) catch return;
+    defer page.free(snippet);
+    self.selectThreadForProject(project_index, target);
+    self.beginDiffLinesCommentDraft(abs_path, .{
+        .side = if (lines.side == .old) .old else .new,
+        .first = lines.first,
+        .last = lines.last,
+    }, snippet);
+}
+
 /// Opens `root/path` as a file tab in the side panel when the app provides
 /// `openFileInSidePanel(abs_path)`; otherwise says it is unavailable.
 pub fn openChangedFileInViewer(self: anytype, root: []const u8, path: []const u8) void {
@@ -1023,6 +1080,24 @@ test "stored listings drop gone expansions and stale filters" {
     try testing.expect(state.patches.items[0].stale);
     try testing.expectEqual(FilterKind.all, state.filter_kind);
     try testing.expectEqual(@as(usize, 4), state.chips.len);
+}
+
+test "comments go to the filtered chat, else a single confident owner" {
+    const repo = testResult().repos[0];
+    const mine = repo.files[0];
+    const unassigned = repo.files[1];
+    const shared = repo.files[2];
+    try testing.expectEqualStrings("t-a", commentTargetThreadId(.{}, mine).?);
+    try testing.expect(commentTargetThreadId(.{}, unassigned) == null);
+    try testing.expect(commentTargetThreadId(.{}, shared) == null);
+    try testing.expect(commentTargetThreadId(.{}, null) == null);
+    // The chat filter wins, even for files several chats touched.
+    try testing.expectEqualStrings("t-b", commentTargetThreadId(.{ .kind = .thread, .thread_id = "t-b" }, shared).?);
+    try testing.expect(commentTargetThreadId(.{ .kind = .unassigned }, unassigned) == null);
+    const guessed = [_]proto.WorkspaceOwner{.{ .local_thread_id = "t-a", .title = "Fix parser", .unclear = true }};
+    var unclear = mine;
+    unclear.owners = &guessed;
+    try testing.expect(commentTargetThreadId(.{}, unclear) == null);
 }
 
 test "patch eviction keeps in-flight and recent entries" {

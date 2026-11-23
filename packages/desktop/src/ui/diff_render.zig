@@ -205,6 +205,107 @@ pub fn selectionLines(state: *AppState, patch: []const u8, layout: Layout, conte
     return ranges;
 }
 
+/// A run of code rows with at least one change, bounded by separator rows
+/// (hunk headers, context gaps): what a per-hunk action covers. View
+/// indices; `anchor` is the separator just above the run, where the action
+/// sits.
+pub const ChangeBlock = struct { anchor: usize, first: usize, last: usize };
+
+/// Feeds view rows in order and yields each finished `ChangeBlock`. Runs
+/// without a separator above them (no hunk header) yield nothing.
+pub const ChangeBlockScanner = struct {
+    anchor: ?usize = null,
+    first: ?usize = null,
+    last: usize = 0,
+    changed: bool = false,
+
+    pub fn feed(self: *ChangeBlockScanner, index: usize, kind: zig_dif.DisplayLineKind) ?ChangeBlock {
+        switch (kind) {
+            .context, .addition, .deletion => {
+                if (self.first == null) self.first = index;
+                self.last = index;
+                if (kind != .context) self.changed = true;
+                return null;
+            },
+            // A "No newline at end of file" note belongs to the run around it.
+            .note => return null,
+            else => {
+                const done = self.finish();
+                self.anchor = index;
+                return done;
+            },
+        }
+    }
+
+    pub fn finish(self: *ChangeBlockScanner) ?ChangeBlock {
+        defer {
+            self.first = null;
+            self.changed = false;
+        }
+        const first = self.first orelse return null;
+        const anchor = self.anchor orelse return null;
+        if (!self.changed) return null;
+        return .{ .anchor = anchor, .first = first, .last = self.last };
+    }
+};
+
+/// Fills `out` with the patch's change blocks in `layout`; returns the count
+/// (blocks past `out.len` drop).
+pub fn changeBlocks(state: *AppState, patch: []const u8, layout: Layout, context_lines: usize, out: []ChangeBlock) usize {
+    var scanner: ChangeBlockScanner = .{};
+    var count: usize = 0;
+    switch (layout) {
+        .stacked => {
+            const view = state.transcript_controller.diff_view_cache.stackedWithContext(state.allocator, patch, context_lines) orelse return 0;
+            for (view.lines, 0..) |line, index| {
+                if (scanner.feed(index, line.kind)) |block| count = pushBlock(out, count, block);
+            }
+        },
+        .split => {
+            const view = state.transcript_controller.diff_view_cache.splitWithContext(state.allocator, patch, context_lines) orelse return 0;
+            for (view.rows, 0..) |row, index| {
+                const kind: zig_dif.DisplayLineKind = switch (row.kind) {
+                    .code => if ((row.left != null and row.left.?.kind == .deletion) or (row.right != null and row.right.?.kind == .addition)) .addition else .context,
+                    .note => .note,
+                    else => .hunk_header,
+                };
+                if (scanner.feed(index, kind)) |block| count = pushBlock(out, count, block);
+            }
+        },
+    }
+    if (scanner.finish()) |block| count = pushBlock(out, count, block);
+    return count;
+}
+
+fn pushBlock(out: []ChangeBlock, count: usize, block: ChangeBlock) usize {
+    if (count >= out.len) return count;
+    out[count] = block;
+    return count + 1;
+}
+
+test "change blocks sit under their separator and skip context-only runs" {
+    const kinds = [_]zig_dif.DisplayLineKind{
+        .file_header, .hunk_header, .context_gap, // 0-2: header then a leading gap
+        .context, .deletion, .addition, .context, // 3-6: first block
+        .context_gap, .context, .context, // 7-9: context-only run, no block
+        .context_gap, .addition, .note, // 10-12: second block, at the end
+    };
+    var scanner: ChangeBlockScanner = .{};
+    var blocks: [4]ChangeBlock = undefined;
+    var count: usize = 0;
+    for (kinds, 0..) |kind, index| {
+        if (scanner.feed(index, kind)) |block| count = pushBlock(&blocks, count, block);
+    }
+    if (scanner.finish()) |block| count = pushBlock(&blocks, count, block);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(ChangeBlock{ .anchor = 2, .first = 3, .last = 6 }, blocks[0]);
+    try std.testing.expectEqual(ChangeBlock{ .anchor = 10, .first = 11, .last = 11 }, blocks[1]);
+    // Code rows before any separator have nowhere to put the action.
+    var bare: ChangeBlockScanner = .{};
+    try std.testing.expect(bare.feed(0, .addition) == null);
+    try std.testing.expect(bare.finish() == null);
+}
+
 fn widenRange(range: ?[2]usize, line: usize) [2]usize {
     const value = range orelse return .{ line, line };
     return .{ @min(value[0], line), @max(value[1], line) };

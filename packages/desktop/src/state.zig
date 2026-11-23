@@ -72,6 +72,7 @@ const side_panel_controller = @import("state/side_panel_controller.zig");
 const cookie_import_controller = @import("state/cookie_import_controller.zig");
 const git_changes_controller = @import("state/git_changes_controller.zig");
 const workspace_changes_controller = @import("state/workspace_changes_controller.zig");
+const diff_comment = @import("state/diff_comment.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
 const chat_controller = @import("state/chat_controller.zig");
@@ -9044,6 +9045,7 @@ pub const AppState = struct {
     pub const workspaceChangesPatch = workspace_changes_controller.workspaceChangesPatch;
     pub const setWorkspaceChangesSelection = workspace_changes_controller.setWorkspaceChangesSelection;
     pub const openWorkspaceChangesCommit = workspace_changes_controller.openWorkspaceChangesCommit;
+    pub const commentOnWorkspaceChangesSelection = workspace_changes_controller.commentOnWorkspaceChangesSelection;
     pub const openChangedFileInViewer = workspace_changes_controller.openChangedFileInViewer;
     pub const refreshGitChangesSummary = git_changes_controller.refreshGitChangesSummary;
     pub const refreshSelectedWorkspaceGitChanges = git_changes_controller.refreshSelectedWorkspaceGitChanges;
@@ -9550,34 +9552,31 @@ pub const AppState = struct {
     /// specific edit and steer the agent. Appends to any in-progress draft
     /// instead of replacing it.
     pub fn beginDiffCommentDraft(self: *AppState, file_path: []const u8, additions: i64, deletions: i64, patch: []const u8) void {
-        if (self.project_controller.projects.items.len == 0) return;
-
-        // Diff cards carry absolute paths; mentions use project-relative ones.
-        var mention_path = file_path;
-        const project_path = self.currentProject().path;
-        if (std.fs.path.isAbsolute(mention_path) and std.mem.startsWith(u8, mention_path, project_path)) {
-            const rest = mention_path[project_path.len..];
-            if (rest.len > 1 and rest[0] == '/') mention_path = rest[1..];
-        }
-
-        const line_summary = diffCommentLineSummary(self.allocator, patch);
+        const line_summary = diff_comment.lineSummary(self.allocator, patch);
         defer if (line_summary) |summary| self.allocator.free(summary);
+        self.appendDiffCommentDraft(.{ .path = file_path, .additions = additions, .deletions = deletions, .line_summary = line_summary }, "Commenting on a file edit. Finish the note and send it.");
+    }
 
-        const draft = self.currentDraft();
-        const separator: []const u8 = if (draft.len == 0 or std.mem.endsWith(u8, draft, "\n")) "" else "\n";
-        const next_draft = std.fmt.allocPrint(
-            self.allocator,
-            "{s}{s}About your edit to @{s} (+{d}/-{d}{s}{s}): ",
-            .{
-                draft,
-                separator,
-                mention_path,
-                additions,
-                deletions,
-                if (line_summary != null) ", " else "",
-                line_summary orelse "",
-            },
-        ) catch |err| {
+    /// Like `beginDiffCommentDraft` for picked diff lines (the Changes view):
+    /// names the exact range and quotes `snippet` (`-`/`+`/` ` lines, capped)
+    /// in the current chat's draft. Callers select the target chat first.
+    pub fn beginDiffLinesCommentDraft(self: *AppState, file_path: []const u8, lines: diff_comment.LineRange, snippet: []const u8) void {
+        const counts = diff_comment.snippetCounts(snippet);
+        self.appendDiffCommentDraft(.{
+            .path = file_path,
+            .additions = counts.additions,
+            .deletions = counts.deletions,
+            .lines = lines,
+            .snippet = snippet,
+        }, "Commenting on the selected lines. Finish the note and send it.");
+    }
+
+    fn appendDiffCommentDraft(self: *AppState, request: diff_comment.Request, notice: []const u8) void {
+        if (self.project_controller.projects.items.len == 0) return;
+        // Diff cards carry absolute paths; mentions use project-relative ones.
+        var relative = request;
+        relative.path = diff_comment.mentionPath(request.path, self.currentProject().path);
+        const next_draft = diff_comment.formatDraft(self.allocator, self.currentDraft(), relative) catch |err| {
             log.warn("failed to build diff comment draft: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start diff comment.");
             return;
@@ -9589,55 +9588,7 @@ pub const AppState = struct {
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
         self.markDirty();
-        self.setSidebarNotice("Commenting on a file edit. Finish the note and send it.");
-    }
-
-    /// Formats the new-file line ranges touched by a unified-diff patch, e.g.
-    /// "lines 12-18, 40", so a diff comment names the exact edit. Lists at
-    /// most four hunks and rolls the rest up as "+N more". Returns null when
-    /// the patch has no parseable `@@` hunk headers.
-    fn diffCommentLineSummary(allocator: std.mem.Allocator, patch: []const u8) ?[]u8 {
-        // Beyond this many ranges the prefix stops reading as a pointer and
-        // starts crowding out the user's actual comment.
-        const max_listed_hunks: usize = 4;
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-
-        var hunk_count: usize = 0;
-        var lines_it = std.mem.splitScalar(u8, patch, '\n');
-        while (lines_it.next()) |line| {
-            if (!std.mem.startsWith(u8, line, "@@")) continue;
-            // The first '+' in a valid header starts the new-side "+start,count".
-            const plus = std.mem.indexOfScalar(u8, line, '+') orelse continue;
-            const rest = line[plus + 1 ..];
-            var digits: usize = 0;
-            while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
-            if (digits == 0) continue;
-            const start = std.fmt.parseInt(u32, rest[0..digits], 10) catch continue;
-            var count: u32 = 1;
-            if (digits < rest.len and rest[digits] == ',') {
-                var end = digits + 1;
-                while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
-                count = std.fmt.parseInt(u32, rest[digits + 1 .. end], 10) catch 1;
-            }
-
-            hunk_count += 1;
-            if (hunk_count > max_listed_hunks) continue;
-
-            var piece_buf: [48]u8 = undefined;
-            const piece = if (count <= 1)
-                std.fmt.bufPrint(&piece_buf, "{s}{d}", .{ if (hunk_count == 1) "lines " else ", ", start }) catch continue
-            else
-                std.fmt.bufPrint(&piece_buf, "{s}{d}-{d}", .{ if (hunk_count == 1) "lines " else ", ", start, start + count - 1 }) catch continue;
-            out.appendSlice(allocator, piece) catch return null;
-        }
-        if (hunk_count == 0 or out.items.len == 0) return null;
-        if (hunk_count > max_listed_hunks) {
-            var more_buf: [32]u8 = undefined;
-            const more = std.fmt.bufPrint(&more_buf, ", +{d} more", .{hunk_count - max_listed_hunks}) catch return null;
-            out.appendSlice(allocator, more) catch return null;
-        }
-        return out.toOwnedSlice(allocator) catch null;
+        self.setSidebarNotice(notice);
     }
 
     /// Opens a file in Verde's file viewer tab, scrolled to `location`.
