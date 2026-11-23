@@ -142,7 +142,7 @@ final class ComposerModel {
     var canSubmit: Bool {
         guard let view, !busy, pendingSelection == nil, !pending, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !view.draft.attachments.isEmpty else { return false }
         if text.hasPrefix("/") && !text.hasPrefix("//") { return view.provider_ready }
-        if chat.state.turn != nil { return view.provider_ready && (view.followup == nil || text.hasPrefix("!")) }
+        if chat.state.turn != nil { return view.provider_ready && (view.followup.map(visibleFollowup) != true || text.hasPrefix("!")) }
         return view.can_send
     }
 

@@ -267,6 +267,35 @@ test "chat follow-up requires durable receipt and uncertain steer is never autom
     _ = try f.find("chat.turn.tail");
 }
 
+test "chat accepted steer receipt does not block a second steer" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.draft("first");
+    _ = try f.intent("followup_submit", .{ .draft_revision = "1", .kind = "steer" });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    try f.reply("chat.turn.steer", .{ .accepted = true });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    const first = f.host.state.chat.threads[0].saved.followup.?;
+    try eql("sent_inline", first.state);
+    try eql("accepted", first.delivery);
+    const first_id = try f.a().dupe(u8, first.id);
+    try f.draft("second");
+    const revision = try std.fmt.allocPrint(f.a(), "{d}", .{f.host.state.chat.threads[0].saved.revision});
+    _ = try f.intent("followup_submit", .{ .draft_revision = revision, .kind = "steer" });
+    const second = f.host.state.chat.threads[0].saved.followup.?;
+    try expect(!h.eq(first_id, second.id));
+    try eql("second", second.text);
+    try eql("pending", second.state);
+    const second_id = try f.a().dupe(u8, second.id);
+    // A follow-up still waiting to deliver keeps blocking the next one.
+    try f.draft("third");
+    const pending_revision = try std.fmt.allocPrint(f.a(), "{d}", .{f.host.state.chat.threads[0].saved.revision});
+    _ = try f.intent("followup_submit", .{ .draft_revision = pending_revision, .kind = "steer" });
+    try eql(second_id, f.host.state.chat.threads[0].saved.followup.?.id);
+}
+
 test "chat shell confirmation binds route and query selectors preserve slash and percent IDs" {
     var f = try Fixture.init();
     defer f.deinit();

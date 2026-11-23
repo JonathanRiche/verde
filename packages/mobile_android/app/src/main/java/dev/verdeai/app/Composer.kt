@@ -215,7 +215,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     val ready = view?.provider_ready == true
     val canSubmit = view != null && hasContent && composer.pendingSelection == null && !composer.busy && !sendPending && when {
         action is ComposerAction.Slash -> ready
-        running -> ready && (action == ComposerAction.Shell || view.followup == null)
+        running -> ready && (action == ComposerAction.Shell || view.followup?.let(::followupDelivered) != false)
         else -> view.can_send
     }
 
@@ -482,10 +482,13 @@ private fun AttachButton(enabled: Boolean, onPhotos: () -> Unit, onCamera: () ->
     }
 }
 
+/** An accepted inline steer: core keeps it as a receipt, and it no longer blocks the next follow-up. */
+internal fun followupDelivered(f: ChatFollowup): Boolean = f.state == "sent_inline" && f.delivery == "accepted"
+
 @Composable
 private fun FollowupCard(f: ChatFollowup, composer: ComposerModel, kind: EventFollowupSubmitKind) {
     // Core retains the receipt until the turn ends; it is no longer pending UI.
-    if (f.state == "sent_inline" && f.delivery == "accepted") return
+    if (followupDelivered(f)) return
     Card(Modifier.fillMaxWidth().testTag(COMPOSER_FOLLOWUP).semantics { contentDescription = "Follow-up" },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

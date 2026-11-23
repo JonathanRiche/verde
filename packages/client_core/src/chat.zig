@@ -583,7 +583,8 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
             }
             try beginSend(tx, i, id, false, p.yes(p.get(event, "voice")));
         } else {
-            if (!active(t) or t.saved.followup != null) {
+            // An accepted inline steer is only a receipt; the next follow-up may replace it.
+            if (!active(t) or (t.saved.followup != null and !steerDelivered(t.saved.followup.?))) {
                 reject(tx, id, "followup_unavailable");
                 return true;
             }
@@ -1588,6 +1589,10 @@ fn validMention(path: []const u8) bool {
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (part.len == 0 or eq(part, "..")) return false;
     return true;
+}
+
+fn steerDelivered(f: m.Followup) bool {
+    return eq(f.state, "sent_inline") and eq(f.delivery, "accepted");
 }
 
 fn validFollowup(f: m.Followup) bool {
