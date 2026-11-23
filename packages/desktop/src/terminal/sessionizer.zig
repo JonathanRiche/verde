@@ -119,9 +119,12 @@ const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// closes the page early. Chat pages are sized by row count, but a single
 /// tool card can hold megabytes (whole-file edits), so a 48-row tail can
 /// exceed the transport limit and every history load fails with
-/// response_too_large. Quarter of the transport cap leaves room for JSON
-/// escaping; a page always carries at least one row.
-const TRANSCRIPT_PAGE_BYTE_BUDGET: usize = SESSIONIZER_MAX_MESSAGE_BYTES / 4;
+/// response_too_large. Pages also cross remote runtime links (the phone and
+/// paired desktops), whose responses are capped at RUNTIME_MAX_MESSAGE_BYTES
+/// (1 MiB), so the budget follows that smaller cap: the estimate already
+/// doubles text for JSON escaping, and three quarters leaves room for the
+/// response envelope. A page always carries at least one row.
+const TRANSCRIPT_PAGE_BYTE_BUDGET: usize = headless.protocol.RUNTIME_MAX_MESSAGE_BYTES * 3 / 4;
 /// Maximum response capacity accepted by the sessionizer protocol.
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
@@ -24214,6 +24217,26 @@ test "bounded transcript tail keeps the newest rows and never drops the last" {
     try std.testing.expectEqual(@as(usize, 2), oversized[0].sort_index);
     try std.testing.expectEqual(@as(usize, 3), boundedTranscriptTail(&rows, std.math.maxInt(usize)).len);
     try std.testing.expectEqual(@as(usize, 0), boundedTranscriptTail(&.{}, 16).len);
+}
+
+test "transcript page of large tool cards fits the remote runtime response cap" {
+    const allocator = std.testing.allocator;
+    // A real thread's newest page (dozens of 100-480 KB tool cards) encoded to
+    // 1.1 MB and never loaded on the phone, whose responses cap at 1 MiB.
+    var rows: [16]store_protocol.Message = undefined;
+    var bodies: [rows.len][]u8 = undefined;
+    for (&rows, &bodies, 0..) |*row, *body, index| {
+        body.* = try allocator.alloc(u8, 100 * 1024);
+        // Tool output is line-heavy; every newline doubles when JSON-escaped.
+        for (body.*, 0..) |*byte, offset| byte.* = if (offset % 16 == 15) '\n' else 'x';
+        row.* = .{ .sort_index = @intCast(index), .role = "tool", .author = "Bash", .body = body.*, .message_id = "turn:page:msg:1" };
+    }
+    defer for (bodies) |body| allocator.free(body);
+    const page = boundedTranscriptTail(&rows, TRANSCRIPT_PAGE_BYTE_BUDGET);
+    try std.testing.expect(page.len >= 1);
+    const encoded = try std.json.Stringify.valueAlloc(allocator, .{ .jsonrpc = "2.0", .id = 1, .result = .{ .messages = page, .next_cursor = "b:0", .has_more = true } }, .{});
+    defer allocator.free(encoded);
+    try std.testing.expect(encoded.len <= headless.protocol.RUNTIME_MAX_MESSAGE_BYTES);
 }
 
 test "in-flight chat title waits for provider output and never starts for a failed send" {
