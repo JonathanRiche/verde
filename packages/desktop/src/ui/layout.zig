@@ -631,7 +631,8 @@ fn renderNoticeToast(state: *runtime.AppState, stack: *ToastStack, area: palette
 // Git outcome card: the first slot of the top-right toast stack. A spinner while a
 // git action runs, then a green check (auto-dismisses), amber warning or red
 // error (stay until dismissed). Title, muted detail, × and, for a rejected
-// push, a Pull & push button. State and timing live in
+// push, a Pull & push button (or, for a push to a GitHub feature branch, a
+// Create PR button). State and timing live in
 // git_changes_controller (`gitToastView`); this draws and records hit rects.
 const GIT_TOAST_TITLE_FONT_UI: f32 = 13.5;
 const GIT_TOAST_DETAIL_FONT_UI: f32 = 12.0;
@@ -661,6 +662,8 @@ var git_toast_card: ?palette.Rect = null;
 var git_toast_close: ?palette.Rect = null;
 var git_toast_action: ?palette.Rect = null;
 var git_toast_dismissible: bool = false;
+/// The action button is Create PR (else Pull & push).
+var git_toast_action_is_pr: bool = false;
 
 /// Draws the git card into the bottom slot of the toast stack.
 fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
@@ -679,16 +682,17 @@ fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
     const title_h = title_font * 1.25;
     const detail_line_h = detail_font * 1.25;
     const close_size = if (view.dismissible) theme.scaledUi(GIT_TOAST_CLOSE_UI) else 0.0;
-    const button_label = "Pull & push";
+    const has_action = view.pull_push or view.pull_request;
+    const button_label: []const u8 = if (view.pull_push) "Pull & push" else "Create PR";
     const button_font = theme.scaledUi(12.5);
-    const button_w = if (view.pull_push)
+    const button_w = if (has_action)
         runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + theme.scaledUi(22.0)
     else
         0.0;
 
     // Width: fit the title/detail, clamped to the workspace and a max.
     const max_w = @min(stack.max_w, theme.scaledUi(GIT_TOAST_MAX_W_UI));
-    const chrome_w = pad * 2.0 + icon_size + gap + (if (view.pull_push) button_w + gap else 0.0) + (if (view.dismissible) close_size + gap * 0.5 else 0.0);
+    const chrome_w = pad * 2.0 + icon_size + gap + (if (has_action) button_w + gap else 0.0) + (if (view.dismissible) close_size + gap * 0.5 else 0.0);
     const title_w = runtime.paletteUiTextPrefixWidth(view.title, title_font, view.title.len) + title_font * 0.35;
     const detail_w = if (view.detail.len > 0) runtime.paletteUiTextPrefixWidth(view.detail, detail_font, view.detail.len) + detail_font * 0.35 else 0.0;
     const card_w = std.math.clamp(chrome_w + @max(title_w, detail_w), @min(theme.scaledUi(GIT_TOAST_MIN_W_UI), max_w), max_w);
@@ -698,7 +702,7 @@ fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
     const detail_wrap = detail_w > text_w;
     const detail_lines: f32 = if (view.detail.len == 0) 0.0 else if (detail_wrap) @min(@ceil(detail_w / text_w) + 1.0, GIT_TOAST_DETAIL_MAX_LINES) else 1.0;
     const text_block_h = title_h + (if (detail_lines > 0.0) theme.scaledUi(2.0) + detail_line_h * detail_lines else 0.0);
-    const card_h = @max(text_block_h, @max(icon_size, if (view.pull_push) theme.scaledUi(GIT_TOAST_BUTTON_H_UI) else 0.0)) + pad * 2.0;
+    const card_h = @max(text_block_h, @max(icon_size, if (has_action) theme.scaledUi(GIT_TOAST_BUTTON_H_UI) else 0.0)) + pad * 2.0;
 
     if (!stack.fits(card_h)) return;
     const slot = stack.place(card_w, card_h);
@@ -760,11 +764,12 @@ fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
         git_toast_close = close;
         right = close.x - gap * 0.5;
     }
-    if (view.pull_push) {
+    if (has_action) {
         const button_h = theme.scaledUi(GIT_TOAST_BUTTON_H_UI);
         const button: palette.Rect = snapRect(.{ .x = right - button_w, .y = card.y + (card.h - button_h) * 0.5, .w = button_w, .h = button_h });
         const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, button);
-        const fill_color = if (hovered) theme.raise(theme.warning(), 0.06) else theme.warning();
+        const base_color = if (view.pull_push) theme.warning() else theme.accent();
+        const fill_color = if (hovered) theme.raise(base_color, 0.06) else base_color;
         var fill = paletteColor(fill_color);
         fill.a *= alpha;
         queuePaletteRoundedRect(state, button, fill, theme.scaledUi(6.0));
@@ -781,6 +786,7 @@ fn renderGitToast(state: *runtime.AppState, stack: *ToastStack) void {
     }
     git_toast_card = card;
     git_toast_dismissible = view.dismissible;
+    git_toast_action_is_pr = view.pull_request and !view.pull_push;
 }
 
 /// Eight dots on a ring, the head brightest; steps on the toast's wake tick
@@ -807,14 +813,15 @@ fn drawGitToastSpinner(state: *runtime.AppState, rect: palette.Rect, color: [4]f
     }
 }
 
-/// Pointer input on the git card: Pull & push runs, × or any other click on
-/// a finished card dismisses it. Consumes presses inside the card.
+/// Pointer input on the git card: Pull & push (or Create PR) runs, × or
+/// any other click on a finished card dismisses it. Consumes presses inside
+/// the card.
 pub fn handleGitToastMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     const card = git_toast_card orelse return false;
     if (!pointInRect(x, y, card)) return false;
     if (!down) return true;
     if (git_toast_action) |rect| if (pointInRect(x, y, rect)) {
-        state.gitToastPullPush();
+        if (git_toast_action_is_pr) state.gitToastPullRequest() else state.gitToastPullPush();
         return true;
     };
     if (git_toast_dismissible) state.dismissGitToast();
@@ -3114,9 +3121,10 @@ fn dismissTopModal(state: *runtime.AppState) void {
         return;
     }
     if (state.commitSheetOpen() and !state.settings_controller.modal_visible) {
-        // A commit in flight keeps the sheet up so its result stays visible.
-        // (Without a sheet this dismisses the default-branch confirmation.)
-        if (state.commitSheet()) |sheet| if (sheet.busy != null) return;
+        // A commit or PR create in flight keeps the sheet up so its result
+        // stays visible. (Without a sheet this dismisses the default-branch
+        // confirmation.)
+        if (state.commitSheet()) |sheet| if (sheet.running()) return;
         state.closeCommitSheet();
         blurModalTextInput(state);
         return;
@@ -3254,7 +3262,8 @@ fn moveModalCursorToEdge(state: *runtime.AppState, start: bool) bool {
 
 fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
     const cursor = focusedCursor(state) orelse return false;
-    const buf = focusedBuffer(state) orelse return false;
+    // A read-only or locked field still owns the key.
+    const buf = focusedBuffer(state) orelse return true;
     const len = std.mem.sliceTo(buf, 0).len;
     if (backwards) {
         if (cursor.* == 0 or len == 0) return true;
@@ -3310,7 +3319,9 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
         .cookie_import_search => state.cookie_import.searchBuffer(),
-        .commit_message => if (state.commitSheet()) |sheet| sheet.messageBuffer() else null,
+        // Locked (a commit or PR in flight) or read-only (the PR URL): select
+        // and copy only, so paste, cut and deletes never reach the text.
+        .commit_message => if (state.commitSheet()) |sheet| (if (sheet.locked()) null else sheet.messageBuffer()) else null,
         .project_import_name => state.importProjectNameBuffer(),
         .project_import => state.importPathBuffer(),
         .runtime_credential => state.runtimeCredentialTokenBuffer(),

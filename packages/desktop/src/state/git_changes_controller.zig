@@ -1,5 +1,6 @@
-//! GUI-side controller for per-chat git change review and user-initiated
-//! commits (daemon `git.changes.*`, see headless git_changes_protocol.zig).
+//! GUI-side controller for per-chat git change review, user-initiated
+//! commits, and opening a GitHub pull request for a pushed branch (daemon
+//! `git.changes.*`, see headless git_changes_protocol.zig).
 //!
 //! Owns the per-workspace change summaries behind the chat header chip and
 //! sidebar dot, and the review sheet state (ticks, message, commit results).
@@ -34,6 +35,10 @@ const GIT_TIMEOUT_MS: u32 = 30_000;
 const PUSH_TIMEOUT_MS: u32 = 120_000;
 /// Commit message generation starts a provider turn.
 const MESSAGE_TIMEOUT_MS: u32 = 150_000;
+/// `pr_prepare` asks gh whether it is signed in and for an open PR.
+const PR_PREPARE_TIMEOUT_MS: u32 = 60_000;
+/// `pr_create` re-checks, then waits on `gh pr create` (daemon caps it).
+const PR_CREATE_TIMEOUT_MS: u32 = 120_000;
 /// Longest commit message the sheet edits.
 pub const MESSAGE_CAPACITY: usize = 8192;
 
@@ -524,6 +529,8 @@ pub const ToastTone = enum { running, success, warning, failure };
 
 /// Success toasts hold this long, then fade; the others stay until dismissed.
 pub const TOAST_SUCCESS_HOLD_MS: i64 = 5000;
+/// A success toast offering Create PR holds longer so the button can be used.
+pub const TOAST_PR_HOLD_MS: i64 = 15000;
 pub const TOAST_IN_MS: i64 = 160;
 pub const TOAST_OUT_MS: i64 = 240;
 /// The running spinner advances one step per tick (no display-rate frames).
@@ -540,6 +547,12 @@ pub const Toast = struct {
     /// Rejected push: the card offers Pull & push for this chat.
     pull_push_thread_buf: [128]u8 = undefined,
     pull_push_thread_len: usize = 0,
+    /// Push landed on a GitHub feature branch: the card offers Create PR for
+    /// this chat and repository.
+    pr_thread_buf: [128]u8 = undefined,
+    pr_thread_len: usize = 0,
+    pr_root_buf: [1024]u8 = undefined,
+    pr_root_len: usize = 0,
     /// Monotonic stamp set when the toast is shown.
     shown_at_ms: i64 = 0,
 
@@ -565,6 +578,17 @@ pub const Toast = struct {
 
     fn setPullPushThread(self: *Toast, value: []const u8) void {
         self.pull_push_thread_len = copyInto(&self.pull_push_thread_buf, value).len;
+    }
+
+    pub fn offerPullRequest(self: *Toast, local_thread_id: []const u8, root: []const u8) void {
+        if (local_thread_id.len > self.pr_thread_buf.len or root.len > self.pr_root_buf.len) return;
+        self.pr_thread_len = copyInto(&self.pr_thread_buf, local_thread_id).len;
+        self.pr_root_len = copyInto(&self.pr_root_buf, root).len;
+    }
+
+    pub fn pullRequestTarget(self: *const Toast) ?struct { thread: []const u8, root: []const u8 } {
+        if (self.pr_thread_len == 0 or self.pr_root_len == 0) return null;
+        return .{ .thread = self.pr_thread_buf[0..self.pr_thread_len], .root = self.pr_root_buf[0..self.pr_root_len] };
     }
 
     /// Leads the detail with how many files the quick path left out.
@@ -732,11 +756,76 @@ pub fn commitProviderLabel(provider: app_config.CommitMessageProvider) []const u
     };
 }
 
+// ---- Pull requests (pure) -------------------------------------------
+
+/// A pushed GitHub feature branch with commits its default branch lacks:
+/// where "Create pull request" applies. Status facts only; the daemon
+/// re-checks and finds a PR that is already open.
+pub fn prEligible(repo: proto.RepoStatus) bool {
+    if (!repo.github or repo.is_default_branch) return false;
+    if (repo.branch == null or repo.upstream == null or repo.ahead > 0) return false;
+    const ahead = repo.ahead_of_default orelse return false;
+    return ahead > 0;
+}
+
+pub fn prCandidate(repos: []const proto.RepoStatus) ?proto.RepoStatus {
+    for (repos) |repo| if (prEligible(repo)) return repo;
+    return null;
+}
+
+/// After a push landed on `branch`: offer Create PR when the repository is
+/// on GitHub and `branch` is not its default (`branch_created`: a commit
+/// onto a new branch made from the default one). `repo` is the status
+/// cached before the push.
+pub fn prOfferAfterPush(repo: ?proto.RepoStatus, branch: ?[]const u8, branch_created: bool) bool {
+    const known = repo orelse return false;
+    if (!known.github) return false;
+    const name = branch orelse return false;
+    if (branch_created) return true;
+    const default = known.default_branch orelse return !known.is_default_branch;
+    return !std.mem.eql(u8, name, default);
+}
+
+pub const PrText = struct { title: []const u8, body: []const u8 };
+
+/// The sheet edits one text like a commit message: the first line is the
+/// title, the rest (after blank lines) the body.
+pub fn splitPrText(text: []const u8) PrText {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    return .{
+        .title = std.mem.trim(u8, trimmed[0..end], " \t\r"),
+        .body = std.mem.trim(u8, trimmed[end..], " \t\r\n"),
+    };
+}
+
+/// Title, blank line, body (or just the title).
+pub fn joinPrText(buf: []u8, title: []const u8, body: []const u8) []const u8 {
+    const clean_body = std.mem.trim(u8, body, " \t\r\n");
+    if (clean_body.len == 0) return copyInto(buf, std.mem.trim(u8, title, " \t\r\n"));
+    return std.fmt.bufPrint(buf, "{s}\n\n{s}", .{ std.mem.trim(u8, title, " \t\r\n"), clean_body }) catch copyInto(buf, title);
+}
+
+/// Headline of the sheet's result and of the toast.
+pub fn prOutcomeTitle(buf: []u8, pr: proto.PullRequest, existing: bool) []const u8 {
+    return (if (existing)
+        std.fmt.bufPrint(buf, "Pull request #{d} is already open", .{pr.number})
+    else
+        std.fmt.bufPrint(buf, "Opened {s}pull request #{d}", .{ if (pr.draft) "draft " else "", pr.number })) catch "Pull request";
+}
+
+/// Errors from an older daemon that predates `git.changes.pr_*`.
+fn prErrorText(code: ?[]const u8, message: ?[]const u8) []const u8 {
+    if (isUnknownMethod(code)) return "Restart Verde to open pull requests (the running daemon is older than this app).";
+    const text = message orelse return "Could not reach GitHub.";
+    return if (text.len > 0) text else "Could not reach GitHub.";
+}
+
 // ------------------------------------------------------------------
 // Background jobs
 // ------------------------------------------------------------------
 
-const Job = enum { summary, status, review, commit_message, commit, push, pull_push, config_set };
+const Job = enum { summary, status, review, commit_message, commit, push, pull_push, config_set, pr_prepare, pr_message, pr_create };
 
 /// Independent lanes so a slow commit message never blocks a summary refresh
 /// or a commit. `quick` and `quick_message` serve the header's one-click
@@ -773,6 +862,9 @@ const Payload = union(enum) {
     commit: std.json.Parsed(proto.CommitResult),
     pull_push: std.json.Parsed(proto.PullPushResult),
     config_set: std.json.Parsed(proto.ConfigCommitSnapshot),
+    pr_prepare: std.json.Parsed(proto.PrPrepareResult),
+    pr_message: std.json.Parsed(proto.PrMessageResult),
+    pr_create: std.json.Parsed(proto.PrCreateResult),
 
     fn deinit(self: *Payload) void {
         switch (self.*) {
@@ -839,6 +931,9 @@ fn methodFor(job: Job) []const u8 {
         .push => proto.METHOD_PUSH,
         .pull_push => proto.METHOD_PULL_PUSH,
         .config_set => proto.METHOD_CONFIG_COMMIT_SET,
+        .pr_prepare => proto.METHOD_PR_PREPARE,
+        .pr_message => proto.METHOD_PR_MESSAGE,
+        .pr_create => proto.METHOD_PR_CREATE,
     };
 }
 
@@ -895,6 +990,9 @@ fn runJob(request: *Request, result: *Result) void {
         .commit => if (parseTyped(proto.CommitResult, value)) |typed| .{ .commit = typed } else .none,
         .push, .pull_push => if (parseTyped(proto.PullPushResult, value)) |typed| .{ .pull_push = typed } else .none,
         .config_set => if (parseTyped(proto.ConfigCommitSnapshot, value)) |typed| .{ .config_set = typed } else .none,
+        .pr_prepare => if (parseTyped(proto.PrPrepareResult, value)) |typed| .{ .pr_prepare = typed } else .none,
+        .pr_message => if (parseTyped(proto.PrMessageResult, value)) |typed| .{ .pr_message = typed } else .none,
+        .pr_create => if (parseTyped(proto.PrCreateResult, value)) |typed| .{ .pr_create = typed } else .none,
     };
     if (result.payload == .none) setError(result, null, "The daemon returned an unexpected response.");
 }
@@ -924,7 +1022,49 @@ pub const SheetPhase = enum {
 
 pub const MessageStatus = enum { idle, writing, failed };
 
+/// What the dialog is for. Both share the chrome, the message field and
+/// its text editing; a pull request has no file review.
+pub const SheetKind = enum { commit, pull_request };
+
+/// Pull request dialog state (`kind == .pull_request`). Phases: `loading`
+/// while `pr_prepare` runs, `ready` to edit and create, `load_error` for a
+/// reason it cannot be opened, `result` to show the PR (created or already
+/// open) with its URL in the read-only field.
+pub const PrSheet = struct {
+    /// `git.changes.pr_prepare` params, kept for Retry.
+    prepare_params: []u8 = &.{},
+    prepared: ?std.json.Parsed(proto.PrPrepareResult) = null,
+    /// The PR shown in `result`.
+    shown: ?std.json.Parsed(proto.PullRequest) = null,
+    existing: bool = false,
+    /// A create is running; the value is `draft`.
+    creating: ?bool = null,
+    /// Create clicked while the text was still being written (`draft`).
+    pending: ?bool = null,
+    /// The text request waits for an earlier message request to land.
+    message_queued: bool = false,
+
+    fn deinit(self: *PrSheet) void {
+        page.free(self.prepare_params);
+        if (self.prepared) |*parsed| parsed.deinit();
+        if (self.shown) |*parsed| parsed.deinit();
+        self.* = .{};
+    }
+
+    pub fn value(self: *const PrSheet) ?proto.PrPrepareResult {
+        return if (self.prepared) |parsed| parsed.value else null;
+    }
+
+    pub fn pullRequest(self: *const PrSheet) ?proto.PullRequest {
+        return if (self.shown) |parsed| parsed.value else null;
+    }
+};
+
 pub const Sheet = struct {
+    kind: SheetKind = .commit,
+    pr: PrSheet = .{},
+    /// The field shows text to select and copy only (the PR URL).
+    read_only: bool = false,
     phase: SheetPhase = .loading,
     workspace_id: []u8 = &.{},
     local_thread_id: []u8 = &.{},
@@ -986,6 +1126,7 @@ pub const Sheet = struct {
         if (self.review) |*parsed| parsed.deinit();
         self.tick_arena.deinit();
         if (self.pull_push_root) |root| page.free(root);
+        self.pr.deinit();
         self.* = undefined;
     }
 
@@ -1032,9 +1173,22 @@ pub const Sheet = struct {
         return effectiveMessage(self.message(), self.generated());
     }
 
-    /// A commit is running or waiting for its message; edits are frozen.
+    /// A commit or PR is running or waiting for its message, or the field
+    /// is read-only; edits are frozen.
     pub fn locked(self: *const Sheet) bool {
-        return self.busy != null or self.pending_new_branch != null;
+        return self.busy != null or self.pending_new_branch != null or self.read_only or self.pr.creating != null or self.pr.pending != null;
+    }
+
+    /// A commit or PR create is in flight: the dialog stays up for its result.
+    pub fn running(self: *const Sheet) bool {
+        return self.busy != null or self.pr.creating != null;
+    }
+
+    /// Replaces the field's text (the PR URL in `result`).
+    fn setMessage(self: *Sheet, text: []const u8) void {
+        self.clearTyped();
+        const len = @min(text.len, MESSAGE_CAPACITY);
+        @memcpy(self.message_storage[0..len], text[0..len]);
     }
 
     fn setGenerated(self: *Sheet, text: []const u8, branch: ?[]const u8) void {
@@ -1251,6 +1405,31 @@ const StatusEntry = struct {
 
 /// Branch status is cached for this many chats; the oldest is dropped.
 const MAX_STATUS_ENTRIES: usize = 32;
+const MAX_KNOWN_PRS: usize = 16;
+
+pub const KnownPr = struct {
+    local_thread_id: []u8,
+    root: []u8,
+    branch: []u8,
+    url: []u8,
+
+    fn init(local_thread_id: []const u8, root: []const u8, branch: []const u8, url: []const u8) !KnownPr {
+        const thread = try page.dupe(u8, local_thread_id);
+        errdefer page.free(thread);
+        const owned_root = try page.dupe(u8, root);
+        errdefer page.free(owned_root);
+        const owned_branch = try page.dupe(u8, branch);
+        errdefer page.free(owned_branch);
+        return .{ .local_thread_id = thread, .root = owned_root, .branch = owned_branch, .url = try page.dupe(u8, url) };
+    }
+
+    fn deinit(self: *KnownPr) void {
+        page.free(self.local_thread_id);
+        page.free(self.root);
+        page.free(self.branch);
+        page.free(self.url);
+    }
+};
 
 pub const State = struct {
     lanes: [LANE_COUNT]Lane = [_]Lane{.{}} ** LANE_COUNT,
@@ -1286,6 +1465,9 @@ pub const State = struct {
     rejected_thread: ?[]u8 = null,
     rejected_root: ?[]u8 = null,
     rejected_workspace: ?[]u8 = null,
+    /// Pull requests this app opened or found per chat and branch, so the
+    /// header menu offers Open instead of Create.
+    known_prs: std.ArrayList(KnownPr) = .empty,
     /// Pointer hover target across the sheet and confirmation, so hover
     /// styling repaints only when it changes.
     hover_action: u16 = 0,
@@ -1316,11 +1498,43 @@ pub const State = struct {
         }
         self.quick = null;
         self.clearRejected();
+        for (self.known_prs.items) |*entry| entry.deinit();
+        self.known_prs.deinit(page);
         if (self.sheet) |sheet| {
             sheet.deinit();
             page.destroy(sheet);
         }
         self.sheet = null;
+    }
+
+    /// The PR known for one of `repos`' current branches in this chat.
+    pub fn knownPr(self: *const State, local_thread_id: []const u8, repos: []const proto.RepoStatus) ?*const KnownPr {
+        for (repos) |repo| {
+            const branch = repo.branch orelse continue;
+            for (self.known_prs.items) |*entry| {
+                if (std.mem.eql(u8, entry.local_thread_id, local_thread_id) and std.mem.eql(u8, entry.root, repo.root) and std.mem.eql(u8, entry.branch, branch)) return entry;
+            }
+        }
+        return null;
+    }
+
+    fn rememberPr(self: *State, local_thread_id: []const u8, root: []const u8, branch: []const u8, url: []const u8) void {
+        for (self.known_prs.items, 0..) |*entry, index| {
+            if (std.mem.eql(u8, entry.local_thread_id, local_thread_id) and std.mem.eql(u8, entry.root, root) and std.mem.eql(u8, entry.branch, branch)) {
+                entry.deinit();
+                _ = self.known_prs.orderedRemove(index);
+                break;
+            }
+        }
+        if (self.known_prs.items.len >= MAX_KNOWN_PRS) {
+            var oldest = self.known_prs.orderedRemove(0);
+            oldest.deinit();
+        }
+        const entry = KnownPr.init(local_thread_id, root, branch, url) catch return;
+        self.known_prs.append(page, entry) catch {
+            var dropped = entry;
+            dropped.deinit();
+        };
     }
 
     /// The review sheet or the default-branch confirmation is up.
@@ -1641,10 +1855,14 @@ fn refreshFocusedStatus(self: anytype, workspace_id: []const u8) void {
     refreshGitChangesStatus(self, project.threads.items[ref.thread_index].local_thread_id);
 }
 
+/// The header menu's pull request row.
+pub const PrMenu = enum { hidden, create, open };
+
 pub const HeaderMenu = struct {
     can_commit: bool = false,
     can_push: bool = false,
     can_pull_push: bool = false,
+    pull_request: PrMenu = .hidden,
     /// A header git action is running (for any chat); actions are disabled.
     busy: bool = false,
 };
@@ -1670,6 +1888,13 @@ pub fn gitChangesHeader(self: anytype, local_thread_id: []const u8) HeaderView {
             .busy = state.quick != null or state.sheet != null,
         },
     };
+    if (state.threadStatus(local_thread_id)) |status| {
+        if (state.knownPr(local_thread_id, status.repos) != null) {
+            view.menu.pull_request = .open;
+        } else if (prCandidate(status.repos) != null) {
+            view.menu.pull_request = .create;
+        }
+    }
     if (state.quick) |quick| {
         if (std.mem.eql(u8, quick.local_thread_id, local_thread_id)) view.busy_label = quick.progressText();
     }
@@ -1804,6 +2029,11 @@ fn loadReview(self: anytype, carry: bool) void {
 pub fn reloadCommitSheet(self: anytype) void {
     const sheet = self.git_changes.sheet orelse return;
     sheet.error_len = 0;
+    if (sheet.kind == .pull_request) {
+        loadPrPrepare(self);
+        self.markDirty();
+        return;
+    }
     loadReview(self, sheet.review != null);
     self.markDirty();
 }
@@ -1856,6 +2086,7 @@ pub fn commitSheetToggleExpanded(self: anytype, flat_index: usize) void {
 pub fn generateCommitMessage(self: anytype, explicit: bool) void {
     const state = &self.git_changes;
     const sheet = state.sheet orelse return;
+    if (sheet.kind == .pull_request) return requestPrMessage(self, explicit);
     const review = sheet.reviewValue() orelse return;
     var arena: std.heap.ArenaAllocator = .init(page);
     defer arena.deinit();
@@ -1889,6 +2120,7 @@ pub fn generateCommitMessage(self: anytype, explicit: bool) void {
 /// written (or no longer matches the selection) the commit waits for it.
 pub fn commitSheetCommit(self: anytype, new_branch: bool) void {
     const sheet = self.git_changes.sheet orelse return;
+    if (sheet.kind == .pull_request) return prSheetCreate(self, false);
     commitSheetCommitAs(self, sheet.mode, new_branch);
 }
 
@@ -1896,6 +2128,7 @@ pub fn commitSheetCommit(self: anytype, new_branch: bool) void {
 /// Commit from a Commit & push sheet.
 pub fn commitSheetCommitAlternate(self: anytype) void {
     const sheet = self.git_changes.sheet orelse return;
+    if (sheet.kind == .pull_request) return prSheetCreate(self, true);
     if (!sheetHasRemote(sheet) and sheet.mode == .commit) return;
     commitSheetCommitAs(self, sheet.mode.other(), false);
 }
@@ -2048,6 +2281,8 @@ pub const ToastView = struct {
     detail: []const u8 = "",
     /// Show the Pull & push button (rejected push).
     pull_push: bool = false,
+    /// Show the Create PR button (push landed on a GitHub feature branch).
+    pull_request: bool = false,
     /// Running toasts have no × and ignore clicks.
     dismissible: bool = true,
     alpha: f32 = 1.0,
@@ -2059,7 +2294,8 @@ fn toastNowMs() i64 {
 }
 
 fn toastHold(toast: *const Toast) ?i64 {
-    return if (toast.tone == .success) TOAST_SUCCESS_HOLD_MS else null;
+    if (toast.tone != .success) return null;
+    return if (toast.pullRequestTarget() != null) TOAST_PR_HOLD_MS else TOAST_SUCCESS_HOLD_MS;
 }
 
 /// The running git action's progress, else the last outcome until it
@@ -2077,6 +2313,7 @@ pub fn gitToastView(self: anytype) ?ToastView {
     }
     if (state.sheet) |sheet| {
         if (sheet.busy) |busy| return .{ .tone = .running, .title = busy.busyLabel(), .dismissible = false };
+        if (sheet.pr.creating != null) return .{ .tone = .running, .title = "Creating pull request\u{2026}", .dismissible = false };
         if (sheet.pull_push_busy) return .{ .tone = .running, .title = "Pulling & pushing\u{2026}", .dismissible = false };
     }
     if (state.toast) |*toast| {
@@ -2086,6 +2323,7 @@ pub fn gitToastView(self: anytype) ?ToastView {
             .title = toast.title(),
             .detail = toast.detail(),
             .pull_push = toast.pullPushThread() != null,
+            .pull_request = toast.pullPushThread() == null and toast.pullRequestTarget() != null,
             .alpha = phase.alpha,
             .rise = phase.rise,
         };
@@ -2124,6 +2362,19 @@ pub fn dismissGitToast(self: anytype) void {
     if (self.git_changes.toast == null) return;
     self.git_changes.toast = null;
     self.markDirty();
+}
+
+/// The toast's Create PR button.
+pub fn gitToastPullRequest(self: anytype) void {
+    const toast = if (self.git_changes.toast) |*value| value else return;
+    const target = toast.pullRequestTarget() orelse return;
+    var thread_buf: [128]u8 = undefined;
+    var root_buf: [1024]u8 = undefined;
+    const thread_id = copyInto(&thread_buf, target.thread);
+    const root = copyInto(&root_buf, target.root);
+    self.git_changes.toast = null;
+    self.markDirty();
+    openPullRequestSheet(self, thread_id, root);
 }
 
 /// The toast's Pull & push button.
@@ -2440,6 +2691,7 @@ fn applyQuickCommit(self: anytype, result: *Result) void {
             endQuick(self);
             var toast = commitToast(parsed.value, push);
             toast.noteLeftOut(left_out);
+            offerPrAfterCommit(self, &toast, thread_id, parsed.value);
             showToast(self, toast);
         },
         else => {
@@ -2538,7 +2790,7 @@ fn applyQuickPush(self: anytype, request: *Request, result: *Result) void {
                 if (state.rejectedFor(thread_id)) state.clearRejected();
                 // A single repository: prefer the daemon's facts about what it published.
                 const single = quick.pushed == 1;
-                const toast = pushToast(
+                var toast = pushToast(
                     quick.pushed,
                     if (single) value.commits orelse quick.push_commits else quick.push_commits,
                     quick.upstream_buf[0..quick.upstream_len],
@@ -2547,6 +2799,11 @@ fn applyQuickPush(self: anytype, request: *Request, result: *Result) void {
                     if (single) value.head orelse "" else "",
                     if (single) value.subject orelse "" else "",
                 );
+                if (single) {
+                    const cached = repoStatusFor(state, thread_id, value.root);
+                    const branch: ?[]const u8 = if (cached) |repo| repo.branch else null;
+                    if (prOfferAfterPush(cached, branch, false)) toast.offerPullRequest(thread_id, value.root);
+                }
                 endQuick(self);
                 showToast(self, toast);
                 return;
@@ -2631,6 +2888,282 @@ fn copyInto(buf: []u8, value: []const u8) []const u8 {
     const len = @min(value.len, buf.len);
     @memcpy(buf[0..len], value[0..len]);
     return buf[0..len];
+}
+
+// ---- Pull requests --------------------------------------------------
+
+/// Cached `git.changes.status` row for one of a chat's repositories.
+fn repoStatusFor(state: *const State, local_thread_id: []const u8, root: []const u8) ?proto.RepoStatus {
+    const status = state.threadStatus(local_thread_id) orelse return null;
+    for (status.repos) |repo| {
+        if (std.mem.eql(u8, repo.root, root)) return repo;
+    }
+    return null;
+}
+
+/// Adds Create PR to a commit toast whose first repository's push landed
+/// on a GitHub feature branch.
+fn offerPrAfterCommit(self: anytype, toast: *Toast, local_thread_id: []const u8, result: proto.CommitResult) void {
+    if (result.repos.len != 1) return;
+    const repo = result.repos[0];
+    if (!std.mem.eql(u8, repo.push, "pushed")) return;
+    if (prOfferAfterPush(repoStatusFor(&self.git_changes, local_thread_id, repo.root), repo.branch, repo.branch_created)) {
+        toast.offerPullRequest(local_thread_id, repo.root);
+    }
+}
+
+/// Header menu / palette: open the PR already known for the chat's branch,
+/// else the Create pull request dialog for its eligible repository.
+pub fn startPullRequest(self: anytype, local_thread_id: []const u8) void {
+    const state = &self.git_changes;
+    if (state.threadStatus(local_thread_id)) |status| {
+        if (state.knownPr(local_thread_id, status.repos)) |known| {
+            self.openWebLinkWithTarget(known.url, .system_browser);
+            return;
+        }
+        if (prCandidate(status.repos)) |repo| return openPullRequestSheet(self, local_thread_id, repo.root);
+    }
+    // No cached facts: the daemon picks the repository (or says why not).
+    openPullRequestSheet(self, local_thread_id, null);
+}
+
+pub fn startPullRequestForFocusedChat(self: anytype) bool {
+    const ref = focusedThreadRef(self) orelse return false;
+    startPullRequest(self, self.project_controller.projects.items[ref.project_index].threads.items[ref.thread_index].local_thread_id);
+    return true;
+}
+
+/// Opens the Create pull request dialog: `pr_prepare` loads in the
+/// background, then the model writes the title and description.
+pub fn openPullRequestSheet(self: anytype, local_thread_id: []const u8, root: ?[]const u8) void {
+    const ref = findThread(self, local_thread_id) orelse return;
+    const project = &self.project_controller.projects.items[ref.project_index];
+    const thread = &project.threads.items[ref.thread_index];
+    const state = &self.git_changes;
+    if (!thread.committed) {
+        self.setSidebarNotice("This chat has no saved changes yet.");
+        return;
+    }
+    if (state.quick != null) {
+        self.setSidebarNotice("Another git action is still running.");
+        return;
+    }
+    closeCommitSheetSilently(self);
+    const sheet = page.create(Sheet) catch return;
+    sheet.* = .{ .kind = .pull_request };
+    sheet.workspace_id = page.dupe(u8, project.id) catch &.{};
+    sheet.local_thread_id = page.dupe(u8, thread.local_thread_id) catch &.{};
+    sheet.thread_title = page.dupe(u8, thread.title) catch &.{};
+    const route = reviewRequestFor(project, thread);
+    sheet.pr.prepare_params = std.json.Stringify.valueAlloc(page, proto.PrPrepareRequest{
+        .workspace_id = route.workspace_id,
+        .local_thread_id = route.local_thread_id,
+        .root = root,
+        .repository_id = route.repository_id,
+        .relative_cwd = route.relative_cwd,
+        .project_path = route.project_path,
+        .cwd = route.cwd,
+    }, .{ .emit_null_optional_fields = false }) catch &.{};
+    state.generation +%= 1;
+    state.sheet = sheet;
+    state.toast = null;
+    if (!runsLocally(thread)) {
+        sheet.phase = .load_error;
+        sheet.setErrorText("Pull requests are only available for chats that run on this machine.");
+        self.markDirty();
+        return;
+    }
+    loadPrPrepare(self);
+    self.markDirty();
+}
+
+fn loadPrPrepare(self: anytype) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    sheet.phase = .loading;
+    sheet.error_len = 0;
+    var params = std.json.parseFromSlice(std.json.Value, page, sheet.pr.prepare_params, .{}) catch {
+        sheet.phase = .load_error;
+        sheet.setErrorText("Could not build the pull request request.");
+        return;
+    };
+    defer params.deinit();
+    if (!spawn(self, .sheet, .pr_prepare, params.value, "", .{ .timeout_ms = PR_PREPARE_TIMEOUT_MS, .generation = state.generation })) {
+        sheet.phase = .load_error;
+        sheet.setErrorText("Another git action is still running. Try again in a moment.");
+    }
+}
+
+/// Asks the model for a title and description; the text from the commits
+/// stays as the placeholder until (and unless) it lands. An explicit ↻
+/// also clears what the user typed.
+fn requestPrMessage(self: anytype, explicit: bool) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    // A Create waiting for the text (`pending`) still needs this request.
+    if (sheet.phase != .ready or sheet.read_only or sheet.pr.creating != null) return;
+    const prepared = sheet.pr.value() orelse return;
+    if (!spawn(self, .message, .pr_message, proto.PrMessageRequest{
+        .workspace_id = sheet.workspace_id,
+        .root = prepared.root,
+        .local_thread_id = sheet.local_thread_id,
+    }, if (explicit) "explicit" else "auto", .{ .timeout_ms = MESSAGE_TIMEOUT_MS, .generation = state.generation })) {
+        // An earlier request (e.g. a closed commit dialog's message) still
+        // holds the lane; ask once it lands (see pollGitChanges).
+        sheet.pr.message_queued = true;
+        sheet.message_status = .writing;
+        self.markDirty();
+        return;
+    }
+    sheet.message_status = .writing;
+    self.markDirty();
+}
+
+/// Create pull request (or draft). An empty field uses the generated text,
+/// waiting for it while it is being written.
+fn prSheetCreate(self: anytype, draft: bool) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    if (sheet.phase != .ready or sheet.locked()) return;
+    sheet.error_len = 0;
+    if (std.mem.trim(u8, sheet.message(), " \t\r\n").len == 0 and sheet.message_status == .writing) {
+        sheet.pr.pending = draft;
+        self.markDirty();
+        return;
+    }
+    spawnPrCreate(self, draft);
+}
+
+fn spawnPrCreate(self: anytype, draft: bool) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    sheet.pr.pending = null;
+    const prepared = sheet.pr.value() orelse return;
+    const text = splitPrText(sheet.messageToCommit() orelse "");
+    if (text.title.len == 0) {
+        sheet.setErrorText("Write a title on the first line.");
+        self.markDirty();
+        return;
+    }
+    if (!spawn(self, .sheet, .pr_create, proto.PrCreateRequest{
+        .workspace_id = sheet.workspace_id,
+        .root = prepared.root,
+        .local_thread_id = sheet.local_thread_id,
+        .title = text.title,
+        .body = text.body,
+        .draft = draft,
+    }, "", .{ .timeout_ms = PR_CREATE_TIMEOUT_MS, .generation = state.generation })) {
+        sheet.setErrorText("Another git action is still running. Try again in a moment.");
+        self.markDirty();
+        return;
+    }
+    sheet.pr.creating = draft;
+    self.markDirty();
+}
+
+/// Switches the dialog to the PR's outcome: headline in the card, its URL in
+/// the read-only field, Copy link and Open in browser in the footer.
+fn showPrResult(self: anytype, pr: proto.PullRequest, existing: bool) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    const prepared = sheet.pr.value();
+    const json = std.json.Stringify.valueAlloc(page, pr, .{}) catch return;
+    defer page.free(json);
+    const parsed = std.json.parseFromSlice(proto.PullRequest, page, json, .{ .allocate = .alloc_always }) catch return;
+    if (sheet.pr.shown) |*previous| previous.deinit();
+    sheet.pr.shown = parsed;
+    sheet.pr.existing = existing;
+    sheet.phase = .result;
+    sheet.read_only = true;
+    sheet.error_len = 0;
+    sheet.setMessage(pr.url);
+    if (self.palette_modal_text_focus == .commit_message) self.modal_text_selection_anchor = null;
+    if (prepared) |value| state.rememberPr(sheet.local_thread_id, value.root, value.branch, pr.url);
+}
+
+/// The result's Open in browser button.
+pub fn prSheetOpenUrl(self: anytype) void {
+    const sheet = self.git_changes.sheet orelse return;
+    const pr = sheet.pr.pullRequest() orelse return;
+    self.openWebLinkWithTarget(pr.url, .system_browser);
+}
+
+/// The result's Copy link button. Never logs the text.
+pub fn prSheetCopyUrl(self: anytype) void {
+    const sheet = self.git_changes.sheet orelse return;
+    const pr = sheet.pr.pullRequest() orelse return;
+    self.setSidebarNotice(if (self.setClipboardText(pr.url)) "Copied pull request link." else "Could not copy the link.");
+}
+
+fn applyPrPrepare(self: anytype, request: *Request, result: *Result) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    if (request.generation != state.generation or sheet.kind != .pull_request) return;
+    switch (result.payload) {
+        .pr_prepare => |parsed| {
+            result.payload = .none;
+            if (sheet.pr.prepared) |*previous| previous.deinit();
+            sheet.pr.prepared = parsed;
+            const value = parsed.value;
+            if (value.existing) |pr| {
+                showPrResult(self, pr, true);
+            } else {
+                var text_buf: [MESSAGE_CAPACITY]u8 = undefined;
+                sheet.setGenerated(joinPrText(&text_buf, value.title, value.body), null);
+                sheet.source_len = copyInto(&sheet.source_buf, "From commits").len;
+                sheet.phase = .ready;
+                requestPrMessage(self, false);
+            }
+        },
+        else => {
+            sheet.phase = .load_error;
+            sheet.setErrorText(prErrorText(result.err_code, result.err_message));
+        },
+    }
+    self.markDirty();
+}
+
+fn applyPrMessage(self: anytype, request: *Request, result: *Result) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    if (request.generation != state.generation or sheet.kind != .pull_request) return;
+    sheet.message_status = .idle;
+    switch (result.payload) {
+        .pr_message => |parsed| {
+            const value = parsed.value;
+            var text_buf: [MESSAGE_CAPACITY]u8 = undefined;
+            sheet.setGenerated(joinPrText(&text_buf, value.title, value.body), null);
+            if (std.mem.eql(u8, request.tag, "explicit")) {
+                sheet.clearTyped();
+                if (self.palette_modal_text_focus == .commit_message) self.modal_text_selection_anchor = null;
+            }
+            const written = std.fmt.bufPrint(&sheet.source_buf, "{s}{s}{s}", .{
+                value.provider,
+                if (value.model.len > 0) " \u{00B7} " else "",
+                value.model,
+            }) catch "";
+            sheet.source_len = written.len;
+        },
+        else => {
+            // The text from the commits stays; say why it was not replaced.
+            sheet.source_len = copyInto(&sheet.source_buf, "From commits \u{00B7} couldn't write one").len;
+            if (std.mem.eql(u8, request.tag, "explicit")) sheet.setErrorText(prErrorText(result.err_code, result.err_message));
+        },
+    }
+    if (sheet.pr.pending) |draft| spawnPrCreate(self, draft);
+    self.markDirty();
+}
+
+fn applyPrCreate(self: anytype, request: *Request, result: *Result) void {
+    const state = &self.git_changes;
+    const sheet = state.sheet orelse return;
+    if (request.generation != state.generation or sheet.kind != .pull_request) return;
+    sheet.pr.creating = null;
+    switch (result.payload) {
+        .pr_create => |parsed| showPrResult(self, parsed.value.pull_request, parsed.value.existing),
+        else => sheet.setErrorText(prErrorText(result.err_code, result.err_message)),
+    }
+    self.markDirty();
 }
 
 // ---- Settings -------------------------------------------------------
@@ -2757,7 +3290,17 @@ pub fn pollGitChanges(self: anytype) void {
         var result = done.result;
         defer result.deinit();
         defer done.request.deinit();
-        applyMessageResult(self, done.request, &result);
+        switch (done.request.job) {
+            .pr_message => applyPrMessage(self, done.request, &result),
+            else => applyMessageResult(self, done.request, &result),
+        }
+        if (state.sheet) |sheet| {
+            if (sheet.kind == .pull_request and sheet.pr.message_queued) {
+                sheet.pr.message_queued = false;
+                sheet.message_status = .idle;
+                requestPrMessage(self, false);
+            }
+        }
     }
     if (takeCompleted(state.lane(.sheet))) |done| {
         var result = done.result;
@@ -2767,6 +3310,8 @@ pub fn pollGitChanges(self: anytype) void {
             .review => applyReviewResult(self, done.request, &result),
             .commit => applyCommitResult(self, done.request, &result),
             .pull_push => applyPullPushResult(self, done.request, &result),
+            .pr_prepare => applyPrPrepare(self, done.request, &result),
+            .pr_create => applyPrCreate(self, done.request, &result),
             else => {},
         }
     }
@@ -2802,7 +3347,7 @@ pub fn pollGitChanges(self: anytype) void {
 fn applyMessageResult(self: anytype, request: *Request, result: *Result) void {
     const state = &self.git_changes;
     const sheet = state.sheet orelse return;
-    if (request.generation != state.generation) return;
+    if (request.generation != state.generation or sheet.kind != .commit) return;
     const explicit = std.mem.eql(u8, request.tag, "explicit");
     defer if (sheet.message_rerun) |rerun_explicit| {
         sheet.message_rerun = null;
@@ -2892,7 +3437,8 @@ fn applyCommitResult(self: anytype, request: *Request, result: *Result) void {
             } else {
                 if (state.rejectedFor(thread_id) and parsed.value.repos.len > 0 and std.mem.eql(u8, parsed.value.repos[0].push, "pushed")) state.clearRejected();
                 // Built before the sheet (and the result it points into) closes.
-                const toast = commitToast(parsed.value, push_requested);
+                var toast = commitToast(parsed.value, push_requested);
+                offerPrAfterCommit(self, &toast, thread_id, parsed.value);
                 closeCommitSheet(self);
                 showToast(self, toast);
             }
@@ -2982,6 +3528,81 @@ fn testReview() ReviewResult {
         .default_action = "commit",
         .repos = &S.repos,
     };
+}
+
+test "pull request offers follow pushed GitHub feature branches" {
+    const feature: proto.RepoStatus = .{ .root = "/w", .name = "w", .branch = "feature/x", .default_branch = "main", .upstream = "origin/feature/x", .has_remote = true, .github = true, .ahead_of_default = 2 };
+    try testing.expect(prEligible(feature));
+    try testing.expectEqualStrings("/w", prCandidate(&.{ .{ .root = "/l", .name = "l", .branch = "main", .is_default_branch = true, .github = true }, feature }).?.root);
+
+    var repo = feature;
+    repo.github = false;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.is_default_branch = true;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.ahead = 1;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.upstream = null;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.ahead_of_default = 0;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.ahead_of_default = null;
+    try testing.expect(!prEligible(repo));
+    repo = feature;
+    repo.branch = null;
+    try testing.expect(!prEligible(repo));
+    try testing.expect(prCandidate(&.{}) == null);
+
+    // After a push: GitHub and not the default branch (cached facts from
+    // before the push; a branch created by the commit counts).
+    try testing.expect(prOfferAfterPush(feature, "feature/x", false));
+    const main: proto.RepoStatus = .{ .root = "/w", .name = "w", .branch = "main", .default_branch = "main", .is_default_branch = true, .has_remote = true, .github = true };
+    try testing.expect(!prOfferAfterPush(main, "main", false));
+    try testing.expect(prOfferAfterPush(main, "feature/new", true));
+    try testing.expect(!prOfferAfterPush(null, "feature/x", false));
+    try testing.expect(!prOfferAfterPush(feature, null, false));
+    var gitlab = feature;
+    gitlab.github = false;
+    try testing.expect(!prOfferAfterPush(gitlab, "feature/x", true));
+}
+
+test "pull request text splits into title and body and back" {
+    const text = splitPrText("  Add dark mode\n\n\nAdds a toggle.\n- tokens\n");
+    try testing.expectEqualStrings("Add dark mode", text.title);
+    try testing.expectEqualStrings("Adds a toggle.\n- tokens", text.body);
+    const title_only = splitPrText("Fix typo");
+    try testing.expectEqualStrings("Fix typo", title_only.title);
+    try testing.expectEqualStrings("", title_only.body);
+    try testing.expectEqualStrings("", splitPrText(" \n ").title);
+
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("Add dark mode\n\nAdds a toggle.", joinPrText(&buf, "Add dark mode", "Adds a toggle.\n"));
+    try testing.expectEqualStrings("Fix typo", joinPrText(&buf, " Fix typo ", "  "));
+
+    try testing.expectEqualStrings("Opened pull request #12", prOutcomeTitle(&buf, .{ .number = 12, .url = "u" }, false));
+    try testing.expectEqualStrings("Opened draft pull request #3", prOutcomeTitle(&buf, .{ .number = 3, .url = "u", .draft = true }, false));
+    try testing.expectEqualStrings("Pull request #7 is already open", prOutcomeTitle(&buf, .{ .number = 7, .url = "u" }, true));
+    try testing.expectEqualStrings("GitHub CLI is not signed in.", prErrorText("gh_unauthenticated", "GitHub CLI is not signed in."));
+    try testing.expect(std.mem.startsWith(u8, prErrorText("method_not_found", "x"), "Restart Verde"));
+}
+
+test "toasts offer Create PR and hold longer while they do" {
+    var toast = pushToast(1, 2, "origin/feature/x", "feature/x", "app", "abc1234", "Add X");
+    try testing.expect(toast.pullRequestTarget() == null);
+    try testing.expectEqual(@as(?i64, TOAST_SUCCESS_HOLD_MS), toastHold(&toast));
+    toast.offerPullRequest("t1", "/w/app");
+    const target = toast.pullRequestTarget().?;
+    try testing.expectEqualStrings("t1", target.thread);
+    try testing.expectEqualStrings("/w/app", target.root);
+    try testing.expectEqual(@as(?i64, TOAST_PR_HOLD_MS), toastHold(&toast));
+    var failed = failureToast("Push failed", "nope");
+    failed.offerPullRequest("t1", "/w/app");
+    try testing.expect(toastHold(&failed) == null);
 }
 
 test "hunk toggles produce partial selections with daemon hunk indices" {

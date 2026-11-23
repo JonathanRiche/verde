@@ -88,6 +88,7 @@ const MUTATING_METHODS = [_][]const u8{
     "git.changes.commit",
     "git.changes.push",
     "git.changes.pull_push",
+    "git.changes.pr_create",
     // Owner-only access administration. Lists are included because they
     // transactionally prune bounded terminal records before replying.
     access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,

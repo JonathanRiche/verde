@@ -2133,6 +2133,7 @@ test {
     _ = @import("daemon/process_registry.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/repo_origin.zig");
+    _ = @import("daemon/pull_request.zig");
     _ = @import("providers/acp.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/cursor.zig");

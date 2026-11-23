@@ -1,5 +1,7 @@
 //! "Commit changes" dialog for one chat's git changes, plus the header's
-//! default-branch confirmation ("Commit & push to main?").
+//! default-branch confirmation ("Commit & push to main?") and the "Create
+//! pull request" variant of the dialog (same chrome, focus model and message
+//! field; the PR URL ends up in the field, read-only, to select and copy).
 //!
 //! The dialog shows the branch, a plain list of the files about to be
 //! committed (Edit switches to per-file and per-hunk ticks with an inline
@@ -40,6 +42,9 @@ pub const Control = enum(u8) {
     confirm_branch,
     /// The sheet's other action (Commit & push from Commit, or Commit).
     alternate,
+    /// Pull request result: open the PR in the browser / copy its link.
+    pr_open,
+    pr_copy,
 };
 
 // Geometry tokens (CSS px, scaled at use).
@@ -546,6 +551,326 @@ fn renderConfirm(state: *runtime.AppState, quick: *const Quick, width: f32, heig
 }
 
 // ------------------------------------------------------------------
+// Create pull request (sheet kind `.pull_request`)
+// ------------------------------------------------------------------
+
+const PR_SUBTITLE = "Opens a pull request on GitHub with the GitHub CLI. The first line is the title; leave the box blank to use the suggested text.";
+const PR_RESULT_SUBTITLE = "Select the link to copy it, or open it in your browser.";
+/// Summary card: branch line, repository line, up to three subjects.
+const PR_CARD_H_CSS: f32 = 112.0;
+const PR_MESSAGE_LINES: f32 = 8.0;
+const PR_MIN_MESSAGE_LINES: f32 = 2.0;
+const PR_MAX_SUBJECTS: usize = 3;
+
+const PrGeometry = struct {
+    modal: palette.Rect,
+    title_y: f32,
+    subtitle: palette.Rect,
+    subtitle_text: []const u8,
+    card: palette.Rect,
+    /// Present while ready (text to edit) or showing the result (the URL).
+    message_label_y: ?f32,
+    message: palette.Rect,
+    regenerate: palette.Rect,
+    error_rect: ?palette.Rect,
+    cancel: palette.Rect,
+    alternate: ?palette.Rect,
+    primary: ?palette.Rect,
+};
+
+fn prPrimaryLabel(sheet: *const Sheet) []const u8 {
+    return switch (sheet.phase) {
+        .ready => if (sheet.pr.creating) |draft|
+            (if (draft) "Create pull request" else "Creating\u{2026}")
+        else if (sheet.pr.pending) |draft|
+            (if (draft) "Create pull request" else "Writing\u{2026}")
+        else
+            "Create pull request",
+        .result => "Open in browser",
+        .load_error => "Retry",
+        .loading => "",
+    };
+}
+
+fn prAlternateLabel(sheet: *const Sheet) []const u8 {
+    return switch (sheet.phase) {
+        .ready => if (sheet.pr.creating) |draft|
+            (if (draft) "Creating draft\u{2026}" else "Create draft")
+        else if (sheet.pr.pending) |draft|
+            (if (draft) "Writing\u{2026}" else "Create draft")
+        else
+            "Create draft",
+        .result => "Copy link",
+        else => "",
+    };
+}
+
+fn prGeometry(sheet: *const Sheet, width: f32, height: f32) PrGeometry {
+    const edge = scaled(MODAL_EDGE_CSS);
+    const modal_w = modalWidth(width, MODAL_MIN_W_CSS, MODAL_MAX_W_CSS);
+    const pad = scaled(PAD_CSS);
+    const inner_w = modal_w - pad * 2.0;
+    const subtitle_text = if (sheet.phase == .result) PR_RESULT_SUBTITLE else PR_SUBTITLE;
+    var subtitle_lines: [6]Line = undefined;
+    const subtitle_count = @max(wrapLines(subtitle_text, scaled(SMALL_FONT_CSS), inner_w, &subtitle_lines), 1);
+    const subtitle_h = scaled(SMALL_FONT_CSS) * 1.3 * @as(f32, @floatFromInt(subtitle_count));
+    const title_h = scaled(24.0);
+    const card_h = scaled(PR_CARD_H_CSS);
+    const has_field = sheet.phase == .ready or sheet.phase == .result;
+    const line_h = messageLineHeight();
+    const field_pad = scaled(MESSAGE_PAD_CSS) * 2.0;
+    const label_block = scaled(16.0) + scaled(20.0) + scaled(6.0);
+    const error_h: f32 = if (sheet.phase == .ready and sheet.error_len > 0) scaled(8.0) + scaled(34.0) else 0.0;
+    const footer_h = scaled(20.0) + scaled(BUTTON_H_CSS);
+    const fixed = pad * 2.0 + title_h + subtitle_h + scaled(14.0) + card_h + error_h + footer_h + (if (has_field) label_block + field_pad else 0.0);
+    // The description box gives up lines first on short windows.
+    var message_lines: f32 = if (sheet.phase == .result) 1.0 else PR_MESSAGE_LINES;
+    const room = height - edge * 2.0 - fixed;
+    if (has_field and sheet.phase == .ready and room < message_lines * line_h) {
+        message_lines = @max(@floor(room / line_h), PR_MIN_MESSAGE_LINES);
+    }
+    const message_h: f32 = if (has_field) line_h * message_lines + field_pad else 0.0;
+    const natural_h = fixed + (if (has_field) message_h - field_pad else 0.0);
+    const modal_h = @min(natural_h, @max(height - edge * 2.0, scaled(200.0)));
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    const inner_x = modal.x + pad;
+
+    const title_y = modal.y + pad;
+    var y = title_y + title_h;
+    const subtitle: palette.Rect = .{ .x = inner_x, .y = y, .w = inner_w, .h = subtitle_h };
+    y += subtitle_h + scaled(14.0);
+    const card: palette.Rect = .{ .x = inner_x, .y = y, .w = inner_w, .h = card_h };
+    y += card_h;
+
+    var message_label_y: ?f32 = null;
+    var message: palette.Rect = .{ .x = inner_x, .y = y, .w = inner_w, .h = 0.0 };
+    var regenerate: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    if (has_field) {
+        y += scaled(16.0);
+        message_label_y = y;
+        y += scaled(20.0) + scaled(6.0);
+        message = .{ .x = inner_x, .y = y, .w = inner_w, .h = message_h };
+        if (sheet.phase == .ready) {
+            const regen = scaled(REGEN_CSS);
+            regenerate = .{ .x = message.x + message.w - regen - scaled(5.0), .y = message.y + scaled(5.0), .w = regen, .h = regen };
+        }
+        y += message_h;
+    }
+    const error_rect: ?palette.Rect = if (error_h > 0.0) .{ .x = inner_x, .y = y + scaled(8.0), .w = inner_w, .h = scaled(34.0) } else null;
+
+    const button_h = scaled(BUTTON_H_CSS);
+    const footer_y = modal.y + modal.h - pad - button_h;
+    const gap = scaled(BUTTON_GAP_CSS);
+    var right = inner_x + inner_w;
+    var primary: ?palette.Rect = null;
+    var alternate: ?palette.Rect = null;
+    if (sheet.phase != .loading) {
+        const primary_w = buttonWidth(prPrimaryLabel(sheet));
+        primary = .{ .x = right - primary_w, .y = footer_y, .w = primary_w, .h = button_h };
+        right -= primary_w + gap;
+    }
+    if (sheet.phase == .ready or sheet.phase == .result) {
+        const alternate_w = buttonWidth(prAlternateLabel(sheet));
+        alternate = .{ .x = right - alternate_w, .y = footer_y, .w = alternate_w, .h = button_h };
+        right -= alternate_w + gap;
+    }
+    const cancel_w = buttonWidth(if (sheet.phase == .result) "Done" else "Cancel");
+    const cancel: palette.Rect = .{ .x = right - cancel_w, .y = footer_y, .w = cancel_w, .h = button_h };
+    return .{
+        .modal = modal,
+        .title_y = title_y,
+        .subtitle = subtitle,
+        .subtitle_text = subtitle_text,
+        .card = card,
+        .message_label_y = message_label_y,
+        .message = message,
+        .regenerate = regenerate,
+        .error_rect = error_rect,
+        .cancel = cancel,
+        .alternate = alternate,
+        .primary = primary,
+    };
+}
+
+/// Hits and Tab stops in visual order: the field (and ↻), then the footer.
+fn registerPrHits(state: *runtime.AppState, sheet: *Sheet, width: f32, height: f32, queue_hit: QueueHit) void {
+    const geo = prGeometry(sheet, width, height);
+    focus_list = .{};
+    focus_list_max_scroll = 0.0;
+    queue_hit(state, .{ .x = 0, .y = 0, .w = width, .h = height }, if (sheet.running()) .modal_block else .modal_dismiss, 0);
+    queue_hit(state, geo.modal, .modal_block, 0);
+    const locked = sheet.locked();
+    const control = Action.commit_sheet_control;
+    if (geo.message_label_y != null) {
+        // The URL field stays selectable while the result is read-only.
+        if (!locked or sheet.read_only) {
+            recordStop(.commit_sheet_message_input, 0, geo.message, .single);
+            queue_hit(state, geo.message, .commit_sheet_message_input, 0);
+        }
+        state.modal_text_input_rect = geo.message;
+        state.modal_text_input_font_size = scaled(MESSAGE_FONT_CSS);
+        if (sheet.phase == .ready and !locked) {
+            recordStop(control, @intFromEnum(Control.regenerate), geo.regenerate, .single);
+            queue_hit(state, geo.regenerate, control, @intFromEnum(Control.regenerate));
+        }
+    }
+    if (!sheet.running()) {
+        queue_hit(state, geo.cancel, control, @intFromEnum(Control.cancel));
+        recordStop(control, @intFromEnum(Control.cancel), geo.cancel, .footer);
+    }
+    switch (sheet.phase) {
+        .ready => if (!locked) {
+            if (geo.alternate) |rect| {
+                queue_hit(state, rect, control, @intFromEnum(Control.alternate));
+                recordStop(control, @intFromEnum(Control.alternate), rect, .footer);
+            }
+            if (geo.primary) |rect| {
+                queue_hit(state, rect, control, @intFromEnum(Control.primary));
+                recordStop(control, @intFromEnum(Control.primary), rect, .footer);
+            }
+        },
+        .result => {
+            if (geo.alternate) |rect| {
+                queue_hit(state, rect, control, @intFromEnum(Control.pr_copy));
+                recordStop(control, @intFromEnum(Control.pr_copy), rect, .footer);
+            }
+            if (geo.primary) |rect| {
+                queue_hit(state, rect, control, @intFromEnum(Control.pr_open));
+                recordStop(control, @intFromEnum(Control.pr_open), rect, .footer);
+            }
+        },
+        .load_error => if (geo.primary) |rect| {
+            queue_hit(state, rect, control, @intFromEnum(Control.reload));
+            recordStop(control, @intFromEnum(Control.reload), rect, .footer);
+        },
+        .loading => {},
+    }
+}
+
+/// Renders the Create pull request dialog.
+fn renderPr(state: *runtime.AppState, sheet: *Sheet, width: f32, height: f32) void {
+    const geo = prGeometry(sheet, width, height);
+    const modal = geo.modal;
+    const full: palette.Rect = .{ .x = 0, .y = 0, .w = width, .h = height };
+
+    // Chrome: scrim, card, border (as the commit dialog).
+    roundedRect(state, full, theme.scrim(0.68), 0.0, full);
+    roundedRect(state, modal, theme.COLOR_PANEL, scaled(MODAL_RADIUS_CSS), full);
+    border(state, modal, theme.withAlpha(theme.borderMuted(), 110), scaled(MODAL_RADIUS_CSS), scaled(1.0), full);
+    labelText(state, .{ .x = geo.subtitle.x, .y = geo.title_y, .w = geo.subtitle.w, .h = scaled(22.0) }, "Create pull request", theme.COLOR_WHITE, scaled(TITLE_FONT_CSS), .ui_bold, modal);
+    labelWrapped(state, geo.subtitle, geo.subtitle_text, theme.COLOR_TEXT_MUTED, scaled(SMALL_FONT_CSS), modal);
+
+    const card_radius = scaled(CARD_RADIUS_CSS);
+    roundedRect(state, geo.card, theme.sink(theme.COLOR_PANEL_ALT, 0.03), card_radius, modal);
+    border(state, geo.card, theme.COLOR_PANEL_MUTED, card_radius, scaled(1.0), modal);
+    drawPrCard(state, sheet, geo.card);
+
+    if (geo.message_label_y) |label_y| drawPrMessageSection(state, sheet, &geo, label_y);
+    if (geo.error_rect) |rect| labelWrapped(state, rect, sheet.errorText(), theme.COLOR_YELLOW, scaled(SMALL_FONT_CSS), modal);
+
+    const locked = sheet.locked();
+    drawSecondaryButton(state, geo.cancel, if (sheet.phase == .result) "Done" else "Cancel", !sheet.running(), modal);
+    switch (sheet.phase) {
+        .ready => {
+            if (geo.alternate) |rect| drawSecondaryButton(state, rect, prAlternateLabel(sheet), !locked, modal);
+            if (geo.primary) |rect| drawActionButton(state, rect, prPrimaryLabel(sheet), !locked, modal);
+        },
+        .result => {
+            if (geo.alternate) |rect| drawSecondaryButton(state, rect, prAlternateLabel(sheet), true, modal);
+            if (geo.primary) |rect| drawActionButton(state, rect, prPrimaryLabel(sheet), true, modal);
+        },
+        .load_error => if (geo.primary) |rect| drawActionButton(state, rect, prPrimaryLabel(sheet), true, modal),
+        .loading => {},
+    }
+    drawFocusRing(state, full, null);
+}
+
+/// Summary card: branch into base, repository and commits (ready); the
+/// outcome headline and PR title (result); or progress / the reason.
+fn drawPrCard(state: *runtime.AppState, sheet: *const Sheet, card: palette.Rect) void {
+    const pad = scaled(CARD_PAD_X_CSS);
+    const x = card.x + pad;
+    const w = card.w - pad * 2.0;
+    const body = scaled(BODY_FONT_CSS);
+    const small = scaled(SMALL_FONT_CSS);
+    var y = card.y + scaled(10.0);
+    var buf: [320]u8 = undefined;
+    var trunc: [320]u8 = undefined;
+    switch (sheet.phase) {
+        .loading => cardMessage(state, card, "Checking the branch and GitHub\u{2026}", theme.COLOR_TEXT_SUBTLE),
+        .load_error => cardMessage(state, card, if (sheet.error_len > 0) sheet.errorText() else "Couldn't prepare a pull request.", theme.COLOR_YELLOW),
+        .ready => {
+            const value = sheet.pr.value() orelse return;
+            const head = std.fmt.bufPrint(&buf, "{s} \u{2192} {s}", .{ value.branch, value.base }) catch value.branch;
+            labelText(state, .{ .x = x, .y = y, .w = w, .h = body * 1.3 }, truncatedLabelRole(&trunc, head, w, body, .ui_bold), theme.COLOR_WHITE, body, .ui_bold, card);
+            y += scaled(22.0);
+            const line = std.fmt.bufPrint(&buf, "{s} \u{00B7} {d} commit{s} ahead", .{ value.repository, value.commits, if (value.commits == 1) "" else "s" }) catch value.repository;
+            labelText(state, .{ .x = x, .y = y, .w = w, .h = small * 1.3 }, truncatedLabel(&trunc, line, w, small), theme.COLOR_TEXT_MUTED, small, .ui, card);
+            y += scaled(20.0);
+            // Newest subjects last in the list; show the most recent ones.
+            const subjects = value.subjects;
+            const shown = @min(subjects.len, PR_MAX_SUBJECTS);
+            const first = subjects.len - shown;
+            for (subjects[first..], 0..) |subject, index| {
+                const more = subjects.len - shown;
+                const text = if (index == 0 and more > 0)
+                    std.fmt.bufPrint(&buf, "\u{2026} {d} earlier \u{00B7} {s}", .{ more, subject }) catch subject
+                else
+                    std.fmt.bufPrint(&buf, "\u{2022} {s}", .{subject}) catch subject;
+                labelText(state, .{ .x = x, .y = y, .w = w, .h = small * 1.3 }, truncatedLabel(&trunc, text, w, small), theme.COLOR_TEXT_SUBTLE, small, .ui, card);
+                y += scaled(17.0);
+            }
+        },
+        .result => {
+            const pr = sheet.pr.pullRequest() orelse return;
+            const headline = git_changes.prOutcomeTitle(&buf, pr, sheet.pr.existing);
+            labelText(state, .{ .x = x, .y = y, .w = w, .h = body * 1.3 }, truncatedLabelRole(&trunc, headline, w, body, .ui_bold), theme.COLOR_WHITE, body, .ui_bold, card);
+            y += scaled(22.0);
+            if (pr.title.len > 0) {
+                labelText(state, .{ .x = x, .y = y, .w = w, .h = small * 1.3 }, truncatedLabel(&trunc, pr.title, w, small), theme.COLOR_TEXT_MUTED, small, .ui, card);
+                y += scaled(20.0);
+            }
+            if (sheet.pr.value()) |value| {
+                const head = std.fmt.bufPrint(&buf, "{s} \u{2192} {s} \u{00B7} {s}", .{ value.branch, value.base, value.repository }) catch value.branch;
+                labelText(state, .{ .x = x, .y = y, .w = w, .h = small * 1.3 }, truncatedLabel(&trunc, head, w, small), theme.COLOR_TEXT_SUBTLE, small, .ui, card);
+            }
+        },
+    }
+}
+
+fn drawPrMessageSection(state: *runtime.AppState, sheet: *Sheet, geo: *const PrGeometry, label_y: f32) void {
+    const modal = geo.modal;
+    const small = scaled(SMALL_FONT_CSS);
+    const label_h = scaled(20.0);
+    const label: []const u8 = if (sheet.phase == .result) "Link" else "Title and description";
+    const label_w = text_measure.textWidth(.ui_bold, small, label);
+    const text_y = label_y + (label_h - small * 1.25) * 0.5;
+    labelText(state, .{ .x = geo.message.x, .y = text_y, .w = label_w + scaled(2.0), .h = small * 1.25 }, label, theme.COLOR_WHITE, small, .ui_bold, modal);
+    if (sheet.phase == .ready) {
+        // Where the suggested text came from (model, or the commits).
+        const status: []const u8 = if (sheet.message_status == .writing) "Writing title and description\u{2026}" else sheet.sourceText();
+        if (status.len > 0) {
+            var status_buf: [160]u8 = undefined;
+            const shown = truncatedLabel(&status_buf, status, @max(geo.message.w - label_w - scaled(24.0), 0.0), small);
+            const w = text_measure.textWidth(.ui, small, shown);
+            labelText(state, .{ .x = geo.message.x + geo.message.w - w, .y = text_y, .w = w + scaled(2.0), .h = small * 1.25 }, shown, theme.COLOR_TEXT_SUBTLE, small, .ui, modal);
+        }
+    }
+    drawMessageField(state, sheet, geo.message);
+    if (sheet.phase != .ready) return;
+    const enabled = !sheet.locked() and sheet.message_status != .writing;
+    const regen_hovered = enabled and pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, geo.regenerate);
+    if (regen_hovered) roundedRect(state, geo.regenerate, controlHoverSurface(), scaled(6.0), geo.message);
+    const icon_font = scaled(14.0);
+    labelText(state, .{
+        .x = geo.regenerate.x + (geo.regenerate.w - icon_font) * 0.5,
+        .y = geo.regenerate.y + (geo.regenerate.h - icon_font * 1.25) * 0.5,
+        .w = icon_font + scaled(2.0),
+        .h = icon_font * 1.25,
+    }, "\u{EB37}", if (enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE, icon_font, .icon, geo.message);
+}
+
+// ------------------------------------------------------------------
 // Hits
 // ------------------------------------------------------------------
 
@@ -565,6 +890,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     };
     beginFocusPass(.sheet);
     defer endFocusPass();
+    if (sheet.kind == .pull_request) return registerPrHits(state, sheet, width, height, queue_hit);
     var layout = Layout.init(sheet, width, height);
     defer layout.deinit();
     const geo = &layout.geo;
@@ -662,6 +988,8 @@ pub fn applyControl(state: *runtime.AppState, index: usize) void {
         .confirm_direct => state.gitQuickContinue(false),
         .confirm_branch => state.gitQuickContinue(true),
         .alternate => state.commitSheetCommitAlternate(),
+        .pr_open => state.prSheetOpenUrl(),
+        .pr_copy => state.prSheetCopyUrl(),
     }
 }
 
@@ -697,6 +1025,14 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
 /// Scrolls the file list or the message field under the pointer.
 pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
     const sheet = state.commitSheet() orelse return state.commitSheetOpen();
+    if (sheet.kind == .pull_request) {
+        const geo = prGeometry(sheet, width, height);
+        if (geo.message_label_y != null and pointInRect(x, y, geo.message)) {
+            sheet.message_scroll_y = @max(0.0, sheet.message_scroll_y - wheel_y * messageLineHeight());
+            state.markDirty();
+        }
+        return true;
+    }
     var layout = Layout.init(sheet, width, height);
     defer layout.deinit();
     const geo = &layout.geo;
@@ -803,7 +1139,8 @@ fn currentStopIndex(state: *const runtime.AppState) ?usize {
 
 fn focusMessageField(state: *runtime.AppState) void {
     const sheet = state.commitSheet() orelse return;
-    if (sheet.locked()) return;
+    // A read-only field (the PR URL) still takes focus to select and copy.
+    if (sheet.locked() and !sheet.read_only) return;
     if (state.palette_modal_text_focus != .commit_message) {
         state.palette_modal_text_focus = .commit_message;
         state.modal_text_selection_anchor = null;
@@ -1220,6 +1557,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         if (state.gitQuickConfirm()) |quick| renderConfirm(state, quick, width, height);
         return;
     };
+    if (sheet.kind == .pull_request) return renderPr(state, sheet, width, height);
     var layout = Layout.init(sheet, width, height);
     defer layout.deinit();
     const geo = &layout.geo;
@@ -1670,6 +2008,11 @@ fn drawMessageSection(state: *runtime.AppState, sheet: *Sheet, geo: *const Geome
 /// Grey placeholder shown while nothing is typed: the generated message
 /// (what an empty box commits), or its progress.
 fn placeholderText(sheet: *const Sheet) []const u8 {
+    if (sheet.kind == .pull_request) {
+        // The text from the commits shows while the model writes.
+        if (sheet.generated_len > 0) return sheet.generated();
+        return "Title on the first line, then a description";
+    }
     if (sheet.message_status == .writing) return "Writing message\u{2026}";
     if (sheet.generated_len > 0) return sheet.generated();
     if (sheet.message_status == .failed) return "Describe the change";

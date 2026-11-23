@@ -105,6 +105,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.review_changes", .title = "Review & commit changes", .keywords = "git commit push diff changes stage", .section = .threads, .run = runReviewChanges, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.commit_and_push", .title = "Commit & push", .keywords = "git commit push changes quick", .section = .threads, .run = runCommitAndPush, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.push", .title = "Push", .keywords = "git push branch upstream publish", .section = .threads, .run = runPush, .enabled = hasFocusedCommittedGuiChat },
+    .{ .id = "thread.pull_request", .title = "Create pull request", .keywords = "git github pr open gh review merge", .section = .threads, .run = runPullRequest, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.handoff_current", .title = "Handoff current chat or TUI", .keywords = "transfer provider model agent continue context", .section = .threads, .run = runHandoffCurrent, .enabled = canHandoffFocusedPane },
     .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for current thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
     .{ .id = "thread.open_current_tui", .title = "Open current thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
@@ -1455,6 +1456,10 @@ fn runCommitAndPush(state: *runtime.AppState) void {
 
 fn runPush(state: *runtime.AppState) void {
     if (!state.startPushForFocusedChat()) state.setSidebarNotice("Focus a chat to push its branch.");
+}
+
+fn runPullRequest(state: *runtime.AppState) void {
+    if (!state.startPullRequestForFocusedChat()) state.setSidebarNotice("Focus a chat to open a pull request for its branch.");
 }
 
 fn workspaceNotBusy(state: *runtime.AppState) bool {

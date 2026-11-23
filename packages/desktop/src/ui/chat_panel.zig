@@ -417,9 +417,9 @@ const WorkspaceHeaderHitCache = struct {
     git_thread_len: usize = 0,
     git_menu_panel_rect: palette.Rect = .{},
     git_menu_row_count: usize = 0,
-    git_menu_row_rects: [4]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 4,
-    git_menu_row_kind: [4]GitMenuRow = [_]GitMenuRow{.commit} ** 4,
-    git_menu_row_enabled: [4]bool = [_]bool{false} ** 4,
+    git_menu_row_rects: [GIT_MENU_MAX_ROWS]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** GIT_MENU_MAX_ROWS,
+    git_menu_row_kind: [GIT_MENU_MAX_ROWS]GitMenuRow = [_]GitMenuRow{.commit} ** GIT_MENU_MAX_ROWS,
+    git_menu_row_enabled: [GIT_MENU_MAX_ROWS]bool = [_]bool{false} ** GIT_MENU_MAX_ROWS,
     menu_panel_rect: palette.Rect = .{},
     menu_row_count: usize = 0,
     menu_row_rects: [5]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 5,
@@ -427,7 +427,9 @@ const WorkspaceHeaderHitCache = struct {
     menu_row_enabled: [5]bool = [_]bool{false} ** 5,
 };
 
-const GitMenuRow = enum { commit, commit_and_push, push, pull_push };
+const GitMenuRow = enum { commit, commit_and_push, push, pull_push, pull_request, open_pull_request };
+/// Commit…, Commit & push, Push, Pull & push, and one pull request row.
+const GIT_MENU_MAX_ROWS: usize = 5;
 
 /// The chat header's git menu (split-button chevron); one open at a time.
 var git_menu_open: bool = false;
@@ -531,6 +533,7 @@ fn runGitMenuRow(state: *app_state.AppState, kind: GitMenuRow, thread_id: []cons
         .commit_and_push => state.startCommitAndPush(thread_id),
         .push => state.startPush(thread_id),
         .pull_push => state.startPullPush(thread_id),
+        .pull_request, .open_pull_request => state.startPullRequest(thread_id),
     }
 }
 
@@ -4159,8 +4162,8 @@ fn renderGitMenu(
     anchor: palette.Rect,
     menu: git_changes.HeaderMenu,
 ) void {
-    var kinds: [4]GitMenuRow = undefined;
-    var enabled: [4]bool = undefined;
+    var kinds: [GIT_MENU_MAX_ROWS]GitMenuRow = undefined;
+    var enabled: [GIT_MENU_MAX_ROWS]bool = undefined;
     var count: usize = 0;
     kinds[count] = .commit;
     enabled[count] = menu.can_commit and !menu.busy;
@@ -4177,6 +4180,14 @@ fn renderGitMenu(
         kinds[count] = .pull_push;
         enabled[count] = !menu.busy;
         count += 1;
+    }
+    switch (menu.pull_request) {
+        .hidden => {},
+        .create, .open => {
+            kinds[count] = if (menu.pull_request == .open) .open_pull_request else .pull_request;
+            enabled[count] = !menu.busy;
+            count += 1;
+        },
     }
 
     const mx = state.transcript_controller.palette_mouse_x;
@@ -4207,12 +4218,16 @@ fn renderGitMenu(
             .commit_and_push => NF_COD_CLOUD_UPLOAD,
             .push => NF_COD_ARROW_UP,
             .pull_push => NF_COD_SYNC,
+            .pull_request => NF_COD_GIT_PULL_REQUEST,
+            .open_pull_request => NF_COD_LINK_EXTERNAL,
         };
         const label: []const u8 = switch (kinds[ri]) {
             .commit => "Commit\u{2026}",
             .commit_and_push => "Commit & push",
             .push => "Push",
             .pull_push => "Pull & push",
+            .pull_request => "Create pull request\u{2026}",
+            .open_pull_request => "Open pull request",
         };
         const icon_size = theme.scaledUi(15.0);
         const icon_x = rr.x + theme.scaledUi(context_menu.LABEL_INSET_UI);
@@ -12474,6 +12489,7 @@ const NF_COD_GIT_COMMIT = "\u{EAFC}";
 const NF_COD_ARROW_UP = "\u{EAA1}";
 const NF_COD_CLOUD_UPLOAD = "\u{EAC3}";
 const NF_COD_SYNC = "\u{EA77}";
+const NF_COD_GIT_PULL_REQUEST = "\u{EA64}";
 const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_SEARCH = "\u{EA6D}";

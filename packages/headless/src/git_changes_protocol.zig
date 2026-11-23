@@ -18,6 +18,9 @@
 //! - `git.changes.pull_push`      PullPushRequest -> PullPushResult      [chat:write + repository:read]
 //! - `git.changes.workspace`      WorkspaceRequest -> WorkspaceResult    [repository:read]
 //! - `git.changes.file_patch`     FilePatchRequest -> FilePatchResult    [repository:read]
+//! - `git.changes.pr_prepare`     PrPrepareRequest -> PrPrepareResult    [repository:read]
+//! - `git.changes.pr_message`     PrMessageRequest -> PrMessageResult    [repository:read]
+//! - `git.changes.pr_create`      PrCreateRequest -> PrCreateResult      [chat:write + repository:read]
 //! - `config.commit.set`          ConfigCommitSetRequest -> ConfigCommitSnapshot [owner only, like config.ui.set]
 //!
 //! Committing and pushing a chat's own changes is a chat action, so the Chat
@@ -105,6 +108,39 @@
 //!   `remote <url>` line filled, and any `local` line replaced. Only the
 //!   chat's 20 most recent `git` rows are considered, and only while the
 //!   chat is idle.
+//!
+//! ## Pull requests (`git.changes.pr_*`)
+//!
+//! Opens a GitHub pull request for a chat's pushed feature branch with the
+//! GitHub CLI (`gh`) on the daemon host. Watching checks and merging are not
+//! part of this API.
+//! - Flow: `pr_prepare` (local branch checks, `gh` installed and signed in,
+//!   an already open PR for the branch, commits ahead and a fallback title
+//!   and body from them), then optionally `pr_message` (title and body
+//!   written by the commit-message model, same provider settings), then
+//!   `pr_create` with the text the user confirmed.
+//! - Eligibility (checked by `pr_prepare` and again by `pr_create`): a branch
+//!   (not a detached HEAD) that is not the default branch, with an upstream
+//!   it is fully pushed to (`ahead == 0`), at least one commit the default
+//!   branch does not have, and a push remote on GitHub. Base is the remote
+//!   default branch (`RepoStatus.default_branch`). The daemon never pushes
+//!   here; clients offer Push first.
+//! - An open PR for the branch is never an error: `pr_prepare` returns it as
+//!   `existing` and `pr_create` returns it with `existing: true`.
+//! - Errors (code: one-line message): `gh_missing`, `gh_unauthenticated`,
+//!   `not_github`, `detached_head`, `on_default_branch`,
+//!   `no_default_branch`, `nothing_ahead`, `not_pushed`, `gh_failed` (gh's
+//!   own last line, or a timeout), plus `invalid_params` and
+//!   `capability_unavailable` (git missing). Every `gh` call has a finite
+//!   timeout.
+//! - `pr_create` appends one UI-only transcript row to the chat (when given
+//!   and idle), like the committed row: `role` `system`, `author` `git`,
+//!   `message_id` `git-pr-<unix_ms>-<nonce>`, body
+//!   `Opened pull request #<n>: <title>` (or `Opened draft pull request …`)
+//!   then a second line with the PR URL. It is not a commit row.
+//! - `RepoStatus.github` and `RepoStatus.ahead_of_default` (filled by
+//!   `git.changes.status` only) let clients decide when to offer the action
+//!   without a network call.
 
 pub const METHOD_SUMMARY: []const u8 = "git.changes.summary";
 pub const METHOD_REVIEW: []const u8 = "git.changes.review";
@@ -122,6 +158,23 @@ pub const METHOD_CONFIG_COMMIT_SET: []const u8 = "config.commit.set";
 pub const METHOD_WORKSPACE: []const u8 = "git.changes.workspace";
 /// One file's patch against HEAD, fetched lazily per expanded file.
 pub const METHOD_FILE_PATCH: []const u8 = "git.changes.file_patch";
+/// Pull request checks and fallback text for a chat's pushed branch.
+pub const METHOD_PR_PREPARE: []const u8 = "git.changes.pr_prepare";
+/// Pull request title and body written by the commit-message model.
+pub const METHOD_PR_MESSAGE: []const u8 = "git.changes.pr_message";
+/// `gh pr create` for the branch, or the PR already open for it.
+pub const METHOD_PR_CREATE: []const u8 = "git.changes.pr_create";
+
+/// Pull request errors (see "Pull requests").
+pub const ERR_GH_MISSING: []const u8 = "gh_missing";
+pub const ERR_GH_UNAUTHENTICATED: []const u8 = "gh_unauthenticated";
+pub const ERR_NOT_GITHUB: []const u8 = "not_github";
+pub const ERR_DETACHED_HEAD: []const u8 = "detached_head";
+pub const ERR_ON_DEFAULT_BRANCH: []const u8 = "on_default_branch";
+pub const ERR_NO_DEFAULT_BRANCH: []const u8 = "no_default_branch";
+pub const ERR_NOTHING_AHEAD: []const u8 = "nothing_ahead";
+pub const ERR_NOT_PUSHED: []const u8 = "not_pushed";
+pub const ERR_GH_FAILED: []const u8 = "gh_failed";
 
 /// Returned when a commit's frozen patch no longer applies. Re-open review.
 pub const ERR_CHANGED_SINCE_REVIEW: []const u8 = "changed_since_review";
@@ -218,6 +271,12 @@ pub const RepoStatus = struct {
     /// Commits on the upstream not on HEAD (0 without an upstream).
     behind: u32 = 0,
     has_remote: bool = false,
+    /// The push remote is on GitHub (`git.changes.status` only; false on a
+    /// detached HEAD or without a remote).
+    github: bool = false,
+    /// Commits on HEAD the remote default branch does not have
+    /// (`git.changes.status` only, as for `github`; null when unknown).
+    ahead_of_default: ?u32 = null,
 };
 
 /// Repositories relevant to the chat: those holding its claims plus its own
@@ -507,6 +566,87 @@ pub const FilePatchResult = struct {
     /// Unified diff (`diff --git` header and hunks); null when clean,
     /// binary, or truncated.
     patch: ?[]const u8 = null,
+};
+
+/// Which repository: `root` when the client knows it (a `RepoStatus.root` or
+/// a pushed `PullPushResult.root`), else the chat's route, exactly as in
+/// `StatusRequest`; the daemon then picks the first eligible repository.
+pub const PrPrepareRequest = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    root: ?[]const u8 = null,
+    repository_id: ?[]const u8 = null,
+    relative_cwd: ?[]const u8 = null,
+    project_path: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+};
+
+pub const PullRequest = struct {
+    number: u32,
+    /// `https://github.com/<owner>/<repo>/pull/<number>`.
+    url: []const u8,
+    title: []const u8 = "",
+    draft: bool = false,
+};
+
+pub const PrPrepareResult = struct {
+    root: []const u8,
+    /// Last path component of `root`.
+    name: []const u8,
+    branch: []const u8,
+    /// Base branch the PR targets (the remote default branch).
+    base: []const u8,
+    /// `owner/repo` on GitHub.
+    repository: []const u8,
+    /// Commits on `branch` that `base` does not have.
+    commits: u32,
+    /// Their subjects, oldest first (at most 50).
+    subjects: []const []const u8 = &.{},
+    /// Text built from the commits, used when the model is unavailable:
+    /// one commit gives its subject and body; several give a title from the
+    /// branch name and a list of subjects.
+    title: []const u8,
+    body: []const u8 = "",
+    /// The PR already open for `branch`; clients show it instead of creating.
+    existing: ?PullRequest = null,
+};
+
+pub const PrMessageRequest = struct {
+    workspace_id: []const u8,
+    /// A `PrPrepareResult.root`.
+    root: []const u8,
+    local_thread_id: ?[]const u8 = null,
+};
+
+pub const PrMessageResult = struct {
+    title: []const u8,
+    body: []const u8,
+    provider: []const u8,
+    model: []const u8,
+};
+
+pub const PrCreateRequest = struct {
+    workspace_id: []const u8,
+    /// A `PrPrepareResult.root`.
+    root: []const u8,
+    /// Chat that receives the transcript row.
+    local_thread_id: ?[]const u8 = null,
+    /// Single line, at most 256 bytes after trimming; required.
+    title: []const u8,
+    /// Markdown; at most 60 KiB.
+    body: []const u8 = "",
+    draft: bool = false,
+};
+
+pub const PrCreateResult = struct {
+    root: []const u8,
+    branch: []const u8,
+    base: []const u8,
+    pull_request: PullRequest,
+    /// The PR was already open; nothing was created.
+    existing: bool = false,
+    /// UI-only transcript row id; null when none was written.
+    transcript_message_id: ?[]const u8 = null,
 };
 
 pub const ConfigCommitSetRequest = struct {

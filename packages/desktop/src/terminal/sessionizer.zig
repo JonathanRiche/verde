@@ -22,6 +22,7 @@ const shell_command = @import("../daemon/shell_command.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const workspace_file_search = @import("../daemon/workspace_file_search.zig");
 const git_changes = @import("../daemon/git_changes.zig");
+const pull_request = @import("../daemon/pull_request.zig");
 const git_changes_protocol = headless.git_changes_protocol;
 const workspace_folders = @import("../workspace/folders.zig");
 const browser_cookie_import = @import("../daemon/browser_cookie_import.zig");
@@ -63,8 +64,8 @@ const provider_models = @import("../state/provider_models.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 const program_status = @import("program_status.zig");
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const log = std.log.scoped(.sessionizer);
@@ -1529,10 +1530,10 @@ const PtySession = struct {
     fx_turn_active: bool = false,
     fx_lifecycle_sequence: u64 = 0,
     fx_provider_thread_id: ?[]u8 = null,
-    created_at_ms: i64,
     /// OSC 7501 Program Status reports seen in this PTY's output; the drain
     /// thread publishes them to the pane's surface (see `program_status.zig`).
     program_status: program_status.Pane = .{},
+    created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
 
@@ -1607,14 +1608,13 @@ const PtySession = struct {
         }
         self.attach_clients.deinit(allocator);
         self.output_ring.deinit(allocator);
-        allocator.destroy(self);
         self.program_status.deinit(allocator);
+        allocator.destroy(self);
     }
 
     fn poll(self: *PtySession, allocator: std.mem.Allocator) !void {
         try self.drainOutput(allocator, DAEMON_POLL_READ_BUDGET);
         _ = self.captureExitStatus();
-    }
         self.pollProgramStatus();
     }
 
@@ -1634,6 +1634,7 @@ const PtySession = struct {
         if (self.program_status.needsForegroundCheck(self.child_pid)) {
             self.program_status.observeForeground(self.foregroundProcessGroup(), self.child_pid);
         }
+    }
 
     fn writeInput(self: *PtySession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
@@ -1744,13 +1745,13 @@ const PtySession = struct {
             if (result.bytes > 0) {
                 try self.appendOutput(allocator, buffer[0..result.bytes]);
                 read_total += result.bytes;
-            }
                 // Managed processes have no pane surface to report to.
                 if (!isManagedSessionId(self.session_id) and
                     self.program_status.observe(allocator, buffer[0..result.bytes]))
                 {
                     self.program_status.noteReporter(self.foregroundProcessGroup());
                 }
+            }
             if (result.eof) self.stream_eof = true;
             if (result.bytes == 0) return;
         }
@@ -3231,6 +3232,9 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_STATUS)) return try gitChangesStatusResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_WORKSPACE)) return try gitChangesWorkspaceResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_FILE_PATCH)) return try gitChangesFilePatchResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PR_PREPARE)) return try gitChangesPrPrepareResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PR_MESSAGE)) return try gitChangesPrMessageResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PR_CREATE)) return try gitChangesPrCreateResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_CONFIG_COMMIT_SET)) return try configCommitSetResponse(self, id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST)) return try browserCookieSourcesListResponse(self, id_value);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST)) return try browserCookieDomainsListResponse(self, id_value, params);
@@ -4266,10 +4270,6 @@ pub const Daemon = struct {
         self.allocator.free(response);
     }
 
-    /// Store request pipeline. Caller must NOT hold lockDaemon: this path takes
-    /// a short bookkeeping lock, then runs SQLite under the service mutex only.
-    fn handleStoreRequest(
-        self: *Daemon,
     /// A lifecycle hook (`verde notify`) reported for this pane. Hooks carry
     /// richer data (session titles, subagents, provider thread ids), so they
     /// own the surface while the same foreground program keeps running and
@@ -4409,6 +4409,10 @@ pub const Daemon = struct {
         self.allocator.free(response);
     }
 
+    /// Store request pipeline. Caller must NOT hold lockDaemon: this path takes
+    /// a short bookkeeping lock, then runs SQLite under the service mutex only.
+    fn handleStoreRequest(
+        self: *Daemon,
         id_value: std.json.Value,
         method: []const u8,
         params: std.json.Value,
@@ -5157,19 +5161,19 @@ pub const Daemon = struct {
         switch (mutation) {
             .surface_upsert => |request| {
                 if (std.mem.startsWith(u8, request.mutation.request_key, "cli:notify:")) {
+                    self.noteHookSurfaceReport(request.surface.session_id);
                     self.deliverHookSurfaceToLive(request, write_result);
                 }
             },
-            // Fill `vcs_identity` from the local checkout's origin when the
-                    self.noteHookSurfaceReport(request.surface.session_id);
-            // caller supplied none. The receipt keeps its own revision; the
-            // capture publishes a separate workspace change.
-            .workspace_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace.workspace_id, .fill_missing),
             .surface_clear => |request| {
                 if (std.mem.startsWith(u8, request.mutation.request_key, "cli:notify:")) {
                     self.noteHookSurfaceReport(request.session_id);
                 }
             },
+            // Fill `vcs_identity` from the local checkout's origin when the
+            // caller supplied none. The receipt keeps its own revision; the
+            // capture publishes a separate workspace change.
+            .workspace_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace.workspace_id, .fill_missing),
             .workspace_repository_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
             .workspace_repository_binding_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
             else => {},
@@ -14367,19 +14371,19 @@ fn drainSessionsThread(context: DrainThreadContext) void {
         // in-memory phase-2 sizes.
         _ = daemon.registry.reap(daemon.allocator, now_ms);
         daemon.pollSessions();
-        daemon.reapOrphanedSessions(now_ms);
-        const should_exit = daemon.shouldExitForIdle();
-        daemon.mutex.unlock();
-        // Staged-attachment TTL sweep: file deletion must never run under
         // OSC 7501 changes are snapshotted under the lock (before reaping can
         // free an exited session) and written to the store after unlocking.
         var program_status_arena: std.heap.ArenaAllocator = .init(daemon.allocator);
         defer program_status_arena.deinit();
         const program_status_publications = daemon.collectProgramStatusPublications(program_status_arena.allocator(), now_ms);
+        daemon.reapOrphanedSessions(now_ms);
+        const should_exit = daemon.shouldExitForIdle();
+        daemon.mutex.unlock();
+        daemon.publishProgramStatus(program_status_publications);
+        // Staged-attachment TTL sweep: file deletion must never run under
         // lockDaemon, so it lives outside the locked bookkeeping above and
         // rate-limits itself with a due timestamp instead of every 20ms tick.
         _ = daemon.maybeSweepStagedChatAttachments(now_ms);
-        daemon.publishProgramStatus(program_status_publications);
         if (should_exit) {
             context.stop_requested.store(true, .release);
             platform_ipc.wake(daemon.allocator, context.endpoint, .{
@@ -14853,10 +14857,6 @@ fn fxLifecycleRelease(turn_active: *bool) FxLifecycleTransition {
     return .clear;
 }
 
-fn exposeTerminalLifecycleSocket(socket_path: [:0]const u8, session_id: [:0]const u8) void {
-    // A provider launched later from an interactive shell must still report to
-    // its owning Verde pane, even when Verde inherited Herdr from its parent.
-    _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 1);
 /// Copies a pane's pending OSC 7501 change out of the locked session.
 fn programStatusPublicationAlloc(
     arena: std.mem.Allocator,
@@ -14886,6 +14886,10 @@ fn programStatusPublicationAlloc(
     };
 }
 
+fn exposeTerminalLifecycleSocket(socket_path: [:0]const u8, session_id: [:0]const u8) void {
+    // A provider launched later from an interactive shell must still report to
+    // its owning Verde pane, even when Verde inherited Herdr from its parent.
+    _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 1);
     _ = setenv("HERDR_PANE_ID", session_id.ptr, 1);
 }
 
@@ -18564,6 +18568,11 @@ fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: s
             error.OutOfMemory => return error.OutOfMemory,
             else => continue,
         };
+        // Lets clients offer "Create pull request" without a network call.
+        const pr_facts = pull_request.statusExtras(&git, root, status) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => pull_request.StatusExtras{},
+        };
         try repos.append(arena, .{
             .root = root,
             .name = std.fs.path.basename(root),
@@ -18574,6 +18583,8 @@ fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: s
             .ahead = status.ahead,
             .behind = status.behind,
             .has_remote = status.has_remote,
+            .github = pr_facts.github,
+            .ahead_of_default = pr_facts.ahead_of_default,
         });
     }
     {
@@ -18585,6 +18596,324 @@ fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: s
         .workspace_id = request.workspace_id,
         .local_thread_id = request.local_thread_id,
         .repos = repos.items,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Pull requests (`git.changes.pr_*`). Local checks, `gh` calls and text
+// live in daemon/pull_request.zig; these handlers resolve the repository,
+// run the model and write the transcript row. git and gh run with no daemon
+// lock held, each call with a finite deadline.
+
+fn gitChangesPrFailureResponse(allocator: std.mem.Allocator, id_value: std.json.Value, failure: pull_request.Failure) ![]u8 {
+    return try errorResponseAlloc(allocator, id_value, failure.code, failure.message);
+}
+
+fn gitChangesPrGitUnavailable(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
+    return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available");
+}
+
+/// A root this workspace already surfaced (claims, reviews, status).
+fn gitChangesPrRootKnown(daemon: *Daemon, arena: std.mem.Allocator, workspace_id: []const u8, root: []const u8) !bool {
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    return try gitChangesRootKnownLocked(daemon, arena, workspace_id, root);
+}
+
+/// Candidate repositories for `pr_prepare`: the request's `root`, else the
+/// chat's claimed repositories plus those its route reaches (as
+/// `git.changes.status` lists them). Null for an unknown `root`.
+fn gitChangesPrRoots(daemon: *Daemon, arena: std.mem.Allocator, git: *git_changes.Git, request: git_changes_protocol.PrPrepareRequest) !?[]const []const u8 {
+    if (request.root) |root| {
+        if (!try gitChangesPrRootKnown(daemon, arena, request.workspace_id, root)) return null;
+        const single = try arena.alloc([]const u8, 1);
+        single[0] = root;
+        return single;
+    }
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        try roots.appendSlice(arena, try daemon.git_changes.ledger.threadRepos(arena, request.workspace_id, request.local_thread_id));
+    }
+    if (gitChangesRouteRoot(daemon, arena, request)) |route_root| {
+        const reachable = git_changes.reachableRepos(git, try gitChangesTurnPaths(arena, route_root, null)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => &.{},
+        };
+        for (reachable) |top| {
+            const seen = for (roots.items) |root| {
+                if (std.mem.eql(u8, root, top)) break true;
+            } else false;
+            if (!seen) try roots.append(arena, top);
+        }
+    }
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    for (roots.items) |root| gitChangesRememberRootLocked(daemon, request.workspace_id, root);
+    return roots.items;
+}
+
+fn gitChangesPrPrepareResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.PrPrepareRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid pull request prepare request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    defer git.deinit();
+    const roots = (try gitChangesPrRoots(daemon, arena, &git, request)) orelse
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown repository for this workspace");
+    const picked = pull_request.inspectFirstEligible(&git, roots) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    const branch = switch (picked) {
+        .ok => |value| value,
+        .failed => |failure| return try gitChangesPrFailureResponse(allocator, id_value, failure),
+    };
+    var gh = pull_request.Gh.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrFailureResponse(allocator, id_value, pull_request.gh_missing),
+    };
+    defer gh.deinit();
+    const outcome = pull_request.prepare(&git, gh.runner(), branch) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    const prepared = switch (outcome) {
+        .ok => |value| value,
+        .failed => |failure| return try gitChangesPrFailureResponse(allocator, id_value, failure),
+    };
+    const subjects = try arena.alloc([]const u8, prepared.commits.len);
+    for (prepared.commits, subjects) |commit, *subject| subject.* = commit.subject;
+    return try okValueResponse(allocator, id_value, git_changes_protocol.PrPrepareResult{
+        .root = branch.root,
+        .name = std.fs.path.basename(branch.root),
+        .branch = branch.facts.branch.?,
+        .base = prepared.base,
+        .repository = try prepared.repo.display(arena),
+        .commits = branch.facts.ahead_of_default,
+        .subjects = subjects,
+        .title = prepared.fallback.title,
+        .body = prepared.fallback.body,
+        .existing = prepared.existing,
+    });
+}
+
+fn gitChangesPrMessageResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.PrMessageRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid pull request message request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (!try gitChangesPrRootKnown(daemon, arena, request.workspace_id, request.root)) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown repository for this workspace");
+    }
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    defer git.deinit();
+    // Bounded inputs: commits and a truncated diff against the merge base.
+    const Input = struct { branch: []const u8, base: []const u8, commits: []const pull_request.Commit, stat: []const u8, diff: []const u8 };
+    const input: Input = blk: {
+        const branch = pull_request.inspect(&git, request.root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try gitChangesPrGitUnavailable(allocator, id_value),
+        };
+        const head = branch.facts.branch orelse
+            return try gitChangesPrFailureResponse(allocator, id_value, try pull_request.problemFailure(arena, .detached_head, branch.facts));
+        const base_ref = branch.base_ref orelse
+            return try gitChangesPrFailureResponse(allocator, id_value, try pull_request.problemFailure(arena, .no_default_branch, branch.facts));
+        const commits = pull_request.commitsAhead(&git, request.root, base_ref) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try gitChangesPrGitUnavailable(allocator, id_value),
+        };
+        if (commits.len == 0) return try gitChangesPrFailureResponse(allocator, id_value, try pull_request.problemFailure(arena, .nothing_ahead, branch.facts));
+        const diff = pull_request.diffAhead(&git, request.root, base_ref) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try gitChangesPrGitUnavailable(allocator, id_value),
+        };
+        break :blk .{ .branch = head, .base = branch.facts.default_branch.?, .commits = commits, .stat = diff.stat, .diff = diff.diff };
+    };
+    const chat_title: []const u8 = if (request.local_thread_id) |thread_id| title: {
+        const service = gitChangesPinStore(daemon);
+        defer if (service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+        break :title gitChangesThreadTitle(arena, service, request.workspace_id, thread_id);
+    } else "";
+    const prompt = try pull_request.buildPrompt(arena, .{
+        .branch = input.branch,
+        .base = input.base,
+        .chat_title = chat_title,
+        .commits = input.commits,
+        .stat = input.stat,
+        .diff = input.diff,
+    });
+    switch (try gitChangesRunCommitModel(daemon, arena, request.root, prompt, pull_request.Text, pull_request.splitGeneratedText)) {
+        .ok => |reply| return try okValueResponse(allocator, id_value, git_changes_protocol.PrMessageResult{
+            .title = reply.value.title,
+            .body = reply.value.body,
+            .provider = reply.provider,
+            .model = reply.model,
+        }),
+        .failed => |failure| return try gitChangesPrFailureResponse(allocator, id_value, failure),
+    }
+}
+
+fn ModelReply(comptime T: type) type {
+    return union(enum) {
+        ok: struct { value: T, provider: []const u8, model: []const u8 },
+        failed: pull_request.Failure,
+    };
+}
+
+/// Runs `prompt` with the commit-message model settings
+/// (`chat.commit_message_provider` / `commit_message_model`): the fixed
+/// provider, else each installed one in turn, until `parse` accepts a reply.
+/// Same path as `gitChangesCommitMessageResponse`; strings live in `arena`.
+fn gitChangesRunCommitModel(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    root: []const u8,
+    prompt: []const u8,
+    comptime T: type,
+    comptime parse: fn (std.mem.Allocator, []const u8) git_changes.Error!?T,
+) !ModelReply(T) {
+    const allocator = daemon.allocator;
+    var config = blk: {
+        daemon.config_mutex.lock();
+        defer daemon.config_mutex.unlock();
+        break :blk app_config.loadAppConfig(allocator) catch |err|
+            return .{ .failed = .{ .code = "config_unavailable", .message = @errorName(err) } };
+    };
+    defer config.deinit(allocator);
+    var candidates: std.ArrayList(app_config.ChatTitleProvider) = .empty;
+    if (config.commit_message_provider.fixed()) |provider| {
+        try candidates.append(arena, provider);
+    } else for ([_]app_config.ChatTitleProvider{ .codex, .claude, .cursor, .opencode }) |provider| {
+        if (nativeProviderInstalled(nativeProviderFromHarness(chatTitleProvider(provider)))) try candidates.append(arena, provider);
+    }
+    if (candidates.items.len == 0) {
+        return .{ .failed = .{ .code = headless.protocol.ERR_PROVIDER_UNAVAILABLE, .message = "No provider is installed to write pull request text." } };
+    }
+    var last_error: []const u8 = "The model returned an empty reply.";
+    for (candidates.items) |candidate| {
+        const provider = chatTitleProvider(candidate);
+        const model = try arena.dupe(u8, config.commitMessageModel(candidate));
+        const result = send_runner.run(allocator, .{
+            .provider = provider,
+            .harness_kind = .local_cli,
+            .project_path = root,
+            .cwd = root,
+            .prompt = prompt,
+            .model_ref = model,
+            .fast_mode = if (provider == .codex) .on else .off,
+            .access_mode = .supervised,
+        }, .{}) catch |err| {
+            log.warn("pull request text generation failed provider={s} err={s}", .{ @tagName(candidate), @errorName(err) });
+            last_error = @errorName(err);
+            continue;
+        };
+        defer allocator.free(result.provider_thread_id);
+        defer allocator.free(result.reply_text);
+        const value = (try parse(arena, result.reply_text)) orelse continue;
+        return .{ .ok = .{ .value = value, .provider = @tagName(candidate), .model = model } };
+    }
+    return .{ .failed = .{ .code = headless.protocol.ERR_PROVIDER_UNAVAILABLE, .message = try arena.dupe(u8, last_error) } };
+}
+
+fn gitChangesPrCreateResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.PrCreateRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid pull request create request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (pull_request.validateText(request.title, request.body)) |failure| return try gitChangesPrFailureResponse(allocator, id_value, failure);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (!try gitChangesPrRootKnown(daemon, arena, request.workspace_id, request.root)) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown repository for this workspace");
+    }
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    defer git.deinit();
+    const branch = pull_request.inspect(&git, request.root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    var gh = pull_request.Gh.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrFailureResponse(allocator, id_value, pull_request.gh_missing),
+    };
+    defer gh.deinit();
+    const outcome = pull_request.createForBranch(&git, gh.runner(), branch, .{
+        .title = request.title,
+        .body = request.body,
+        .draft = request.draft,
+        .nonce = daemon.git_changes.nonce.fetchAdd(1, .monotonic),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try gitChangesPrGitUnavailable(allocator, id_value),
+    };
+    const created = switch (outcome) {
+        .ok => |value| value,
+        .failed => |failure| return try gitChangesPrFailureResponse(allocator, id_value, failure),
+    };
+
+    // UI-only transcript row for a PR this request opened (format:
+    // git_changes_protocol.zig, "Pull requests"), when the chat is idle.
+    var transcript_message_id: ?[]const u8 = null;
+    if (!created.existing) if (request.local_thread_id) |thread_id| if (gitChangesPinStore(daemon)) |service| {
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        if (gitChangesThreadIdle(service, request.workspace_id, thread_id)) {
+            const body_text = try pull_request.rowBody(arena, created.pull_request, request.title);
+            const message_id = try std.fmt.allocPrint(arena, "git-pr-{d}-{d}", .{ nowMs(), daemon.git_changes.nonce.fetchAdd(1, .monotonic) });
+            const now = nowMs();
+            lockStoreService(service);
+            const written = service.store.appendMessage(.{
+                .mutation = .{ .request_key = message_id, .client_id = "daemon" },
+                .workspace_id = request.workspace_id,
+                .thread_id = thread_id,
+                .message = .{
+                    .message_id = message_id,
+                    .role = "system",
+                    .author = git_changes.ROW_AUTHOR,
+                    .body = body_text,
+                    .created_at_ms = now,
+                    .updated_at_ms = now,
+                },
+            });
+            service.mutex.unlock();
+            if (written) |_| {
+                transcript_message_id = message_id;
+            } else |err| log.warn("pull request transcript row failed err={s}", .{@errorName(err)});
+        }
+    };
+    return try okValueResponse(allocator, id_value, git_changes_protocol.PrCreateResult{
+        .root = request.root,
+        .branch = branch.facts.branch orelse "",
+        .base = branch.facts.default_branch orelse "",
+        .pull_request = created.pull_request,
+        .existing = created.existing,
+        .transcript_message_id = transcript_message_id,
     });
 }
 

@@ -417,6 +417,9 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "git.changes.commit", .scope_mask = GIT_COMMIT },
     .{ .method = "git.changes.push", .scope_mask = GIT_COMMIT },
     .{ .method = "git.changes.pull_push", .scope_mask = GIT_COMMIT },
+    .{ .method = "git.changes.pr_prepare", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.pr_message", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.pr_create", .scope_mask = GIT_COMMIT },
     // config.commit.set is owner-only, like config.ui.set and
     // config.favoriteModel.set: shared settings are not paired-device RPCs.
 
