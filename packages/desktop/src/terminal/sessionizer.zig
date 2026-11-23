@@ -64,6 +64,7 @@ const send_runner = @import("../chat/send_runner.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+const program_status = @import("program_status.zig");
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const log = std.log.scoped(.sessionizer);
@@ -1529,6 +1530,9 @@ const PtySession = struct {
     fx_lifecycle_sequence: u64 = 0,
     fx_provider_thread_id: ?[]u8 = null,
     created_at_ms: i64,
+    /// OSC 7501 Program Status reports seen in this PTY's output; the drain
+    /// thread publishes them to the pane's surface (see `program_status.zig`).
+    program_status: program_status.Pane = .{},
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
 
@@ -1604,12 +1608,32 @@ const PtySession = struct {
         self.attach_clients.deinit(allocator);
         self.output_ring.deinit(allocator);
         allocator.destroy(self);
+        self.program_status.deinit(allocator);
     }
 
     fn poll(self: *PtySession, allocator: std.mem.Allocator) !void {
         try self.drainOutput(allocator, DAEMON_POLL_READ_BUDGET);
         _ = self.captureExitStatus();
     }
+        self.pollProgramStatus();
+    }
+
+    /// Answers OSC 7501 feature queries (Claude Code stays silent until a
+    /// terminal answers) and applies the spec's process-exit lifecycle.
+    fn pollProgramStatus(self: *PtySession) void {
+        while (self.program_status.tracker.takeReply()) |reply| {
+            _ = self.writeInput(reply) catch |err| {
+                log.warn("program status reply failed id_len={d} err={s}", .{ self.session_id.len, @errorName(err) });
+                break;
+            };
+        }
+        if (!self.running) {
+            self.program_status.processExited();
+            return;
+        }
+        if (self.program_status.needsForegroundCheck(self.child_pid)) {
+            self.program_status.observeForeground(self.foregroundProcessGroup(), self.child_pid);
+        }
 
     fn writeInput(self: *PtySession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
@@ -1721,6 +1745,12 @@ const PtySession = struct {
                 try self.appendOutput(allocator, buffer[0..result.bytes]);
                 read_total += result.bytes;
             }
+                // Managed processes have no pane surface to report to.
+                if (!isManagedSessionId(self.session_id) and
+                    self.program_status.observe(allocator, buffer[0..result.bytes]))
+                {
+                    self.program_status.noteReporter(self.foregroundProcessGroup());
+                }
             if (result.eof) self.stream_eof = true;
             if (result.bytes == 0) return;
         }
@@ -4240,6 +4270,145 @@ pub const Daemon = struct {
     /// a short bookkeeping lock, then runs SQLite under the service mutex only.
     fn handleStoreRequest(
         self: *Daemon,
+    /// A lifecycle hook (`verde notify`) reported for this pane. Hooks carry
+    /// richer data (session titles, subagents, provider thread ids), so they
+    /// own the surface while the same foreground program keeps running and
+    /// OSC 7501 reports from it are not published (no double notifications).
+    fn noteHookSurfaceReport(self: *Daemon, session_id: []const u8) void {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        const session = self.find(session_id) orelse return;
+        session.program_status.noteHookReport(session.foregroundProcessGroup());
+    }
+
+    const ProgramStatusPublication = struct {
+        session_id: []const u8,
+        workspace_id: []const u8,
+        workspace_path: []const u8,
+        dock_id: u32,
+        pane_id: u32,
+        request_key: []const u8,
+        action: program_status.Action,
+        provider: ?[]const u8,
+        event_title: []const u8,
+        event_body: ?[]const u8,
+    };
+
+    /// Drain-thread step under lockDaemon: snapshot each pane's pending OSC
+    /// 7501 surface change into `arena`, to be written after unlocking.
+    fn collectProgramStatusPublications(self: *Daemon, arena: std.mem.Allocator, now_ms: i64) []const ProgramStatusPublication {
+        if (!self.accepting_mutations) return &.{};
+        const service = self.store_service orelse return &.{};
+        if (service.draining) return &.{};
+        var publications: std.ArrayList(ProgramStatusPublication) = .empty;
+        for (self.sessions.items) |session| {
+            if (isManagedSessionId(session.session_id)) continue;
+            const pending = session.program_status.nextPublication(now_ms) orelse continue;
+            const publication = programStatusPublicationAlloc(arena, session, pending) catch |err| {
+                log.warn("program status snapshot failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+                continue;
+            };
+            publications.append(arena, publication) catch break;
+        }
+        return publications.items;
+    }
+
+    /// Mirrors the FX lifecycle path: durable surface write as the daemon,
+    /// then the GUI's live notifier with the commit proof.
+    fn publishProgramStatus(self: *Daemon, publications: []const ProgramStatusPublication) void {
+        if (publications.len == 0) return;
+        const service = service: {
+            lockDaemon(self);
+            defer self.mutex.unlock();
+            if (!self.accepting_mutations) return;
+            const attached = self.store_service orelse return;
+            if (attached.draining) return;
+            _ = attached.in_flight.fetchAdd(1, .monotonic);
+            break :service attached;
+        };
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        for (publications) |publication| {
+            const changed_at_ms = nowMs();
+            const mutation: store_protocol.MutationHeader = .{ .request_key = publication.request_key, .client_id = "daemon" };
+            const write_result = write: {
+                lockStoreService(service);
+                defer service.mutex.unlock();
+                const result = switch (publication.action) {
+                    .clear => service.store.clearSurface(.{
+                        .mutation = mutation,
+                        .session_id = publication.session_id,
+                        .workspace_id = publication.workspace_id,
+                    }),
+                    .status => |published| service.store.upsertSurface(.{
+                        .mutation = mutation,
+                        .surface = .{
+                            .session_id = publication.session_id,
+                            .workspace_id = publication.workspace_id,
+                            .workspace_path = publication.workspace_path,
+                            .dock_id = publication.dock_id,
+                            .pane_id = publication.pane_id,
+                            .provider = publication.provider,
+                            // Keep the program's live OSC title as the label.
+                            .title = "",
+                            .status = @tagName(published.status),
+                            .status_changed_at_ms = changed_at_ms,
+                            .completed_at_ms = if (published.status == .done) changed_at_ms else 0,
+                            .last_event_title = publication.event_title,
+                            .last_event_body = publication.event_body,
+                        },
+                    }),
+                };
+                break :write result catch |err| {
+                    log.warn("program status surface write failed id_len={d} err={s}", .{ publication.session_id.len, @errorName(err) });
+                    continue;
+                };
+            };
+            switch (publication.action) {
+                .clear => {},
+                .status => |published| self.deliverProgramStatusToLive(publication, published.status, write_result.store_revision, changed_at_ms),
+            }
+        }
+    }
+
+    fn deliverProgramStatusToLive(
+        self: *Daemon,
+        publication: ProgramStatusPublication,
+        status: program_status.SurfaceStatus,
+        store_revision: u64,
+        changed_at_ms: i64,
+    ) void {
+        const endpoint = platform_live_endpoint.alloc(self.allocator, self.pref_path) catch return;
+        defer self.allocator.free(endpoint);
+
+        var request_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer request_writer.deinit();
+        var json: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
+        json.write(.{
+            .id = "program-status",
+            .method = "notification.update",
+            .params = .{
+                .session_id = publication.session_id,
+                .workspace_id = publication.workspace_id,
+                .workspace_path = publication.workspace_path,
+                .dock_id = publication.dock_id,
+                .pane_id = publication.pane_id,
+                .provider = publication.provider,
+                .status = @tagName(status),
+                .event_title = publication.event_title,
+                .event_body = publication.event_body,
+                .store_request_key = publication.request_key,
+                .store_revision = store_revision,
+                .store_status_changed_at_ms = changed_at_ms,
+                .store_completed_at_ms = if (status == .done) changed_at_ms else 0,
+            },
+        }) catch return;
+        const request = request_writer.toOwnedSlice() catch return;
+        defer self.allocator.free(request);
+        // Runs on the drain thread: keep a hung GUI from stalling PTY reads.
+        const response = platform_ipc.requestAlloc(self.allocator, endpoint, request, .{ .timeout_ms = 250 }) catch return;
+        self.allocator.free(response);
+    }
+
         id_value: std.json.Value,
         method: []const u8,
         params: std.json.Value,
@@ -4992,9 +5161,15 @@ pub const Daemon = struct {
                 }
             },
             // Fill `vcs_identity` from the local checkout's origin when the
+                    self.noteHookSurfaceReport(request.surface.session_id);
             // caller supplied none. The receipt keeps its own revision; the
             // capture publishes a separate workspace change.
             .workspace_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace.workspace_id, .fill_missing),
+            .surface_clear => |request| {
+                if (std.mem.startsWith(u8, request.mutation.request_key, "cli:notify:")) {
+                    self.noteHookSurfaceReport(request.session_id);
+                }
+            },
             .workspace_repository_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
             .workspace_repository_binding_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
             else => {},
@@ -14196,9 +14371,15 @@ fn drainSessionsThread(context: DrainThreadContext) void {
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
         // Staged-attachment TTL sweep: file deletion must never run under
+        // OSC 7501 changes are snapshotted under the lock (before reaping can
+        // free an exited session) and written to the store after unlocking.
+        var program_status_arena: std.heap.ArenaAllocator = .init(daemon.allocator);
+        defer program_status_arena.deinit();
+        const program_status_publications = daemon.collectProgramStatusPublications(program_status_arena.allocator(), now_ms);
         // lockDaemon, so it lives outside the locked bookkeeping above and
         // rate-limits itself with a due timestamp instead of every 20ms tick.
         _ = daemon.maybeSweepStagedChatAttachments(now_ms);
+        daemon.publishProgramStatus(program_status_publications);
         if (should_exit) {
             context.stop_requested.store(true, .release);
             platform_ipc.wake(daemon.allocator, context.endpoint, .{
@@ -14676,6 +14857,35 @@ fn exposeTerminalLifecycleSocket(socket_path: [:0]const u8, session_id: [:0]cons
     // A provider launched later from an interactive shell must still report to
     // its owning Verde pane, even when Verde inherited Herdr from its parent.
     _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 1);
+/// Copies a pane's pending OSC 7501 change out of the locked session.
+fn programStatusPublicationAlloc(
+    arena: std.mem.Allocator,
+    session: *const PtySession,
+    pending: program_status.Publication,
+) !Daemon.ProgramStatusPublication {
+    const event_title = switch (pending.action) {
+        .clear => "",
+        .status => |published| try arena.dupe(u8, program_status.eventTitle(try arena.alloc(u8, 96), pending.app, published)),
+    };
+    return .{
+        .session_id = try arena.dupe(u8, session.session_id),
+        .workspace_id = try arena.dupe(u8, session.project_id),
+        .workspace_path = try arena.dupe(u8, session.project_path),
+        .dock_id = session.dock_id,
+        .pane_id = session.pane_id,
+        .request_key = try std.fmt.allocPrint(arena, "osc7501:{s}:{d}:{d}:{d}", .{
+            session.session_id,
+            session.created_at_ms,
+            session.child_pid,
+            pending.sequence,
+        }),
+        .action = pending.action,
+        .provider = program_status.surfaceProviderForApp(pending.app),
+        .event_title = event_title,
+        .event_body = if (pending.msg.len > 0) try arena.dupe(u8, pending.msg) else null,
+    };
+}
+
     _ = setenv("HERDR_PANE_ID", session_id.ptr, 1);
 }
 

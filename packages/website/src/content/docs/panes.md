@@ -165,6 +165,22 @@ Terminal applications can render Kitty graphics-protocol images inline. The
 image follows terminal scrolling and is cleared when the application erases or
 replaces it, like other terminal content.
 
+### Program status (OSC 7501)
+
+Terminal panes understand the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+(OSC 7501). A program that reports `working`, `blocked`, `done`, or `error`
+gets the same working / needs-you / done status in the sidebar as an agent with
+Verde's lifecycle hooks, without a hook installed. Verde answers the protocol's
+feature query, so programs that wait for it before reporting status start
+sending reports. A `working` or `blocked` status clears when the program
+returns to the shell prompt or the pane's process exits. `done` and `error`
+stay after the program exits.
+
+When a provider's lifecycle hook also reports for the same program, the hook
+wins, because it carries the session title. You get one notification, not two.
+Reports sent from inside `tmux` do not reach Verde.
+
 ## The browser pane
 
 Press `Ctrl+Shift+B` to toggle the embedded browser pane next to the focused chat.

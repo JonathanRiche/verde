@@ -2120,6 +2120,7 @@ test "signal watcher recognizes only an accepted prepare-shutdown result" {
 // Include the daemon's RPC/store/provider regression tests in its owning test target.
 test {
     _ = sessionizer;
+    _ = @import("terminal/program_status.zig");
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/client.zig");
     _ = @import("daemon/chat_links.zig");
