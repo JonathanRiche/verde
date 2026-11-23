@@ -13,9 +13,11 @@ import { marked, type Tokens } from 'marked'
 import type { HighlighterCore } from 'shiki/core'
 
 import { SITE_ORIGIN } from '../../lib/seo'
+import { COMPARE_DESCRIPTION, renderCompareMarkdown } from '../compare'
 
 import quickstartRaw from './quickstart.md?raw'
 import providersRaw from './providers.md?raw'
+import comingFromConductorRaw from './coming-from-conductor.md?raw'
 import chatRaw from './chat.md?raw'
 import designModeRaw from './design-mode.md?raw'
 import panesRaw from './panes.md?raw'
@@ -98,6 +100,7 @@ function parseFrontmatter(raw: string, githubPath: string): DocEntry {
 const docs: DocEntry[] = [
   parseFrontmatter(quickstartRaw, 'src/content/docs/quickstart.md'),
   parseFrontmatter(providersRaw, 'src/content/docs/providers.md'),
+  parseFrontmatter(comingFromConductorRaw, 'src/content/docs/coming-from-conductor.md'),
   parseFrontmatter(chatRaw, 'src/content/docs/chat.md'),
   parseFrontmatter(designModeRaw, 'src/content/docs/design-mode.md'),
   parseFrontmatter(panesRaw, 'src/content/docs/panes.md'),
@@ -352,6 +355,7 @@ export function renderLlmsFull(): string {
       `# ${doc.title}\n\nSource: ${url}\nEdit: ${REPO_ROOT}${doc.githubPath}\n\n${doc.body.trim()}\n`,
     )
   }
+  parts.push(renderCompareMarkdown())
   return parts.join('\n---\n\n')
 }
 
@@ -391,6 +395,7 @@ export function renderLlmsIndex(): string {
   lines.push(`## Optional`)
   lines.push(`- [Full docs as one markdown file](${SITE_ORIGIN}/llms-full.txt)`)
   lines.push(`- [Per-page raw markdown](${SITE_ORIGIN}/docs/<slug>.md) (e.g. ${SITE_ORIGIN}/docs/quickstart.md)`)
+  lines.push(`- [Verde compared with other agent workspaces](${SITE_ORIGIN}/compare.md): ${COMPARE_DESCRIPTION}`)
   lines.push(`- [verde.json JSON Schema](${SITE_ORIGIN}/config.schema.json)`)
   lines.push(`- [Homepage](${SITE_ORIGIN}/)`)
   lines.push('')

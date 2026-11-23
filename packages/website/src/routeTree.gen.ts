@@ -15,6 +15,8 @@ import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
 import { Route as InstallDotshRouteImport } from './routes/install[.]sh'
 import { Route as InstallDotps1RouteImport } from './routes/install[.]ps1'
 import { Route as ConfigDotschemaDotjsonRouteImport } from './routes/config[.]schema[.]json'
+import { Route as CompareDotmdRouteImport } from './routes/compare[.]md'
+import { Route as CompareRouteImport } from './routes/compare'
 import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
@@ -51,6 +53,16 @@ const ConfigDotschemaDotjsonRoute = ConfigDotschemaDotjsonRouteImport.update({
   path: '/config.schema.json',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CompareDotmdRoute = CompareDotmdRouteImport.update({
+  id: '/compare.md',
+  path: '/compare.md',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CompareRoute = CompareRouteImport.update({
+  id: '/compare',
+  path: '/compare',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AboutRoute = AboutRouteImport.update({
   id: '/about',
   path: '/about',
@@ -80,6 +92,8 @@ const DocsSlugRoute = DocsSlugRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/compare': typeof CompareRoute
+  '/compare.md': typeof CompareDotmdRoute
   '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
@@ -93,6 +107,8 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/compare': typeof CompareRoute
+  '/compare.md': typeof CompareDotmdRoute
   '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
@@ -107,6 +123,8 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/compare': typeof CompareRoute
+  '/compare.md': typeof CompareDotmdRoute
   '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
@@ -122,6 +140,8 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/about'
+    | '/compare'
+    | '/compare.md'
     | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
@@ -135,6 +155,8 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/about'
+    | '/compare'
+    | '/compare.md'
     | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
@@ -148,6 +170,8 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/about'
+    | '/compare'
+    | '/compare.md'
     | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
@@ -162,6 +186,8 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AboutRoute: typeof AboutRoute
+  CompareRoute: typeof CompareRoute
+  CompareDotmdRoute: typeof CompareDotmdRoute
   ConfigDotschemaDotjsonRoute: typeof ConfigDotschemaDotjsonRoute
   InstallDotps1Route: typeof InstallDotps1Route
   InstallDotshRoute: typeof InstallDotshRoute
@@ -217,6 +243,20 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof ConfigDotschemaDotjsonRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/compare.md': {
+      id: '/compare.md'
+      path: '/compare.md'
+      fullPath: '/compare.md'
+      preLoaderRoute: typeof CompareDotmdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/compare': {
+      id: '/compare'
+      path: '/compare'
+      fullPath: '/compare'
+      preLoaderRoute: typeof CompareRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/about': {
       id: '/about'
       path: '/about'
@@ -258,6 +298,8 @@ declare module '@tanstack/solid-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AboutRoute: AboutRoute,
+  CompareRoute: CompareRoute,
+  CompareDotmdRoute: CompareDotmdRoute,
   ConfigDotschemaDotjsonRoute: ConfigDotschemaDotjsonRoute,
   InstallDotps1Route: InstallDotps1Route,
   InstallDotshRoute: InstallDotshRoute,

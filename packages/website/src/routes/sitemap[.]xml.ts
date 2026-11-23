@@ -10,6 +10,7 @@ export const Route = createFileRoute('/sitemap.xml')({
         const paths = [
           '/',
           '/about',
+          '/compare',
           '/docs',
           ...getAllDocs().map((doc) => `/docs/${doc.slug}`),
         ]

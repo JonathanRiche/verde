@@ -869,6 +869,11 @@ function App() {
             <span><span class="comp-cell comp-cell--partial">~</span> partial / with effort</span>
             <span><span class="comp-cell comp-cell--no">–</span> not really</span>
           </p>
+          <p class="comp-more">
+            <a href="/compare" class="text-link">
+              Compare Verde with T3 Code, Conductor, Orca and others
+            </a>
+          </p>
         </div>
       </section>
 
@@ -1065,6 +1070,9 @@ bash ./scripts/release/install-linux-local.sh
               <p class="footer-col-title">Project</p>
               <a href="/about" class="footer-link">
                 About
+              </a>
+              <a href="/compare" class="footer-link">
+                Compare
               </a>
               <a href="https://github.com/JonathanRiche/verde" target="_blank" rel="noreferrer" class="footer-link">
                 GitHub
